@@ -1,0 +1,26 @@
+# Build output
+build*/
+*-build/
+*.o
+*.a
+*.so
+
+# CMake in-source artifacts (configure uses -B build, but guard anyway)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+
+# Tooling
+compile_commands.json
+.cache/
+.vscode/
+.idea/

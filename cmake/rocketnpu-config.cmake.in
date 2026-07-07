@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+# rocketnpu exposes Threads::Threads through its public interface; re-find it so
+# downstream find_package(rocketnpu) consumers get a usable imported target.
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/rocketnpu-targets.cmake")
+
+check_required_components(rocketnpu)
