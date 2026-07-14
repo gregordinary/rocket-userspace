@@ -200,6 +200,23 @@ int main(int argc, char **argv)
         if (rc >= 0) fails++;
         free(C32);
     }
+    /* An unaligned CALL-M must be REJECTED, not computed. The resident path plans at the
+     * canonical MAX_TILE, so the planner's own M%4 guard never sees the call's M, and
+     * M-independence is precisely what lets a caller vary M freely against one packed
+     * weight — so this is the one place the contract can be enforced. It is not a
+     * performance nicety: an unaligned M silently MISCOMPUTES on HW (M = 1/2/3/5/6 all
+     * return garbage), which is exactly what a MoE router's ragged per-expert row count
+     * would hand us. */
+    for (int bad = 1; bad <= 6; bad++) {
+        if (bad % 4 == 0) continue;
+        int rc = rocket_matmul_int8_prepacked_gw(ctx, bad, K, N, A, as, bs[0], Cr, rw[0]);
+        if (rc >= 0) {
+            printf("  [guard] unaligned M=%d -> %d FAIL (accepted; HW miscomputes)\n", bad, rc);
+            fails++;
+        }
+    }
+    printf("  [guard] unaligned call-M (1,2,3,5,6) rejected -> %s\n",
+           fails ? "see above" : "PASS");
 
     for (int w = 0; w < W; w++) rocket_i8_weights_free(ctx, rw[w]);
     rocket_i8_ctx_free(ctx);

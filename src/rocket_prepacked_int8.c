@@ -661,6 +661,20 @@ static void *rki_thread(void *a)
 static int rki_resolve(rocket_i8_ctx *ctx, const char *who, int M, int K, int N,
                        const rocket_i8_weights *w, rki_scratch **psc)
 {
+    /* The CALL's M must satisfy M%4, and nothing upstream checks it. The pack-time
+     * shape check only saw the PACK's M, and rki_worker_alloc plans at the canonical
+     * tileM (= MAX_TILE), so rocket_matmul_plan_int8's own M%4 guard never sees this M
+     * either. M-independence is exactly what makes that gap reachable: the whole point
+     * is that callers vary M freely against one packed weight. An unaligned M is not
+     * merely suboptimal — it silently MISCOMPUTES (HW sweep: M = 1/2/3/5/6 all return
+     * garbage with rc=0; only M%4 is correct), so it must be rejected, not padded here:
+     * padding M would need a matching pad of a_scale, which only the caller can supply.
+     * Callers with a ragged row count pad to 4 (see rocket_pad_m). */
+    if (M % 4 != 0 || M <= 0) {
+        ROCKET_LOGE("%s: M=%d must be a positive multiple of 4 (an unaligned M "
+                "miscomputes on HW) — pad rows caller-side\n", who, M);
+        return -1;
+    }
     if (K != w->K || N != w->N) {
         ROCKET_LOGE("%s: shape K=%d N=%d != packed %d/%d\n", who, K, N, w->K, w->N);
         return -1;

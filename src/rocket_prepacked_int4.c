@@ -245,6 +245,22 @@ static rk4_scratch *rk4_ctx_scratch(rocket_i4_ctx *ctx, int M, int K, int N, int
     return sc;
 }
 
+/* The CALL's M must satisfy M%4, and nothing upstream checks it: the pack-time shape
+ * check only saw the PACK's M, and rk4_worker_alloc plans at the canonical tileM (=
+ * MAX_TILE), so rocket_matmul_plan_int4's own M%4 guard never sees the call's M either.
+ * M-independence is what makes the gap reachable — varying M against one packed weight is
+ * the feature. An unaligned M silently MISCOMPUTES (the int8 twin's HW sweep: M =
+ * 1/2/3/5/6 all return garbage with rc=0), so reject rather than pad: padding M would
+ * need a matching pad of a_scale, which only the caller can supply. */
+static int rk4_call_m_ok(const char *who, int M) {
+    if (M % 4 != 0 || M <= 0) {
+        ROCKET_LOGE("%s: M=%d must be a positive multiple of 4 (an unaligned M "
+                "miscomputes on HW) — pad rows caller-side\n", who, M);
+        return 0;
+    }
+    return 1;
+}
+
 /* True iff a weight scattered for the `packed` scratch's per-worker tile layout is valid
  * to compute against the `sc` scratch (a different call-M). The weight bytes depend only
  * on the N-split + Nt/Kt/nNt/nKt/wt_slot; canonical tiling makes these M-independent, so
@@ -472,6 +488,7 @@ static void *rk4_thread(void *a) {
 int rocket_matmul_int4_prepacked(rocket_i4_ctx *ctx, int M, int K, int N,
                                  const int8_t *A, int32_t *C, rocket_i4_weights *w) {
     if (!ctx || !w || !w->sc) return -1;
+    if (!rk4_call_m_ok("rocket_matmul_int4_prepacked", M)) return -1;
     if (K != w->K || N != w->N) {
         ROCKET_LOGE("rocket_matmul_int4_prepacked: shape K=%d N=%d != packed %d/%d\n",
                 K, N, w->K, w->N);
@@ -633,6 +650,7 @@ int rocket_matmul_int4_prepacked_gw(rocket_i4_ctx *ctx, int M, int K, int N,
                                     const int8_t *A, const float *a_scale,
                                     const float *b_scale, float *Cf, rocket_i4_weights *w) {
     if (!ctx || !w || !w->sc || w->group <= 0) return -1;
+    if (!rk4_call_m_ok("rocket_matmul_int4_prepacked_gw", M)) return -1;
     if (K != w->K || N != w->N) {
         ROCKET_LOGE("rocket_matmul_int4_prepacked_gw: shape K=%d N=%d != packed %d/%d\n",
                 K, N, w->K, w->N);
