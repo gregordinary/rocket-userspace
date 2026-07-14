@@ -403,6 +403,14 @@ if(ROCKETNPU_BUILD_TESTS)
     # group's scale. group=1440 forces Kt=480 (3 tiles per group) and gates that mapping.
     add_test(NAME matmul_int8_prepacked_gw_wide_rocket
              COMMAND matmul_int8_prepacked_gw_rocket 256 2880 512 1440 2)
+    # The default N=512 splits into 128-wide slices — BELOW the 256 tile cap, so every N-tile
+    # already fits its slice exactly and the tile-padding path is never taken. The real MoE
+    # expert shape (N=2880 over 5 worker fds -> a 576-wide slice, the first width that exceeds
+    # the cap) is what exercises i8_pick_nt, and it is also the shape whose bit-exactness the
+    # fix must not disturb: shrinking Nt frees CBUF banks, and if that let Kt grow the resident
+    # path would re-tile K and stop matching the one-shot oracle. Both are gated here.
+    add_test(NAME matmul_int8_prepacked_gw_moe_rocket
+             COMMAND matmul_int8_prepacked_gw_rocket 256 2880 2880 576 2)
     add_test(NAME matmul_int8_crossm_gw_rocket COMMAND matmul_int8_crossm_gw_rocket)
     add_test(NAME matmul_int4_prepacked_rocket COMMAND matmul_int4_prepacked_rocket)
     add_test(NAME matmul_int4_prepacked_gw_rocket COMMAND matmul_int4_prepacked_gw_rocket)
@@ -415,7 +423,8 @@ if(ROCKETNPU_BUILD_TESTS)
         matmul_bf16_tiled_rocket matmul_bf16_stream_rocket matmul_tf32_tiled_rocket
         matmul_int8_prepacked_rocket matmul_int8_crossm_rocket
         matmul_int8_groupwise_rocket matmul_int8_prepacked_gw_rocket
-        matmul_int8_prepacked_gw_wide_rocket matmul_int8_crossm_gw_rocket
+        matmul_int8_prepacked_gw_wide_rocket matmul_int8_prepacked_gw_moe_rocket
+        matmul_int8_crossm_gw_rocket
         matmul_int4_prepacked_rocket matmul_int4_prepacked_gw_rocket
         matmul_int4_crossm_rocket
         matmul_int16_exact_rocket replay_dw_mesa conv_dw_int8_runtime

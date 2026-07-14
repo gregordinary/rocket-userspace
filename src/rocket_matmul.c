@@ -2245,6 +2245,42 @@ static int banks_for_i8(int rows, int Kt) {
     return ((long)rows * Kt + CBUF_BANK - 1) / CBUF_BANK;
 }
 
+/* The starting N-tile for an int8 plan: the SMALLEST tile that still reaches the fewest
+ * tiles the hardware's tile cap allows.
+ *
+ * max_tile fixes the tile COUNT — nNt = ceil(N/max_tile) is the fewest possible, and that
+ * count is what sets the task count and the dispatch. But ANY Nt >= ceil(N/nNt) reaches that
+ * same count, so defaulting Nt to max_tile buys nothing and leaves the tail tile mostly
+ * empty. Take the smallest such Nt instead: same tiles, same tasks, same real DMA — but the
+ * ALLOCATED columns drop from nNt*max_tile to nNt*Nt, and for a RESIDENT weight those columns
+ * are memory held for the process lifetime.
+ *
+ * At the resident-MoE operating point that is not a rounding error. A resident weight's N is
+ * split across the worker fds, so each worker plans on a SLICE: gpt-oss's N=2880 over 5
+ * workers gives a 576-wide slice, which at Nt=256 stores 3*256 = 768 columns to hold 576 — a
+ * 33% padding tax on every resident expert, when residency is the entire product of the
+ * native-quant expert route. At Nt=192 the same 3 tiles store exactly 576.
+ *
+ * Rounding UP to the 32-column int8 N-alignment is load-bearing: rounding DOWN can drop the
+ * tile below ceil(N/nNt) and cost an EXTRA tile — a real dispatch cost, to save nothing.
+ *
+ * Callers may still shrink Nt afterwards to fit the CBUF; that stays correct (it only costs
+ * tiles), it just may no longer divide N evenly.
+ */
+static int i8_pick_nt(int N, int max_tile) {
+    int Nt;
+    if (N <= max_tile) {
+        Nt = N;
+    } else {
+        const int nNt = (N + max_tile - 1) / max_tile;   /* fewest tiles max_tile allows */
+        Nt = (N + nNt - 1) / nNt;                        /* smallest tile reaching them   */
+    }
+    Nt = (Nt + 31) / 32 * 32;                            /* int8 N-align — UP, see above  */
+    if (Nt > max_tile) Nt = (max_tile / 32) * 32;
+    if (Nt < 32)       Nt = 32;
+    return Nt;
+}
+
 /* int8 NPU layout index math (cf. feat_idx/wt_idx). Input feature cube C2=16,
  * weight k-group 32 (== weight_int8()), int32-output cube C2=4. */
 static inline size_t feat_idx_i8(int H, int ch, int h) {   /* input, C2=16 */
@@ -2270,6 +2306,14 @@ int rocket_matmul_plan_int8(int M, int K, int N, int *pMt, int *pKt, int *pNt)
         return ROCKET_E_SHAPE;
 
     int Mt = (M < MAX_TILE) ? M : MAX_TILE;
+    /* Deliberately NOT i8_pick_nt here, unlike the group-wise twin below. This planner's Kt
+     * is unconstrained (it starts at K and shrinks to fit the CBUF), so a smaller Nt frees
+     * CBUF banks and lets Kt GROW — at the resident MoE shape it would move Kt 640 -> 768 and
+     * re-tile K on a shipped, HW-validated path, for a padding win this plan does not need
+     * (the dense W8A8 path holds one weight per tensor, not thousands of experts). The
+     * group-wise planner has no such coupling: its Kt can never exceed the quant group.
+     * Applying it here is a real lever for dense-int8 model fit, but it is its own change,
+     * with its own gate run — int8 CBUF edges are where the feature-DMA resonance lived. */
     int Nt = (N < MAX_TILE) ? N : MAX_TILE;
     Nt = (Nt / 32) * 32; if (Nt < 32) Nt = 32;   /* int8 N-align is 32 */
 
@@ -2546,8 +2590,7 @@ int rocket_matmul_plan_int8_gw(int M, int K, int N, int group,
     const int I8_BUDGET = CBUF_BANKS - 1;
 
     int Mt = (M < MAX_TILE) ? M : MAX_TILE;
-    int Nt = (N < MAX_TILE) ? N : MAX_TILE;
-    Nt = (Nt / 32) * 32; if (Nt < 32) Nt = 32;   /* int8 N-align is 32 */
+    int Nt = i8_pick_nt(N, MAX_TILE);
 
     const char *e;
     if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }

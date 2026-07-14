@@ -166,9 +166,30 @@ int main(int argc, char **argv)
         rw[w] = rocket_i8_weights_pack_gw(ctx, M, K, N, B[w], group);
         if (!rw[w]) { fprintf(stderr, "pack_gw %d failed\n", w); return -1; }
     }
-    printf("resident weight bytes (per weight): %zu MB\n", rocket_i8_weights_bytes(rw[0]) >> 20);
-
     int fails = 0;
+
+    /* The resident weight's TILE-PADDING overhead, gated rather than merely printed.
+     *
+     * A resident weight's N is split across the worker fds, and each worker tiles its own
+     * SLICE. If the N-tile is left at MAX_TILE the slice's tail tile is mostly empty: at the
+     * gpt-oss expert shape (N=2880 over 5 workers -> a 576-wide slice) that stores 3*256 =
+     * 768 columns to hold 576, a 33% tax on every resident expert — and for the native-quant
+     * MoE route, how many experts stay resident is the entire product. i8_pick_nt picks the
+     * smallest N-tile that still reaches the same tile COUNT (192 here), which stores exactly
+     * 576 at the same task count and the same DMA.
+     *
+     * 1.20x is a bound the tiling rule GUARANTEES, not one fitted to this shape: swept over
+     * every %32 slice width a real weight can produce, the worst case with i8_pick_nt is
+     * 1.123x (the 32-column alignment). Reverting to Nt=MAX_TILE reads 1.353x at the MoE
+     * shape, so this catches the regression without flaking on any other. */
+    const size_t wbytes  = rocket_i8_weights_bytes(rw[0]);
+    const size_t logical = (size_t)N * K;
+    const double overhead = (double)wbytes / (double)logical;
+    printf("resident weight bytes (per weight): %.2f MiB for %.2f MiB logical = %.3fx %s\n",
+           wbytes / 1048576.0, logical / 1048576.0, overhead,
+           overhead <= 1.20 ? "PASS" : "FAIL (tile padding — see i8_pick_nt)");
+    if (overhead > 1.20) fails++;
+
     for (int w = 0; w < W; w++) {
         char tag[16]; snprintf(tag, sizeof(tag), "w%d", w);
         ref_gw(M, K, N, group, A, B[w], as, bs[w], ref);
