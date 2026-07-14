@@ -105,6 +105,13 @@ void rocket_bo_free(int fd, rocket_bo *bo);
 int  rocket_bo_prep(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns);
 int  rocket_bo_fini(int fd, rocket_bo *bo);
 
+/* 1 if the running kernel honors DRM_ROCKET_JOB_BATCHED (per-job chained submit)
+ * AND its master switch is on; 0 otherwise. Probed once and cached. Chaining is a
+ * joint layout contract with the kernel, so a kernel that would ignore the flag
+ * must not be self-chained into -- callers must gate on this, not on the
+ * ROCKET_BATCH_SUBMIT env var alone. */
+int  rocket_batched_submit_supported(void);
+
 /* Spin-poll the completion fence for up to `us` microseconds before a blocking
  * wait falls asleep (overrides the ROCKET_BUSY_POLL env, which sets the default;
  * us<=0 disables). A single-stream latency lever for tiny submit-bound jobs with

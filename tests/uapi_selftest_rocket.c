@@ -36,6 +36,7 @@
  * Build: linked against rocketnpu by CMake. Run: ./uapi_selftest_rocket
  */
 #define _GNU_SOURCE
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,6 +183,143 @@ int main(void)
         }
         rocket_bo_free(fd,&in); rocket_bo_free(fd,&wt);
         rocket_bo_free(fd,&rc_bo); rocket_bo_free(fd,&out);
+    }
+
+    /* 6. EXTENSIBLE-STRUCT uAPI CONTRACT --------------------------------
+     *
+     * drm_rocket_job / drm_rocket_task carry @job_struct_size / @task_struct_size
+     * so the descriptors can GROW: userspace declares the size it was built
+     * against, and the kernel must accept anything from the original ("v1")
+     * layout upward. A kernel that instead compares against its own sizeof()
+     * rejects every older userspace the moment a field is appended.
+     *
+     * That is not hypothetical. A uAPI header carrying drm_rocket_job.flags,
+     * installed against a driver whose code did not implement it, rejected every
+     * submit from a userspace built on the older header with -EINVAL -- which is
+     * what made matmul_int8_dequant_rocket "require" the batched-submit patch
+     * (2026-07-14). These checks fail loudly in exactly that configuration.
+     *
+     * The v1 sizes are header-independent by construction: offsetofend() of the
+     * last ORIGINAL field, which no appended field can move.
+     *
+     * The probe job below is well-formed EXCEPT for a deliberately invalid BO
+     * handle, so it can never reach the NPU, and a size rejection (-EINVAL) stays
+     * distinguishable from the job-level rejection (-ENOENT / 0).
+     */
+    {
+        const size_t job_v1  = offsetof(struct drm_rocket_job, out_bo_handle_count) +
+                               sizeof(((struct drm_rocket_job *)0)->out_bo_handle_count);
+        const size_t task_v1 = offsetof(struct drm_rocket_task, regcmd_count) +
+                               sizeof(((struct drm_rocket_task *)0)->regcmd_count);
+
+        char vname[32] = {0};
+        struct drm_version dv = { .name = vname, .name_len = sizeof(vname)-1 };
+        ioctl(fd, DRM_IOCTL_VERSION, &dv);
+        const int extensible = (dv.version_major >= 1);              /* >= 1.0 */
+        const int has_flags  = (dv.version_major > 1 ||
+                                (dv.version_major == 1 && dv.version_minor >= 1));
+
+        /* Every check here SUBMITS a deliberately-malformed job. Only a driver
+         * advertising the contract (>= 1.0) is safe to probe this way: the same
+         * patch that added the extensible-struct handling also fixed the latent
+         * rocket_iommu_domain_put() NULL deref that a rejected submit walks into,
+         * so a pre-1.0 kernel would OOPS rather than return an errno. Skip the
+         * submits there -- userspace already refuses to rely on the contract when
+         * the driver does not advertise it. */
+        if (!extensible) {
+            INFO("driver %d.%d predates the extensible-struct contract (< 1.0): "
+                 "submit-based contract checks skipped (would oops a pre-fix kernel)",
+                 dv.version_major, dv.version_minor);
+        } else {
+        uint32_t bogus[1] = { 0xFFFFFFF0u };   /* no such GEM handle => -ENOENT */
+        struct drm_rocket_task t = { .regcmd = 0, .regcmd_count = 1 };
+        struct drm_rocket_job  j = {
+            .tasks               = (uint64_t)(uintptr_t)&t,
+            .task_count          = 1,
+            .task_struct_size    = (uint32_t)task_v1,
+            .in_bo_handles       = (uint64_t)(uintptr_t)bogus,
+            .in_bo_handle_count  = 1,
+            .out_bo_handles      = (uint64_t)(uintptr_t)bogus,
+            .out_bo_handle_count = 1,
+        };
+        struct drm_rocket_submit s = {
+            .jobs = (uint64_t)(uintptr_t)&j, .job_count = 1,
+            .job_struct_size = (uint32_t)job_v1,
+        };
+
+        /* (a) THE REGRESSION CHECK: a v1-sized declaration must never be rejected
+         *     for being too small. The job still fails (bad handle), but it must
+         *     not fail at the SIZE gate. */
+        errno = 0;
+        int rc = ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &s);
+        int e  = errno;
+        CHECK(!(rc < 0 && e == EINVAL),
+              "job_struct_size = the v1 minimum is accepted (extensible-struct "
+              "contract; a kernel whose struct grew but kept the '< sizeof' guard "
+              "fails HERE with -EINVAL)");
+        INFO("driver %d.%d, job v1=%zu sizeof=%zu -> rc=%d (%s)",
+             dv.version_major, dv.version_minor, job_v1,
+             sizeof(struct drm_rocket_job), rc, rc ? strerror(e) : "accepted");
+
+        /* (b) Below the v1 minimum must still be refused. */
+        struct drm_rocket_submit s_short = s;
+        s_short.job_struct_size = (uint32_t)(job_v1 - 4);
+        errno = 0;
+        CHECK(ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &s_short) < 0 && errno == EINVAL,
+              "job_struct_size below the v1 minimum is rejected (-EINVAL)");
+
+        {
+            /* (c) Same contract for the task descriptor -- the struct the original
+             *     batched-submit patch left with a strict sizeof() guard. */
+            struct drm_rocket_job j_bt = j;
+            j_bt.task_struct_size = (uint32_t)(task_v1 - 4);
+            struct drm_rocket_submit s_bt = s;
+            s_bt.jobs = (uint64_t)(uintptr_t)&j_bt;
+            errno = 0;
+            CHECK(ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &s_bt) < 0 && errno == EINVAL,
+                  "task_struct_size below the v1 minimum is rejected (-EINVAL)");
+
+            /* (d) A trailing field this kernel does not know, SET by userspace,
+             *     must be refused loudly rather than silently dropped -- otherwise
+             *     the job runs with semantics nobody asked for. */
+            struct { struct drm_rocket_job job; uint32_t tail[8]; } big = { .job = j };
+            big.tail[7] = 0xDEADBEEFu;
+            struct drm_rocket_submit s_big = {
+                .jobs = (uint64_t)(uintptr_t)&big, .job_count = 1,
+                .job_struct_size = (uint32_t)sizeof(big),
+            };
+            errno = 0;
+            CHECK(ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &s_big) < 0 && errno == E2BIG,
+                  "a trailing field the kernel does not know, set by userspace, is "
+                  "refused with -E2BIG (never silently ignored)");
+        }
+
+        /* (e) Unknown flag bits must be rejected, so a future flag cannot be
+         *     silently ignored by a kernel that does not implement it. */
+        if (has_flags) {
+            /* Written by OFFSET, not through the struct: the installed header may
+             * predate @flags, and @flags sits exactly at the v1 end by definition. */
+            unsigned char jb[128] = {0};
+            uint32_t bad_flag = 0x80000000u;     /* no such flag */
+            memcpy(jb, &j, job_v1);
+            memcpy(jb + job_v1, &bad_flag, sizeof(bad_flag));   /* @flags    */
+                                                                /* @reserved stays 0 */
+            struct drm_rocket_submit s_bf = {
+                .jobs = (uint64_t)(uintptr_t)jb, .job_count = 1,
+                .job_struct_size = (uint32_t)(job_v1 + 8),
+            };
+            errno = 0;
+            CHECK(ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &s_bf) < 0 && errno == EINVAL,
+                  "an unknown drm_rocket_job.flags bit is rejected (-EINVAL)");
+        }
+
+        /* Chaining is a joint layout contract: if the kernel would ignore the
+         * flag, userspace must not self-chain. Pin that the library agrees with
+         * what the driver advertises. */
+        CHECK(rocket_batched_submit_supported() == 0 || has_flags,
+              "library enables chained submit only on a driver that honors "
+              "DRM_ROCKET_JOB_BATCHED (>= 1.1)");
+        }  /* extensible */
     }
 
     /* 5. IOVA growth report (informational) ------------------------------ */

@@ -16,6 +16,7 @@
 
 #include "rocket_chain.h"
 #include "npu_hw.h"   /* OP_NONE, OP_REG_PC, PC_BASE_ADDRESS, PC_REGISTER_AMOUNTS */
+#include "rocket_npu.h"  /* rocket_batched_submit_supported */
 #include "rocket_log.h"
 
 /* A trailer rewrite below can only fail if a gen_* generator stops emitting the
@@ -38,7 +39,23 @@ int rkt_chain_enabled(void) {
     static _Atomic int c = -1;
     if (c < 0) {
         const char *e = getenv("ROCKET_BATCH_SUBMIT");
-        c = (e && atoi(e) > 0) ? 1 : 0;
+        int want = (e && atoi(e) > 0) ? 1 : 0;
+        /*
+         * Asking for chaining is not enough — the kernel has to hold up its half.
+         * Chaining is a joint layout contract (we self-chain the regcmds, the
+         * kernel sets TASK_NUMBER = task_count); a kernel that does not know
+         * DRM_ROCKET_JOB_BATCHED ignores the flag and runs our chained layout
+         * down the per-task path, which corrupts or stalls the job. So an
+         * unsupported kernel must DISABLE chaining, not silently proceed.
+         */
+        if (want && !rocket_batched_submit_supported()) {
+            ROCKET_LOGW("ROCKET_BATCH_SUBMIT=1 but this kernel does not honor "
+                        "DRM_ROCKET_JOB_BATCHED (needs the rocket batched-submit "
+                        "patch; driver must report >= 1.1). Running the stock "
+                        "per-task path instead.\n");
+            want = 0;
+        }
+        c = want;
     }
     return c;
 }

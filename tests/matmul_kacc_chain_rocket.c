@@ -145,6 +145,19 @@ int main(int argc, char **argv)
     int fd = rocket_open();
     if (fd < 0) { printf("no NPU (%d) -> SKIP\n", fd); return 2; }
 
+    /* Chaining needs a kernel that honors DRM_ROCKET_JOB_BATCHED (the rocket
+     * batched-submit patch; driver interface >= 1.1). On an older kernel the
+     * KACC-chain path correctly falls back to per-ki fences, so a chained-vs-
+     * unchained comparison would just compare two unchained runs -- a vacuous
+     * pass. SKIP instead, so the result honestly reflects that chaining was not
+     * exercised. */
+    if (!rocket_batched_submit_supported()) {
+        printf("kernel does not honor DRM_ROCKET_JOB_BATCHED (needs interface "
+               ">= 1.1) -> SKIP\n");
+        rocket_close(fd);
+        return 2;
+    }
+
     int fails = 0, ran = 0;
     if (argc == 4) {
         int M = atoi(argv[1]), K = atoi(argv[2]), N = atoi(argv[3]);

@@ -21,6 +21,7 @@
 #include <time.h>
 
 #include <stddef.h>         /* offsetof */
+#include <stdatomic.h>      /* the cached capability probe */
 
 #include <libdrm/drm.h>
 #include <drm/rocket_accel.h>   /* DRM_IOCTL_ROCKET_*, struct drm_rocket_*    */
@@ -35,9 +36,8 @@
  * <drm/rocket_accel.h> already carries it, set job.flags directly. When it
  * predates the field (e.g. an off-device syntax check against an unpatched
  * header), append the field via a wrapper at exactly the offset the kernel
- * expects (pinned by the static_assert) and pass the larger job_struct_size; a
- * patched kernel reads min(job_struct_size, its sizeof) and honors it, a stock
- * one ignores the tail. Either way the flag is a no-op against a stock kernel.
+ * expects (pinned by the static_assert). Either way the flag is a no-op against
+ * a kernel that does not implement it.
  */
 #ifndef DRM_ROCKET_JOB_BATCHED
 #define DRM_ROCKET_JOB_BATCHED (1u << 0)
@@ -52,16 +52,44 @@ _Static_assert(offsetof(struct rocket_job_flagged, flags) ==
 #define ROCKET_JOB_FLAGS_VENDORED 1
 #endif
 
-/* Submit one job (n_tasks tasks) on `fd`, optionally with the per-job batched
- * flag set. Centralizes the vendored-vs-native job_struct_size handling so the
- * callers below stay uniform. Returns 0 / negative errno. */
-static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tasks,
-                              const uint32_t *in_handles,  uint32_t n_in,
-                              const uint32_t *out_handles, uint32_t n_out,
-                              int batched)
+/*
+ * rkt_job — the ABI-complete job struct: drm_rocket_job plus its trailing
+ * @flags/@reserved, whether the installed header declares them or we append
+ * them. EVERY submit site must build one of these and declare sizeof(rkt_job)
+ * as job_struct_size, so the size we advertise never depends on which
+ * <drm/rocket_accel.h> happens to be installed.
+ *
+ * Always sending the full struct is the compatible direction against both
+ * kernels: one that predates @flags copies only the fields it knows and strides
+ * past the tail, and one that has it reads flags == 0 -> the stock per-task
+ * path. The REVERSE is not safe -- declaring the shorter, pre-@flags size to a
+ * kernel whose drm_rocket_job has grown trips its "job_struct_size ... is too
+ * small" guard and the submit fails with -EINVAL. (A kernel carrying the
+ * uapi-extensible-structs patch guards on the v1 minimum instead and tolerates a
+ * short declaration, but do not rely on that: declare what you have.) Both
+ * @flags and @reserved are named identically in the vendored wrapper and the
+ * native struct, so only the base fields need the accessor.
+ *
+ * Note this is only about the SIZE we declare. Whether the kernel HONORS the
+ * batched flag is a separate question -- see rocket_batched_submit_supported().
+ */
+#ifdef ROCKET_JOB_FLAGS_VENDORED
+typedef struct rocket_job_flagged rkt_job;
+#define RKT_JOB_BASE(j) ((j).job)
+#else
+typedef struct drm_rocket_job rkt_job;
+#define RKT_JOB_BASE(j) (j)
+#endif
+
+/* Fill one rkt_job. Zeroes the whole struct first so @reserved (and any field a
+ * newer header adds) stays 0. */
+static void rkt_job_init(rkt_job *j, struct drm_rocket_task *dt, uint32_t n_tasks,
+                         const uint32_t *in_handles,  uint32_t n_in,
+                         const uint32_t *out_handles, uint32_t n_out,
+                         int batched)
 {
-    __u32 flags = batched ? DRM_ROCKET_JOB_BATCHED : 0u;
-    struct drm_rocket_job job = {
+    memset(j, 0, sizeof(*j));
+    RKT_JOB_BASE(*j) = (struct drm_rocket_job){
         .tasks               = (uint64_t)(uintptr_t)dt,
         .task_count          = n_tasks,
         .task_struct_size    = sizeof(struct drm_rocket_task),
@@ -70,27 +98,93 @@ static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tas
         .out_bo_handles      = (uint64_t)(uintptr_t)out_handles,
         .out_bo_handle_count = n_out,
     };
-#ifdef ROCKET_JOB_FLAGS_VENDORED
-    struct rocket_job_flagged jx = { .job = job, .flags = flags, .reserved = 0 };
+    j->flags = batched ? DRM_ROCKET_JOB_BATCHED : 0u;
+}
+
+/* Submit one job (n_tasks tasks) on `fd`, optionally with the per-job batched
+ * flag set. Returns 0 / negative errno. */
+static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tasks,
+                              const uint32_t *in_handles,  uint32_t n_in,
+                              const uint32_t *out_handles, uint32_t n_out,
+                              int batched)
+{
+    rkt_job jx;
+    rkt_job_init(&jx, dt, n_tasks, in_handles, n_in, out_handles, n_out, batched);
+
     struct drm_rocket_submit submit = {
         .jobs            = (uint64_t)(uintptr_t)&jx,
         .job_count       = 1,
         .job_struct_size = sizeof(jx),
     };
-#else
-    job.flags = flags;
-    struct drm_rocket_submit submit = {
-        .jobs            = (uint64_t)(uintptr_t)&job,
-        .job_count       = 1,
-        .job_struct_size = sizeof(job),
-    };
-#endif
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
         ROCKET_LOGE("ROCKET_SUBMIT(%u tasks, batched=%d): %s\n",
                     n_tasks, batched, strerror(errno));
         return -errno;
     }
     return 0;
+}
+
+/* ============================================================================
+ * SECTION — Kernel capabilities
+ * ==========================================================================*/
+
+/*
+ * Does the running kernel actually honor DRM_ROCKET_JOB_BATCHED?
+ *
+ * This is not a nicety. Chaining is a JOINT layout contract: userspace lays a
+ * job's per-task regcmds out contiguously and rewrites each trailer to link to
+ * the next, and the kernel must set TASK_NUMBER = task_count so the PC streams
+ * them from one kick. A kernel that does not know the flag ignores it and runs
+ * that self-chained layout down the stock per-task path (TASK_NUMBER = 1,
+ * re-arming each task from the IRQ) -- which corrupts or stalls the job. So
+ * "the kernel silently ignored our flag" is NOT a safe degradation, and
+ * userspace must never assume support just because ROCKET_BATCH_SUBMIT is set.
+ *
+ * Probed once, in order of specificity:
+ *
+ *  1. /sys/module/rocket/parameters/rocket_batch_submit -- created by the kernel
+ *     half of the batched-submit patch, so its mere existence proves the flag is
+ *     understood. Its VALUE is the master switch: 0 means the kernel forces every
+ *     job to the per-task path, which is exactly the mix we must not self-chain
+ *     into, so 0 disables chaining here too.
+ *
+ *  2. Otherwise fall back to the advertised DRM interface version. A kernel that
+ *     implements the flag without the kill switch (an upstreamed variant, say)
+ *     still reports >= 1.1, the version in which DRM_ROCKET_JOB_BATCHED appears.
+ *     Stock mainline leaves .major/.minor unset and reports 0.0.0 -> unsupported.
+ *
+ * Returns 1 if it is safe to self-chain, 0 otherwise.
+ */
+int rocket_batched_submit_supported(void)
+{
+    static _Atomic int cached = -1;
+    int c = atomic_load(&cached);
+    if (c >= 0)
+        return c;
+
+    FILE *f = fopen("/sys/module/rocket/parameters/rocket_batch_submit", "r");
+    if (f) {
+        int v = 0;
+        c = (fscanf(f, "%d", &v) == 1 && v != 0) ? 1 : 0;
+        fclose(f);
+        if (!c)
+            ROCKET_LOGI("rocket_batch_submit=0: the kernel forces every job to the "
+                        "per-task path, so chained submit stays off.\n");
+        atomic_store(&cached, c);
+        return c;
+    }
+
+    c = 0;
+    int fd = rocket_open();
+    if (fd >= 0) {
+        struct drm_version dv = {0};
+        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
+            c = (dv.version_major > 1 ||
+                 (dv.version_major == 1 && dv.version_minor >= 1)) ? 1 : 0;
+        rocket_close(fd);
+    }
+    atomic_store(&cached, c);
+    return c;
 }
 
 /* ============================================================================
@@ -342,27 +436,9 @@ int rocket_submit_matmul(int fd,
         .regcmd_count = regcmd_count,
     };
 
-    struct drm_rocket_job job = {
-        .tasks              = (uint64_t)(uintptr_t)&task,
-        .task_count         = 1,
-        .task_struct_size   = sizeof(task),
-        .in_bo_handles      = (uint64_t)(uintptr_t)in_handles,
-        .in_bo_handle_count = n_in,
-        .out_bo_handles     = (uint64_t)(uintptr_t)out_handles,
-        .out_bo_handle_count= n_out,
-    };
-
-    struct drm_rocket_submit submit = {
-        .jobs            = (uint64_t)(uintptr_t)&job,
-        .job_count       = 1,
-        .job_struct_size = sizeof(job),
-    };
-
-    if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
-        ROCKET_LOGE("ROCKET_SUBMIT: %s\n", strerror(errno));
-        return -errno;
-    }
-    return 0;
+    /* Goes through rkt_submit_one_job so this path declares the same
+     * job_struct_size as every other submit site (see rkt_job). */
+    return rkt_submit_one_job(fd, &task, 1, in_handles, n_in, out_handles, n_out, 0);
 }
 
 /* Scratch (bytes) a caller must provide to rocket_submit_tasks_pre for up to
@@ -418,7 +494,9 @@ int rocket_submit_tasks(int fd,
 int rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs)
 {
     if (n_jobs == 0) return 0;   // nothing to submit; calloc(0) may return NULL (cf. rocket_submit_tasks)
-    struct drm_rocket_job *dj = calloc(n_jobs, sizeof(*dj));
+    /* rkt_job, not drm_rocket_job: the array stride and the declared
+     * job_struct_size must both be the ABI-complete size (see rkt_job). */
+    rkt_job *dj = calloc(n_jobs, sizeof(*dj));
     struct drm_rocket_task **dts = calloc(n_jobs, sizeof(*dts));
     if (!dj || !dts) { free(dj); free(dts); return -ENOMEM; }
 
@@ -430,21 +508,16 @@ int rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs)
             dts[j][i].regcmd       = jobs[j].tasks[i].regcmd;
             dts[j][i].regcmd_count = jobs[j].tasks[i].regcmd_count;
         }
-        dj[j] = (struct drm_rocket_job){
-            .tasks               = (uint64_t)(uintptr_t)dts[j],
-            .task_count          = jobs[j].n_tasks,
-            .task_struct_size    = sizeof(struct drm_rocket_task),
-            .in_bo_handles       = (uint64_t)(uintptr_t)jobs[j].in_handles,
-            .in_bo_handle_count  = jobs[j].n_in,
-            .out_bo_handles      = (uint64_t)(uintptr_t)jobs[j].out_handles,
-            .out_bo_handle_count = jobs[j].n_out,
-        };
+        /* Multi-job submit keeps the stock gapped per-task path (batched=0). */
+        rkt_job_init(&dj[j], dts[j], jobs[j].n_tasks,
+                     jobs[j].in_handles,  jobs[j].n_in,
+                     jobs[j].out_handles, jobs[j].n_out, 0);
     }
 
     struct drm_rocket_submit submit = {
         .jobs            = (uint64_t)(uintptr_t)dj,
         .job_count       = n_jobs,
-        .job_struct_size = sizeof(struct drm_rocket_job),
+        .job_struct_size = sizeof(rkt_job),
     };
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
         ROCKET_LOGE("ROCKET_SUBMIT(%u jobs): %s\n", n_jobs, strerror(errno));
