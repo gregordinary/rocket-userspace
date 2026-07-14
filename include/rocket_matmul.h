@@ -145,6 +145,30 @@ int rocket_matmul_plan_int8(int M, int K, int N, int *Mt, int *Kt, int *Nt);
 int rocket_matmul_int8(int fd, int M, int K, int N,
                        const int8_t *A, const int8_t *B, int32_t *C);
 
+/* GROUP-WISE int8: C_f[M,N] = sum_g a_scale[m,g]*b_scale[n,g] * (int32 partial of
+ * K-group g), fp32-accumulated. A,B are pre-quantized int8; a_scale is [M*nG],
+ * b_scale is [N*nG] (nG = K/group), the per-group quant scales; Cf[M,N] is
+ * overwritten. Every K-tile is kept inside ONE quant group, so that group's scale
+ * applies to the tile's partial as it is read back -- no extra NPU work over
+ * rocket_matmul_int8, just a scaled multiply-add on readback instead of an integer
+ * one. This is what a natively-quantized weight (a GGUF MXFP4/Q8_0/Q4_K block, one
+ * scale per K-block) needs, since the NPU cannot apply a K-blocked scale on-chip.
+ *
+ * group must be %32 and divide K; alignment as rocket_matmul_int8 minus the M==1
+ * pad (K%32, N%32, M%4 — pad single vectors to M=4 caller-side). Unlike the int4
+ * twin there is no saturation bound: the NPU output is int32, not int16.
+ * rocket_matmul_plan_int8_gw previews the tiling (pure, no HW) and reports the Kt
+ * it actually chose, which may be a proper DIVISOR of `group` when the group is
+ * too wide for the CBUF (a K-tile need only lie inside one group, not be one).
+ * Like rocket_matmul_plan_int8 it returns the NPU tile count, or <0 (rocket_status)
+ * on an unsupported shape; rocket_matmul_int8_groupwise returns 0 on success. */
+int rocket_matmul_plan_int8_gw(int M, int K, int N, int group,
+                               int *Mt, int *Kt, int *Nt);
+int rocket_matmul_int8_groupwise(int fd, int M, int K, int N,
+                                 const int8_t *A, const int8_t *B,
+                                 const float *a_scale, const float *b_scale,
+                                 float *Cf, int group);
+
 /* ---- int4 tiled matmul -------------------------------------------------
  * int4 x int4 -> int16 (the NPU output), host-accumulated to int32 C. A and B are
  * PRE-QUANTIZED int4 values stored one-per-int8_t in [-8,7] (the backend owns the
@@ -417,6 +441,30 @@ size_t             rocket_i8_weights_bytes(const rocket_i8_weights *w);
 
 int rocket_matmul_int8_prepacked(rocket_i8_ctx *ctx, int M, int K, int N,
                                  const int8_t *A, int32_t *C, rocket_i8_weights *w);
+
+/* GROUP-WISE resident int8 — the resident sibling of rocket_matmul_int8_groupwise, and
+ * the path a NATIVELY quantized weight (a GGUF MXFP4 / Q8_0 / Q4_K block, one scale per
+ * K-block) needs: the int8 codes live on the NPU permanently, so the per-forward-pass
+ * host dequant-to-fp16 and weight scatter both disappear. Pack once with
+ * rocket_i8_weights_pack_gw (group%32, K%group); then each call quantizes only A and
+ * returns the fp32 dequantized Cf[M,N] = sum_g a_scale[m,g]*b_scale[n,g] * (int32
+ * partial of K-group g). a_scale is [M*nG], b_scale is [N*nG] (nG = K/group), the
+ * per-row / per-channel per-group scales.
+ *
+ * Deltas from the int4 twin, both from int8's int32 (not int16) output accumulator:
+ * there is NO saturation bound on `group`, and the K-tile is not forced to equal the
+ * group — it is the largest DIVISOR of the group the CBUF can hold, so a group wider
+ * than the CBUF cap is legal (it just costs more K-tiles per group). The raw-int32
+ * path stays rocket_matmul_int8_prepacked.
+ *
+ * The weight stays M-independent (canonical tiling), so one pack serves every
+ * micro-batch size; a genuine tiling mismatch returns -2 (re-pack), never a wrong
+ * answer. NOT thread-safe (as rocket_ctx): one ctx per concurrent host thread. */
+rocket_i8_weights *rocket_i8_weights_pack_gw(rocket_i8_ctx *ctx, int M, int K, int N,
+                                             const int8_t *B, int group);
+int rocket_matmul_int8_prepacked_gw(rocket_i8_ctx *ctx, int M, int K, int N,
+                                    const int8_t *A, const float *a_scale,
+                                    const float *b_scale, float *Cf, rocket_i8_weights *w);
 
 /* ---- resident int4 (W4A4) path — int4 sibling of the resident int8 path.
  * Same usage; A/B pre-quantized int4 one-per-int8_t in [-8,7], C raw int32. N

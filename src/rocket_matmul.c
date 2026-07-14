@@ -163,7 +163,19 @@ static int kacc_on(void) {
 static int kacc_chain_on(void) {
     const char *e = getenv("ROCKET_KACC_CHAIN");
     int v = e ? atoi(e) : 0;
-    return v < 0 ? 0 : v;
+    if (v <= 0)
+        return 0;
+    /*
+     * Chaining is a joint contract with the kernel (we self-chain the regcmds and
+     * set DRM_ROCKET_JOB_BATCHED; the kernel sets TASK_NUMBER = task_count). On a
+     * kernel that does not honor the flag the submit is rejected (a contract kernel
+     * refuses the unknown trailing field with -E2BIG) or the chained layout runs
+     * down the per-task path and corrupts. Either way, fall back to the per-ki
+     * fenced KACC path, which is correct on any kernel. Same gate as
+     * rkt_chain_enabled() -- see rocket_batched_submit_supported(). */
+    if (!rocket_batched_submit_supported())
+        return 0;
+    return v;
 }
 
 /* Asymmetric-Nt tiling (ROCKET_MM_ASYM, default ON; set =0 to opt out). The planner maximizes
@@ -2471,6 +2483,251 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
 
 free_host:
     free(acc); free(tasks); free(bm0); free(bn0); free(bMtile); free(bNtile); free(boff);
+free_bos:
+    rocket_bo_free(fd, &guard);
+    rocket_bo_free(fd, &regcmd); rocket_bo_free(fd, &in_all);
+    rocket_bo_free(fd, &wt_all); rocket_bo_free(fd, &out_all);
+    return ret;
+}
+
+/* ============================================================================
+ * GROUP-WISE int8 matmul: C_f[M,N] = sum_g a_scale[m,g]*b_scale[n,g] * (int32
+ * partial of K-group g), accumulated in fp32.
+ *
+ * The int8 sibling of rocket_matmul_int4_groupwise, and the primitive a natively
+ * quantized weight needs. Such a weight (a GGUF MXFP4 / Q8_0 / Q4_K block) carries
+ * one scale per K-block, and the NPU cannot apply a K-blocked scale on-chip: at the
+ * output stage K is fully contracted, so nothing in the DPU is indexed by a K-block,
+ * for any dtype. But the integer partials ALREADY leave the chip at every K-tile
+ * boundary — on-device integer K-accum is HW-dead (see rocket_matmul_int8 above) —
+ * so the block scale is free at a boundary that is already being paid for. Keep each
+ * K-tile inside one quant group, multiply its int32 partial by that group's scale,
+ * accumulate in fp32 on the host. The NPU-side work is identical to
+ * rocket_matmul_int8; the only delta is `float += scale * int32` on readback instead
+ * of `int64 += int32`.
+ *
+ * A, B are PRE-QUANTIZED int8 (row-major); a_scale is [M*nG] and b_scale is [N*nG]
+ * (row-major, nG = K/group); Cf[M,N] is overwritten. Alignment is rocket_matmul_int8's
+ * minus the M==1 pad: K%32, N%32, M%4 — a padded M==1 would need a padded a_scale
+ * too, so single vectors are padded to M=4 caller-side (as the resident paths require).
+ *
+ * There is NO saturation bound here. The int4 twin needs `49*group < 32767` because
+ * its NPU output is int16; int8's is int32, and a K-tile partial is bounded by
+ * |group * 127 * 127| = 16129*group — well inside int32 for any group the CBUF can
+ * hold (Kt <= 640 on RK3588). That headroom is exactly why int8, not int4, is the
+ * dtype for a GGUF-quantized weight.
+ * ==========================================================================*/
+
+/* Group-wise int8 tiling (pure). Kt is constrained to lie inside one quant group,
+ * which the free-Kt search in rocket_matmul_plan_int8 cannot express, so the CBUF is
+ * re-fitted here around that constraint.
+ *
+ * Kt need only DIVIDE the group, not equal it: each K-tile must lie wholly inside one
+ * group so its partial can take that group's single scale, but it does not have to BE
+ * the group. So readback (~ M*N*nKt, and these paths are readback-bound) is set by the
+ * CBUF's Kt cap, and `group` only upper-bounds it. Take the largest divisor that fits.
+ *
+ * Do NOT do what rocket_matmul_int4_groupwise does — overwrite the planner's Kt with
+ * `group` and re-check nothing. int4 gets away with that only because its int16
+ * saturation bound already caps group at 668 AND its nibble packing halves the bytes.
+ * int8 has neither (the int32 accumulator is the whole point), so an un-rechecked wide
+ * group would silently overflow the CBUF. */
+int rocket_matmul_plan_int8_gw(int M, int K, int N, int group,
+                               int *pMt, int *pKt, int *pNt)
+{
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+    const int MAX_TILE = hw->max_tile, CBUF_BANKS = hw->cbuf_banks;
+    if (K % 32 || N % 32 || M % 4 != 0) return ROCKET_E_SHAPE;
+    if (group < 32 || group % 32 || K % group) return ROCKET_E_SHAPE;
+
+    /* Reserve ONE feature slack bank, exactly as rocket_matmul_plan_int8 does:
+     * gen_matmul_int8 sets data_bank = fd_banks+1 to dodge the int8 feature-DMA
+     * tail-row resonance, so feature+weight must stay within BANKS-1. */
+    const int I8_BUDGET = CBUF_BANKS - 1;
+
+    int Mt = (M < MAX_TILE) ? M : MAX_TILE;
+    int Nt = (N < MAX_TILE) ? N : MAX_TILE;
+    Nt = (Nt / 32) * 32; if (Nt < 32) Nt = 32;   /* int8 N-align is 32 */
+
+    const char *e;
+    if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }
+    if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= 32) { Nt = (v/32)*32; if (Nt > N) Nt = N; } }
+    /* ROCKET_MM_KT is deliberately NOT honored: Kt is pinned by the quant group. */
+
+    int Kt = 0;
+    for (;;) {
+        for (int d = group; d >= 32; d -= 32) {
+            if (group % d) continue;             /* a K-tile must never straddle a group */
+            if (banks_for_i8(Mt, d) + banks_for_i8(Nt, d) <= I8_BUDGET) { Kt = d; break; }
+        }
+        if (Kt) break;
+        /* Not even a 32-wide K-tile fits at this tile size. Unreachable on RK3588
+         * (Mt,Nt <= 256 costs 2 banks at Kt=32, against a budget of 11); defensive
+         * against a future profile with a large max_tile or a small CBUF. */
+        if      (Nt > 32) Nt -= 32;
+        else if (Mt > 4)  Mt -= 4;
+        else return ROCKET_E_SHAPE;
+    }
+
+    if (pMt) *pMt = Mt;
+    if (pKt) *pKt = Kt;
+    if (pNt) *pNt = Nt;
+
+    int nm = (M + Mt - 1) / Mt, nn = (N + Nt - 1) / Nt, nk = K / Kt;   /* Kt | group | K */
+    if ((int64_t)nm * nn * nk > INT32_MAX) return ROCKET_E_SHAPE;
+    return nm * nn * nk;
+}
+
+int rocket_matmul_int8_groupwise(int fd, int M, int K, int N,
+                                 const int8_t *A, const int8_t *B,
+                                 const float *a_scale, const float *b_scale,
+                                 float *Cf, int group)
+{
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
+        return ROCKET_E_UNSUPPORTED;
+    int Mt, Kt, Nt;
+    if (rocket_matmul_plan_int8_gw(M, K, N, group, &Mt, &Kt, &Nt) < 0) {
+        ROCKET_LOGE("rocket_matmul_int8_groupwise: unsupported shape M=%d K=%d N=%d "
+                "group=%d (need K%%32, N%%32, M%%4, group%%32, group|K)\n", M, K, N, group);
+        return ROCKET_E_SHAPE;
+    }
+    int nG = K / group;                                        /* quant groups along K */
+    int nMt = (M + Mt - 1) / Mt, nNt = (N + Nt - 1) / Nt, nKt = K / Kt;
+    int kt_per_group = group / Kt;                             /* K-tiles inside one group */
+    size_t in_slot  = (size_t)rup(Mt, 4)  * rup(Kt, 32);       /* int8 elems  */
+    size_t wt_slot  = (size_t)rup(Nt, 32) * rup(Kt, 32);       /* int8 elems  */
+    size_t out_slot = (size_t)rup(Mt, 4)  * rup(Nt, 16);       /* int32 elems */
+
+    /* ---- allocate BOs (int8 in/wt @1B, int32 out @4B) — geometry identical to
+     * rocket_matmul_int8, which is what makes this a drop-in scale-on-readback. ---- */
+    rocket_bo guard = {0}, regcmd = {0}, in_all = {0}, wt_all = {0}, out_all = {0};
+    size_t in_sz  = (size_t)nMt * nKt * in_slot  + CBUF_BANK;
+    size_t wt_sz  = (size_t)nNt * nKt * wt_slot  + CBUF_BANK;
+    size_t rc_sz  = (size_t)BATCH * RC_STRIDE * sizeof(uint64_t);
+    size_t out_sz = (size_t)BATCH * out_slot * sizeof(int32_t) + CBUF_BANK;
+
+    int ret = 0;
+    ret |= rocket_bo_alloc(fd, 4096, &guard);                  /* push allocs off IOVA 0 */
+    ret |= rocket_bo_alloc(fd, rc_sz,  &regcmd);
+    ret |= rocket_bo_alloc(fd, in_sz,  &in_all);
+    ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
+    ret |= rocket_bo_alloc(fd, out_sz, &out_all);
+    if (ret) { ROCKET_LOGE("rocket_matmul_int8_groupwise: BO alloc failed\n"); ret = -1; goto free_bos; }
+    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
+         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
+        ROCKET_LOGE("rocket_matmul_int8_groupwise: a BO dma_address exceeds 32 bits\n");
+        ret = -1; goto free_bos;
+    }
+
+    /* ---- pack weights B[N,K] -> (N/32,K/32,32,32) int8 tile layout ---- */
+    if (rocket_bo_prep(fd, &wt_all, 1, 0) != 0) { ret = -1; goto free_bos; }
+    memset(wt_all.ptr, 0, wt_all.size);
+    for (int ni = 0; ni < nNt; ni++) {
+        int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
+        for (int ki = 0; ki < nKt; ki++) {
+            int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
+            int8_t *slot = (int8_t *)wt_all.ptr + (size_t)(ni * nKt + ki) * wt_slot;
+            for (int kk = 1; kk <= Ntile; kk++)
+                for (int c = 1; c <= Ktile; c++)
+                    slot[wt_idx_i8(Ktile, kk, c)] = B[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)];
+        }
+    }
+    rocket_bo_fini(fd, &wt_all);
+
+    /* ---- pack input A[M,K] -> (M,K) int8 feature cube (C2=16) ---- */
+    if (rocket_bo_prep(fd, &in_all, 1, 0) != 0) { ret = -1; goto free_bos; }
+    memset(in_all.ptr, 0, in_all.size);
+    for (int mi = 0; mi < nMt; mi++) {
+        int m0 = mi * Mt, Mtile = (M - m0 < Mt) ? (M - m0) : Mt;
+        for (int ki = 0; ki < nKt; ki++) {
+            int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
+            int8_t *slot = (int8_t *)in_all.ptr + (size_t)(mi * nKt + ki) * in_slot;
+            for (int h = 1; h <= Mtile; h++)
+                for (int c = 1; c <= Ktile; c++)
+                    slot[feat_idx_i8(Mtile, c, h)] = A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)];
+        }
+    }
+    rocket_bo_fini(fd, &in_all);
+
+    /* ---- batched tile compute: host fp32 K-accumulation with per-group scales ---- */
+    rocket_task_desc *tasks = malloc(BATCH * sizeof(*tasks));
+    uint64_t npu_regs[256] = {0};
+    int *bm0 = malloc(BATCH * sizeof(int)), *bn0 = malloc(BATCH * sizeof(int));
+    int *bMtile = malloc(BATCH * sizeof(int)), *bNtile = malloc(BATCH * sizeof(int));
+    int *bg = malloc(BATCH * sizeof(int));
+    size_t *boff = malloc(BATCH * sizeof(size_t));
+    if (!tasks || !bm0 || !bn0 || !bMtile || !bNtile || !bg || !boff) { ret = -1; goto free_host; }
+    memset(Cf, 0, (size_t)M * N * sizeof(float));
+
+    int total = nMt * nNt * nKt, done_tiles = 0, nb = 0;
+    for (int mi = 0; mi < nMt; mi++) {
+        int m0 = mi * Mt, Mtile = (M - m0 < Mt) ? (M - m0) : Mt;
+        for (int ni = 0; ni < nNt; ni++) {
+            int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
+            for (int ki = 0; ki < nKt; ki++) {
+                int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
+
+                if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
+
+                size_t out_off = (size_t)nb * out_slot;
+                matmul_params_t p = {
+                    .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
+                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot),
+                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot),
+                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(int32_t)),
+                    .tasks = npu_regs,
+                };
+                if ((ret = gen_matmul_int8(&p)) != 0) {
+                    ROCKET_LOGE("rocket_matmul_int8_groupwise: gen failed (%d)\n", ret); goto free_host;
+                }
+                if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
+                memcpy((uint64_t *)regcmd.ptr + (size_t)nb * RC_STRIDE, npu_regs,
+                       (size_t)p.task_count * sizeof(uint64_t));
+                tasks[nb].regcmd = (uint32_t)(regcmd.dma_address + (size_t)nb * RC_STRIDE * sizeof(uint64_t));
+                tasks[nb].regcmd_count = p.task_count;
+                bm0[nb] = m0; bn0[nb] = n0; bMtile[nb] = Mtile; bNtile[nb] = Ntile;
+                bg[nb] = ki / kt_per_group;    /* Kt | group, so the tile lies in ONE group */
+                boff[nb] = out_off;
+                nb++; done_tiles++;
+
+                if (nb == BATCH || done_tiles == total) {
+                    rocket_bo_fini(fd, &regcmd);
+                    rocket_bo_prep(fd, &out_all, 1, 0);
+                    rocket_bo_fini(fd, &out_all);
+
+                    uint32_t in_h[]  = { in_all.handle, wt_all.handle, regcmd.handle };
+                    uint32_t out_h[] = { out_all.handle };
+                    if ((ret = rocket_submit_tasks(fd, tasks, nb, in_h, 3, out_h, 1)) != 0) goto free_host;
+                    if ((ret = rocket_bo_prep(fd, &out_all, 0, rocket_wait_ns())) != 0) {
+                        ROCKET_LOGE("rocket_matmul_int8_groupwise: WAIT TIMEOUT (%d) M=%d K=%d N=%d "
+                                "batch=%d tiles=%d/%d\n", ret, M, K, N, nb, done_tiles, total);
+                        goto free_host;
+                    }
+
+                    int32_t *ob = (int32_t *)out_all.ptr;
+                    for (int j = 0; j < nb; j++) {
+                        int32_t *slot = ob + boff[j];
+                        int g = bg[j];
+                        for (int h = 1; h <= bMtile[j]; h++) {
+                            int mrow = bm0[j] + h - 1;
+                            float as = a_scale[(size_t)mrow * nG + g];
+                            for (int nn = 1; nn <= bNtile[j]; nn++) {
+                                int ncol = bn0[j] + nn - 1;
+                                Cf[(size_t)mrow * N + ncol] +=
+                                    as * b_scale[(size_t)ncol * nG + g] *
+                                    (float)slot[out_idx_i8(bMtile[j], nn, h)];
+                            }
+                        }
+                    }
+                    rocket_bo_fini(fd, &out_all);
+                    nb = 0;
+                }
+            }
+        }
+    }
+
+free_host:
+    free(tasks); free(bm0); free(bn0); free(bMtile); free(bNtile); free(bg); free(boff);
 free_bos:
     rocket_bo_free(fd, &guard);
     rocket_bo_free(fd, &regcmd); rocket_bo_free(fd, &in_all);

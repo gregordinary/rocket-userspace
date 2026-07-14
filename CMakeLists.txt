@@ -182,6 +182,9 @@ if(ROCKETNPU_BUILD_TESTS)
             mixed_chain_coexist_rocket # GATE: chained-fp16 + gapped-int8 in one process (per-job batched flag)
             matmul_int8_prepacked_rocket # resident int8 weights (bit-exact vs one-shot)
             matmul_int8_crossm_rocket # resident int8 weight reused across M, no re-pack (warmup-M serves prefill-M)
+            matmul_int8_groupwise_rocket # group-wise int8 (per-K-group scales, fp32 K-accum) — the native-quant primitive
+            matmul_int8_prepacked_gw_rocket # resident GROUP-WISE int8 vs one-shot + fp64 (native-quant MoE experts)
+            matmul_int8_crossm_gw_rocket # resident group-wise int8 weight reused across M, no re-pack
             matmul_int8_dequant_rocket # fold int8 dequant scale into DPU OUT_CVT (int8->float out)
             activation_lut_rocket  # DPU LUT elementwise activation (sigmoid/hardsigmoid) HW gate
             leaky_relu_rocket      # parametric LeakyReLU on the DPU LUT (shifted single-table, x≈0 glitch-free)
@@ -238,6 +241,7 @@ if(ROCKETNPU_BUILD_TESTS)
             multicore_probe        # 1 fd, N jobs -> serial (scheduling probe)
             multicore_threads      # N fds/threads -> parallel cores
             ctx_pool_throughput    # multi-instance context-pool throughput sweep (detection)
+            moe_gw_bench           # resident group-wise int8 at the MoE expert shape (hand-run, not a gate)
             uapi_selftest_rocket   # rocket uAPI conformance gate (BO/deadline/IOVA contracts)
             submit_overhead_rocket # per-job dispatch floor (us/submit) A/B probe for IOMMU keep-attach
             x0_glitch_probe        # RE: does the x≈0 LE/LO mux glitch fire for a shifted table straddling 0?
@@ -392,6 +396,14 @@ if(ROCKETNPU_BUILD_TESTS)
     add_test(NAME matmul_tf32_tiled_rocket     COMMAND matmul_tf32_tiled_rocket 512 3840 4096)
     add_test(NAME matmul_int8_prepacked_rocket COMMAND matmul_int8_prepacked_rocket)
     add_test(NAME matmul_int8_crossm_rocket    COMMAND matmul_int8_crossm_rocket)
+    add_test(NAME matmul_int8_groupwise_rocket COMMAND matmul_int8_groupwise_rocket)
+    add_test(NAME matmul_int8_prepacked_gw_rocket COMMAND matmul_int8_prepacked_gw_rocket)
+    # group=576 (the default above) has Kt == group, so it never exercises the resident
+    # path's kt_per_group > 1 branch — the one that maps several K-tiles onto ONE quant
+    # group's scale. group=1440 forces Kt=480 (3 tiles per group) and gates that mapping.
+    add_test(NAME matmul_int8_prepacked_gw_wide_rocket
+             COMMAND matmul_int8_prepacked_gw_rocket 256 2880 512 1440 2)
+    add_test(NAME matmul_int8_crossm_gw_rocket COMMAND matmul_int8_crossm_gw_rocket)
     add_test(NAME matmul_int4_prepacked_rocket COMMAND matmul_int4_prepacked_rocket)
     add_test(NAME matmul_int4_prepacked_gw_rocket COMMAND matmul_int4_prepacked_gw_rocket)
     add_test(NAME matmul_int4_crossm_rocket    COMMAND matmul_int4_crossm_rocket)
@@ -402,6 +414,8 @@ if(ROCKETNPU_BUILD_TESTS)
         matmul_int8_tiled_rocket matmul_int4_tiled_rocket matmul_int4_groupwise_rocket
         matmul_bf16_tiled_rocket matmul_bf16_stream_rocket matmul_tf32_tiled_rocket
         matmul_int8_prepacked_rocket matmul_int8_crossm_rocket
+        matmul_int8_groupwise_rocket matmul_int8_prepacked_gw_rocket
+        matmul_int8_prepacked_gw_wide_rocket matmul_int8_crossm_gw_rocket
         matmul_int4_prepacked_rocket matmul_int4_prepacked_gw_rocket
         matmul_int4_crossm_rocket
         matmul_int16_exact_rocket replay_dw_mesa conv_dw_int8_runtime
