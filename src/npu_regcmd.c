@@ -962,10 +962,14 @@ int gen_matmul_int8(matmul_params_t *params)
    /* ROCKET_INT8_FP32_OUT: emit the int8 conv's accumulator as fp32 instead of raw
     * int32. The int32-integer DPU-EW add is HW-unsupported (the EW is a float-only
     * unit), so the only remaining NPU K-accum route is fp32-EW — which requires the
-    * int8 conv to CAST its int32 MAC accumulator to fp32 on output. When set we
-    * switch the DPU output side to the float32 geometry (out_precision=float32,
-    * size_e=3, surf_add=stride*4), leaving the int8 INPUT side (CNA C2=16, weight
-    * k-group 32) untouched. Default unset = the raw-int32 path. */
+    * int8 conv to CAST its int32 MAC accumulator to fp32 on output. When set we set
+    * out_precision=float32, leaving the int8 INPUT side (CNA C2=16, weight k-group
+    * 32) untouched. Default unset = the raw-int32 path.
+    *
+    * This buys NO readback: the output WRITER geometry stays size_e=7 / surf*8 (the
+    * int8-conv datapath quirk — see the size_e block below; SIZE_E=3 gives garbage),
+    * so fp32-out costs the same 8 B/elem as int32-out. It is a free int->float cast
+    * for a host that wants floats, not a bandwidth lever. */
    int fp32_out = getenv("ROCKET_INT8_FP32_OUT") != NULL;
 
    /* Dequant-output mode: instead of reading back the raw int32 accumulator
