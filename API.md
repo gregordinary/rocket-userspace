@@ -78,7 +78,9 @@ tests/                         standalone tests + benchmarks (see below)
 | `rocket_ctx` / `rocket_weights_pack` / `rocket_matmul_fp16_prepacked` | pack weights once, reuse across calls (resident fp16). The compute M MAY differ from the pack M — the resident layout is M-independent for M≥256, so a weight packed at warmup-M is reused at prefill-M with no re-pack; an incompatible tiling returns -2 |
 | `rocket_stream` / `rocket_matmul_fp16_stream[_fused]` | streaming path for LLM prefill (re-pack B, but cache scratch per shape; fuse gate/up) |
 | `rocket_matmul_int8` / `rocket_matmul_plan_int8` | int8×int8→int32 tiled (pre-quantized in, raw int32 out) |
-| `rocket_i8_ctx` / `rocket_matmul_int8_prepacked` | resident int8 (W8A8) weights. The compute M MAY differ from the pack M — the resident tile layout is M-independent (canonical-tileM: the tiling is planned at `MAX_TILE`), so a weight packed at warmup-M is reused at any prefill-M with no re-pack (int32 K-accum is exact for any tiling → bit-exact); an incompatible tiling returns -2 |
+| `rocket_i8_ctx` / `rocket_matmul_int8_prepacked` | resident int8 (W8A8) weights. The compute M MAY differ from the pack M — the resident tile layout is M-independent (canonical-tileM: the tiling is planned at `MAX_TILE`), so a weight packed at warmup-M is reused at any prefill-M with no re-pack (int32 K-accum is exact for any tiling → bit-exact); an incompatible tiling returns -2. The compute M must still be a **positive multiple of 4** — an unaligned M miscomputes on the HW height geometry, so it is rejected (-1), not padded (padding M would need a matching pad of `a_scale`, which only the caller has); pad ragged row counts with `rocket_pad_m` |
+| `rocket_matmul_int8_groupwise` / `rocket_matmul_plan_int8_gw` | **per-K-group int8 dequant scales**, fp32-accumulated: `C_f[m,n] = Σ_g a_scale[m,g]·b_scale[n,g]·(int32 partial of K-group g)`. The primitive a **natively quantized** weight needs — a GGUF MXFP4/Q8_0/Q4_K block carries one scale per K-block, and the NPU cannot apply a K-blocked scale on-chip (at the output stage K is fully contracted). Integer partials already leave the chip at every K-tile boundary (on-device integer K-accum is HW-dead), so the block scale is free at a boundary already being paid for: it fuses into the readback accumulate and costs **+0.6%** over per-channel int8. Unlike the int4 twin there is **no saturation bound on `group`** (the output accumulator is int32, not int16), and `Kt` need only **divide** the group, not equal it — a K-tile must lie *inside* one group, not *be* one — so a group wider than the CBUF cap stays legal. `rocket_matmul_plan_int8_gw` previews the tiling (pure, no HW) and reports the `Kt` it chose |
+| `rocket_i8_weights_pack_gw` / `rocket_matmul_int8_prepacked_gw` | **resident group-wise int8**: the int8 codes are scattered into NPU BOs once and never leave, so a quantized weight costs **no per-forward-pass dequant and no per-call weight scatter** — the point of the path. Each call quantizes only A (per row, per K-group) and returns the fp32 per-group dequant. Same M-independence and the same M%4 contract as the per-channel form above. Bit-exact vs the one-shot oracle when the group fits the CBUF at the worst-case tile (which forces `Kt == group` in both paths); a wider group can land on a different `Kt` divisor, and the two then agree to fp32 reassociation |
 | `rocket_matmul_int4` / `rocket_matmul_int4_ex` | int4×int4→int16 tiled (host-accum to int32); `_ex` adds the int16-saturation Kt cap (in-model `[-7,7]` needs `kt_cap=480`) |
 | `rocket_matmul_int4_groupwise` | per-K-group int4 dequant scales, fp32-accumulated (the W4A4 quality lever; group = the saturation-safe K-tile) |
 | `rocket_i4_ctx` / `rocket_matmul_int4_prepacked` | resident int4 (W4A4) weights, raw int32 out (per-channel) |
@@ -278,6 +280,9 @@ real on-device regression. Perf probes and RE sweeps are built but left unregist
 | `matmul_int8_rocket` | int8×int8→int32 readiness (encoding sweep) |
 | `matmul_int8_tiled_rocket` | tiled int8 (M/N tiles + host int64 K-accum), bit-exact |
 | `matmul_int8_prepacked_rocket` | resident int8 weights, bit-exact vs one-shot |
+| `matmul_int8_groupwise_rocket` | one-shot **group-wise** int8 vs an fp64 reference, swept over both tiling regimes: `Kt == group` (one K-tile per quant group) and `Kt < group` (several tiles sharing one group's scale) |
+| `matmul_int8_prepacked_gw_rocket` | resident **group-wise** int8 (the native-quant path) vs the one-shot oracle + fp64, plus a distinct-weights-sharing-one-ctx aliasing guard, a wrong-entry-point guard, and the unaligned-call-M rejection. Registered twice: at `group=576` (bit-exact) and at a group wider than the CBUF cap (`Kt < group`) |
+| `matmul_int8_crossm_gw_rocket` | resident group-wise int8 weight packed once and reused at M = 512/256/768/64/8 with no re-pack, bit-exact at every M |
 | `matmul_int8_dequant_rocket` | folding the dequant/cast into the DPU `OUT_CVT`: bit-exact int8→fp32 cast + per-tensor integer scale (gated), the ratio-classifier RE harness (`ROCKET_INT8_DEQ*`), + the fp16-cast diagnostic. Proves OUT_CVT is an *integer* converter (fractional dequant can't fold) |
 | `matmul_int4_rocket` | int4×int4→int16 readiness + the precision/size_e sweep |
 | `matmul_int4_tiled_rocket` | tiled int4, bit-exact, single-pass-K proof |
@@ -366,12 +371,19 @@ robustness lever rather than a large idle-box speedup (`tests/ctx_pool_throughpu
 `ROCKET_BATCH_SUBMIT=1` runs a tiled matmul's output tiles as **one HW kick** — the
 per-tile regcmds are laid contiguously and self-chain (each task's trailer links to the
 next), so the NPU streams through them and raises a single completion interrupt instead
-of one submit + IRQ per tile. This needs the matching kernel module
-(`rocket_batch_submit=1`, the `patches/rocket` batched-submit patch): with the kernel
-half off the job runs only its first tile and times out. It cuts the dispatch floor on
-jobs that decompose into independent tiles; bit-exact with the default per-task path. The
-same chaining backs `rocket_matmul_fp16_batch` (and so `ROCKET_FA_CHAIN`), where the
-contiguous self-chaining spans a batch of same-shape matmuls rather than one matmul's tiles.
+of one submit + IRQ per tile. It cuts the dispatch floor on jobs that decompose into
+independent tiles; bit-exact with the default per-task path. The same chaining backs
+`rocket_matmul_fp16_batch` (and so `ROCKET_FA_CHAIN`), where the contiguous self-chaining
+spans a batch of same-shape matmuls rather than one matmul's tiles.
+
+Chaining is a **joint layout contract with the kernel** — userspace self-chains the
+regcmds, the kernel sets `TASK_NUMBER = task_count` — so both halves must agree. A kernel
+that does not know `DRM_ROCKET_JOB_BATCHED` ignores the flag and runs a self-chained
+layout down the per-task path, which stalls or corrupts the job. `rocket_batched_submit_supported()`
+(`rocket_npu.h`; probed once, cached) reports whether the running kernel honors it, and
+the driver gates every chaining entry point on it: asking for `ROCKET_BATCH_SUBMIT=1` on a
+kernel without the `patches/rocket` batched-submit patch warns and runs the stock per-task
+path rather than producing garbage. Call it before self-chaining anything yourself.
 
 `ROCKET_KACC_CHAIN` (default off) extends that chaining **across the fp16 K-accumulation
 ki-steps**: instead of one fenced submit per K-tile, it chains a tile's whole nKt-step
