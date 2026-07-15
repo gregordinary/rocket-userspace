@@ -420,9 +420,13 @@ int rocket_matmul_fp16_stream_fused(rocket_stream *s, int M, int K,
  * RAW int32 accumulation (host int64 K-accum — int8 NPU K-accum is HW-dead, the
  * EW operand DMA is <=16-bit). Alignment: K%32, N%32, M%4==0 (resident paths do
  * NOT pad M==1 — pad single vectors to 4 caller-side); the per-worker
- * N-slice is rounded to a multiple of 32. The (M,K,N) given to _prepacked MUST
- * match those given to _pack (the tile plan, hence the resident layout, depends
- * on all three). Result is BIT-EXACT to the one-shot rocket_matmul_int8.
+ * N-slice is rounded to a multiple of 32. The _prepacked call's M MAY DIFFER
+ * from the _pack M: the weight is planned at the canonical tile M (MAX_TILE),
+ * so the resident layout depends only on K, N, and the K/N tiling and is
+ * M-independent — one pack serves every micro-batch size (a warmup-M pack is
+ * reused directly at prefill-M). K and N must still match; a genuine tiling
+ * mismatch returns -2 (re-pack for that M), never a wrong answer. Result is
+ * BIT-EXACT to the one-shot rocket_matmul_int8.
  *
  * NOT thread-safe (as rocket_ctx): a ctx mutates its shared per-shape scratch each
  * call — give each concurrent host thread its own ctx. */
@@ -467,7 +471,7 @@ int rocket_matmul_int8_prepacked_gw(rocket_i8_ctx *ctx, int M, int K, int N,
                                     const float *b_scale, float *Cf, rocket_i8_weights *w);
 
 /* ---- resident int4 (W4A4) path — int4 sibling of the resident int8 path.
- * Same usage; A/B pre-quantized int4 one-per-int8_t in [-8,7], C raw int32. N
+ * Same usage; A/B pre-quantized int4 one-per-int8_t in [-7,7], C raw int32. N
  * fanned across worker fds; weight scattered once into resident int4 NPU BOs.
  * Built to measure int4's multicore throughput vs the resident fp16/int8 bars.
  * NOT thread-safe (as rocket_ctx): one ctx per concurrent host thread. */
@@ -488,7 +492,12 @@ int rocket_matmul_int4_prepacked(rocket_i4_ctx *ctx, int M, int K, int N,
  * (int4 partial of K-group g). a_scale is [M*nG], b_scale is [N*nG] (nG = K/group), the
  * per-row / per-channel per-group scales. Hadamard (when used) is baked into the packed
  * weight + applied to A by the caller — the rotation is product-preserving, so no driver
- * support is needed. C raw-int32 path stays rocket_matmul_int4_prepacked. */
+ * support is needed. C raw-int32 path stays rocket_matmul_int4_prepacked.
+ *
+ * The 49*group bound is 49 = 7*7: it assumes the [-7,7] value range every int4 quantizer
+ * produces, so a single K-tile partial stays inside the int16 group readback. If a future
+ * producer ever emits -8, this bound must tighten to 64*group (and kt_cap drop to match) —
+ * so the [-7,7] range and this bound are one invariant; do not widen one without the other. */
 rocket_i4_weights *rocket_i4_weights_pack_gw(rocket_i4_ctx *ctx, int M, int K, int N,
                                              const int8_t *B, int group);
 int rocket_matmul_int4_prepacked_gw(rocket_i4_ctx *ctx, int M, int K, int N,
