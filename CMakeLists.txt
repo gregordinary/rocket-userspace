@@ -243,6 +243,7 @@ if(ROCKETNPU_BUILD_TESTS)
             ctx_pool_throughput    # multi-instance context-pool throughput sweep (detection)
             moe_gw_bench           # resident group-wise int8 at the MoE expert shape (hand-run, not a gate)
             uapi_selftest_rocket   # rocket uAPI conformance gate (BO/deadline/IOVA contracts)
+            prep_signal_robust_rocket # PREP_BO wait: EINTR-retry + UINT64_MAX-deadline saturation gate
             submit_overhead_rocket # per-job dispatch floor (us/submit) A/B probe for IOMMU keep-attach
             x0_glitch_probe        # RE: does the x≈0 LE/LO mux glitch fire for a shifted table straddling 0?
             regcmd_persist_rocket  # does register state persist across tasks in a job (delta regcmd)?
@@ -436,4 +437,10 @@ if(ROCKETNPU_BUILD_TESTS)
     # The cross-kernel canary — a kernel that drifts fails here, not deep in matmul.
     add_test(NAME uapi_selftest_rocket COMMAND uapi_selftest_rocket)
     set_tests_properties(uapi_selftest_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    # PREP_BO wait robustness: a SIGUSR1 storm (handler without SA_RESTART) must not turn the
+    # interruptible kernel wait into a spurious timeout (EINTR retry), and a UINT64_MAX
+    # "wait forever" timeout must saturate rather than wrap the signed deadline negative into an
+    # instant poll. 60 iters/phase keeps the gate ~1s; exit 2 (SKIP) when no NPU is present.
+    add_test(NAME prep_signal_robust_rocket COMMAND prep_signal_robust_rocket)
+    set_tests_properties(prep_signal_robust_rocket PROPERTIES SKIP_RETURN_CODE 2 ENVIRONMENT "ROCKET_SIG_ITERS=60")
 endif()

@@ -346,9 +346,11 @@ int rocket_bo_prep(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns)
 
     /* Optional spin-before-sleep (ROCKET_BUSY_POLL, µs). Only for a real wait
      * (timeout_ns>0); a timeout_ns==0 caller is a plain cache sync, not a wait.
-     * Poll the fence for up to the budget, then fall through to the blocking
-     * wait below for the remainder of the original timeout. A successful probe
-     * has already CPU-synced the BO, so we return straight away. */
+     * Poll the fence for up to the budget, then fall through to the blocking wait
+     * below, which arms the FULL timeout_ns afresh (so the worst-case total wait is
+     * spin_us + timeout_ns, not the remainder; spin_us is microseconds against a
+     * multi-second timeout, so the overshoot is negligible). A successful probe has
+     * already CPU-synced the BO, so we return straight away. */
     if (timeout_ns) {
         long spin_us = rkt_busy_poll_us();
         if (spin_us > 0) {
@@ -373,13 +375,32 @@ int rocket_bo_prep(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns)
     if (timeout_ns) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        deadline = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec + (int64_t)timeout_ns;
+        int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        /* Saturate the absolute deadline. timeout_ns is unsigned: a caller passing a
+         * huge value (UINT64_MAX is the idiomatic "wait forever") would, through the
+         * signed add, wrap `deadline` NEGATIVE — a past deadline, which makes PREP_BO
+         * return -EBUSY instantly (a bogus timeout while the job keeps running). Cap at
+         * INT64_MAX (~292 years out = "wait forever" in practice); this also absorbs a
+         * genuine now+timeout int64 overflow. */
+        deadline = (timeout_ns > (uint64_t)(INT64_MAX - now))
+                   ? INT64_MAX : now + (int64_t)timeout_ns;
     }
     struct drm_rocket_prep_bo prep = {
         .handle     = bo->handle,
         .timeout_ns = deadline,
     };
-    if (ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &prep) < 0) {
+    /* The kernel wait (dma_resv_wait_timeout) is INTERRUPTIBLE, so a signal delivered to
+     * this thread makes the wait return -ERESTARTSYS, surfacing as ioctl -1/EINTR (unless
+     * the handler carries SA_RESTART). A healthy multi-second wait must not become a
+     * spurious "WAIT TIMEOUT" because of an unrelated signal — a subprocess reaper's
+     * SIGCHLD, a profiler's SIGALRM/SIGPROF, or a Python embedder's non-PEP-475 ioctl. The
+     * deadline is ABSOLUTE, so a plain retry resumes waiting to the same deadline with no
+     * recompute. (A timeout_ns==0 poll does not sleep, so it is effectively unaffected.) */
+    int rc;
+    do {
+        rc = ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &prep);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
         int e = errno;                       /* capture before any clobber */
         /* A timed wait (timeout_ns>0) returning -EBUSY/-ETIMEDOUT is the caller's to
          * report (it owns the retry/abort policy, e.g. the "WAIT TIMEOUT" messages).
