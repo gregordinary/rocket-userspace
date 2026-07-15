@@ -4,7 +4,7 @@
  * rocket_prepacked_int4.c — resident-weight int4 (W4A4) matmul path.
  *
  * The int4 sibling of rocket_prepacked_int8.c: a pre-quantized int4 weight B[N,K]
- * (values one-per-int8_t in [-8,7]) is scattered into resident per-worker NPU BOs
+ * (values one-per-int8_t in [-7,7]) is scattered into resident per-worker NPU BOs
  * ONCE, every matmul reuses them and only packs A. N fanned across worker fds.
  * Built to MEASURE int4's raw multicore throughput against the resident fp16/int8
  * bars at matched shapes (no model) — in particular whether int4's single-pass-K
@@ -83,6 +83,7 @@ typedef struct {
     size_t in_slot, wt_slot, out_slot;       /* in/wt nibbles, out int16 elems */
     rocket_bo guard, regcmd, in_all, out_all;
     rocket_task_desc *tasks;
+    void   *submit_dt;                       /* resident drm_rocket_task[] submit scratch */
     int64_t *acc;                            /* M*nsub (per-channel/raw-int32 path) */
     float   *facc;                           /* M*nsub (group-wise fp32 path) */
     int *bm0, *bn0, *bMtile, *bNtile, *bki;  /* bki = a tile's K-group index (group-wise) */
@@ -140,7 +141,7 @@ rocket_i4_ctx *rocket_i4_ctx_create(int nthreads) {
 static void rk4_worker_free(int fd, rk4_worker *w) {
     rocket_bo_free(fd, &w->guard);  rocket_bo_free(fd, &w->regcmd);
     rocket_bo_free(fd, &w->in_all); rocket_bo_free(fd, &w->out_all);
-    free(w->tasks); free(w->acc); free(w->facc);
+    free(w->tasks); free(w->submit_dt); free(w->acc); free(w->facc);
     free(w->bm0); free(w->bn0); free(w->bMtile); free(w->bNtile); free(w->bki); free(w->boff);
 }
 
@@ -200,12 +201,13 @@ static int rk4_worker_alloc(int fd, rk4_worker *w, int M, int tileM, int K, int 
         ROCKET_LOGE("rk4_worker_alloc: scratch BO dma_address exceeds 32 bits\n"); goto fail;
     }
     w->tasks  = malloc(I4_BATCH * sizeof(*w->tasks));
+    w->submit_dt = malloc(rocket_submit_scratch_size(I4_BATCH));  /* reused every submit; no per-job calloc */
     if (group > 0) { w->facc = malloc((size_t)M * nsub * sizeof(float));   w->bki = malloc(I4_BATCH * sizeof(int)); }
     else             w->acc  = malloc((size_t)M * nsub * sizeof(int64_t));
     w->bm0    = malloc(I4_BATCH * sizeof(int));   w->bn0    = malloc(I4_BATCH * sizeof(int));
     w->bMtile = malloc(I4_BATCH * sizeof(int));   w->bNtile = malloc(I4_BATCH * sizeof(int));
     w->boff   = malloc(I4_BATCH * sizeof(size_t));
-    if (!w->tasks || (group > 0 ? (!w->facc || !w->bki) : !w->acc) ||
+    if (!w->tasks || !w->submit_dt || (group > 0 ? (!w->facc || !w->bki) : !w->acc) ||
         !w->bm0 || !w->bn0 || !w->bMtile || !w->bNtile || !w->boff) {
         ROCKET_LOGE("rk4_worker_alloc: host scratch alloc failed\n"); goto fail;
     }
@@ -459,7 +461,7 @@ static void *rk4_thread(void *a) {
                     if ((t->ret = rocket_bo_fini(fd, &w->out_all))  != 0) return NULL;
                     uint32_t in_h[]  = { w->in_all.handle, t->wt->handle, w->regcmd.handle };
                     uint32_t out_h[] = { w->out_all.handle };
-                    if ((t->ret = rocket_submit_tasks(fd, tasks, nb, in_h, 3, out_h, 1)) != 0) return NULL;
+                    if ((t->ret = rocket_submit_tasks_pre(fd, w->submit_dt, tasks, nb, in_h, 3, out_h, 1, 0)) != 0) return NULL;
                     if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, i4_wait_ns())) != 0) {
                         ROCKET_LOGE("rocket_matmul_int4_prepacked: WAIT TIMEOUT (%d) M=%d K=%d N=%d slice=%d\n",
                                 t->ret, M, K, nsub, w->n0);
@@ -612,7 +614,7 @@ static void *rk4_thread_gw(void *a) {
                     if ((t->ret = rocket_bo_fini(fd, &w->out_all))  != 0) return NULL;
                     uint32_t in_h[]  = { w->in_all.handle, t->wt->handle, w->regcmd.handle };
                     uint32_t out_h[] = { w->out_all.handle };
-                    if ((t->ret = rocket_submit_tasks(fd, tasks, nb, in_h, 3, out_h, 1)) != 0) return NULL;
+                    if ((t->ret = rocket_submit_tasks_pre(fd, w->submit_dt, tasks, nb, in_h, 3, out_h, 1, 0)) != 0) return NULL;
                     if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, i4_wait_ns())) != 0) {
                         ROCKET_LOGE("rocket_matmul_int4_prepacked_gw: WAIT TIMEOUT (%d) M=%d K=%d N=%d slice=%d\n",
                                 t->ret, M, K, nsub, w->n0);

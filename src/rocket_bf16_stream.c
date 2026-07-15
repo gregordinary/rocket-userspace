@@ -109,6 +109,7 @@ typedef struct {
     rocket_bo guard, regcmd, in_all, wt_all, out_all;
     int prezeroed;                       /* in_all/wt_all zeroed once at alloc */
     rocket_task_desc *tasks;             /* BATCH                              */
+    void   *submit_dt;                   /* resident drm_rocket_task[] submit scratch */
     int    *bm0, *bn0, *bMtile, *bNtile; /* BATCH each                         */
     size_t *boff;                        /* BATCH                              */
     double *acc;                         /* M*N fp32 (double) accumulator      */
@@ -121,7 +122,7 @@ static void bfs_bos_free(int fd, bfs_bos *b)
     rocket_bo_free(fd, &b->in_all);
     rocket_bo_free(fd, &b->wt_all);
     rocket_bo_free(fd, &b->out_all);
-    free(b->tasks); free(b->bm0); free(b->bn0); free(b->bMtile);
+    free(b->tasks); free(b->submit_dt); free(b->bm0); free(b->bn0); free(b->bMtile);
     free(b->bNtile); free(b->boff); free(b->acc);
     memset(b, 0, sizeof(*b));
 }
@@ -155,13 +156,14 @@ static int bfs_bos_alloc(int fd, const bfs_plan *pl, bfs_bos *b)
     b->prezeroed = 1;
 
     b->tasks  = malloc(BFS_BATCH * sizeof(*b->tasks));
+    b->submit_dt = malloc(rocket_submit_scratch_size(BFS_BATCH));  /* reused every submit; no per-job calloc */
     b->bm0    = malloc(BFS_BATCH * sizeof(int));
     b->bn0    = malloc(BFS_BATCH * sizeof(int));
     b->bMtile = malloc(BFS_BATCH * sizeof(int));
     b->bNtile = malloc(BFS_BATCH * sizeof(int));
     b->boff   = malloc(BFS_BATCH * sizeof(size_t));
     b->acc    = calloc((size_t)pl->M * pl->N, sizeof(double));
-    if (!b->tasks || !b->bm0 || !b->bn0 || !b->bMtile || !b->bNtile || !b->boff || !b->acc) {
+    if (!b->tasks || !b->submit_dt || !b->bm0 || !b->bn0 || !b->bMtile || !b->bNtile || !b->boff || !b->acc) {
         ret = -1; goto fail;
     }
     return 0;
@@ -276,7 +278,9 @@ static int bfs_compute(int fd, const bfs_plan *pl, bfs_bos *b, float *Csub)
 
                     uint32_t in_h[]  = { b->in_all.handle, b->wt_all.handle, b->regcmd.handle };
                     uint32_t out_h[] = { b->out_all.handle };
-                    if ((ret = rocket_submit_tasks(fd, b->tasks, nb, in_h, 3, out_h, 1)) != 0) return ret;
+                    /* Resident submit scratch (b->submit_dt), no per-job calloc/free; batched=0
+                     * keeps the stock gapped per-task layout (matches the prior behavior). */
+                    if ((ret = rocket_submit_tasks_pre(fd, b->submit_dt, b->tasks, nb, in_h, 3, out_h, 1, 0)) != 0) return ret;
                     if ((ret = rocket_bo_prep(fd, &b->out_all, 0, bfs_wait_ns())) != 0) {
                         ROCKET_LOGE("bf16_stream: WAIT TIMEOUT (%d) M=%d K=%d N=%d batch=%d %d/%d\n",
                                 ret, M, pl->K, N, nb, done, total);

@@ -119,6 +119,7 @@ typedef struct {
 
     rocket_bo guard, regcmd, in_all, out_all;   /* shared scratch (NOT the weight)   */
     rocket_task_desc *tasks;                     /* I8_BATCH descriptors              */
+    void   *submit_dt;                           /* resident drm_rocket_task[] submit scratch */
     int64_t *acc;                                /* M*nsub int64 K-accum (per-channel) */
     float   *facc;                               /* M*nsub fp32 K-accum (group-wise)  */
     int    *bm0, *bn0, *bMtile, *bNtile, *bg;    /* I8_BATCH each; bg = tile's K-group */
@@ -192,7 +193,7 @@ static void rki_worker_free(int fd, rki_worker *w)
     rocket_bo_free(fd, &w->regcmd);
     rocket_bo_free(fd, &w->in_all);
     rocket_bo_free(fd, &w->out_all);
-    free(w->tasks);  free(w->acc);   free(w->facc);
+    free(w->tasks);  free(w->submit_dt); free(w->acc);   free(w->facc);
     free(w->bm0);    free(w->bn0);
     free(w->bMtile); free(w->bNtile); free(w->bg); free(w->boff);
 }
@@ -270,6 +271,7 @@ static int rki_worker_alloc(int fd, rki_worker *w, int M, int tileM, int K, int 
     }
 
     w->tasks  = malloc(I8_BATCH * sizeof(*w->tasks));
+    w->submit_dt = malloc(rocket_submit_scratch_size(I8_BATCH));  /* reused every submit; no per-job calloc */
     if (group > 0) { w->facc = malloc((size_t)M * nsub * sizeof(float));
                      w->bg   = malloc(I8_BATCH * sizeof(int)); }
     else             w->acc  = malloc((size_t)M * nsub * sizeof(int64_t));
@@ -278,7 +280,7 @@ static int rki_worker_alloc(int fd, rki_worker *w, int M, int tileM, int K, int 
     w->bMtile = malloc(I8_BATCH * sizeof(int));
     w->bNtile = malloc(I8_BATCH * sizeof(int));
     w->boff   = malloc(I8_BATCH * sizeof(size_t));
-    if (!w->tasks || (group > 0 ? (!w->facc || !w->bg) : !w->acc) ||
+    if (!w->tasks || !w->submit_dt || (group > 0 ? (!w->facc || !w->bg) : !w->acc) ||
         !w->bm0 || !w->bn0 || !w->bMtile || !w->bNtile || !w->boff) {
         ROCKET_LOGE("rki_worker_alloc: host scratch alloc failed\n");
         goto fail;
@@ -599,7 +601,10 @@ static void *rki_thread(void *a)
 
                     uint32_t in_h[]  = { w->in_all.handle, t->wt->handle, w->regcmd.handle };
                     uint32_t out_h[] = { w->out_all.handle };
-                    if ((t->ret = rocket_submit_tasks(fd, tasks, nb, in_h, 3, out_h, 1)) != 0)
+                    /* Resident submit scratch (w->submit_dt), no per-job calloc/free; batched=0
+                     * keeps the gapped per-task layout (integer chaining is HW-blocked here). */
+                    if ((t->ret = rocket_submit_tasks_pre(fd, w->submit_dt, tasks, nb,
+                                                          in_h, 3, out_h, 1, 0)) != 0)
                         return NULL;
 
                     if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, i8_wait_ns())) != 0) {
