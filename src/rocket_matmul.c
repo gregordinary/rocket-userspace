@@ -417,6 +417,73 @@ static inline void detile_store_f16(_Float16 *restrict C, int N,
     }
 }
 
+/* packA scatter — the INVERSE of detile_store_f16: one row-major A[m0.., k0..] tile ->
+ * NPU input cube. For a fixed row h, group g=(c-1)/8 is 8 CONTIGUOUS fp16 in the
+ * row-major source (arow[g*8 .. +7]) AND 8 CONTIGUOUS fp16 in the cube at
+ * slot[g*H*8 + 8*(h-1) + 0..7] -> one 128-bit fp16 load -> one 128-bit fp16 store,
+ * hoisting the per-element feat_idx divide/mod out of the hot loop (it was the bulk of
+ * packA wall time). Bit-identical to the scalar
+ * slot[feat_idx(H,c,h)] = A[(m0+h-1)*Astride + (k0+c-1)] it replaces (same elements,
+ * same values), so the cosine-sim correctness matrix gates it. */
+static inline void feat_scatter_tile(_Float16 *restrict slot, const _Float16 *restrict A,
+                                     size_t Astride, int m0, int k0,
+                                     int Mtile, int Ktile) {
+    const int H = Mtile;
+    for (int h = 1; h <= Mtile; h++) {
+        const _Float16 *arow = A + (size_t)(m0 + h - 1) * Astride + k0;
+        int g = 0;
+#ifdef ROCKET_HAVE_NEON
+        _Float16 *s = slot + 8 * (size_t)(h - 1);
+        const int ng = Ktile / 8;
+        for (; g < ng; g++)
+            vst1q_f16((__fp16 *)(s + (size_t)g * H * 8),
+                      vld1q_f16((const __fp16 *)(arow + (size_t)g * 8)));
+        g *= 8;   /* columns already done = ng*8 */
+#endif
+        for (int c = g + 1; c <= Ktile; c++)   /* scalar tail (and the non-NEON build) */
+            slot[feat_idx(H, c, h)] = arow[c - 1];
+    }
+}
+
+/* packB scatter of ONE weight row `k` from a row-major source `brow` (already offset
+ * to [.., k0]) into the (N/16,K/32,16,32) wt_idx cube. Each 32-wide K-block is 32
+ * CONTIGUOUS fp16 in both source and cube -> four 128-bit fp16 copies per block,
+ * hoisting the per-element wt_idx divide/mod out of the hot loop. Bit-identical to the
+ * scalar slot[wt_idx(Ktile,k,c)] = brow[c-1]. Shared by wt_scatter_tile (contiguous
+ * weight) and mm_pack_weights_seg (per-row segment-resolved weight). Ktile is normally
+ * a multiple of 32 (K%32 offload constraint); the tail covers the remainder. */
+static inline void wt_scatter_row(_Float16 *restrict slot, const _Float16 *restrict brow,
+                                  int k, int Ktile) {
+    const int C = Ktile;
+    const size_t kbase = (size_t)((k - 1) / 16) * 16 * C + (size_t)((k - 1) % 16) * 32;
+    int c = 1;
+    for (; c + 31 <= Ktile; c += 32) {   /* full 32-block: 32 contiguous fp16 */
+        _Float16 *d = slot + (size_t)((c - 1) / 32) * 32 * 16 + kbase;
+        const _Float16 *sB = brow + (c - 1);
+#ifdef ROCKET_HAVE_NEON
+        vst1q_f16((__fp16 *)(d),      vld1q_f16((const __fp16 *)(sB)));
+        vst1q_f16((__fp16 *)(d + 8),  vld1q_f16((const __fp16 *)(sB + 8)));
+        vst1q_f16((__fp16 *)(d + 16), vld1q_f16((const __fp16 *)(sB + 16)));
+        vst1q_f16((__fp16 *)(d + 24), vld1q_f16((const __fp16 *)(sB + 24)));
+#else
+        for (int j = 0; j < 32; j++) d[j] = sB[j];
+#endif
+    }
+    for (; c <= Ktile; c++)   /* partial-block tail (and the non-NEON build) */
+        slot[wt_idx(Ktile, k, c)] = brow[c - 1];
+}
+
+/* packB scatter of a contiguous B[N,K] weight tile -> wt_idx cube (the weight sibling
+ * of feat_scatter_tile). Row-parallel over wt_scatter_row. */
+static inline void wt_scatter_tile(_Float16 *restrict slot, const _Float16 *restrict B,
+                                   size_t Bstride, int n0, int k0,
+                                   int Ntile, int Ktile) {
+    for (int k = 1; k <= Ntile; k++) {
+        const _Float16 *brow = B + (size_t)(n0 + k - 1) * Bstride + k0;
+        wt_scatter_row(slot, brow, k, Ktile);
+    }
+}
+
 /* Upper bound on a single matmul dimension. The tile-count math below (M+Mt-1 etc.,
  * with Mt/Nt <= MAX_TILE and Kt <= 16384) is computed in signed int, so a dimension
  * within a tile of INT_MAX would overflow BEFORE the nm*nn*nk product guard catches it.
@@ -768,10 +835,7 @@ double mm_pack_weights(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *B)
         for (int ki = 0; ki < pl->nKt; ki++) {
             int k0 = ki * pl->Kt, Ktile = (pl->K - k0 < pl->Kt) ? (pl->K - k0) : pl->Kt;
             _Float16 *slot = (_Float16 *)b->wt_all.ptr + (size_t)(ni * pl->nKt + ki) * pl->wt_slot;
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[wt_idx(Ktile, kk, c)] =
-                        B[(size_t)(n0 + kk - 1) * pl->K + (k0 + c - 1)];
+            wt_scatter_tile(slot, B, pl->K, n0, k0, Ntile, Ktile);
         }
     }
     rocket_bo_fini(fd, &b->wt_all);
@@ -805,8 +869,7 @@ double mm_pack_weights_seg(int fd, const mm_plan *pl, mm_bos *b,
                         break;
                     }
                 if (!Brow) continue;     /* column beyond all segments: leave zero */
-                for (int c = 1; c <= Ktile; c++)
-                    slot[wt_idx(Ktile, kk, c)] = Brow[k0 + c - 1];
+                wt_scatter_row(slot, Brow + k0, kk, Ktile);
             }
         }
     }
@@ -825,10 +888,7 @@ double mm_pack_input(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *A)
         for (int ki = 0; ki < pl->nKt; ki++) {
             int k0 = ki * pl->Kt, Ktile = (pl->K - k0 < pl->Kt) ? (pl->K - k0) : pl->Kt;
             _Float16 *slot = (_Float16 *)b->in_all.ptr + (size_t)(mi * pl->nKt + ki) * pl->in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[feat_idx(Mtile, c, h)] =
-                        A[(size_t)(m0 + h - 1) * pl->K + (k0 + c - 1)];
+            feat_scatter_tile(slot, A, pl->K, m0, k0, Mtile, Ktile);
         }
     }
     rocket_bo_fini(fd, &b->in_all);
@@ -852,10 +912,7 @@ static void feat_scatter_into(const mm_plan *pl, _Float16 *restrict dst, const _
         for (int ki = 0; ki < pl->nKt; ki++) {
             int k0 = ki * pl->Kt, Ktile = (pl->K - k0 < pl->Kt) ? (pl->K - k0) : pl->Kt;
             _Float16 *slot = dst + (size_t)(mi * pl->nKt + ki) * pl->in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[feat_idx(Mtile, c, h)] =
-                        A[(size_t)(m0 + h - 1) * pl->K + (k0 + c - 1)];
+            feat_scatter_tile(slot, A, pl->K, m0, k0, Mtile, Ktile);
         }
     }
 }
@@ -873,10 +930,7 @@ static void wt_scatter_into(const mm_plan *pl, _Float16 *restrict dst, const _Fl
         for (int ki = 0; ki < pl->nKt; ki++) {
             int k0 = ki * pl->Kt, Ktile = (pl->K - k0 < pl->Kt) ? (pl->K - k0) : pl->Kt;
             _Float16 *slot = dst + (size_t)(ni * pl->nKt + ki) * pl->wt_slot;
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[wt_idx(Ktile, kk, c)] =
-                        B[(size_t)(n0 + kk - 1) * pl->K + (k0 + c - 1)];
+            wt_scatter_tile(slot, B, pl->K, n0, k0, Ntile, Ktile);
         }
     }
 }
@@ -3570,9 +3624,7 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             _Float16 *slot = (_Float16 *)wt_all.ptr + (size_t)(ni * nKt + ki) * wt_slot;
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[wt_idx(Ktile, kk, c)] = B[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)];
+            wt_scatter_tile(slot, B, K, n0, k0, Ntile, Ktile);
         }
     }
     rocket_bo_fini(fd, &wt_all);
@@ -3585,9 +3637,7 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             _Float16 *slot = (_Float16 *)in_all.ptr + (size_t)(mi * nKt + ki) * in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[feat_idx(Mtile, c, h)] = A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)];
+            feat_scatter_tile(slot, A, K, m0, k0, Mtile, Ktile);
         }
     }
     rocket_bo_fini(fd, &in_all);
