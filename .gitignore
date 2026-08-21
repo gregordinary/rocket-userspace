@@ -24,3 +24,6 @@ compile_commands.json
 .cache/
 .vscode/
 .idea/
+
+# Tool dump output (dump_dw_regcmd et al. write into the cwd)
+*-regcmd.bin

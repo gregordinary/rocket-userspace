@@ -23,6 +23,22 @@
  */
 
 // RK3588 NPU register offsets and field descriptions (some cryptic or missing).
+//
+// These offsets are the RK3588's and are IP-REVISION-specific, not shared across every
+// Rockchip NPU. The block BASES (PC 0x0xxx, CNA 0x1xxx, CORE 0x3xxx, DPU 0x4xxx) and the
+// datapath SEMANTICS (precision fields, BS/BN/EW/LUT meanings, the CNA->CORE->DPU
+// sequence) are IP-inherent, but the CNA/CORE/DPU GEOMETRY-register encoding is not: the
+// RK3576 re-packs the CNA block at the same block base -- registers move, the bit-packing
+// differs at shared offsets, and it writes offsets that are gaps here (0x1018/0x101c/
+// 0x103c/0x1090-0x1098/0x118c). Barely any CNA geometry reg coincides: 0x1014 (stride)
+// and 0x1110 (weight addr) do; the FEATURE address does NOT -- the RK3576 carries it at
+// 0x1088 on BOTH its datapaths, and leaves 0x1070 (this chip's slot) at zero. Several
+// registers that look RK3576-only are these same ones moved: its 0x1048 is CNA_CVT_CON0
+// with identical packing, and its 0x108c is CNA_DMA_CON0 (the burst-length word).
+// A second-chip port therefore needs a per-chip regcmd ENCODER for the geometry
+// registers, not just an offset table -- npu_regcmd_rk3576.c is that encoder for the
+// RK3576 int8 conv path. See rocket_hw_profile.h and
+// rockchip-npu-notes/chips/rk3576-regcmd.md.
 
 /* ============================================================================
  * SECTION — PC / CNA / CORE register offsets
@@ -258,12 +274,12 @@
 #define NPUOP(op, value, reg) ((((uint64_t)((op) & 0xffff)) << 48) | (((uint64_t)((value) & 0xffffffff)) << 16) | (uint64_t)((reg) & 0xffff))
 
 /* CBUF geometry — RK3588 machine parameters, and the COMPILE-TIME source the
- * rocket_hw_profile mirrors (rocket_hw_rk3588.cbuf_bank_size / .cbuf_banks). The
- * inherent regcmd datapath (npu_regcmd.c bank-assignment math) reads NPU_CBUF_BANKS
- * directly; the tiling planners (rocket_matmul.c / rocket_conv.c) read the profile.
- * They cannot disagree today — one literal, mirrored. When a second chip's profile
- * lands (multi-chip support), the npu_regcmd.c reads must migrate to ctx->hw->cbuf_banks too;
- * see rocket_hw_profile.h. */
+ * rocket_hw_profile mirrors (rocket_hw_rk3588.cbuf_bank_size / .cbuf_banks). Every
+ * consumer now reads the PROFILE, not these literals: the tiling planners
+ * (rocket_matmul.c / rocket_conv.c) through ctx->hw, and the regcmd bank-assignment
+ * math in npu_regcmd.c through rocket_hw_current() (its generators take a params
+ * struct and never see a context). These remain as the RK3588 profile's initializers,
+ * so the literal still lives exactly once. See rocket_hw_profile.h. */
 #define NPU_CBUF_BANK_SIZE 32768
 #define NPU_CBUF_BANKS 12
 

@@ -354,6 +354,22 @@ online/tiled long-context flash attention; a memory escape hatch, slower than th
 path on this dispatch-bound NPU, engages above `ROCKET_FA_TILE_MIN_KV`, default 8192). Note:
 `sudo` strips env — use `sudo -E`.
 
+**Chip selection.** At device open the library resolves a hardware profile — the machine
+parameters (CBUF banks and bank size, tile caps, weight tile groups, the datatype menu, the
+worker default) — from the NPU's device-tree `compatible`: the driver-bound per-core device
+under `/sys/bus/platform/drivers/rocket/`, else `/proc/device-tree/compatible`. Two profiles
+exist. `rk3588` is the fully validated target — every operation this library offers runs
+there. `rk3576` carries machine parameters measured on the part, but only its int8 **direct**
+`CONV_2D` has this chip's own geometry-register encoder; selecting it warns exactly which
+paths that leaves unserved.
+
+That warning is load-bearing, because a profile selects machine parameters only — it does not
+switch the regcmd encoder, and the CNA/CORE/DPU geometry-register **encoding** is
+IP-revision-specific. An operation with no encoder for the running chip does not degrade: on
+RK3576 silicon an RK3588 program submits and the job completes with the output buffer
+untouched. A Rockchip NPU with no profile at all warns and runs with RK3588 parameters.
+`ROCKET_CHIP=<name>` forces a profile (a name with no profile warns and falls back).
+
 **CPU-affinity for multi-pool processes.** `ROCKET_CPU_AFFINITY` (a CPU list like `4-7`, or
 `off`) sets the per-process big-core SET the pack/readback workers pin to (auto-detected as the
 top-cpufreq cores otherwise). For running **several context pools concurrently in one process**

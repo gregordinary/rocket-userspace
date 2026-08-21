@@ -27,7 +27,8 @@
 #include <drm/rocket_accel.h>   /* DRM_IOCTL_ROCKET_*, struct drm_rocket_*    */
 
 #include "rocket_npu.h"
-#include "rocket_log.h"     // centralized log channel
+#include "rocket_log.h"            // centralized log channel
+#include "rocket_hw_profile.h"     // chip detection (warn on unprofiled silicon)
 
 /*
  * Per-job batched-submit flag (DRM_ROCKET_JOB_BATCHED): runs a job's tasks as
@@ -218,6 +219,10 @@ int rocket_open(void)
     if (getenv("ROCKET_DEBUG"))
         ROCKET_LOGD("opened rocket: %s %d.%d.%d\n", name,
                 dv.version_major, dv.version_minor, dv.version_patchlevel);
+    /* Resolve the hardware profile here, at the one point every user of the device
+     * passes through, so a chip we have no profile for warns once per process even
+     * on a path (single-task generator, dump tools) that never reads ctx->hw. */
+    (void)rocket_hw_current();
     return fd;
 }
 

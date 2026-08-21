@@ -35,7 +35,18 @@
 #include "npu_matmul.h"
 #include "npu_activation.h"
 #include "npu_pool.h"
+#include "rocket_hw_profile.h"
 #include "rocket_log.h"     // centralized log channel
+
+/* CBUF bank count, read from the ACTIVE hardware profile rather than the
+ * compile-time NPU_CBUF_BANKS literal, so a second chip's bank-assignment math
+ * follows its own CBUF. The generators here take a params struct and never see a
+ * context, so they go through rocket_hw_current() — the same resolved-once,
+ * pointer-cached accessor chip detection uses. On the RK3588 this is identical to
+ * NPU_CBUF_BANKS: rocket_hw_rk3588.cbuf_banks mirrors that literal. Unsigned so the
+ * comparisons against the unsigned bank counters keep the signedness the bare
+ * literal gave them. */
+#define CBUF_BANKS ((unsigned)rocket_hw_current()->cbuf_banks)
 
 /* DPU_RDMA domain (base 0x5xxx) — the registers the conv path touches. The write
  * target is BLOCK_DPU_RDMA|PC_OP_01, exactly as OP_REG_DPU is BLOCK_DPU|PC_OP_01. */
@@ -418,11 +429,11 @@ int gen_matmul_fp16(matmul_params_t *params)
    fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks +1;
    weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
    weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE)==0) ? weight_banks : weight_banks + 1;
-   if ((fd_banks) > NPU_CBUF_BANKS-1) {
+   if ((fd_banks) > CBUF_BANKS-1) {
      return -1;
    } else {
        if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE) {
-        weight_banks = NPU_CBUF_BANKS - fd_banks;
+        weight_banks = CBUF_BANKS - fd_banks;
        } else {
          return -2;
        }
@@ -893,11 +904,11 @@ int gen_matmul_int8(matmul_params_t *params)
    fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks +1;
    weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
    weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE)==0) ? weight_banks : weight_banks + 1;
-   if ((fd_banks) > NPU_CBUF_BANKS-1) {
+   if ((fd_banks) > CBUF_BANKS-1) {
      return -1;
    } else {
        if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE) {
-        weight_banks = NPU_CBUF_BANKS - fd_banks;
+        weight_banks = CBUF_BANKS - fd_banks;
        } else {
          return -2;
        }
@@ -914,16 +925,16 @@ int gen_matmul_int8(matmul_params_t *params)
     * here with fd_banks == BANKS-1, where silently clamping data_bank back to fd_banks
     * would re-create the exact int8 tail-row corruption the slack prevents — so fail
     * loudly and unconditionally instead of clamping. */
-   if (fd_banks + 1 > (unsigned)NPU_CBUF_BANKS - 1) {
+   if (fd_banks + 1 > (unsigned)CBUF_BANKS - 1) {
        ROCKET_LOGE("gen_matmul_int8: int8 CBUF bank-slack does not fit "
                "(fd_banks=%u, need fd_banks+1 <= %d) — use rocket_matmul_plan_int8\n",
-               fd_banks, NPU_CBUF_BANKS - 1);
+               fd_banks, CBUF_BANKS - 1);
        return -1;
    }
    {
        unsigned data_bank = fd_banks + 1;
        cna_desc.data_bank   = data_bank;
-       cna_desc.weight_bank = NPU_CBUF_BANKS - data_bank;
+       cna_desc.weight_bank = CBUF_BANKS - data_bank;
    }
    cna_desc.weight_reuse = params->weight_reuse & 0x1;   /* default 0 */
    cna_desc.data_reuse   = params->data_reuse   & 0x1;
@@ -1127,9 +1138,9 @@ int gen_matmul_int8(matmul_params_t *params)
        int x = atoi(e);
        int nb = (int)cna_desc.data_bank + x;
        if (nb < 1) nb = 1;
-       if (nb > (int)NPU_CBUF_BANKS - 1) nb = NPU_CBUF_BANKS - 1;
+       if (nb > (int)CBUF_BANKS - 1) nb = CBUF_BANKS - 1;
        cna_desc.data_bank   = nb;
-       cna_desc.weight_bank = NPU_CBUF_BANKS - nb;
+       cna_desc.weight_bank = CBUF_BANKS - nb;
      }
      if ((e = getenv("ROCKET_I8_GRAINS")))     cna_desc.feature_grains = (unsigned)strtoul(e, NULL, 0);
      if ((e = getenv("ROCKET_I8_SURF")))       cna_desc.surf_stride    = (int)strtol(e, NULL, 0);
@@ -1226,11 +1237,11 @@ int gen_matmul_int4(matmul_params_t *params)
    fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks + 1;
    weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
    weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE) == 0) ? weight_banks : weight_banks + 1;
-   if (fd_banks > NPU_CBUF_BANKS - 1) {
+   if (fd_banks > CBUF_BANKS - 1) {
      return -1;
    } else {
        if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE) {
-        weight_banks = NPU_CBUF_BANKS - fd_banks;
+        weight_banks = CBUF_BANKS - fd_banks;
        } else {
          return -2;
        }
@@ -1447,11 +1458,11 @@ int gen_matmul_int16(matmul_params_t *params)
    fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks + 1;
    weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
    weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE) == 0) ? weight_banks : weight_banks + 1;
-   if (fd_banks > NPU_CBUF_BANKS - 1) {
+   if (fd_banks > CBUF_BANKS - 1) {
      return -1;
    } else {
        if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE) {
-        weight_banks = NPU_CBUF_BANKS - fd_banks;
+        weight_banks = CBUF_BANKS - fd_banks;
        } else {
          return -2;
        }
@@ -1657,11 +1668,11 @@ int gen_matmul_bf16(matmul_params_t *params)
    fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks + 1;
    weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
    weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE) == 0) ? weight_banks : weight_banks + 1;
-   if (fd_banks > NPU_CBUF_BANKS - 1) {
+   if (fd_banks > CBUF_BANKS - 1) {
      return -1;
    } else {
        if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE) {
-        weight_banks = NPU_CBUF_BANKS - fd_banks;
+        weight_banks = CBUF_BANKS - fd_banks;
        } else {
          return -2;
        }
@@ -1878,11 +1889,11 @@ int gen_matmul_tf32(matmul_params_t *params)
    fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks + 1;
    weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
    weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE) == 0) ? weight_banks : weight_banks + 1;
-   if (fd_banks > NPU_CBUF_BANKS - 1) {
+   if (fd_banks > CBUF_BANKS - 1) {
      return -1;
    } else {
        if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE) {
-        weight_banks = NPU_CBUF_BANKS - fd_banks;
+        weight_banks = CBUF_BANKS - fd_banks;
        } else {
          return -2;
        }
@@ -2492,7 +2503,7 @@ static int gen_conv2d_fill(conv_params_t *params, int depthwise)
    fd_bytes = IW * IH * IC * sizeof(_Float16);
    fd_banks = (fd_bytes / NPU_CBUF_BANK_SIZE);
    fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks + 1;
-   if (fd_banks > NPU_CBUF_BANKS - 1)
+   if (fd_banks > CBUF_BANKS - 1)
      return -1;
 
    if (depthwise) {
@@ -2514,9 +2525,9 @@ static int gen_conv2d_fill(conv_params_t *params, int depthwise)
      cna_desc.weight_bytes_per_kernel = KW * KH * IC * sizeof(_Float16);  /* Mesa WEIGHT_SIZE1 = KW*KH*IC */
      cna_desc.weight_bytes = Cpad * KH * KW * sizeof(_Float16);           /* G-padded cube bytes */
      weight_banks = (cna_desc.weight_bytes + NPU_CBUF_BANK_SIZE - 1) / NPU_CBUF_BANK_SIZE;
-     if (fd_banks + weight_banks > NPU_CBUF_BANKS)
+     if (fd_banks + weight_banks > CBUF_BANKS)
        return -2;
-     weight_banks = NPU_CBUF_BANKS - fd_banks;   /* weight gets all remaining banks (== direct path) */
+     weight_banks = CBUF_BANKS - fd_banks;   /* weight gets all remaining banks (== direct path) */
    } else {
      cna_desc.weight_kernels = OC;
      cna_desc.weight_bytes_per_kernel = KW * KH * IC * sizeof(_Float16);
@@ -2524,7 +2535,7 @@ static int gen_conv2d_fill(conv_params_t *params, int depthwise)
      weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
      weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE) == 0) ? weight_banks : weight_banks + 1;
      if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE)
-       weight_banks = NPU_CBUF_BANKS - fd_banks;
+       weight_banks = CBUF_BANKS - fd_banks;
      else
        return -2;
    }
@@ -2760,7 +2771,7 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
    fd_bytes = IW * IH * IC * sizeof(int8_t);
    fd_banks = (fd_bytes / NPU_CBUF_BANK_SIZE);
    fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks + 1;
-   if (fd_banks > NPU_CBUF_BANKS - 1)
+   if (fd_banks > CBUF_BANKS - 1)
      return -1;
 
    if (depthwise) {
@@ -2775,9 +2786,9 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
      cna_desc.weight_bytes_per_kernel = KW * KH * IC * sizeof(int8_t);  /* Mesa WEIGHT_SIZE1 = KW*KH*IC */
      cna_desc.weight_bytes = Cpad * KH * KW * sizeof(int8_t);           /* G-padded cube bytes */
      weight_banks = (cna_desc.weight_bytes + NPU_CBUF_BANK_SIZE - 1) / NPU_CBUF_BANK_SIZE;
-     if (fd_banks + weight_banks > NPU_CBUF_BANKS)
+     if (fd_banks + weight_banks > CBUF_BANKS)
        return -2;
-     weight_banks = NPU_CBUF_BANKS - fd_banks;
+     weight_banks = CBUF_BANKS - fd_banks;
    } else {
      cna_desc.weight_kernels = OC;
      cna_desc.weight_bytes_per_kernel = KW * KH * IC * sizeof(int8_t);
@@ -2785,7 +2796,7 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
      weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
      weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE) == 0) ? weight_banks : weight_banks + 1;
      if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE)
-       weight_banks = NPU_CBUF_BANKS - fd_banks;
+       weight_banks = CBUF_BANKS - fd_banks;
      else
        return -2;
    }
@@ -2804,16 +2815,16 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
     * As in gen_matmul_int8, the +1 slack must actually fit: if the conv tiler is
     * bypassed and fd_banks == BANKS-1, silently clamping data_bank back to fd_banks
     * re-creates the tail-row corruption — fail loudly and unconditionally instead. */
-   if (fd_banks + 1 > (unsigned)NPU_CBUF_BANKS - 1) {
+   if (fd_banks + 1 > (unsigned)CBUF_BANKS - 1) {
        ROCKET_LOGE("gen_conv2d_int8: int8 CBUF bank-slack does not fit "
                "(fd_banks=%u, need fd_banks+1 <= %d) — use the int8 conv tiler\n",
-               fd_banks, NPU_CBUF_BANKS - 1);
+               fd_banks, CBUF_BANKS - 1);
        return -1;
    }
    {
        unsigned data_bank = fd_banks + 1;
        cna_desc.data_bank   = data_bank;
-       cna_desc.weight_bank = NPU_CBUF_BANKS - data_bank;
+       cna_desc.weight_bank = CBUF_BANKS - data_bank;
    }
    /* AUDIT sentinel, kept for future RE (mirrors gen_matmul_int8's ROCKET_I8_FDBANK_EXTRA),
     * RELATIVE to the +1 base: EXTRA=-1 reproduces the old exact-fit (resonates), EXTRA=+1
@@ -2822,9 +2833,9 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
        int x = atoi(e);
        int nb = (int)cna_desc.data_bank + x;
        if (nb < 1) nb = 1;
-       if (nb > (int)NPU_CBUF_BANKS - 1) nb = NPU_CBUF_BANKS - 1;
+       if (nb > (int)CBUF_BANKS - 1) nb = CBUF_BANKS - 1;
        cna_desc.data_bank   = (unsigned)nb;
-       cna_desc.weight_bank = NPU_CBUF_BANKS - (unsigned)nb;
+       cna_desc.weight_bank = CBUF_BANKS - (unsigned)nb;
    }
    cna_desc.weight_reuse = 0;
    cna_desc.data_reuse = 0;

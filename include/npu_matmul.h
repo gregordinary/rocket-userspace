@@ -165,6 +165,13 @@ typedef struct {
    * is fp16. Build with rocket_lut_epilogue_build. SMOOTH single-pass kinds only
    * (SiLU/tanh/GELU); see lut_epilogue_t. */
   const lut_epilogue_t *act;
+  /* Full-plane feature/output height, when this task covers only a row window of a
+   * taller plane. 0 (default) == "this task is the whole plane" == ih / oh. Read
+   * ONLY by the RK3576 generators (npu_regcmd_rk3576.c), whose stream carries the
+   * task window and the full plane in separate registers; the RK3588 generators
+   * never look at them, so every existing path is byte-identical. */
+  uint16_t  ih_full;
+  uint16_t  oh_full;
   uint32_t  task_count;   /* OUT: number of NPUOP words written      */
 } conv_params_t;
 
