@@ -57,6 +57,7 @@ set(ROCKETNPU_SOURCES
     src/rocket_attn.c         # on-NPU multi-head self-attention (QKV + scores + softmax + P·V + out-proj)
     src/rocket_encoder.c      # one Whisper encoder block (LN -> MHA -> residual -> LN -> MLP -> residual)
     src/rocket_siglip_encoder.c # SigLIP-B/16 vision encoder (patch-embed + pos + 12x block + post-LN)
+    src/rocket_sam_encoder.c  # SAM ViT-Det image encoder (windowed + global attn + decomposed rel-pos + conv neck)
     src/rocket_activation.c   # elementwise fp16 activation via the DPU LUT block
     src/rocket_matmul_mt.c    # multicore fan-out (per-core worker fds)
     src/rocket_bf16_stream.c  # fast bf16 matmul: multicore fan-out + streaming resident scratch
@@ -118,6 +119,7 @@ set(ROCKETNPU_PUBLIC_HEADERS
     include/rocket_attn.h      # rocket_mha_self_fp16 (multi-head self-attention)
     include/rocket_encoder.h   # rocket_encoder_block_fp16 (one Whisper encoder block)
     include/rocket_siglip.h    # rocket_siglip_encode (SigLIP-B/16 vision encoder end to end)
+    include/rocket_sam.h       # rocket_sam_encode (SAM ViT-Det image encoder end to end)
     include/rocket_activation.h # rocket_activation_fp16 (DPU LUT elementwise)
     include/npu_matmul.h       # matmul_params_t + gen_matmul_fp16 / gen_conv2d_* (low-level)
     include/npu_pool.h         # pool_params_t + gen_pool_fp16 (low-level PPU pooling)
@@ -219,6 +221,7 @@ if(ROCKETNPU_BUILD_TESTS)
             flash_attn_rocket      # masked GQA flash attention (decoder/LLM prefill, FLASH_ATTN_EXT) vs fp64 oracle (cos-sim)
             encoder_block_rocket   # one full Whisper encoder block (LN+MHA+residual+LN+MLP) vs fp64 oracle (cos-sim)
             siglip_rocket          # full SigLIP-B/16 vision encoder vs fp32 HF oracle (per-layer cos-sim) + bench
+            sam_rocket             # full SAM ViT-Det image encoder vs fp32 HF ref (per-layer cos-sim) + host-ref self-check + bench
             conv2d_int8_rocket     # native int8 CONV_2D: cube self-check + int32 single-job HW gate
             replay_dw_mesa         # replay captured Teflon int8 DW BOs vs mesa-output (ground truth)
             conv_dw_int8_runtime   # int8 DW int8-out RUNTIME (host packing) vs mesa-output
@@ -353,6 +356,8 @@ if(ROCKETNPU_BUILD_TESTS)
     set_tests_properties(encoder_block_rocket PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME siglip_rocket COMMAND siglip_rocket)
     set_tests_properties(siglip_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME sam_rocket COMMAND sam_rocket)
+    set_tests_properties(sam_rocket PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME conv2d_int8_rocket COMMAND conv2d_int8_rocket)
     add_test(NAME matmul_tiled_rocket COMMAND matmul_tiled_rocket)
     add_test(NAME fc_data_bank_sweep_rocket COMMAND fc_data_bank_sweep_rocket)
