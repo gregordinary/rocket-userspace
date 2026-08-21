@@ -111,6 +111,11 @@ int rocket_siglip_encode(int fd, const rocket_siglip_model *m,
                          const _Float16 *pixels_chw, _Float16 *out, _Float16 *hidden_opt)
 {
     if (!m || !m->map || !pixels_chw || !out) return -1;
+    /* This per-call path handles only the SigLIP configuration. A CLIP-shaped model (prefix/cls
+     * token, pre-encoder LayerNorm, quick-GELU, or a bias-less patch Conv / no sequence post-LN)
+     * must go through the resident ctx path, which open-codes the block and supports those. */
+    if (m->n_prefix != 0 || m->prefix || m->pre_g || m->act_kind != 0 || !m->patch_b || !m->post_g)
+        return -3;
     const int d = m->d, L = m->L, pdim = m->patch_dim, dff = m->d_ff, nh = m->n_head;
     const int side = m->image_size / m->stride, H = m->image_size, W = m->image_size;
     const int ic = m->ic, kh = m->kh, kw = m->kw, stride = m->stride;
@@ -319,6 +324,51 @@ static void h_gelu_tanh(size_t n, _Float16 *x, int nt)
     parallel_for((int)n, nt, gelu_range, x);
 }
 
+/* CLIP's quick-GELU: x*sigmoid(1.702x). Same fp16-input LUT trick as gelu-tanh (all 65536
+ * outputs fit one table, bit-exact to the scalar path incl inf/nan), so the hot activation is
+ * a load. Built once before the parallel fan-out. */
+static inline _Float16 quickgelu1(_Float16 xv)
+{
+    float v = (float)xv;
+    return (_Float16)(v / (1.f + expf(-1.702f * v)));
+}
+static _Float16 g_qgelu_lut[65536];
+static int      g_qgelu_lut_ready;
+static void qgelu_lut_build(void)
+{
+    for (int u = 0; u < 65536; u++) {
+        uint16_t bits = (uint16_t)u; _Float16 h; memcpy(&h, &bits, sizeof h);
+        g_qgelu_lut[u] = quickgelu1(h);
+    }
+    g_qgelu_lut_ready = 1;
+}
+static void qgelu_range(void *a, int lo, int hi)
+{
+    _Float16 *x = a;
+    for (int i = lo; i < hi; i++) {
+        uint16_t bits; memcpy(&bits, &x[i], sizeof bits);
+        x[i] = g_qgelu_lut[bits];
+    }
+}
+static void qgelu_range_scalar(void *a, int lo, int hi)
+{
+    _Float16 *x = a;
+    for (int i = lo; i < hi; i++) x[i] = quickgelu1(x[i]);
+}
+static void h_quick_gelu(size_t n, _Float16 *x, int nt)
+{
+    if (getenv("ROCKET_SIGLIP_GELU_SCALAR")) { parallel_for((int)n, nt, qgelu_range_scalar, x); return; }
+    if (!g_qgelu_lut_ready) qgelu_lut_build();
+    parallel_for((int)n, nt, qgelu_range, x);
+}
+
+/* the model's MLP nonlinearity (host, in place over n elements) */
+static void h_mlp_act(const rocket_siglip_model *m, size_t n, _Float16 *x, int nt)
+{
+    if (m->act_kind == 1) h_quick_gelu(n, x, nt);
+    else                  h_gelu_tanh(n, x, nt);
+}
+
 static void h_add_bias(int M, int N, _Float16 *C, const _Float16 *b)
 {
     if (!b) return;
@@ -364,6 +414,12 @@ rocket_siglip_ctx *rocket_siglip_ctx_create(const rocket_siglip_model *m, int nt
     c->m = m;
     c->ht = (nthreads <= 1) ? 1 : 4;   /* host softmax/GELU across the 4 A76 big cores */
     const int d = m->d, L = m->L, pdim = m->patch_dim, dff = m->d_ff, nL = m->n_layers;
+    /* The token-projection matmuls run over ntok = L + n_prefix rows (the cls token joins the
+     * sequence); the patch projection runs over L patch rows. Both need M % 4 == 0, so pack the
+     * resident weights at the padded M the prepacked calls will use (the layout is M-independent
+     * for M >= 256, but Mp/Lp < 256 here, so pack-M and call-M must agree exactly). */
+    const int Mp = ((L + m->n_prefix) + 3) & ~3;
+    const int Lp = (L + 3) & ~3;
 
     c->mm = rocket_ctx_create(nthreads);
     c->strm = rocket_stream_create(1);   /* attention matmuls are small (K=64/N=64) — N-split hurts */
@@ -374,16 +430,16 @@ rocket_siglip_ctx *rocket_siglip_ctx_create(const rocket_siglip_model *m, int nt
     if (!c->mm || !c->strm || c->aux_fd < 0 ||
         !c->wq || !c->wk || !c->wv || !c->wo || !c->wf1 || !c->wf2) goto fail;
 
-    c->w_patch = rocket_weights_pack(c->mm, L, pdim, d, m->patch_W);
+    c->w_patch = rocket_weights_pack(c->mm, Lp, pdim, d, m->patch_W);
     if (!c->w_patch) goto fail;
     for (int l = 0; l < nL; l++) {
         layer_ptrs p = unpack_layer(m, l);
-        c->wq[l]  = rocket_weights_pack(c->mm, L, d,   d,   p.Wq);
-        c->wk[l]  = rocket_weights_pack(c->mm, L, d,   d,   p.Wk);
-        c->wv[l]  = rocket_weights_pack(c->mm, L, d,   d,   p.Wv);
-        c->wo[l]  = rocket_weights_pack(c->mm, L, d,   d,   p.Wo);
-        c->wf1[l] = rocket_weights_pack(c->mm, L, d,   dff, p.Wf1);
-        c->wf2[l] = rocket_weights_pack(c->mm, L, dff, d,   p.Wf2);
+        c->wq[l]  = rocket_weights_pack(c->mm, Mp, d,   d,   p.Wq);
+        c->wk[l]  = rocket_weights_pack(c->mm, Mp, d,   d,   p.Wk);
+        c->wv[l]  = rocket_weights_pack(c->mm, Mp, d,   d,   p.Wv);
+        c->wo[l]  = rocket_weights_pack(c->mm, Mp, d,   d,   p.Wo);
+        c->wf1[l] = rocket_weights_pack(c->mm, Mp, d,   dff, p.Wf1);
+        c->wf2[l] = rocket_weights_pack(c->mm, Mp, dff, d,   p.Wf2);
         if (!c->wq[l] || !c->wk[l] || !c->wv[l] || !c->wo[l] || !c->wf1[l] || !c->wf2[l]) goto fail;
     }
 
@@ -431,47 +487,56 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
     if (sl_pin_enabled()) rocket_pin_worker(0);   /* keep this thread's serial parts on an A76 */
     const rocket_siglip_model *m = c->m;
     const int d = m->d, L = m->L, pdim = m->patch_dim, dff = m->d_ff, nh = m->n_head, dh = d / nh;
+    const int npre = m->n_prefix;
+    const int ntok = L + npre;                    /* token-sequence length (cls prefix + patches) */
+    const int Mp = (ntok + 3) & ~3;               /* token-projection matmul M % 4 == 0            */
+    const int Lp = (L + 3) & ~3;                  /* patch-projection matmul M % 4 == 0            */
     const int side = m->image_size / m->stride, H = m->image_size, W = m->image_size;
     const int ic = m->ic, kh = m->kh, kw = m->kw, stride = m->stride;
     const float scale = 1.f / sqrtf((float)dh);
-    const size_t Ld = (size_t)L * d;
+    const size_t Td = (size_t)ntok * d;           /* real token-sequence element count */
     int rc = -2;
 
     const int use_fa = (c->fa != NULL);
-    _Float16 *patches = malloc((size_t)L * pdim * sizeof(_Float16));
-    _Float16 *x  = malloc(Ld * sizeof(_Float16));
-    _Float16 *ln = malloc(Ld * sizeof(_Float16));
-    _Float16 *q  = malloc(Ld * sizeof(_Float16));
-    _Float16 *k  = malloc(Ld * sizeof(_Float16));
-    _Float16 *v  = malloc(Ld * sizeof(_Float16));
-    _Float16 *cc = malloc(Ld * sizeof(_Float16));      /* concat per-head context */
-    _Float16 *y  = malloc((size_t)L * dff * sizeof(_Float16));  /* o-proj / fc1 / fc2 out */
-    /* FA path: head-major Q/K/V/OUT for the flash-attention fan-out (each Ld elems).
+    /* Token buffers hold Mp rows (padded to M%4); host elementwise touches only the first ntok, and
+     * every projection matmul runs at M=Mp with the pad rows held at zero. calloc + ntok-bounded host
+     * writes keep the pad rows zero, so each matmul's pad-row output stays zero (never poisons a real
+     * token, which the attention reads at n_tokens=ntok). patches/xp hold Lp patch rows. */
+    _Float16 *patches = calloc((size_t)Lp * pdim, sizeof(_Float16));
+    _Float16 *xp = calloc((size_t)Lp * d, sizeof(_Float16));      /* patch-projection output */
+    _Float16 *x  = calloc((size_t)Mp * d, sizeof(_Float16));
+    _Float16 *ln = calloc((size_t)Mp * d, sizeof(_Float16));
+    _Float16 *q  = calloc((size_t)Mp * d, sizeof(_Float16));
+    _Float16 *k  = calloc((size_t)Mp * d, sizeof(_Float16));
+    _Float16 *v  = calloc((size_t)Mp * d, sizeof(_Float16));
+    _Float16 *cc = calloc((size_t)Mp * d, sizeof(_Float16));      /* concat per-head context */
+    _Float16 *y  = calloc((size_t)Mp * dff, sizeof(_Float16));    /* o-proj / fc1 / fc2 out */
+    /* FA path: head-major Q/K/V/OUT for the flash-attention fan-out (each ntok*d elems).
      * single-stream path: per-head gather scratch qh/khh/vhT + all-heads scores sc. */
     _Float16 *Qh = NULL, *Kh = NULL, *Vh = NULL, *Oh = NULL;
     _Float16 *qh = NULL, *khh = NULL, *vhT = NULL, *sc = NULL;
     int alloc_ok;
     if (use_fa) {
-        Qh = malloc(Ld * sizeof(_Float16)); Kh = malloc(Ld * sizeof(_Float16));
-        Vh = malloc(Ld * sizeof(_Float16)); Oh = malloc(Ld * sizeof(_Float16));
+        Qh = calloc(Td, sizeof(_Float16)); Kh = calloc(Td, sizeof(_Float16));
+        Vh = calloc(Td, sizeof(_Float16)); Oh = calloc(Td, sizeof(_Float16));
         alloc_ok = Qh && Kh && Vh && Oh;
     } else {
-        qh  = malloc((size_t)L * dh * sizeof(_Float16));
-        khh = malloc((size_t)L * dh * sizeof(_Float16));
-        vhT = malloc((size_t)dh * L * sizeof(_Float16));
+        qh  = malloc((size_t)ntok * dh * sizeof(_Float16));
+        khh = malloc((size_t)ntok * dh * sizeof(_Float16));
+        vhT = malloc((size_t)dh * ntok * sizeof(_Float16));
         /* all heads' scores in one buffer; softmaxed in place on the host (one pass over
-         * [nh*L, L] rows), so no NPU softmax round-trip and PV reads sc directly. */
-        sc  = malloc((size_t)nh * L * L * sizeof(_Float16));
+         * [nh*ntok, ntok] rows), so no NPU softmax round-trip and PV reads sc directly. */
+        sc  = malloc((size_t)nh * ntok * ntok * sizeof(_Float16));
         alloc_ok = qh && khh && vhT && sc;
     }
-    if (!patches || !x || !ln || !q || !k || !v || !cc || !y || !alloc_ok) goto done;
+    if (!patches || !xp || !x || !ln || !q || !k || !v || !cc || !y || !alloc_ok) goto done;
 
     int prof = getenv("ROCKET_SIGLIP_PROF") != NULL;
     double tb[16] = {0}, t0 = 0;
 #define TIC (t0 = prof_ms())
 #define TOC(i) do { if (prof) tb[i] += prof_ms() - t0; } while (0)
 
-    /* im2col (same ordering as the simple path) */
+    /* im2col (same ordering as the simple path); patches has L rows, pad rows L..Lp stay zero */
     TIC;
     for (int ph = 0; ph < side; ph++)
         for (int pw = 0; pw < side; pw++) {
@@ -488,55 +553,71 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
         }
     TOC(0);
 
-    /* patch projection (prepacked) + bias + pos (host) */
+    /* patch projection (prepacked, M=Lp) -> xp, then assemble the token sequence: prefix (cls) rows
+     * = prefix + pos; patch rows = patch_proj + patch_b (if any) + pos. pos is [ntok][d]. The
+     * patch-row add keeps the SigLIP order (proj + patch_b + pos) so that path stays bit-identical. */
     TIC;
-    if ((rc = rocket_matmul_fp16_prepacked(c->mm, L, pdim, d, patches, x, c->w_patch)) != 0) goto done;
-    for (int p = 0; p < L; p++) {
-        _Float16 *xr = x + (size_t)p * d; const _Float16 *pr = m->pos + (size_t)p * d;
-        for (int j = 0; j < d; j++) xr[j] = (_Float16)((float)xr[j] + (float)m->patch_b[j] + (float)pr[j]);
+    if ((rc = rocket_matmul_fp16_prepacked(c->mm, Lp, pdim, d, patches, xp, c->w_patch)) != 0) goto done;
+    for (int j = 0; j < npre; j++) {
+        _Float16 *xr = x + (size_t)j * d;
+        const _Float16 *cr = m->prefix + (size_t)j * d, *pr = m->pos + (size_t)j * d;
+        for (int e = 0; e < d; e++) xr[e] = (_Float16)((float)cr[e] + (float)pr[e]);
     }
+    for (int p = 0; p < L; p++) {
+        _Float16 *xr = x + (size_t)(npre + p) * d;
+        const _Float16 *sr = xp + (size_t)p * d, *pr = m->pos + (size_t)(npre + p) * d;
+        for (int e = 0; e < d; e++) {
+            float acc = (float)sr[e];
+            if (m->patch_b) acc += (float)m->patch_b[e];
+            acc += (float)pr[e];
+            xr[e] = (_Float16)acc;
+        }
+    }
+    /* optional pre-encoder LayerNorm (CLIP pre_layrnorm) over the token rows, in place */
+    if (m->pre_g) { h_layernorm(ntok, d, x, m->pre_g, m->pre_b, m->eps, ln); memcpy(x, ln, Td * sizeof(_Float16)); }
     TOC(1);
-    if (hidden_opt) memcpy(hidden_opt, x, Ld * sizeof(_Float16));
+    if (hidden_opt) memcpy(hidden_opt, x, Td * sizeof(_Float16));
 
     for (int l = 0; l < m->n_layers; l++) {
         layer_ptrs p = unpack_layer(m, l);
 
         /* --- attention sublayer: x += Wo·MHA(LN1(x)) --- */
-        TIC; h_layernorm(L, d, x, p.ln1_g, p.ln1_b, m->eps, ln); TOC(2);
+        TIC; h_layernorm(ntok, d, x, p.ln1_g, p.ln1_b, m->eps, ln); TOC(2);
         TIC;
-        if ((rc = rocket_matmul_fp16_prepacked(c->mm, L, d, d, ln, q, c->wq[l])) != 0) goto done;
-        if ((rc = rocket_matmul_fp16_prepacked(c->mm, L, d, d, ln, k, c->wk[l])) != 0) goto done;
-        if ((rc = rocket_matmul_fp16_prepacked(c->mm, L, d, d, ln, v, c->wv[l])) != 0) goto done;
-        h_add_bias(L, d, q, p.bq); h_add_bias(L, d, k, p.bk); h_add_bias(L, d, v, p.bv);
+        if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, d, ln, q, c->wq[l])) != 0) goto done;
+        if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, d, ln, k, c->wk[l])) != 0) goto done;
+        if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, d, ln, v, c->wv[l])) != 0) goto done;
+        h_add_bias(ntok, d, q, p.bq); h_add_bias(ntok, d, k, p.bk); h_add_bias(ntok, d, v, p.bv);
         if (!use_fa)
-            for (size_t i = 0; i < Ld; i++) q[i] = (_Float16)((float)q[i] * scale);  /* fold 1/sqrt(dh) */
+            for (size_t i = 0; i < Td; i++) q[i] = (_Float16)((float)q[i] * scale);  /* fold 1/sqrt(dh) */
         TOC(3);
 
         if (use_fa) {
-            /* re-lay q/k/v [L,d] (heads interleaved) into head-major operands and run all
-             * heads across the worker fds: Q/K=[nh][L][dh], V=[nh][dh][L] (the AV B-operand),
-             * OUT=[nh][L][dh]. scale is applied inside flash-attn (q is NOT pre-scaled). */
+            /* re-lay q/k/v [ntok,d] (heads interleaved) into head-major operands and run all heads
+             * across the worker fds: Q/K=[nh][ntok][dh], V=[nh][dh][ntok] (the AV B-operand),
+             * OUT=[nh][ntok][dh]. scale is applied inside flash-attn (q is NOT pre-scaled). The FA
+             * primitive pads the odd token count internally and masks the pad keys. */
             TIC;
             for (int h = 0; h < nh; h++) {
                 int off = h * dh;
-                _Float16 *Qd = Qh + (size_t)h * L * dh, *Kd = Kh + (size_t)h * L * dh;
-                _Float16 *Vd = Vh + (size_t)h * dh * L;
-                for (int t = 0; t < L; t++) {
+                _Float16 *Qd = Qh + (size_t)h * ntok * dh, *Kd = Kh + (size_t)h * ntok * dh;
+                _Float16 *Vd = Vh + (size_t)h * dh * ntok;
+                for (int t = 0; t < ntok; t++) {
                     memcpy(Qd + (size_t)t * dh, q + (size_t)t * d + off, dh * sizeof(_Float16));
                     memcpy(Kd + (size_t)t * dh, k + (size_t)t * d + off, dh * sizeof(_Float16));
-                    for (int cx = 0; cx < dh; cx++) Vd[(size_t)cx * L + t] = v[(size_t)t * d + off + cx];
+                    for (int cx = 0; cx < dh; cx++) Vd[(size_t)cx * ntok + t] = v[(size_t)t * d + off + cx];
                 }
             }
             TOC(4);
             TIC;
-            if ((rc = rocket_flash_attn_fp16_ctx(c->fa, L, L, dh, dh, nh, nh, scale, 0.f,
+            if ((rc = rocket_flash_attn_fp16_ctx(c->fa, ntok, ntok, dh, dh, nh, nh, scale, 0.f,
                                                  Qh, Kh, Vh, NULL, Oh)) != 0) goto done;
             TOC(5);   /* scores + softmax + PV, fanned across cores */
             TIC;
             for (int h = 0; h < nh; h++) {
                 int off = h * dh;
-                const _Float16 *Od = Oh + (size_t)h * L * dh;
-                for (int t = 0; t < L; t++)
+                const _Float16 *Od = Oh + (size_t)h * ntok * dh;
+                for (int t = 0; t < ntok; t++)
                     memcpy(cc + (size_t)t * d + off, Od + (size_t)t * dh, dh * sizeof(_Float16));
             }
             TOC(8);
@@ -545,55 +626,60 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
         for (int h = 0; h < nh; h++) {
             int off = h * dh;
             TIC;
-            for (int t = 0; t < L; t++) {
+            for (int t = 0; t < ntok; t++) {
                 memcpy(qh  + (size_t)t * dh, q + (size_t)t * d + off, dh * sizeof(_Float16));
                 memcpy(khh + (size_t)t * dh, k + (size_t)t * d + off, dh * sizeof(_Float16));
             }
             TOC(4);
-            TIC; if ((rc = cmatmul(c, L, dh, L, qh, khh, sc + (size_t)h * L * L)) != 0) goto done; TOC(5);
+            TIC; if ((rc = cmatmul(c, ntok, dh, ntok, qh, khh, sc + (size_t)h * ntok * ntok)) != 0) goto done; TOC(5);
         }
         /* phase 2: row-wise softmax on the host, in place (no NPU round-trip), threaded */
-        TIC; h_softmax_rows(nh * L, L, sc, c->ht); TOC(6);
+        TIC; h_softmax_rows(nh * ntok, ntok, sc, c->ht); TOC(6);
         /* phase 3: every head's ctx_h = P_h·v_h, scattered into cc columns [off,off+dh) */
         for (int h = 0; h < nh; h++) {
             int off = h * dh;
             TIC;
-            for (int t = 0; t < L; t++)
-                for (int cx = 0; cx < dh; cx++) vhT[(size_t)cx * L + t] = v[(size_t)t * d + off + cx];
+            for (int t = 0; t < ntok; t++)
+                for (int cx = 0; cx < dh; cx++) vhT[(size_t)cx * ntok + t] = v[(size_t)t * d + off + cx];
             TOC(4);
-            TIC; if ((rc = cmatmul(c, L, L, dh, sc + (size_t)h * L * L, vhT, qh)) != 0) goto done; TOC(7);
+            TIC; if ((rc = cmatmul(c, ntok, ntok, dh, sc + (size_t)h * ntok * ntok, vhT, qh)) != 0) goto done; TOC(7);
             TIC;
-            for (int t = 0; t < L; t++) memcpy(cc + (size_t)t * d + off, qh + (size_t)t * dh, dh * sizeof(_Float16));
+            for (int t = 0; t < ntok; t++) memcpy(cc + (size_t)t * d + off, qh + (size_t)t * dh, dh * sizeof(_Float16));
             TOC(8);
         }
         }
         TIC;
-        if ((rc = rocket_matmul_fp16_prepacked(c->mm, L, d, d, cc, y, c->wo[l])) != 0) goto done;
-        h_add_bias(L, d, y, p.bo);
+        if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, d, cc, y, c->wo[l])) != 0) goto done;
+        h_add_bias(ntok, d, y, p.bo);
         TOC(9);
-        TIC; h_residual(Ld, x, y); TOC(13);
+        TIC; h_residual(Td, x, y); TOC(13);
 
-        /* --- FFN sublayer: x += fc2(GELU(fc1(LN2(x)))) --- */
-        TIC; h_layernorm(L, d, x, p.ln2_g, p.ln2_b, m->eps, ln); TOC(2);
+        /* --- FFN sublayer: x += fc2(ACT(fc1(LN2(x)))) --- ACT = gelu-tanh (SigLIP) / quick-GELU (CLIP) */
+        TIC; h_layernorm(ntok, d, x, p.ln2_g, p.ln2_b, m->eps, ln); TOC(2);
         TIC;
-        if ((rc = rocket_matmul_fp16_prepacked(c->mm, L, d, dff, ln, y, c->wf1[l])) != 0) goto done;
-        h_add_bias(L, dff, y, p.bf1);
+        if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, dff, ln, y, c->wf1[l])) != 0) goto done;
+        h_add_bias(ntok, dff, y, p.bf1);
         TOC(10);
-        TIC; h_gelu_tanh((size_t)L * dff, y, c->ht); TOC(11);
+        TIC; h_mlp_act(m, (size_t)ntok * dff, y, c->ht); TOC(11);
         TIC;
-        if ((rc = rocket_matmul_fp16_prepacked(c->mm, L, dff, d, y, cc, c->wf2[l])) != 0) goto done;
-        h_add_bias(L, d, cc, p.bf2);
+        if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, dff, d, y, cc, c->wf2[l])) != 0) goto done;
+        h_add_bias(ntok, d, cc, p.bf2);
         TOC(12);
-        TIC; h_residual(Ld, x, cc); TOC(13);
+        TIC; h_residual(Td, x, cc); TOC(13);
 
-        if (hidden_opt) memcpy(hidden_opt + (size_t)(l + 1) * Ld, x, Ld * sizeof(_Float16));
+        if (hidden_opt) memcpy(hidden_opt + (size_t)(l + 1) * Td, x, Td * sizeof(_Float16));
     }
 
-    TIC; h_layernorm(L, d, x, m->post_g, m->post_b, m->eps, out); TOC(2);
+    /* optional post-LayerNorm over the sequence (SigLIP); CLIP leaves last_hidden_state un-normed
+     * (its post_layernorm applies only to the pooled cls row, done on the host tail). */
+    TIC;
+    if (m->post_g) h_layernorm(ntok, d, x, m->post_g, m->post_b, m->eps, out);
+    else           memcpy(out, x, Td * sizeof(_Float16));
+    TOC(2);
     rc = 0;
     if (prof) {
         const char *nm[14] = {"im2col","patch+pos","layernorm","qkv-proj","head-xpose",
-            "scores-mm","softmax","pv-mm","ctx-scatter","o-proj","fc1","gelu","fc2","residual"};
+            "scores-mm","softmax","pv-mm","ctx-scatter","o-proj","fc1","act","fc2","residual"};
         double tot = 0; for (int i = 0; i < 14; i++) tot += tb[i];
         ROCKET_LOGE("[siglip prof] total %.1f ms:\n", tot);
         for (int i = 0; i < 14; i++)
@@ -602,7 +688,7 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
 #undef TIC
 #undef TOC
 done:
-    free(patches); free(x); free(ln); free(q); free(k); free(v); free(cc); free(y);
+    free(patches); free(xp); free(x); free(ln); free(q); free(k); free(v); free(cc); free(y);
     free(qh); free(khh); free(vhT); free(sc);
     free(Qh); free(Kh); free(Vh); free(Oh);
     return rc;

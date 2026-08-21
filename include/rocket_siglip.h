@@ -40,13 +40,23 @@ typedef struct {
     float eps;
 
     /* base weight pointers into the mmap (fp16) */
-    const _Float16 *patch_W;     /* [d][patch_dim]  row-major [oc][ic*kh*kw] */
-    const _Float16 *patch_b;     /* [d]                                      */
-    const _Float16 *pos;         /* [L][d]  position table in patch order     */
+    const _Float16 *patch_W;     /* [d][patch_dim]  row-major [oc][ic*kh*kw]  */
+    const _Float16 *patch_b;     /* [d], or NULL for a bias-less patch Conv    */
+    const _Float16 *pos;         /* [ntok][d] position table (ntok = L+n_prefix) */
     const _Float16 *layers;      /* base of the per-layer weight region       */
-    const _Float16 *post_g;      /* [d] post_layernorm weight                 */
-    const _Float16 *post_b;      /* [d] post_layernorm bias                   */
+    const _Float16 *post_g;      /* [d] post_layernorm weight, or NULL         */
+    const _Float16 *post_b;      /* [d] post_layernorm bias, or NULL           */
     size_t          layer_stride;/* fp16 elements between consecutive layers  */
+
+    /* Plain-ViT variant knobs (the EP marshaling path sets these; the blob loader
+     * leaves them at the SigLIP defaults 0/NULL, so a v1 blob loads unchanged).
+     * ntok = L + n_prefix is the token-sequence length the encoder runs over. */
+    int             n_prefix;    /* prepended tokens (CLIP cls = 1); 0 for SigLIP */
+    const _Float16 *prefix;      /* [n_prefix][d] prefix (cls) embeddings, or NULL */
+    const _Float16 *pre_g;       /* [d] pre-encoder LayerNorm weight (CLIP), or NULL */
+    const _Float16 *pre_b;       /* [d] pre-encoder LayerNorm bias, or NULL         */
+    int             act_kind;    /* MLP activation: 0 = gelu_pytorch_tanh (SigLIP),
+                                  *                 1 = quick-GELU x*sigmoid(1.702x) (CLIP) */
 } rocket_siglip_model;
 
 #ifdef __cplusplus
@@ -60,11 +70,16 @@ void rocket_siglip_free(rocket_siglip_model *m);
 
 /*
  * Encode one image. `pixels_chw` is the preprocessed input [ic][image_size][image_size]
- * fp16 (the same tensor the oracle saved). `out` receives the post_layernorm output
- * [L][d] fp16. If `hidden_opt` is non-NULL it receives the (n_layers+1) intermediate
- * hidden states [(n_layers+1)][L][d] fp16 (index 0 = patch+pos embeddings, index k = the
- * output of encoder layer k-1) — used by the gate to score per-layer cosine vs the oracle.
+ * fp16 (the same tensor the oracle saved). `out` receives the encoder output
+ * [ntok][d] fp16 (ntok = L + n_prefix; post_layernorm applied when post_g != NULL, else the
+ * raw last residual == CLIP's last_hidden_state). If `hidden_opt` is non-NULL it receives the
+ * (n_layers+1) intermediate hidden states [(n_layers+1)][ntok][d] fp16 (index 0 = embeddings,
+ * index k = the output of encoder layer k-1) — used by the gate to score per-layer cosine.
  * fd >= 0 runs on the NPU; fd < 0 runs the exact host reference. Returns 0, <0 on error.
+ *
+ * This per-call path handles the SigLIP configuration (n_prefix==0, no pre-LN, gelu-tanh,
+ * post-LN); a CLIP-shaped model (cls token / pre-LN / quick-GELU) must use the resident ctx
+ * path below, and this returns -3 if handed one.
  */
 int  rocket_siglip_encode(int fd, const rocket_siglip_model *m,
                           const _Float16 *pixels_chw, _Float16 *out,
