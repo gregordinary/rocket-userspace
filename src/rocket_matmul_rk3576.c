@@ -43,6 +43,7 @@
  * path, and the requant moves to the host.
  */
 #include <dirent.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +74,102 @@
 
 int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
 int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+
+/* ============================================================================
+ * SECTION — phase profiling
+ *
+ * A THIRD accumulator, on the same ROCKET_MM_PROFILE knob and with its own exit line,
+ * for the same reason the int8 path has one separate from the fp16 path: the buckets are
+ * not the same SET. `g_prof`/`g_prof_i8` in rocket_matmul.c split an RK3588 job into
+ * pack/gen/sync/submit/wait/read, and three of this route's real terms have no bucket
+ * there at all — the O(K*N) `sum_abs_w` pass, the per-tile per-column ramp plan, and the
+ * poisoning stamp-and-check. A term with no bucket is charged to whichever neighbour the
+ * timer happens to span, which is how a profile reports a plausible wrong split.
+ *
+ * The unit is ONE CALL of the entry, and the tile loop's buckets accumulate ACROSS tiles
+ * within it, so `calls` counts entry calls and not tiles or submits. `submits` and
+ * `tiles` are carried beside them because a per-submit or per-tile term cannot be read
+ * off a total that does not say how many there were.
+ *
+ * WHAT IT CANNOT SEE: anything the caller does around the entry — the frontend's
+ * quantize, its rotation and its dequantize are in ggml-rocket and are timed there, on
+ * this same knob; and the wall this route is quoted against also carries attention, the
+ * norms, rope and the scheduler, none of which reach this file. So these buckets sum to
+ * the entry's own time, NOT to the model's.
+ * ==========================================================================*/
+static int r76_mm_profile(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("ROCKET_MM_PROFILE") != NULL;
+    return v;
+}
+
+static pthread_mutex_t g_prof_r76_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    double sumabs, packA, packB, coeff, gen, alloc, stamp, submit, wait, read;
+    double setup, bofree, wall;
+    long calls, tiles, submits, redos;
+} g_prof_r76;
+static int g_prof_r76_armed = 0;
+
+static void r76_mm_prof_dump(void)
+{
+    const double t = g_prof_r76.sumabs + g_prof_r76.packA + g_prof_r76.packB
+                   + g_prof_r76.coeff + g_prof_r76.gen + g_prof_r76.alloc
+                   + g_prof_r76.stamp + g_prof_r76.submit + g_prof_r76.wait
+                   + g_prof_r76.read + g_prof_r76.setup + g_prof_r76.bofree;
+    /* `wall` spans the entry from its first statement to the fold, so wall-accounted is
+     * the in-entry time no bucket owns — printed here so pricing it never needs a second
+     * instrument's wall subtracted from this one's sum. */
+    ROCKET_LOGI("ROCKET rk3576 matmul profile total(ms): wall=%.0f accounted=%.0f "
+                "sumabs=%.0f packA=%.0f packB=%.0f coeff=%.0f gen=%.0f alloc=%.0f "
+                "stamp=%.0f submit=%.0f wait=%.0f read=%.0f setup=%.0f bofree=%.0f  "
+                "over %ld calls / %ld tiles / %ld submits (%ld redos)\n",
+                g_prof_r76.wall, t, g_prof_r76.sumabs, g_prof_r76.packA, g_prof_r76.packB,
+                g_prof_r76.coeff, g_prof_r76.gen, g_prof_r76.alloc, g_prof_r76.stamp,
+                g_prof_r76.submit, g_prof_r76.wait, g_prof_r76.read,
+                g_prof_r76.setup, g_prof_r76.bofree,
+                g_prof_r76.calls, g_prof_r76.tiles, g_prof_r76.submits,
+                g_prof_r76.redos);
+}
+
+static double r76_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+/* One accumulator struct per call, folded in under the mutex at the end, so the timers
+ * themselves cost no lock and a concurrent caller cannot interleave partial phases. */
+struct r76_mm_prof {
+    double sumabs, packA, packB, coeff, gen, alloc, stamp, submit, wait, read;
+    double setup, bofree, wall;
+    long tiles, submits, redos;
+};
+
+static void r76_mm_prof_fold(const struct r76_mm_prof *p)
+{
+    pthread_mutex_lock(&g_prof_r76_mu);
+    if (!g_prof_r76_armed) { atexit(r76_mm_prof_dump); g_prof_r76_armed = 1; }
+    g_prof_r76.sumabs += p->sumabs; g_prof_r76.packA += p->packA;
+    g_prof_r76.packB  += p->packB;  g_prof_r76.coeff += p->coeff;
+    g_prof_r76.gen    += p->gen;    g_prof_r76.alloc += p->alloc;
+    g_prof_r76.stamp  += p->stamp;  g_prof_r76.submit += p->submit;
+    g_prof_r76.wait   += p->wait;   g_prof_r76.read  += p->read;
+    g_prof_r76.setup  += p->setup;  g_prof_r76.bofree += p->bofree;
+    g_prof_r76.wall   += p->wall;
+    g_prof_r76.calls++;
+    g_prof_r76.tiles   += p->tiles;
+    g_prof_r76.submits += p->submits;
+    g_prof_r76.redos   += p->redos;
+    pthread_mutex_unlock(&g_prof_r76_mu);
+}
+
+/* PROF_T0/PROF_ADD: no-ops when the knob is off, so the un-profiled path pays one
+ * predictable branch per phase and no clock_gettime at all. */
+#define PROF_T0()        (prof ? r76_now_ms() : 0.0)
+#define PROF_ADD(f, t0)  do { if (prof) pr.f += r76_now_ms() - (t0); } while (0)
 
 /* Both machine parameters come from the profile, not from literals here: the feature
  * budget in int8 elements is the CBUF data allocation, and the output-channel tile is
@@ -205,6 +302,166 @@ int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *N
 }
 
 /* ============================================================================
+ * SECTION — the transient-BO pool
+ *
+ * The entry allocates and frees its feature, weight, coefficient, output and regcmd
+ * BOs per tile per call — `alloc` is its largest bucket — and the same sizes recur on
+ * every call of a given shape. ROCKET_RK3576_BO_POOL=1 keeps freed BOs on a small
+ * free list keyed by (fd, size) and hands them back on the next matching request;
+ * ROCKET_RK3576_BO_POOL_MB caps the held bytes (default 64). Default OFF: holding
+ * device memory across calls is an exposure — whether the per-call free is what keeps
+ * IOMMU mapping churn inside what the BO-lifetime fixes were written for is
+ * unmeasured — so the pool is a measured opt-in, not the shipped path.
+ *
+ * The knob is read on EVERY allocation (not latched), so an A/B can flip it between
+ * arms inside one process. Correctness does not depend on the pool: a pooled BO is
+ * fully rewritten before use by the same packs that fill a fresh one, and the
+ * poisoning sentinel stamps the output BO per task either way — what a pooled BO
+ * skips is only the kernel's zero-fill, which the sentinel never relied on.
+ * ==========================================================================*/
+static int r76_bo_pool_on(void)
+{
+    const char *e = getenv("ROCKET_RK3576_BO_POOL");
+    return e && atoi(e) != 0;
+}
+static size_t r76_bo_pool_cap(void)
+{
+    const char *e = getenv("ROCKET_RK3576_BO_POOL_MB");
+    long mb = e ? atol(e) : 64;
+    if (mb < 0) mb = 0;
+    return (size_t)mb << 20;
+}
+#define R76_BO_POOL_SLOTS 16
+static pthread_mutex_t g_r76_bo_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { int fd; rocket_bo bo; } g_r76_bo_pool[R76_BO_POOL_SLOTS];
+static size_t g_r76_bo_pool_bytes;
+
+/* Smallest pooled BO that covers the request wins; a larger BO is always safe (the
+ * consumers bound every access by the size they asked for). In practice a model's
+ * shapes recur exactly, so the match is exact. */
+static int r76_bo_get(int fd, size_t size, rocket_bo *bo)
+{
+    if (r76_bo_pool_on()) {
+        int i, best = -1;
+        pthread_mutex_lock(&g_r76_bo_pool_mu);
+        for (i = 0; i < R76_BO_POOL_SLOTS; i++) {
+            if (!g_r76_bo_pool[i].bo.ptr || g_r76_bo_pool[i].fd != fd) continue;
+            if (g_r76_bo_pool[i].bo.size < size) continue;
+            if (best < 0 || g_r76_bo_pool[i].bo.size < g_r76_bo_pool[best].bo.size)
+                best = i;
+        }
+        if (best >= 0) {
+            *bo = g_r76_bo_pool[best].bo;
+            g_r76_bo_pool_bytes -= g_r76_bo_pool[best].bo.size;
+            memset(&g_r76_bo_pool[best], 0, sizeof g_r76_bo_pool[best]);
+            pthread_mutex_unlock(&g_r76_bo_pool_mu);
+            return 0;
+        }
+        pthread_mutex_unlock(&g_r76_bo_pool_mu);
+    }
+    return rocket_bo_alloc(fd, size, bo);
+}
+static void r76_bo_put(int fd, rocket_bo *bo)
+{
+    if (bo->ptr && r76_bo_pool_on()) {
+        int i;
+        pthread_mutex_lock(&g_r76_bo_pool_mu);
+        if (g_r76_bo_pool_bytes + bo->size <= r76_bo_pool_cap()) {
+            for (i = 0; i < R76_BO_POOL_SLOTS; i++) {
+                if (g_r76_bo_pool[i].bo.ptr) continue;
+                g_r76_bo_pool[i].fd = fd;
+                g_r76_bo_pool[i].bo = *bo;
+                g_r76_bo_pool_bytes += bo->size;
+                memset(bo, 0, sizeof *bo);
+                pthread_mutex_unlock(&g_r76_bo_pool_mu);
+                return;
+            }
+        }
+        pthread_mutex_unlock(&g_r76_bo_pool_mu);
+    }
+    if (bo->ptr) rocket_bo_free(fd, bo);
+}
+void rocket_rk3576_bo_pool_drain(int fd)
+{
+    int i;
+    pthread_mutex_lock(&g_r76_bo_pool_mu);
+    for (i = 0; i < R76_BO_POOL_SLOTS; i++) {
+        if (!g_r76_bo_pool[i].bo.ptr || g_r76_bo_pool[i].fd != fd) continue;
+        g_r76_bo_pool_bytes -= g_r76_bo_pool[i].bo.size;
+        rocket_bo_free(fd, &g_r76_bo_pool[i].bo);
+        memset(&g_r76_bo_pool[i], 0, sizeof g_r76_bo_pool[i]);
+    }
+    pthread_mutex_unlock(&g_r76_bo_pool_mu);
+}
+
+/* ============================================================================
+ * SECTION — the resident weight cube
+ *
+ * One weight, packed once into the int8 weight-cube layout in a device BO. The pack
+ * puts column n's 32-byte k-runs at (n/32)*nK1*1024 + (n%32)*32 + (k/32)*1024, and
+ * the tile loop steps n0 by a multiple of 32, so the whole-N cube is exactly the
+ * concatenation of the per-tile cubes and one BO serves every N tile at every M —
+ * a tile's program just offsets weights_dma by (n0/32)*nK1*1024. The contract, and
+ * what a stale object computes, are on the declarations in rocket_matmul.h.
+ * ==========================================================================*/
+struct rocket_rk3576_wbo {
+    rocket_bo bo;
+    int K, N;
+};
+
+int rocket_rk3576_wbo_create(int fd, int K, int N, const int8_t *B,
+                             struct rocket_rk3576_wbo **out)
+{
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+    struct rocket_rk3576_wbo *w;
+    unsigned nK1, k1, n;
+    size_t bytes;
+
+    if (out) *out = NULL;
+    if (fd < 0 || !B || !out) return ROCKET_E_SHAPE;
+    if (strcmp(hw->name, "rk3576") != 0) {
+        ROCKET_LOGE("rocket_rk3576_wbo_create: this is the RK3576 encoding and the "
+                    "active profile is %s\n", hw->name);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    if (K <= 0 || N <= 0 || (K % 32) || (N % 32)) {
+        ROCKET_LOGE("rk3576 wbo: K=%d N=%d — both must be multiples of 32 (the int8 "
+                    "weight cube groups each channel axis by 32)\n", K, N);
+        return ROCKET_E_SHAPE;
+    }
+    nK1 = ((unsigned)K + 31u) / 32u;
+    bytes = (size_t)((unsigned)N / 32u) * nK1 * 1024u;
+    w = calloc(1, sizeof *w);
+    if (!w) return ROCKET_E_NOMEM;
+    if (rocket_bo_alloc(fd, bytes, &w->bo) < 0) { free(w); return ROCKET_E_NOMEM; }
+    rocket_bo_prep(fd, &w->bo, 1, 0);
+    /* The same blocked copy the per-call path uses, over the whole N. K and N are
+     * multiples of 32, so every 1024-byte (n-group, k-group) block is fully written
+     * and no memset is needed. */
+    {
+        int8_t *cube = (int8_t *)w->bo.ptr;
+        for (n = 0; n < (unsigned)N; n++) {
+            const int8_t *src = B + (size_t)n * (unsigned)K;
+            int8_t *dst = cube + (size_t)(n / 32u) * nK1 * 1024u
+                               + (size_t)(n % 32u) * 32u;
+            for (k1 = 0; k1 < nK1; k1++)
+                memcpy(dst + (size_t)k1 * 1024u, src + (size_t)k1 * 32u, 32);
+        }
+    }
+    rocket_bo_fini(fd, &w->bo);
+    w->K = K; w->N = N;
+    *out = w;
+    return ROCKET_OK;
+}
+
+void rocket_rk3576_wbo_free(int fd, struct rocket_rk3576_wbo *w)
+{
+    if (!w) return;
+    if (w->bo.ptr) rocket_bo_free(fd, &w->bo);
+    free(w);
+}
+
+/* ============================================================================
  * SECTION — one N tile
  * ==========================================================================*/
 struct r76_mm_bos {
@@ -213,11 +470,11 @@ struct r76_mm_bos {
 
 static void r76_mm_free(int fd, struct r76_mm_bos *b)
 {
-    if (b->rc.ptr)    rocket_bo_free(fd, &b->rc);
-    if (b->out.ptr)   rocket_bo_free(fd, &b->out);
-    if (b->coeff.ptr) rocket_bo_free(fd, &b->coeff);
-    if (b->w.ptr)     rocket_bo_free(fd, &b->w);
-    if (b->in.ptr)    rocket_bo_free(fd, &b->in);
+    if (b->rc.ptr)    r76_bo_put(fd, &b->rc);
+    if (b->out.ptr)   r76_bo_put(fd, &b->out);
+    if (b->coeff.ptr) r76_bo_put(fd, &b->coeff);
+    if (b->w.ptr)     r76_bo_put(fd, &b->w);
+    if (b->in.ptr)    r76_bo_put(fd, &b->in);
     memset(b, 0, sizeof *b);
 }
 
@@ -232,6 +489,8 @@ static void r76_mm_free(int fd, struct r76_mm_bos *b)
 static int r76_mm_int8(int fd, int M, int K, int N,
                        const int8_t *A, const int8_t *B,
                        const int32_t *bias, float scale, const float *scale_n,
+                       const int64_t *sum_abs_in,
+                       const struct rocket_rk3576_wbo *wbo,
                        int8_t *C, double *worst_rel_err)
 {
     const struct rocket_hw_profile *hw = rocket_hw_current();
@@ -240,19 +499,36 @@ static int r76_mm_int8(int fd, int M, int K, int N,
     int8_t *stage = NULL;
     int32_t *tile_bias = NULL;
     int16_t *cmul = NULL;
-    int64_t *sum_abs_w = NULL;
+    /* `sum_abs_own` is this call's, and is freed; `sum_abs_w` is what the planner reads
+     * and may point at the caller's, which is not. */
+    int64_t *sum_abs_own = NULL;
+    const int64_t *sum_abs_w = NULL;
     rocket_rk3576_row_task *plan = NULL;
     unsigned iw, ih, nt, n0, surf_elems, max_tasks;
     size_t in_bytes;
     unsigned char blank = rocket_rk3576_sentinel_on() ? (unsigned char)R76_SENTINEL_BYTE : 0;
     int rc = ROCKET_E_SHAPE;
+    const int prof = r76_mm_profile();
+    struct r76_mm_prof pr = {0};
+    double pt0;
+    const double wall_t0 = PROF_T0();
 
-    if (fd < 0 || !A || !B || !C) return ROCKET_E_SHAPE;
+    if (fd < 0 || !A || (!B && !wbo) || !C) return ROCKET_E_SHAPE;
     if (worst_rel_err) *worst_rel_err = 0.0;
     if (strcmp(hw->name, "rk3576") != 0) {
         ROCKET_LOGE("rocket_matmul_int8_rk3576: this is the RK3576 encoding and the "
                     "active profile is %s\n", hw->name);
         return ROCKET_E_UNSUPPORTED;
+    }
+    /* K and N are the one cheap consistency check a resident weight admits: the packed
+     * cube cannot be validated against anything per call (checking it would be the pass
+     * the object exists to skip), but an object of the wrong shape is always the
+     * caller's bookkeeping and refusing beats indexing off the end of its BO. */
+    if (wbo && (wbo->K != K || wbo->N != N)) {
+        ROCKET_LOGE("rk3576 matmul: resident weight is K=%d N=%d and the call is "
+                    "K=%d N=%d — the object was created from a different weight\n",
+                    wbo->K, wbo->N, K, N);
+        return ROCKET_E_SHAPE;
     }
     if (!scale_n && scale <= 0.0f) {
         ROCKET_LOGE("rk3576 matmul: scale must be positive (the DPU's OUT_CVT gates "
@@ -281,6 +557,7 @@ static int r76_mm_int8(int fd, int M, int K, int N,
                     "(the int8 weight cube groups each channel axis by 32)\n", M, K, N);
         return ROCKET_E_SHAPE;
     }
+    pt0 = PROF_T0();
     {
         int ntile = 0;
         if (rocket_matmul_plan_int8_rk3576(M, K, N, NULL, NULL, &ntile) < 0) {
@@ -308,6 +585,12 @@ static int r76_mm_int8(int fd, int M, int K, int N,
              * and carries the same warning. */
             int32_t *acc;
             int m, rc32;
+            if (wbo) {
+                ROCKET_LOGE("rk3576 matmul: K=%d has no single-task plan and the "
+                            "resident-weight entry does not carry the row-major B the "
+                            "int32 K-split fallback needs — declining\n", K);
+                return ROCKET_E_UNSUPPORTED;
+            }
             if (!r76_mm_ksplit_opt_in()) {
                 ROCKET_LOGE("rk3576 matmul: K=%d has no single-task plan (the boundary is "
                             "K>=6176), and the int32 K-split route that would run it has "
@@ -342,22 +625,42 @@ static int r76_mm_int8(int fd, int M, int K, int N,
     plan  = calloc(max_tasks, sizeof *plan);
     stage = calloc(in_bytes, 1);
     if (!ops || !plan || !stage) { rc = ROCKET_E_NOMEM; goto done; }
+    PROF_ADD(setup, pt0);
 
     /* THE C RAMP IS CAPPED BY THE ACCUMULATOR, so the plan needs each column's own
      * sum of |weight| — the actual one. The int8 envelope (128*K*127) is one to two
      * orders of magnitude looser than a real weight row and the difference IS the
      * available precision, which is why this O(N*K) pass is worth its cost. It is one
-     * pass over the same bytes the weight cube copies. */
+     * pass over the same bytes the weight cube copies.
+     *
+     * A caller holding the weight across calls has usually computed this already, and it
+     * is `M`-independent, so `_perc_sa` lets it hand the sums over instead — the same
+     * numbers, one pass fewer. The supplied array is NOT validated: checking it is the
+     * pass being skipped, and what a wrong one does is on that entry's declaration. */
     if (scale_n) {
-        int n;
-        sum_abs_w = calloc((size_t)N, sizeof *sum_abs_w);
-        if (!sum_abs_w) { rc = ROCKET_E_NOMEM; goto done; }
-        for (n = 0; n < N; n++) {
-            const int8_t *w = B + (size_t)n * K;
-            int64_t s = 0;
-            int k;
-            for (k = 0; k < K; k++) s += w[k] < 0 ? -(int64_t)w[k] : (int64_t)w[k];
-            sum_abs_w[n] = s;
+        if (sum_abs_in) {
+            sum_abs_w = sum_abs_in;
+        } else if (!B) {
+            /* The resident-weight wrapper refuses NULL sums before it gets here; this
+             * is the backstop for an internal caller, because the recompute below is a
+             * pass over the row-major B this call does not have. */
+            ROCKET_LOGE("rk3576 matmul: per-column scales with no sum_abs_w and no "
+                        "row-major B to derive them from\n");
+            rc = ROCKET_E_SHAPE; goto done;
+        } else {
+            int n;
+            pt0 = PROF_T0();
+            sum_abs_own = calloc((size_t)N, sizeof *sum_abs_own);
+            if (!sum_abs_own) { rc = ROCKET_E_NOMEM; goto done; }
+            for (n = 0; n < N; n++) {
+                const int8_t *w = B + (size_t)n * K;
+                int64_t s = 0;
+                int k;
+                for (k = 0; k < K; k++) s += w[k] < 0 ? -(int64_t)w[k] : (int64_t)w[k];
+                sum_abs_own[n] = s;
+            }
+            sum_abs_w = sum_abs_own;
+            PROF_ADD(sumabs, pt0);
         }
     }
 
@@ -369,6 +672,7 @@ static int r76_mm_int8(int fd, int M, int K, int N,
      * consecutive bytes at BOTH ends — a copy rather than a scatter. K is a multiple of
      * 32 on this path, so every run is a whole sixteen. The per-element form is what
      * the index function above spells out and is the reference for this one. */
+    pt0 = PROF_T0();
     {
         size_t plane = (size_t)ih * iw * C2;
         unsigned k1, ngrp = (unsigned)K / C2;
@@ -380,16 +684,23 @@ static int r76_mm_int8(int fd, int M, int K, int N,
                 memcpy(dst + (size_t)k1 * plane, src + (size_t)k1 * C2, C2);
         }
     }
-    if (rocket_bo_alloc(fd, in_bytes, &b.in) < 0) { rc = ROCKET_E_NOMEM; goto done; }
+    PROF_ADD(packA, pt0);
+    pt0 = PROF_T0();
+    if (r76_bo_get(fd, in_bytes, &b.in) < 0) { rc = ROCKET_E_NOMEM; goto done; }
+    PROF_ADD(alloc, pt0);
+    pt0 = PROF_T0();
     rocket_bo_prep(fd, &b.in, 1, 0);
     memcpy(b.in.ptr, stage, in_bytes);
     rocket_bo_fini(fd, &b.in);
+    PROF_ADD(packA, pt0);
     free(stage);
     stage = NULL;
 
-    if (rocket_bo_alloc(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
+    pt0 = PROF_T0();
+    if (r76_bo_get(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
         rc = ROCKET_E_NOMEM; goto done;
     }
+    PROF_ADD(alloc, pt0);
 
     for (n0 = 0; n0 < (unsigned)N; n0 += nt) {
         unsigned tile_n = (unsigned)N - n0 < nt ? (unsigned)N - n0 : nt;
@@ -402,44 +713,56 @@ static int r76_mm_int8(int fd, int M, int K, int N,
         unsigned ntask = 1, t, n;
         float base_scale;
 
-        if (b.w.ptr)     rocket_bo_free(fd, &b.w);
-        if (b.coeff.ptr) rocket_bo_free(fd, &b.coeff);
-        if (b.out.ptr)   rocket_bo_free(fd, &b.out);
+        pr.tiles++;
+        pt0 = PROF_T0();
+        if (b.w.ptr)     r76_bo_put(fd, &b.w);
+        if (b.coeff.ptr) r76_bo_put(fd, &b.coeff);
+        if (b.out.ptr)   r76_bo_put(fd, &b.out);
         memset(&b.w, 0, sizeof b.w);
         memset(&b.coeff, 0, sizeof b.coeff);
         memset(&b.out, 0, sizeof b.out);
 
-        if (rocket_bo_alloc(fd, w_bytes, &b.w) < 0 ||
-            rocket_bo_alloc(fd, coeff_bytes, &b.coeff) < 0 ||
-            rocket_bo_alloc(fd, obytes, &b.out) < 0) { rc = ROCKET_E_NOMEM; goto done; }
+        if ((!wbo && r76_bo_get(fd, w_bytes, &b.w) < 0) ||
+            r76_bo_get(fd, coeff_bytes, &b.coeff) < 0 ||
+            r76_bo_get(fd, obytes, &b.out) < 0) { rc = ROCKET_E_NOMEM; goto done; }
+        PROF_ADD(alloc, pt0);
 
         /* The WEIGHT cube is per-tile and each tile is its own convolution, so its
-         * group count follows the tile rather than the whole N. */
-        rocket_bo_prep(fd, &b.w, 1, 0);
-        memset(b.w.ptr, 0, w_bytes);
-        /* BLOCKED, NOT PER ELEMENT — and this is the one that mattered. At kh=kw=1
-         * weight_conv_int8() reduces to (n/32)*nK1*1024 + (k/32)*1024 + (n%32)*32 +
-         * (k%32), so thirty-two consecutive k are thirty-two consecutive bytes at both
-         * ends. A K*N element-at-a-time scatter through the index function is a million
-         * calls at K=N=1024, which was most of that shape's wall clock; the memset above
-         * still covers the output-channel tail of a partial group. */
-        {
-            unsigned nK1 = ((unsigned)K + 31u) / 32u, k1;
-            int8_t *w = (int8_t *)b.w.ptr;
-            for (n = 0; n < tile_n; n++) {
-                const int8_t *src = B + (size_t)(n0 + n) * K;
-                int8_t *dst = w + (size_t)(n / 32u) * nK1 * 1024u
-                                + (size_t)(n % 32u) * 32u;
-                for (k1 = 0; k1 < nK1; k1++)
-                    memcpy(dst + (size_t)k1 * 1024u, src + (size_t)k1 * 32u, 32);
+         * group count follows the tile rather than the whole N — unless the caller
+         * handed the weight in resident, in which case the cached whole-N cube IS the
+         * concatenation of these per-tile ones and the program below just offsets into
+         * it. */
+        if (!wbo) {
+            pt0 = PROF_T0();
+            rocket_bo_prep(fd, &b.w, 1, 0);
+            memset(b.w.ptr, 0, w_bytes);
+            /* BLOCKED, NOT PER ELEMENT — and this is the one that mattered. At kh=kw=1
+             * weight_conv_int8() reduces to (n/32)*nK1*1024 + (k/32)*1024 + (n%32)*32 +
+             * (k%32), so thirty-two consecutive k are thirty-two consecutive bytes at
+             * both ends. A K*N element-at-a-time scatter through the index function is
+             * a million calls at K=N=1024, which was most of that shape's wall clock;
+             * the memset above still covers the output-channel tail of a partial
+             * group. */
+            {
+                unsigned nK1 = ((unsigned)K + 31u) / 32u, k1;
+                int8_t *w = (int8_t *)b.w.ptr;
+                for (n = 0; n < tile_n; n++) {
+                    const int8_t *src = B + (size_t)(n0 + n) * K;
+                    int8_t *dst = w + (size_t)(n / 32u) * nK1 * 1024u
+                                    + (size_t)(n % 32u) * 32u;
+                    for (k1 = 0; k1 < nK1; k1++)
+                        memcpy(dst + (size_t)k1 * 1024u, src + (size_t)k1 * 32u, 32);
+                }
             }
+            rocket_bo_fini(fd, &b.w);
+            PROF_ADD(packB, pt0);
         }
-        rocket_bo_fini(fd, &b.w);
 
         /* The COEFFICIENT buffer is NOT a flat int32 bias array on this part, and a
          * zeroed one makes the DPU write a full but entirely empty surface whatever
          * the MAC did — the C term gates the BS stage. Pad the tail channels of a
          * partial group with a zero bias so they carry a C term too. */
+        pt0 = PROF_T0();
         free(tile_bias);
         tile_bias = calloc(nreg, sizeof *tile_bias);
         if (!tile_bias) { rc = ROCKET_E_NOMEM; goto done; }
@@ -472,6 +795,7 @@ static int r76_mm_int8(int fd, int M, int K, int N,
         else
             rocket_rk3576_pack_coeff(b.coeff.ptr, coeff_bytes, tile_bias, nreg);
         rocket_bo_fini(fd, &b.coeff);
+        PROF_ADD(coeff, pt0);
 
         p.ic = (uint16_t)K;    p.ih = (uint16_t)ih; p.iw = (uint16_t)iw;
         p.oc = (uint16_t)nreg; p.oh = (uint16_t)ih; p.ow = (uint16_t)iw;
@@ -490,10 +814,13 @@ static int r76_mm_int8(int fd, int M, int K, int N,
         p.weight_zero_point = 0x80;
         p.tasks       = ops;
         p.input_dma   = b.in.dma_address;
-        p.weights_dma = b.w.dma_address;
+        p.weights_dma = wbo ? wbo->bo.dma_address
+                              + (size_t)(n0 / 32u) * (((unsigned)K + 31u) / 32u) * 1024u
+                            : b.w.dma_address;
         p.bias_dma    = b.coeff.dma_address;
         p.output_dma  = b.out.dma_address;
 
+        pt0 = PROF_T0();
         {
             conv_params_t q = p;
             if (rocket_rk3576_plan_rows(&q, 0, plan, max_tasks, &ntask) < 0) {
@@ -502,8 +829,9 @@ static int r76_mm_int8(int fd, int M, int K, int N,
                 rc = ROCKET_E_SHAPE; goto done;
             }
         }
+        PROF_ADD(gen, pt0);
 
-        in_h[0] = b.in.handle; in_h[1] = b.w.handle;
+        in_h[0] = b.in.handle; in_h[1] = wbo ? wbo->bo.handle : b.w.handle;
         in_h[2] = b.coeff.handle; in_h[3] = b.rc.handle;
         out_h[0] = b.out.handle;
 
@@ -521,9 +849,11 @@ static int r76_mm_int8(int fd, int M, int K, int N,
          * be read as failure. The stamp is bracketed by PREP_BO and FINI_BO so no dirty
          * line is left to race the DPU's DMA. */
         if (blank) {
+            pt0 = PROF_T0();
             rocket_bo_prep(fd, &b.out, 1, 0);
             memset(b.out.ptr, blank, obytes);
             rocket_bo_fini(fd, &b.out);
+            PROF_ADD(stamp, pt0);
         }
 
         for (t = 0; t < ntask; t++) {
@@ -538,28 +868,38 @@ static int r76_mm_int8(int fd, int M, int K, int N,
              * channel-group stride from the FULL plane, and leaving these at the
              * window makes every group past the first read at the wrong offset. */
             q.ih_full = (uint16_t)ih; q.oh_full = (uint16_t)ih;
+            pt0 = PROF_T0();
             if (gen_conv2d_int8_rk3576(&q) != 0) { rc = ROCKET_E_SHAPE; goto done; }
+            PROF_ADD(gen, pt0);
             /* PER TASK, not per tile. One poisoned submit among several leaves its own
              * rows stale while its siblings are full, so a check over the whole tile
              * reads "something was written" and passes the hole through. */
             task_ok = 0;
             for (tattempt = 0; tattempt < R76_I32_TASK_ATTEMPTS; tattempt++) {
+                pr.submits++;
+                if (tattempt) pr.redos++;
+                pt0 = PROF_T0();
                 rocket_bo_prep(fd, &b.rc, 1, 0);
                 memcpy(b.rc.ptr, ops, q.task_count * sizeof(uint64_t));
                 rocket_bo_fini(fd, &b.rc);
                 if (rocket_submit_matmul(fd, &b.rc, q.task_count, in_h, 4, out_h, 1, 4000) != 0) {
                     rc = ROCKET_E_DEVICE; goto done;
                 }
+                PROF_ADD(submit, pt0);
+                pt0 = PROF_T0();
                 if (rocket_bo_prep(fd, &b.out, 0, 2000000000ull) < 0) {
                     rc = ROCKET_E_DEVICE; goto done;
                 }
+                PROF_ADD(wait, pt0);
                 if (blank) {
                     const unsigned char *sp = (const unsigned char *)b.out.ptr +
                                               plan[t].output_off;
                     size_t tb = (size_t)plan[t].oh * iw * C2, si;
                     int twrote = 0;
+                    pt0 = PROF_T0();
                     for (si = 0; si < tb; si++) if (sp[si] != blank) { twrote = 1; break; }
                     rocket_bo_fini(fd, &b.out);
+                    PROF_ADD(stamp, pt0);
                     if (twrote) { task_ok = 1; break; }
                     ROCKET_LOGD("rk3576 matmul: n0=%u row task %u wrote nothing, idling "
                                 "and redoing it\n", n0, t);
@@ -582,6 +922,7 @@ static int r76_mm_int8(int fd, int M, int K, int N,
         }
 
         /* De-scatter this tile's channels straight into the caller's row-major C. */
+        pt0 = PROF_T0();
         rocket_bo_prep(fd, &b.out, 0, 2000000000ull);
         /* BLOCKED, NOT PER ELEMENT, the same way round: y*iw + x IS m, so the source
          * index is (n/16)*surf_elems*16 + 16*m + (n%16) and sixteen consecutive output
@@ -600,13 +941,21 @@ static int r76_mm_int8(int fd, int M, int K, int N,
             }
         }
         rocket_bo_fini(fd, &b.out);
+        PROF_ADD(read, pt0);
     }
     rc = ROCKET_OK;
 
 done:
     free(ops); free(plan); free(stage); free(tile_bias);
-    free(cmul); free(sum_abs_w);
+    free(cmul); free(sum_abs_own);
+    pt0 = PROF_T0();
     r76_mm_free(fd, &b);
+    PROF_ADD(bofree, pt0);
+    /* Folded on EVERY exit that reaches here, including the refusals: a call that
+     * returned -4 still spent its pack and its submits, and dropping those would report
+     * a clean split over a run that was not clean. Folded LAST so `wall` covers the BO
+     * teardown the bucket above just priced. */
+    if (prof) { pr.wall = r76_now_ms() - wall_t0; r76_mm_prof_fold(&pr); }
     return rc;
 }
 
@@ -614,7 +963,7 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
                               const int8_t *A, const int8_t *B,
                               const int32_t *bias, float scale, int8_t *C)
 {
-    return r76_mm_int8(fd, M, K, N, A, B, bias, scale, NULL, C, NULL);
+    return r76_mm_int8(fd, M, K, N, A, B, bias, scale, NULL, NULL, NULL, C, NULL);
 }
 
 int rocket_matmul_int8_rk3576_perc(int fd, int M, int K, int N,
@@ -623,7 +972,37 @@ int rocket_matmul_int8_rk3576_perc(int fd, int M, int K, int N,
                                    int8_t *C, double *worst_rel_err)
 {
     if (!scale_n) return ROCKET_E_SHAPE;
-    return r76_mm_int8(fd, M, K, N, A, B, bias, 0.0f, scale_n, C, worst_rel_err);
+    return r76_mm_int8(fd, M, K, N, A, B, bias, 0.0f, scale_n, NULL, NULL, C,
+                       worst_rel_err);
+}
+
+int rocket_matmul_int8_rk3576_perc_sa(int fd, int M, int K, int N,
+                                      const int8_t *A, const int8_t *B,
+                                      const int32_t *bias, const float *scale_n,
+                                      const int64_t *sum_abs_w,
+                                      int8_t *C, double *worst_rel_err)
+{
+    if (!scale_n) return ROCKET_E_SHAPE;
+    return r76_mm_int8(fd, M, K, N, A, B, bias, 0.0f, scale_n, sum_abs_w, NULL, C,
+                       worst_rel_err);
+}
+
+int rocket_matmul_int8_rk3576_perc_wbo(int fd, int M, int K, int N,
+                                       const int8_t *A,
+                                       const struct rocket_rk3576_wbo *wbo,
+                                       const int32_t *bias, const float *scale_n,
+                                       const int64_t *sum_abs_w,
+                                       int8_t *C, double *worst_rel_err)
+{
+    if (!scale_n || !wbo) return ROCKET_E_SHAPE;
+    if (!sum_abs_w) {
+        ROCKET_LOGE("rk3576 matmul: the resident-weight entry needs sum_abs_w — the "
+                    "row-major B is not an argument here and re-deriving the sums from "
+                    "the packed cube would be the O(N*K) pass this entry removes\n");
+        return ROCKET_E_SHAPE;
+    }
+    return r76_mm_int8(fd, M, K, N, A, NULL, bias, 0.0f, scale_n, sum_abs_w, wbo, C,
+                       worst_rel_err);
 }
 
 /* ============================================================================

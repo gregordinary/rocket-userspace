@@ -265,6 +265,97 @@ int rocket_matmul_int8_rk3576_perc(int fd, int M, int K, int N,
                                    const int32_t *bias, const float *scale_n,
                                    int8_t *C, double *worst_rel_err);
 
+/* The same entry with the per-column sum of |B| supplied by the caller.
+ *
+ * `sum_abs_w[n]` must be exactly `sum_k |B[n][k]|` over the SAME B and the SAME K this
+ * call is given. NULL means compute it here, which is what the entry above does.
+ *
+ * WHY IT IS A PARAMETER. That sum caps the C ramp (see above), so the entry needs it on
+ * every call; it is a pass over all N*K weight bytes, it is `M`-independent, and the
+ * weight does not change between calls. A caller that holds a weight across calls has
+ * usually computed the same quantity already — a frontend deriving the no-saturate scale
+ * `127/(128*sum_k|B[n][k]|+1)` has it exactly — so handing it over removes the pass
+ * rather than duplicating it.
+ *
+ * WHAT A WRONG VALUE DOES. It is not checked and it cannot be: verifying it is the pass
+ * this entry exists to skip. A value that does not match B changes the per-column
+ * multiplier the ramp plans, so the call returns a full, correctly sized, entirely
+ * plausible surface computed at a gain the caller did not ask for — too small and the
+ * output loses resolution, too large and `(acc + bias)*C` overflows int32 and the column
+ * saturates. Recompute it whenever B changes, and do not derive it back from a float
+ * scale: the round trip is not exact and the plan is a function of the integer.
+ *
+ * Measured: bit-identical to the computing entry — supplying the sum returns the same
+ * surface, and `llama-perplexity --chunks 4` over Qwen2.5-1.5B returns the same
+ * PPL 12.8615 to every printed digit either way.
+ * [HW gate, H96 MAX M9, tests/rk3576_mm_requant, 2026-08-13] */
+int rocket_matmul_int8_rk3576_perc_sa(int fd, int M, int K, int N,
+                                      const int8_t *A, const int8_t *B,
+                                      const int32_t *bias, const float *scale_n,
+                                      const int64_t *sum_abs_w,
+                                      int8_t *C, double *worst_rel_err);
+
+/* ---- the same matmul with the weight resident in a device BO -----------------
+ *
+ * rocket_rk3576_wbo holds one weight, packed once into the NPU's int8 weight-cube
+ * layout in a device BO that lives until freed. The entry below is
+ * rocket_matmul_int8_rk3576_perc_sa() with that object in place of `B`: the same
+ * arithmetic, the same tiling, the same refusals — minus the per-call cube memset,
+ * blocked copy and cache maintenance, and minus the weight BO's per-tile allocate and
+ * free. Those are per-call passes over all N*K weight bytes for a weight that does not
+ * change between calls, which is the whole reason this object exists.
+ *
+ * WHAT IT HOLDS. N*ceil(K/32)*32 bytes of DEVICE memory per weight (N and K are
+ * multiples of 32, so N*K bytes), allocated on `fd` and freed only by
+ * rocket_rk3576_wbo_free() or the fd closing. A caller that creates one per model
+ * weight is choosing to hold the model's packed int8 bytes on the device; the create
+ * cost is one pass over B (the same pass one call used to pay).
+ *
+ * WHAT IS REQUIRED, AND WHY THE SUMS ARE NOT OPTIONAL HERE. `sum_abs_w` must be
+ * non-NULL: the C-ramp planner needs each column's sum of |B|, the row-major B is not
+ * an argument to this entry, and re-deriving the sums from the packed cube would be the
+ * O(N*K) pass this route removes. NULL refuses. The array carries the _sa contract
+ * unchanged: it is not validated, and a value that does not match the packed weight
+ * plans a wrong per-column gain and returns a full, plausible surface.
+ *
+ * WHAT A STALE OBJECT DOES. The object is not validated against anything on each call
+ * (checking it would be the pass being skipped): an object created from different bytes
+ * than the caller thinks, or outliving a weight it was created from, computes a full,
+ * correctly sized, entirely plausible surface from the OLD weight. K and N are the one
+ * cheap consistency check and a mismatch refuses.
+ *
+ * A K this part has no single-task plan for (K >= 6176) refuses here outright — the
+ * int32 K-split fallback needs the row-major B this entry does not take, and that route
+ * wedges the device at prefill scale anyway (see above).
+ *
+ * Measured: bit-identical to rocket_matmul_int8_rk3576_perc_sa() over the requant
+ * gate's shapes, including a forced eight-tile run — the cached cube is byte-for-byte
+ * the concatenation of the per-tile cubes the per-call path packs.
+ * [HW gate, H96 MAX M9, tests/rk3576_mm_requant, 2026-08-19] */
+struct rocket_rk3576_wbo;
+int rocket_rk3576_wbo_create(int fd, int K, int N, const int8_t *B,
+                             struct rocket_rk3576_wbo **out);
+void rocket_rk3576_wbo_free(int fd, struct rocket_rk3576_wbo *w);
+int rocket_matmul_int8_rk3576_perc_wbo(int fd, int M, int K, int N,
+                                       const int8_t *A,
+                                       const struct rocket_rk3576_wbo *wbo,
+                                       const int32_t *bias, const float *scale_n,
+                                       const int64_t *sum_abs_w,
+                                       int8_t *C, double *worst_rel_err);
+
+/* ROCKET_RK3576_BO_POOL=1 keeps this path's transient BOs (feature, coefficient,
+ * output, regcmd) on a small per-process free list instead of allocating and freeing
+ * them per tile per call; ROCKET_RK3576_BO_POOL_MB caps the pooled bytes (default 64).
+ * Default OFF: holding device memory across calls is the exposure the pool shares with
+ * the weight object above — whether the per-call free is what keeps IOMMU mapping churn
+ * inside what the BO-lifetime fixes were written for is unmeasured. The knob is read on
+ * every allocation, so an A/B can flip it between arms in one process. The pool does
+ * not change any surface: a pooled BO is fully rewritten before use by the same packs
+ * that filled a fresh one, and the poisoning sentinel stamps the output BO per task
+ * either way. rocket_rk3576_bo_pool_drain(fd) frees whatever the pool holds for `fd`
+ * (call it before closing an fd whose allocations may have been pooled). */
+void rocket_rk3576_bo_pool_drain(int fd);
+
 /* ---- the RK3576's int32-output matmul, and the K split ------------------
  *
  *     C[m][n] = sum_k A[m][k]*B[n][k] + bias[n]          (raw int32, no requant)

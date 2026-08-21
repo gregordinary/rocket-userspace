@@ -126,7 +126,7 @@ static int perc_arm(int fd, int M, int K, int N, const int8_t *A, const int8_t *
     int64_t *sum_abs_w = calloc((size_t)N, sizeof *sum_abs_w);
     int32_t *tile_bias = NULL;
     int16_t *cmul = NULL;
-    double worst = -1.0, model_worst = 0.0;
+    double worst = -1.0, worst_sa = -1.0, model_worst = 0.0;
     long long wrong = 0, vs_exact = 0;
     int maxd = 0, maxd_exact = 0, nt = 0, rc, shown = 0, bad = 0;
 
@@ -201,6 +201,125 @@ static int perc_arm(int fd, int M, int K, int N, const int8_t *A, const int8_t *
            "(%.3f%%, max |d| %d)\n",
            wrong, (long long)M * N, maxd, vs_exact,
            100.0 * (double)vs_exact / ((double)M * N), maxd_exact);
+
+    /* THE SUPPLIED-SUM ENTRY IS THE SAME ENTRY. `_perc_sa` skips the O(N*K) pass over B
+     * and takes the caller's per-column sums instead; the sums handed over here are the
+     * ones this gate computed for its own model, so the two surfaces must be identical
+     * byte for byte. A difference is not a tolerance question — it means the supplied
+     * array is not the quantity the entry's own pass produces, which is the one way this
+     * parameter can be wrong without any caller noticing. */
+    {
+        int8_t *C_sa = malloc((size_t)M * N);
+        long long diff = 0;
+        if (!C_sa) { free(C); free(model); free(sum_abs_w); free(tile_bias); free(cmul);
+                     return -1; }
+        memset(C_sa, HOST_STAMP, (size_t)M * N);
+        rc = rocket_matmul_int8_rk3576_perc_sa(fd, M, K, N, A, B, bias, scale_n,
+                                               sum_abs_w, C_sa, &worst_sa);
+        if (rc != 0) {
+            printf("      supplied-sum arm REFUSED rc=%d\n", rc);
+            wrong++;
+        } else {
+            for (size_t i = 0; i < (size_t)M * N; i++) if (C_sa[i] != C[i]) diff++;
+            printf("      supplied-sum vs computed-sum %lld of %lld differ  "
+                   "worst_rel_err %.4f%%\n", diff, (long long)M * N, 100.0 * worst_sa);
+            if (diff) wrong++;
+        }
+        free(C_sa);
+    }
+
+    /* THE RESIDENT-WEIGHT ENTRY IS THE SAME ENTRY AGAIN. The cached whole-N cube must
+     * be byte-for-byte the concatenation of the per-tile cubes the per-call path packs
+     * — including across a forced multi-tile run — so the surface must match exactly.
+     * And with ROCKET_RK3576_BO_POOL=1 the same call must still match: the pool
+     * recycles this path's transient BOs, and a pooled BO not fully rewritten before
+     * use shows up here as a differing surface. Run twice pooled — the first pooled
+     * call only FILLS the pool on its frees; the second is the one that reuses. */
+    {
+        struct rocket_rk3576_wbo *wbo = NULL;
+        int8_t *C_w = malloc((size_t)M * N);
+        long long diffw = 0, diffp = 0;
+        double worst_w = -1.0;
+        if (!C_w) { free(C); free(model); free(sum_abs_w); free(tile_bias); free(cmul);
+                    return -1; }
+        rc = rocket_rk3576_wbo_create(fd, K, N, B, &wbo);
+        if (rc != 0 || !wbo) {
+            printf("      resident-weight create REFUSED rc=%d\n", rc);
+            wrong++;
+        } else {
+            memset(C_w, HOST_STAMP, (size_t)M * N);
+            rc = rocket_matmul_int8_rk3576_perc_wbo(fd, M, K, N, A, wbo, bias, scale_n,
+                                                    sum_abs_w, C_w, &worst_w);
+            if (rc != 0) {
+                printf("      resident-weight arm REFUSED rc=%d\n", rc);
+                wrong++;
+            } else {
+                for (size_t i = 0; i < (size_t)M * N; i++) if (C_w[i] != C[i]) diffw++;
+                printf("      resident-weight vs per-call %lld of %lld differ\n",
+                       diffw, (long long)M * N);
+                if (diffw) wrong++;
+            }
+            setenv("ROCKET_RK3576_BO_POOL", "1", 1);
+            memset(C_w, HOST_STAMP, (size_t)M * N);
+            rc = rocket_matmul_int8_rk3576_perc_wbo(fd, M, K, N, A, wbo, bias, scale_n,
+                                                    sum_abs_w, C_w, &worst_w);
+            if (rc == 0) {
+                memset(C_w, HOST_STAMP, (size_t)M * N);
+                rc = rocket_matmul_int8_rk3576_perc_wbo(fd, M, K, N, A, wbo, bias,
+                                                        scale_n, sum_abs_w, C_w,
+                                                        &worst_w);
+            }
+            setenv("ROCKET_RK3576_BO_POOL", "0", 1);
+            rocket_rk3576_bo_pool_drain(fd);
+            if (rc != 0) {
+                printf("      pooled arm REFUSED rc=%d\n", rc);
+                wrong++;
+            } else {
+                for (size_t i = 0; i < (size_t)M * N; i++) if (C_w[i] != C[i]) diffp++;
+                printf("      pooled(x2) vs per-call %lld of %lld differ\n",
+                       diffp, (long long)M * N);
+                if (diffp) wrong++;
+            }
+            /* Force the narrowest tile so the resident cube's per-tile dma offset is
+             * exercised across MANY tiles, not the two the default tiling gives these
+             * shapes. The ramp is planned per tile, so the reference is the per-call
+             * path at the SAME tiling, not the default-tiling surface above. MM_NT is
+             * read per call. */
+            setenv("ROCKET_RK3576_MM_NT", "32", 1);
+            memset(C_w, HOST_STAMP, (size_t)M * N);
+            rc = rocket_matmul_int8_rk3576_perc_sa(fd, M, K, N, A, B, bias, scale_n,
+                                                   sum_abs_w, C_w, &worst_w);
+            if (rc != 0) {
+                printf("      MM_NT=32 reference REFUSED rc=%d\n", rc);
+                wrong++;
+            } else {
+                int8_t *C_nt = malloc((size_t)M * N);
+                long long diffnt = 0;
+                if (C_nt) {
+                    memset(C_nt, HOST_STAMP, (size_t)M * N);
+                    rc = rocket_matmul_int8_rk3576_perc_wbo(fd, M, K, N, A, wbo, bias,
+                                                            scale_n, sum_abs_w, C_nt,
+                                                            &worst_w);
+                    if (rc != 0) {
+                        printf("      MM_NT=32 resident arm REFUSED rc=%d\n", rc);
+                        wrong++;
+                    } else {
+                        for (size_t i = 0; i < (size_t)M * N; i++)
+                            if (C_nt[i] != C_w[i]) diffnt++;
+                        printf("      resident vs per-call at MM_NT=32 %lld of %lld "
+                               "differ\n", diffnt, (long long)M * N);
+                        if (diffnt) wrong++;
+                    }
+                    free(C_nt);
+                } else {
+                    wrong++;
+                }
+            }
+            unsetenv("ROCKET_RK3576_MM_NT");
+            rocket_rk3576_wbo_free(fd, wbo);
+        }
+        free(C_w);
+    }
 
     free(C); free(model); free(sum_abs_w); free(tile_bias); free(cmul);
     return wrong ? 1 : 0;
