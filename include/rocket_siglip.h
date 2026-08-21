@@ -27,6 +27,8 @@
  * fd < 0 runs the exact host reference (a structural self-check vs the fp32 oracle).
  */
 
+#define ROCKET_SIGLIP_MAX_TAPS 8   /* DPT heads tap 4; headroom for wider variants */
+
 typedef struct {
     /* mmap handle (private) */
     void  *map;
@@ -38,6 +40,14 @@ typedef struct {
     int   patch_dim;    /* ic*kh*kw (the im2col / patch_W contraction)  */
     int   ic, kh, kw, stride, image_size;
     float eps;
+
+    /* The patch projection's matmul K. The NPU matmul requires K % 32, and ic*kh*kw is only
+     * a multiple of 32 for some patch sizes (768 for patch 16, but 588 for patch 14). Set this
+     * to patch_dim rounded up to a multiple of 32 and lay patch_W out at THAT row stride with a
+     * zeroed [patch_dim, patch_dim_pad) tail; the encoder then zero-pads the im2col columns to
+     * match, which leaves the product unchanged. 0 means "no padding needed" (patch_dim is
+     * already %32) and is what the blob loader sets, so a v1 blob is unaffected. */
+    int   patch_dim_pad;
 
     /* base weight pointers into the mmap (fp16) */
     const _Float16 *patch_W;     /* [d][patch_dim]  row-major [oc][ic*kh*kw]  */
@@ -56,7 +66,17 @@ typedef struct {
     const _Float16 *pre_g;       /* [d] pre-encoder LayerNorm weight (CLIP), or NULL */
     const _Float16 *pre_b;       /* [d] pre-encoder LayerNorm bias, or NULL         */
     int             act_kind;    /* MLP activation: 0 = gelu_pytorch_tanh (SigLIP),
-                                  *                 1 = quick-GELU x*sigmoid(1.702x) (CLIP) */
+                                  *                 1 = quick-GELU x*sigmoid(1.702x) (CLIP),
+                                  *                 2 = exact erf GELU x*Phi(x) (DINOv2) */
+
+    /* Multi-tap exit. A DPT-style dense head (Depth Anything v2) does not consume the final
+     * encoder output — it consumes SEVERAL intermediate layer outputs, each through the same
+     * post_g/post_b LayerNorm. With n_taps > 0 the encoder writes n_taps token blocks to `out`
+     * ([n_taps][ntok][d], tap t = the output of layer tap_layer[t], normalized by post_g/post_b
+     * when present) instead of the single final block. 0 (the default) keeps the single-exit
+     * behaviour SigLIP and CLIP use. tap_layer must be ascending and < n_layers. */
+    int             n_taps;
+    int             tap_layer[ROCKET_SIGLIP_MAX_TAPS];
 } rocket_siglip_model;
 
 #ifdef __cplusplus
@@ -72,14 +92,15 @@ void rocket_siglip_free(rocket_siglip_model *m);
  * Encode one image. `pixels_chw` is the preprocessed input [ic][image_size][image_size]
  * fp16 (the same tensor the oracle saved). `out` receives the encoder output
  * [ntok][d] fp16 (ntok = L + n_prefix; post_layernorm applied when post_g != NULL, else the
- * raw last residual == CLIP's last_hidden_state). If `hidden_opt` is non-NULL it receives the
+ * raw last residual == CLIP's last_hidden_state), or, when n_taps > 0, the n_taps normalized
+ * tap blocks [n_taps][ntok][d]. If `hidden_opt` is non-NULL it receives the
  * (n_layers+1) intermediate hidden states [(n_layers+1)][ntok][d] fp16 (index 0 = embeddings,
  * index k = the output of encoder layer k-1) — used by the gate to score per-layer cosine.
  * fd >= 0 runs on the NPU; fd < 0 runs the exact host reference. Returns 0, <0 on error.
  *
  * This per-call path handles the SigLIP configuration (n_prefix==0, no pre-LN, gelu-tanh,
- * post-LN); a CLIP-shaped model (cls token / pre-LN / quick-GELU) must use the resident ctx
- * path below, and this returns -3 if handed one.
+ * post-LN, single exit); a CLIP-shaped model (cls token / pre-LN / quick-GELU) or a multi-tap
+ * DPT-style model must use the resident ctx path below, and this returns -3 if handed one.
  */
 int  rocket_siglip_encode(int fd, const rocket_siglip_model *m,
                           const _Float16 *pixels_chw, _Float16 *out,

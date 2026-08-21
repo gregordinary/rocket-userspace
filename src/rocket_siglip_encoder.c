@@ -114,15 +114,19 @@ int rocket_siglip_encode(int fd, const rocket_siglip_model *m,
     /* This per-call path handles only the SigLIP configuration. A CLIP-shaped model (prefix/cls
      * token, pre-encoder LayerNorm, quick-GELU, or a bias-less patch Conv / no sequence post-LN)
      * must go through the resident ctx path, which open-codes the block and supports those. */
-    if (m->n_prefix != 0 || m->prefix || m->pre_g || m->act_kind != 0 || !m->patch_b || !m->post_g)
+    if (m->n_prefix != 0 || m->prefix || m->pre_g || m->act_kind != 0 || !m->patch_b ||
+        !m->post_g || m->n_taps != 0)
         return -3;
     const int d = m->d, L = m->L, pdim = m->patch_dim, dff = m->d_ff, nh = m->n_head;
+    /* matmul K for the patch projection: patch_dim rounded up to %32 (see rocket_siglip.h).
+     * patch_W is laid out at this stride with a zero tail; the im2col below zero-fills to match. */
+    const int pdp = m->patch_dim_pad ? m->patch_dim_pad : pdim;
     const int side = m->image_size / m->stride, H = m->image_size, W = m->image_size;
     const int ic = m->ic, kh = m->kh, kw = m->kw, stride = m->stride;
     const size_t Ld = (size_t)L * d;
     int rc = -2;
 
-    _Float16 *patches = malloc((size_t)L * pdim * sizeof(_Float16));
+    _Float16 *patches = calloc((size_t)L * pdp, sizeof(_Float16));   /* calloc: [pdim,pdp) tail 0 */
     _Float16 *xa = malloc(Ld * sizeof(_Float16));
     _Float16 *xb = malloc(Ld * sizeof(_Float16));
     if (!patches || !xa || !xb) goto done;
@@ -132,7 +136,7 @@ int rocket_siglip_encode(int fd, const rocket_siglip_model *m,
     for (int ph = 0; ph < side; ph++)
         for (int pw = 0; pw < side; pw++) {
             int p = ph * side + pw;
-            _Float16 *row = patches + (size_t)p * pdim;
+            _Float16 *row = patches + (size_t)p * pdp;
             for (int ci = 0; ci < ic; ci++) {
                 const _Float16 *chan = pixels_chw + (size_t)ci * H * W;
                 for (int r = 0; r < kh; r++) {
@@ -144,8 +148,8 @@ int rocket_siglip_encode(int fd, const rocket_siglip_model *m,
         }
 
     /* --- patch projection x = patches·patch_W^T  (NPU GEMM; host fp32 for fd<0) --- */
-    if (fd >= 0) { if ((rc = rocket_matmul_fp16(fd, L, pdim, d, patches, m->patch_W, xa)) != 0) goto done; }
-    else         host_matmul(L, pdim, d, patches, m->patch_W, xa);
+    if (fd >= 0) { if ((rc = rocket_matmul_fp16(fd, L, pdp, d, patches, m->patch_W, xa)) != 0) goto done; }
+    else         host_matmul(L, pdp, d, patches, m->patch_W, xa);
 
     /* --- + patch bias (broadcast) + position embedding (host glue) --- */
     for (int p = 0; p < L; p++) {
@@ -362,11 +366,50 @@ static void h_quick_gelu(size_t n, _Float16 *x, int nt)
     parallel_for((int)n, nt, qgelu_range, x);
 }
 
+/* DINOv2's exact erf GELU x*Phi(x) (what Depth Anything v2 exports as an Erf node). Same
+ * fp16-input LUT trick, bit-exact to the scalar path. */
+static inline _Float16 erfgelu1(_Float16 xv)
+{
+    const float inv_sqrt2 = 0.70710678118654752f;
+    float v = (float)xv;
+    return (_Float16)(0.5f * v * (1.f + erff(v * inv_sqrt2)));
+}
+static _Float16 g_egelu_lut[65536];
+static int      g_egelu_lut_ready;
+static void egelu_lut_build(void)
+{
+    for (int u = 0; u < 65536; u++) {
+        uint16_t bits = (uint16_t)u; _Float16 h; memcpy(&h, &bits, sizeof h);
+        g_egelu_lut[u] = erfgelu1(h);
+    }
+    g_egelu_lut_ready = 1;
+}
+static void egelu_range(void *a, int lo, int hi)
+{
+    _Float16 *x = a;
+    for (int i = lo; i < hi; i++) {
+        uint16_t bits; memcpy(&bits, &x[i], sizeof bits);
+        x[i] = g_egelu_lut[bits];
+    }
+}
+static void egelu_range_scalar(void *a, int lo, int hi)
+{
+    _Float16 *x = a;
+    for (int i = lo; i < hi; i++) x[i] = erfgelu1(x[i]);
+}
+static void h_erf_gelu(size_t n, _Float16 *x, int nt)
+{
+    if (getenv("ROCKET_SIGLIP_GELU_SCALAR")) { parallel_for((int)n, nt, egelu_range_scalar, x); return; }
+    if (!g_egelu_lut_ready) egelu_lut_build();
+    parallel_for((int)n, nt, egelu_range, x);
+}
+
 /* the model's MLP nonlinearity (host, in place over n elements) */
 static void h_mlp_act(const rocket_siglip_model *m, size_t n, _Float16 *x, int nt)
 {
-    if (m->act_kind == 1) h_quick_gelu(n, x, nt);
-    else                  h_gelu_tanh(n, x, nt);
+    if      (m->act_kind == 1) h_quick_gelu(n, x, nt);
+    else if (m->act_kind == 2) h_erf_gelu(n, x, nt);
+    else                       h_gelu_tanh(n, x, nt);
 }
 
 static void h_add_bias(int M, int N, _Float16 *C, const _Float16 *b)
@@ -414,6 +457,11 @@ rocket_siglip_ctx *rocket_siglip_ctx_create(const rocket_siglip_model *m, int nt
     c->m = m;
     c->ht = (nthreads <= 1) ? 1 : 4;   /* host softmax/GELU across the 4 A76 big cores */
     const int d = m->d, L = m->L, pdim = m->patch_dim, dff = m->d_ff, nL = m->n_layers;
+    const int pdp = m->patch_dim_pad ? m->patch_dim_pad : pdim;   /* patch matmul K (%32) */
+    if (m->n_taps < 0 || m->n_taps > ROCKET_SIGLIP_MAX_TAPS) goto fail;
+    for (int t = 0; t < m->n_taps; t++)
+        if (m->tap_layer[t] < 0 || m->tap_layer[t] >= nL ||
+            (t && m->tap_layer[t] <= m->tap_layer[t - 1])) goto fail;   /* ascending, in range */
     /* The token-projection matmuls run over ntok = L + n_prefix rows (the cls token joins the
      * sequence); the patch projection runs over L patch rows. Both need M % 4 == 0, so pack the
      * resident weights at the padded M the prepacked calls will use (the layout is M-independent
@@ -430,7 +478,7 @@ rocket_siglip_ctx *rocket_siglip_ctx_create(const rocket_siglip_model *m, int nt
     if (!c->mm || !c->strm || c->aux_fd < 0 ||
         !c->wq || !c->wk || !c->wv || !c->wo || !c->wf1 || !c->wf2) goto fail;
 
-    c->w_patch = rocket_weights_pack(c->mm, Lp, pdim, d, m->patch_W);
+    c->w_patch = rocket_weights_pack(c->mm, Lp, pdp, d, m->patch_W);
     if (!c->w_patch) goto fail;
     for (int l = 0; l < nL; l++) {
         layer_ptrs p = unpack_layer(m, l);
@@ -487,6 +535,7 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
     if (sl_pin_enabled()) rocket_pin_worker(0);   /* keep this thread's serial parts on an A76 */
     const rocket_siglip_model *m = c->m;
     const int d = m->d, L = m->L, pdim = m->patch_dim, dff = m->d_ff, nh = m->n_head, dh = d / nh;
+    const int pdp = m->patch_dim_pad ? m->patch_dim_pad : pdim;   /* patch matmul K (%32) */
     const int npre = m->n_prefix;
     const int ntok = L + npre;                    /* token-sequence length (cls prefix + patches) */
     const int Mp = (ntok + 3) & ~3;               /* token-projection matmul M % 4 == 0            */
@@ -495,14 +544,14 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
     const int ic = m->ic, kh = m->kh, kw = m->kw, stride = m->stride;
     const float scale = 1.f / sqrtf((float)dh);
     const size_t Td = (size_t)ntok * d;           /* real token-sequence element count */
-    int rc = -2;
+    int rc = -2, tap_next = 0;                    /* next multi-tap block to emit into `out` */
 
     const int use_fa = (c->fa != NULL);
     /* Token buffers hold Mp rows (padded to M%4); host elementwise touches only the first ntok, and
      * every projection matmul runs at M=Mp with the pad rows held at zero. calloc + ntok-bounded host
      * writes keep the pad rows zero, so each matmul's pad-row output stays zero (never poisons a real
      * token, which the attention reads at n_tokens=ntok). patches/xp hold Lp patch rows. */
-    _Float16 *patches = calloc((size_t)Lp * pdim, sizeof(_Float16));
+    _Float16 *patches = calloc((size_t)Lp * pdp, sizeof(_Float16));
     _Float16 *xp = calloc((size_t)Lp * d, sizeof(_Float16));      /* patch-projection output */
     _Float16 *x  = calloc((size_t)Mp * d, sizeof(_Float16));
     _Float16 *ln = calloc((size_t)Mp * d, sizeof(_Float16));
@@ -541,7 +590,7 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
     for (int ph = 0; ph < side; ph++)
         for (int pw = 0; pw < side; pw++) {
             int p = ph * side + pw;
-            _Float16 *row = patches + (size_t)p * pdim;
+            _Float16 *row = patches + (size_t)p * pdp;
             for (int ci = 0; ci < ic; ci++) {
                 const _Float16 *chan = pixels_chw + (size_t)ci * H * W;
                 for (int r = 0; r < kh; r++) {
@@ -557,7 +606,7 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
      * = prefix + pos; patch rows = patch_proj + patch_b (if any) + pos. pos is [ntok][d]. The
      * patch-row add keeps the SigLIP order (proj + patch_b + pos) so that path stays bit-identical. */
     TIC;
-    if ((rc = rocket_matmul_fp16_prepacked(c->mm, Lp, pdim, d, patches, xp, c->w_patch)) != 0) goto done;
+    if ((rc = rocket_matmul_fp16_prepacked(c->mm, Lp, pdp, d, patches, xp, c->w_patch)) != 0) goto done;
     for (int j = 0; j < npre; j++) {
         _Float16 *xr = x + (size_t)j * d;
         const _Float16 *cr = m->prefix + (size_t)j * d, *pr = m->pos + (size_t)j * d;
@@ -668,14 +717,27 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
         TIC; h_residual(Td, x, cc); TOC(13);
 
         if (hidden_opt) memcpy(hidden_opt + (size_t)(l + 1) * Td, x, Td * sizeof(_Float16));
+        /* multi-tap exit (DPT heads): emit this layer's output NOW, while it is the live
+         * residual -- the next layer adds into x in place. */
+        if (tap_next < m->n_taps && m->tap_layer[tap_next] == l) {
+            TIC;
+            _Float16 *ob = out + (size_t)tap_next * Td;
+            if (m->post_g) h_layernorm(ntok, d, x, m->post_g, m->post_b, m->eps, ob);
+            else           memcpy(ob, x, Td * sizeof(_Float16));
+            TOC(2);
+            tap_next++;
+        }
     }
 
-    /* optional post-LayerNorm over the sequence (SigLIP); CLIP leaves last_hidden_state un-normed
-     * (its post_layernorm applies only to the pooled cls row, done on the host tail). */
-    TIC;
-    if (m->post_g) h_layernorm(ntok, d, x, m->post_g, m->post_b, m->eps, out);
-    else           memcpy(out, x, Td * sizeof(_Float16));
-    TOC(2);
+    /* single exit (SigLIP/CLIP): the optional post-LayerNorm over the sequence. CLIP leaves
+     * last_hidden_state un-normed (its post_layernorm applies only to the pooled cls row, done
+     * on the host tail). A multi-tap model wrote every block inside the loop above. */
+    if (m->n_taps == 0) {
+        TIC;
+        if (m->post_g) h_layernorm(ntok, d, x, m->post_g, m->post_b, m->eps, out);
+        else           memcpy(out, x, Td * sizeof(_Float16));
+        TOC(2);
+    }
     rc = 0;
     if (prof) {
         const char *nm[14] = {"im2col","patch+pos","layernorm","qkv-proj","head-xpose",
