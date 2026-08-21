@@ -58,6 +58,10 @@ NETENV=(ROCKET_RK3576_NET_RESIDENT=1 ROCKET_RK3576_NET_CUBE=1)
 # gen_matmul_fp16/int8/int4, which refuse on this part by construction, so it fails
 # rather than skipping. It is an RK3588 gate.
 g regcmd_rk3576              -- regcmd_rk3576_gate
+# The claim-time plan against the run's own verdict, over the whole envelope table. Pure —
+# no submit, no device — so it belongs with the host-only gates even though its subject is
+# the convolution path. It is what says the two have not drifted apart.
+g conv_claimplan             -- rk3576_conv_lib_gate claimplan
 
 # --- the encoder and its envelope -----------------------------------------------
 g first_light                -- rk3576_first_light

@@ -333,6 +333,7 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_row_pitch       # RK3576 board: will the PPU read a plane whose ROWS sit further apart than its windows consume?
             rk3576_conv_pitch      # RK3576 board: and will the CNA? a readout of what 0x1090 does
             rk3576_conv_sym        # RK3576 board: the symmetry audit on the CNA — non-square strides, and a rung fitted at kh == kw
+            rk3576_rowplan         # RK3576 host: the row window the planner chooses for one layer, and what it stages
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
             uapi_regcmd_fault_rocket # probe, NOT a gate: a client-requested NPU DMA fault (faults the NPU on purpose)
             hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure

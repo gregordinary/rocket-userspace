@@ -3,7 +3,8 @@
 """
 mkresnet18.py — a per-tensor int8 ResNet-18, built rather than fetched.
 
-    .venv-build/bin/python mkresnet18.py        # writes resnet18_224_quant.tflite
+    .venv-build/bin/python mkresnet18.py             # writes resnet18_224_quant.tflite
+    .venv-build/bin/python mkresnet18.py --per-axis  # writes resnet18_224_peraxis.tflite
 
 WHY THIS EXISTS. MobileNetV1 and V2 arrive from google-coral/test_data already
 quantized per tensor. No such ResNet-18 is published: the well-known checkpoints are
@@ -50,7 +51,15 @@ WHAT IT ASSEMBLES.
 WHAT IT ASSERTS, because a quantizer flag that silently stops working would produce a
 model this gate reads WRONG rather than one it refuses: that every weight carries
 exactly one scale (per-tensor, not per-axis), and that the input quantization is the
-byte identity.
+byte identity. `--per-axis` inverts the first of those — it asserts that every
+convolution came out per-axis — and writes a separate file.
+
+WHY THE --per-axis VARIANT EXISTS. It is the same architecture, the same weights and the
+same calibration set, so the quantization GRANULARITY is the only variable, and the top-1
+label is an assertion a classifier carries end to end. A per-axis defect in the delegate
+or the library would otherwise show only as a detector's mAP loss, which has no other
+symptom to read. It is not a gate blob — mknet.py reads the first scale only, so this file
+is for a frontend that consumes the .tflite directly.
 
 The .tflite is not committed. `./fetch.sh && .venv-build/bin/python mkresnet18.py`
 rebuilds it; `mknet.py r18` then turns it into the .rnet blob the gate runs.
@@ -61,6 +70,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEIGHTS = os.path.join(HERE, "resnet18_a1_in1k.safetensors")
 OUT = os.path.join(HERE, "resnet18_224_quant.tflite")
+OUT_PER_AXIS = os.path.join(HERE, "resnet18_224_peraxis.tflite")
 
 # timm/resnet18.a1_in1k is trained with the standard ImageNet statistics.
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float64)
@@ -190,6 +200,8 @@ def calib_images():
 
 def main():
     import tensorflow as tf
+    per_axis = "--per-axis" in sys.argv[1:]
+    out = OUT_PER_AXIS if per_axis else OUT
     if not os.path.exists(WEIGHTS):
         sys.exit("%s is not fetched — run ./fetch.sh" % os.path.basename(WEIGHTS))
     P = read_safetensors(WEIGHTS)
@@ -208,9 +220,9 @@ def main():
     conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     conv.inference_input_type = tf.int8
     conv.inference_output_type = tf.int8
-    conv._experimental_disable_per_channel = True
+    conv._experimental_disable_per_channel = not per_axis
     buf = conv.convert()
-    with open(OUT, "wb") as f:
+    with open(out, "wb") as f:
         f.write(buf)
 
     # ---- the two assertions this file exists to make -----------------------------
@@ -220,7 +232,7 @@ def main():
     codes = [m.OperatorCodes(i).BuiltinCode() for i in range(m.OperatorCodesLength())]
     names = {v: k for k, v in vars(tflite.BuiltinOperator).items()
              if isinstance(v, int)}
-    seen, peraxis = {}, 0
+    seen, peraxis, pertensor, spread = {}, 0, 0, 1.0
     for i in range(g.OperatorsLength()):
         op = g.Operators(i)
         n = names[codes[op.OpcodeIndex()]]
@@ -229,8 +241,18 @@ def main():
             q = g.Tensors(op.Inputs(1)).Quantization()
             if q.ScaleLength() != 1:
                 peraxis += 1
+                s = np.array([q.Scale(j) for j in range(q.ScaleLength())])
+                spread = max(spread, float(s.max() / s.min()))
+            else:
+                pertensor += 1
     print("ops: " + ", ".join("%s x%d" % kv for kv in sorted(seen.items())))
-    if peraxis:
+    if per_axis:
+        if pertensor:
+            sys.exit("%d convolution(s) came out PER-TENSOR under --per-axis; the "
+                     "quantizer no longer honours the flag" % pertensor)
+        print("%d convolutions per-axis, widest per-layer scale spread %.1fx"
+              % (peraxis, spread))
+    elif peraxis:
         sys.exit("%d convolution(s) came out PER-AXIS; the per-tensor quantizer flag "
                  "no longer works and mknet.py would read only the first scale" % peraxis)
 
@@ -240,7 +262,7 @@ def main():
     if abs(isc - 1.0) > 1e-6 or izp != -128:
         sys.exit("the input quantization is not the byte identity (scale 1.0, zp -128); "
                  "the calibration set does not span [0, 255]")
-    print("wrote %s, %d bytes" % (OUT, len(buf)))
+    print("wrote %s, %d bytes" % (out, len(buf)))
 
 
 if __name__ == "__main__":

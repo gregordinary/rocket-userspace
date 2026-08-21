@@ -144,12 +144,15 @@ static int r76_desc_asym(const rocket_conv2d_desc *d)
                                                   d->dil_x ? d->dil_x : 1));
 }
 
-static int r76_conv_check(const char *entry, int fd, const rocket_conv2d_desc *d,
+/* PURE — no fd, no allocation, no device. The pack entries check their own fd before
+ * calling; keeping this side of the validation free of one is what lets a frontend ask the
+ * same question at CLAIM time, where a refusal costs one node the framework runs itself. */
+static int r76_conv_check(const char *entry, const rocket_conv2d_desc *d,
                           int dw, int argb_ok, unsigned *ow_out, unsigned *oh_out)
 {
     int ow, oh;
 
-    if (fd < 0 || !d) return ROCKET_E_SHAPE;
+    if (!d) return ROCKET_E_SHAPE;
     if (!r76_is_this_chip(entry)) return ROCKET_E_UNSUPPORTED;
     if (d->ic <= 0 || d->oc <= 0 || d->ih <= 0 || d->iw <= 0 ||
         d->kh <= 0 || d->kw <= 0 || d->stride_y <= 0 || d->stride_x <= 0 ||
@@ -830,13 +833,109 @@ static int r76_plan_perchannel(const char *entry, unsigned oc0, unsigned tile_oc
  * ROCKET_RK3576_PC_MAX_ERR sets the target (default 1%); ROCKET_RK3576_PC_OC_TILE
  * forces a tile and skips the search.
  */
+/*
+ * WHETHER A CLAMPED CHANNEL'S CLAMP CAN REACH THE SURFACE — which is a different question
+ * from whether its gain is a value the ramp holds, and the only one of the two the output
+ * depends on.
+ *
+ * A channel whose filter is entirely zero reaches exactly ONE accumulator: the fold A, at
+ * every output position, because the MAC term is zero whatever the feature cube holds. So
+ * for it "does the wrong gain change the byte" is decidable EXACTLY — compute both — with
+ * no bound, no sampling and no assumption about the input.
+ *
+ * This is not a corner case, it is what a PRUNED channel looks like after quantization: an
+ * all-zero filter is quantized against an all-zero tensor, so its scale sits at the
+ * quantizer's own floor (1e-6 in TFLite) while its bias still carries the layer's
+ * magnitude — which is exactly the shape that puts a channel below half the tile's base
+ * gain. Every one of the 111 clamped channels across EfficientDet-Lite0's six refused
+ * depthwise layers is one, and its stem's four are too. [HW sweep, H96 MAX M9]
+ *
+ * The test is written as SATURATION rather than as equality on purpose: both gains have to
+ * drive the fold past the same rail, by more than one count, so the answer cannot depend on
+ * the rounding rule. That is what makes it safe to decide here, where the DPU's round-half-
+ * to-even is modelled rather than run. A large negative fold saturating to -128 under either
+ * gain is 105 of those 111.
+ *
+ * A LIVE channel is refused without asking: its accumulator ranges over +-128*sum|w| around
+ * A and a gain wrong by a factor is wrong somewhere in that range.
+ */
+/* DEFAULT ON. `ROCKET_RK3576_PC_INERT=0` turns it off; `dw` restricts it to depthwise
+ * layers.
+ *
+ * The rule below is exact per layer: the three EfficientDet-Lite0 layers it accepts have
+ * every clamped channel dead and provably byte-identical, every non-clamped channel within
+ * 0.077-0.097% of its own gain, and `rk3576_perchannel_gate`'s `pruned` / `dw-pruned` cells
+ * measure ZERO counts of distance from an exact per-axis requant on the part.
+ *
+ * What accepting them uncovered was a DIFFERENT defect, in code that already shipped: one of
+ * the two depthwise layers is `blocks_0` — 160x160, ic = oc = 32, k3 — whose three row
+ * windows all selected a CBUF rung the depthwise path does not honour, so each window staged
+ * 51 rows against a programmed 55, 56 and 53. It was not the per-axis path and not the graph.
+ * With the rung declined there, that layer computes at the planner's own window.
+ *
+ * Measured over 500 val2017 images, NO forced cap: refusing scores 0.2809 against the CPU's
+ * 0.2823, `dw` scores 0.2832 and full acceptance 0.2826. So accepting is worth about
+ * +0.0023 mAP over refusing and every mode sits at CPU parity.
+ *
+ * THE WALL IS WHAT DECIDES IT, and it is the larger half. A refused layer is a host
+ * fallback, and in this graph it also SPLITS the partition it sits in: refusing leaves
+ * EfficientDet-Lite0's head as a 12-layer and a 28-layer partition carrying 5394 KiB of
+ * cube joins between them, where accepting makes it one 43-layer partition carrying 7594.
+ * Five interleaved rounds at 20 iterations, governor pinned to `performance`, first process
+ * discarded: refusing 99.3 ms, `dw` 90.3, full acceptance 82.8, each arm's four rounds
+ * inside 0.6 ms — 1.23x, 1.35x and 1.47x against the same CPU TFLite at 121.9. That is what
+ * separates `dw` from full acceptance: 7.5 ms and one more joined pair at the stem, not the
+ * 0.0006 mAP, which is inside what one count of drift does to an NMS-ordered list.
+ * [HW sweep, H96 MAX M9]. See chips/rk3576.md.
+ *
+ * Read per call, so the arms can be set between two runs of one binary. */
+static int r76_pc_inert_mode(int dw)
+{
+    const char *e = getenv("ROCKET_RK3576_PC_INERT");
+    if (!e || !*e) return 1;
+    if (*e == '0') return 0;
+    if (e[0] == 'd' && e[1] == 'w') return dw;
+    return 1;
+}
+
+static int r76_pc_clamp_inert(double A, int64_t sum_abs_w, double cs,
+                              double base_actual, int out_zp, int dw)
+{
+    double lo, hi, v_exact, v_clamp;
+
+    if (!r76_pc_inert_mode(dw)) return 0;
+    if (sum_abs_w != 0) return 0;
+    /* The DPU applies the offset before saturating, so these are the rails in accumulator
+     * units: at or below `lo` every value becomes -128, at or above `hi` every value 127. */
+    lo = -128.0 - (double)out_zp;
+    hi =  127.0 - (double)out_zp;
+    v_exact = A * cs;
+    v_clamp = A * base_actual;          /* C is 1 on a clamped channel, by definition */
+    return (v_exact < lo - 1.0 && v_clamp < lo - 1.0) ||
+           (v_exact > hi + 1.0 && v_clamp > hi + 1.0);
+}
+
+/* `unrep`, when asked for, counts the channels whose C came out below the field's own
+ * floor and was CLAMPED up to 1 AND whose clamp can reach the surface — the qualitative
+ * boundary, and not the same thing as a coarse ramp. Above it C is merely an integer and
+ * the gain resolution is 0.5/C; below it the channel's gain is not a value the ramp holds
+ * at all, and what it computes with instead is the tile's base.
+ *
+ * The returned worst-case error is the GAIN's and counts the inert channels too, so it
+ * stays the same quantity the tile search has always spent submits against — and an
+ * accepted layer can therefore report one above 100%, which the refusal's own log line
+ * splits out. Excluding them from the error as well would let the search choose a LARGER
+ * tile on a layer that passes today; that is sound, since an inert channel's surface is
+ * exact, but it would move arithmetic that is currently gated, so it is not taken here. */
 static double r76_pc_err_at(unsigned OC, unsigned tile, const unsigned *perm,
                             const int64_t *sum_abs_w, const int32_t *bias,
                             const int64_t *sum_w, int in_zp, int w_zp, unsigned taps,
-                            float in_scale, const float *w_scale, float out_scale)
+                            float in_scale, const float *w_scale, float out_scale,
+                            int out_zp, int dw, unsigned *unrep)
 {
     double worst = 0.0;
     unsigned oc0;
+    if (unrep) *unrep = 0;
     for (oc0 = 0; oc0 < OC; oc0 += tile) {
         unsigned n = OC - oc0 < tile ? OC - oc0 : tile, j;
         double best_base = 0.0, base_actual;
@@ -864,7 +963,15 @@ static double r76_pc_err_at(unsigned OC, unsigned tile, const unsigned *perm,
             double cs = (double)in_scale * (double)w_scale[c] / (double)out_scale;
             long long v = (long long)(cs / base_actual + 0.5);
             double err;
-            if (v < 1)     v = 1;
+            if (v < 1) {
+                double A = (double)(bias ? bias[c] : 0)
+                         - (double)in_zp * (double)sum_w[c]
+                         + (double)in_zp * w_zp * taps;
+                v = 1;
+                if (unrep &&
+                    !r76_pc_clamp_inert(A, sum_abs_w[c], cs, base_actual, out_zp, dw))
+                    (*unrep)++;
+            }
             if (v > 32767) v = 32767;
             err = fabs((double)v * base_actual - cs) / cs;
             if (err > worst) worst = err;
@@ -873,29 +980,38 @@ static double r76_pc_err_at(unsigned OC, unsigned tile, const unsigned *perm,
     return worst;
 }
 
+/* The tile chooser's accuracy GOAL. Distinct from the refusal below, which is keyed on the
+ * ramp's own floor rather than on a number: missing this target costs counts, and it is
+ * what the tile search spends submits to reach. */
+static double r76_pc_target(void)
+{
+    const char *e = getenv("ROCKET_RK3576_PC_MAX_ERR");
+    if (e && *e) {
+        double v = strtod(e, NULL);
+        if (v > 0.0) return v;
+    }
+    return 0.01;
+}
+
 static unsigned r76_pc_oc_tile(unsigned OC, unsigned cbuf_tile, const unsigned *perm,
                                const int64_t *sum_abs_w, const int32_t *bias,
                                const int64_t *sum_w, int in_zp, int w_zp, unsigned taps,
-                               float in_scale, const float *w_scale, float out_scale)
+                               float in_scale, const float *w_scale, float out_scale,
+                               int out_zp, int dw)
 {
     const char *e = getenv("ROCKET_RK3576_PC_OC_TILE");
-    double target = 0.01;
+    double target = r76_pc_target();
     unsigned tile;
 
     if (e && *e) {
         long v = strtol(e, NULL, 0);
         if (v > 0) return (unsigned)v < cbuf_tile ? (unsigned)v : cbuf_tile;
     }
-    e = getenv("ROCKET_RK3576_PC_MAX_ERR");
-    if (e && *e) {
-        double v = strtod(e, NULL);
-        if (v > 0.0) target = v;
-    }
     /* Largest first, so the search stops at the fewest submits that will do. The floor
      * is the 32-channel MAC group; below it a tile is not a shape the emitter takes. */
     for (tile = cbuf_tile; ; tile = tile / 2u > 32u ? tile / 2u : 32u) {
         if (r76_pc_err_at(OC, tile, perm, sum_abs_w, bias, sum_w, in_zp, w_zp, taps,
-                          in_scale, w_scale, out_scale) <= target)
+                          in_scale, w_scale, out_scale, out_zp, dw, NULL) <= target)
             return tile;
         if (tile <= 32u) return 32u;   /* nothing narrower to try */
     }
@@ -1316,7 +1432,8 @@ static int r76_w_prepare(const char *entry, int fd, const rocket_conv2d_desc *d,
         d = &dx;
     }
 
-    rc = r76_conv_check(entry, fd, d, dw, argb, &ow, &oh);
+    if (fd < 0) return ROCKET_E_SHAPE;
+    rc = r76_conv_check(entry, d, dw, argb, &ow, &oh);
     if (rc != ROCKET_OK) return rc;
     if (argb) {
         rc = r76_argb_bounds(entry, d, ow, oh, in_zp, ext_lead != 0);
@@ -1564,7 +1681,85 @@ static void r76_w_sums(r76_w *h, const int8_t *W)
     if (h->w_scale_oc && !h->dw)
         h->oc_tile = r76_pc_oc_tile(h->OC, h->oc_tile, h->perm, h->sum_abs_w, h->bias,
                                     h->sum_w, h->in_zp, h->w_zp, h->taps, h->in_scale,
-                                    h->w_scale_oc, h->out_scale);
+                                    h->w_scale_oc, h->out_scale, h->out_zp, h->dw);
+
+    /* AND THE SORT IS DROPPED AGAIN WHERE IT BUYS NOTHING, WHICH IS ALSO WHERE IT WOULD
+     * COST CORRECTNESS. A tile's channels occupy consecutive slots of the surface, so
+     * sorting them reorders the SURFACE — and a surface is what the cube path hands the
+     * next layer as its feature cube, where the channel order is the layout and no
+     * consumer can be told a permutation. The de-scatter puts a materialised tensor back
+     * in model order and hides it, so this is invisible to every per-op gate and to any
+     * graph whose per-axis layers do not join.
+     *
+     * With ONE tile the sort cannot buy anything either: that tile spans every channel
+     * whatever their order, so the base gain and each channel's C are the same values in
+     * different slots. So it is dropped, the surface comes out in model order, and a
+     * single-tile per-axis handle is a cube producer like any other. Multi-tile handles
+     * keep the sort — it is the whole accuracy lever there — and their cube is refused
+     * anyway, because each tile owns its own surface. */
+    if (h->perm && h->OC <= h->oc_tile) {
+        free(h->perm);
+        h->perm = NULL;
+    }
+}
+
+/*
+ * WHETHER EVERY CHANNEL'S GAIN IS A VALUE THE RAMP HOLDS — which is a different question
+ * from how finely it holds it, and the only one of the two that is refused.
+ *
+ * A tile is one task and a task carries one OUT_CVT shift, so a channel reaches its own
+ * scale through the int16 C in its coefficient group and nothing else. The base gain is
+ * already the smallest the tile admits (every channel's C must fit that channel's own
+ * accumulator bound), so a channel whose scale sits below HALF the base has a C of less
+ * than one — and the field's floor is one. It is then computed at the base's gain instead
+ * of its own: wrong by a factor rather than by a count, on a full, correctly sized,
+ * entirely plausible surface.
+ *
+ * That is the boundary this refuses at, and it is the RAMP's rather than a threshold: above
+ * it C is an integer and the resolution is 0.5/C, which is what the tile search spends
+ * submits to improve; below it there is no C to choose. Equivalently, the clamped channels
+ * are exactly those whose relative gain error exceeds 100%.
+ *
+ * Measured through a frontend: a per-axis ResNet-18 carrying two clamped layers returned
+ * TFLite's top-1 on 0 of 100 images where its per-tensor build returned it on 93, and
+ * EfficientDet-Lite0, with clamped channels in 7 layers of 182, scored mAP 0.0000 against
+ * the CPU's 0.2823. [HW sweep, H96 MAX M9]
+ *
+ * The prediction is the same function the tile chooser uses, so the pure claim-time query
+ * below and this refusal cannot disagree. ROCKET_RK3576_PC_ALLOW_CLAMP=1 computes anyway,
+ * which is the A/B arm for what the refusal buys.
+ */
+static double r76_pc_pred_err(const r76_w *h, unsigned *unrep)
+{
+    return r76_pc_err_at(h->OC, h->dw ? h->OC : h->oc_tile, h->perm, h->sum_abs_w,
+                         h->bias, h->sum_w, h->in_zp, h->w_zp, h->taps,
+                         h->in_scale, h->w_scale_oc, h->out_scale, h->out_zp, h->dw,
+                         unrep);
+}
+
+static int r76_pc_allow_clamp(void)
+{
+    const char *e = getenv("ROCKET_RK3576_PC_ALLOW_CLAMP");
+    return e && *e && *e != '0';
+}
+
+static int r76_pc_accept(const char *entry, const r76_w *h)
+{
+    unsigned unrep = 0;
+    double err;
+
+    if (!h->w_scale_oc) return ROCKET_OK;
+    err = r76_pc_pred_err(h, &unrep);
+    if (!unrep || r76_pc_allow_clamp()) return ROCKET_OK;
+    ROCKET_LOGE("%s: per-channel requant, %u of %u output channel(s) need a C below the "
+                "int16 field's floor of 1 in tile(s) of %u AND their clamp reaches the "
+                "surface, so they would compute at the tile's base gain instead of their "
+                "own — worst-case gain error %.3g%% over every clamped channel, including "
+                "any whose clamp is inert. The tile search is the only lever and it cannot "
+                "reach this, so the layer is refused rather than computed at the wrong "
+                "gain. ROCKET_RK3576_PC_ALLOW_CLAMP=1 computes anyway\n",
+                entry, unrep, h->OC, h->dw ? h->OC : h->oc_tile, err * 100.0);
+    return ROCKET_E_UNSUPPORTED;
 }
 
 /* The tile table, once the tile is decided. Separate from the packing so a transient run
@@ -2299,7 +2494,8 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
     r76_w_sums(h, W);
     R76_ACC(prof, sums_us, pt0);
 
-    rc = r76_w_tiles(h);
+    rc = r76_pc_accept(entry, h);
+    if (rc == ROCKET_OK) rc = r76_w_tiles(h);
     if (rc == ROCKET_OK) rc = r76_int8_exec(entry, h, W, in, out, &prof);
 
     if (h->w_scale_oc && rc == ROCKET_OK)
@@ -2336,52 +2532,97 @@ int rocket_conv2d_int8_rk3576(int fd, const rocket_conv2d_desc *d,
                              in_zp, w_zp, out_zp, NULL, out);
 }
 
-unsigned rocket_conv2d_int8_perchannel_oc_tile_rk3576(const rocket_conv2d_desc *d,
-                                                      const int8_t *W,
-                                                      const int32_t *bias,
-                                                      float in_scale,
-                                                      const float *w_scale,
-                                                      float out_scale, int in_zp)
+int rocket_conv2d_int8_perchannel_plan_rk3576(const rocket_conv2d_desc *d,
+                                              const int8_t *W, const int32_t *bias,
+                                              float in_scale, const float *w_scale,
+                                              float out_scale, int in_zp, int out_zp,
+                                              unsigned *oc_tile, double *max_rel_err)
 {
     unsigned IC, OC, KH, KW, icreg, taps, cbuf_tile, tile = 0;
     int64_t *sum_w = NULL, *sum_abs_w = NULL;
     unsigned *perm = NULL;
-    unsigned c, i, y, x;
+    size_t per_oc, k;
+    unsigned c;
+    double err = 0.0;
+    int rc = ROCKET_E_SHAPE;
 
-    if (!d || !W || !w_scale) return 0;
-    /* A depthwise layer is one task by construction — output channel c is bound to
-     * input channel c, so there is no output-channel window to program. */
-    if (d->depthwise) return (unsigned)d->oc;
-    if (d->ic <= 4) return 0;
+    if (oc_tile) *oc_tile = 0;
+    if (max_rel_err) *max_rel_err = 0.0;
+    if (!d || !W || !w_scale) return ROCKET_E_SHAPE;
+    /* Four or fewer input channels is the packed-image first conv, which refuses a
+     * per-axis quantization outright — so there is no ramp to ask about. `direct_datapath`
+     * is a caller saying it wants the ordinary encoding instead, and there the question is
+     * the same as at any other channel count (the int8 direct cube is a 32-channel MAC
+     * group at every count). */
+    if (!d->depthwise && d->ic <= 4 && !d->direct_datapath) return ROCKET_E_SHAPE;
     IC = (unsigned)d->ic; OC = (unsigned)d->oc;
     KH = (unsigned)d->kh; KW = (unsigned)d->kw;
     icreg = rocket_rk3576_pad_ic(IC);
     /* The PROGRAMMED count, matching r76_w_prepare()'s fold — see the tap-count note
      * there. It only enters the A term, and a per-axis quantization has w_zp == 0, so the
      * two counts predict the same error; kept in agreement rather than left to differ. */
-    taps  = icreg * KH * KW;
-    cbuf_tile = r76_conv_oc_tile(icreg, KH, KW, rocket_rk3576_pad_oc(OC));
-    if (!cbuf_tile) return 0;
+    taps  = d->depthwise ? KH * KW : icreg * KH * KW;
+    if (d->depthwise) {
+        /* One task by construction — output channel c is bound to input channel c, so
+         * there is no output-channel window to program and no scale sort to make. The
+         * ramp therefore spans the WHOLE layer's spread with no lever on it, which is why
+         * a wide depthwise layer is the shape this check refuses most often. */
+        cbuf_tile = OC;
+    } else {
+        cbuf_tile = r76_conv_oc_tile(icreg, KH, KW, rocket_rk3576_pad_oc(OC));
+        if (!cbuf_tile) return ROCKET_E_SHAPE;
+    }
 
+    per_oc = d->depthwise ? (size_t)KH * KW : (size_t)IC * KH * KW;
     sum_w = calloc(OC, sizeof *sum_w);
     sum_abs_w = calloc(OC, sizeof *sum_abs_w);
-    perm = calloc(OC, sizeof *perm);
-    if (!sum_w || !sum_abs_w || !perm) goto done;
+    if (!d->depthwise) perm = calloc(OC, sizeof *perm);
+    if (!sum_w || !sum_abs_w || (!d->depthwise && !perm)) { rc = ROCKET_E_NOMEM; goto done; }
     for (c = 0; c < OC; c++) {
+        const int8_t *w = W + (size_t)c * per_oc;
         int64_t s = 0, sa = 0;
-        for (i = 0; i < IC; i++)
-            for (y = 0; y < KH; y++)
-                for (x = 0; x < KW; x++) {
-                    int64_t v = W[(((size_t)c * IC + i) * KH + y) * KW + x];
-                    s += v; sa += v < 0 ? -v : v;
-                }
+        for (k = 0; k < per_oc; k++) {
+            int64_t v = w[k];
+            s += v; sa += v < 0 ? -v : v;
+        }
         sum_w[c] = s; sum_abs_w[c] = sa;
     }
-    r76_sort_by_scale(perm, OC, w_scale);
-    tile = r76_pc_oc_tile(OC, cbuf_tile, perm, sum_abs_w, bias, sum_w,
-                          in_zp, 0, taps, in_scale, w_scale, out_scale);
+    if (perm) {
+        r76_sort_by_scale(perm, OC, w_scale);
+        tile = r76_pc_oc_tile(OC, cbuf_tile, perm, sum_abs_w, bias, sum_w,
+                              in_zp, 0, taps, in_scale, w_scale, out_scale, out_zp,
+                              d->depthwise);
+    } else {
+        tile = cbuf_tile;
+    }
+    {
+        unsigned unrep = 0;
+        err = r76_pc_err_at(OC, tile, perm, sum_abs_w, bias, sum_w, in_zp, 0, taps,
+                            in_scale, w_scale, out_scale, out_zp, d->depthwise, &unrep);
+        rc = (!unrep || r76_pc_allow_clamp()) ? ROCKET_OK : ROCKET_E_UNSUPPORTED;
+    }
 done:
     free(sum_w); free(sum_abs_w); free(perm);
+    if (oc_tile) *oc_tile = tile;
+    if (max_rel_err) *max_rel_err = err;
+    return rc;
+}
+
+unsigned rocket_conv2d_int8_perchannel_oc_tile_rk3576(const rocket_conv2d_desc *d,
+                                                      const int8_t *W,
+                                                      const int32_t *bias,
+                                                      float in_scale,
+                                                      const float *w_scale,
+                                                      float out_scale, int in_zp,
+                                                      int out_zp)
+{
+    unsigned tile = 0;
+    /* A refused layer still HAS a tile — this query is about the submit count, and the
+     * caller that wants the accept/refuse answer asks for it by name. */
+    if (rocket_conv2d_int8_perchannel_plan_rk3576(d, W, bias, in_scale, w_scale,
+                                                  out_scale, in_zp, out_zp, &tile, NULL)
+        == ROCKET_E_SHAPE)
+        return 0;
     return tile;
 }
 
@@ -2801,6 +3042,58 @@ int rocket_conv2d_int8_act_rk3576(int fd, const rocket_conv2d_desc *d,
                              in_zp, w_zp, out_zp, &lut, out);
 }
 
+int rocket_conv2d_int8_plan_rk3576(const rocket_conv2d_desc *d)
+{
+    static const char entry[] = "rocket_conv2d_int8_plan_rk3576";
+    rocket_conv2d_desc dd;
+    rocket_rk3576_row_task *plan;
+    conv_params_t q;
+    unsigned ow, oh, icreg, oc_tile, tile_oc, ocreg, max_tasks, ntask = 0u;
+    int dw, rc;
+
+    if (!d) return ROCKET_E_SHAPE;
+    dd = *d;
+    dw = dd.depthwise ? 1 : 0;
+    /* THE ENCODING THIS ANSWERS ABOUT IS THE ONE THE PACK WILL SETTLE ON. Four or fewer
+     * input channels may take the packed-image first conv, but that encoding is ATTEMPTED
+     * rather than predicted and a refusal there falls back to the direct datapath — which
+     * is exact at any geometry — so the shape that decides whether the pack succeeds at
+     * all is the direct one, and that is what is priced here. A caller that has already
+     * set `direct_datapath` is asking the same question. */
+    if (!dw && dd.ic <= 4) dd.direct_datapath = 1;
+
+    rc = r76_conv_check(entry, &dd, dw, 0, &ow, &oh);
+    if (rc != ROCKET_OK) return rc;
+
+    icreg = dw ? (unsigned)dd.ic : rocket_rk3576_pad_ic((unsigned)dd.ic);
+    oc_tile = dw ? (unsigned)dd.oc
+                 : r76_conv_oc_tile(icreg, (unsigned)dd.kh, (unsigned)dd.kw,
+                                    rocket_rk3576_pad_oc((unsigned)dd.oc));
+    if (!oc_tile) return ROCKET_E_SHAPE;
+    /* The FIRST tile is the widest one and so plans the shortest row window; a tail tile
+     * carries fewer channels and can only ever fit more rows. Mirrors r76_w_prepare(). */
+    tile_oc = (unsigned)dd.oc < oc_tile ? (unsigned)dd.oc : oc_tile;
+    ocreg = dw ? tile_oc : rocket_rk3576_pad_oc(tile_oc);
+
+    memset(&q, 0, sizeof q);
+    q.ic = (uint16_t)icreg;      q.oc = (uint16_t)ocreg;
+    q.ih = (uint16_t)dd.ih;      q.iw = (uint16_t)dd.iw;
+    q.oh = (uint16_t)oh;         q.ow = (uint16_t)ow;
+    q.kh = (uint16_t)dd.kh;      q.kw = (uint16_t)dd.kw;
+    q.stride_y = (uint8_t)dd.stride_y; q.stride_x = (uint8_t)dd.stride_x;
+    q.pad_top  = (uint8_t)dd.pad_top;  q.pad_left = (uint8_t)dd.pad_left;
+    q.ih_full  = (uint16_t)dd.ih;      q.oh_full  = (uint16_t)oh;
+    q.int8_out = 1;
+
+    max_tasks = oh + 2u;                    /* r76_w_prepare()'s own bound */
+    plan = calloc(max_tasks, sizeof *plan);
+    if (!plan) return ROCKET_E_NOMEM;
+    rc = rocket_rk3576_plan_rows(&q, dw, plan, max_tasks, &ntask) < 0
+             ? ROCKET_E_UNSUPPORTED : ROCKET_OK;
+    free(plan);
+    return rc;
+}
+
 rocket_conv2d_int8_weights_rk3576 *
 rocket_conv2d_int8_pack_rk3576(int fd, const rocket_conv2d_desc *d,
                                const int8_t *W, const int32_t *bias,
@@ -2826,6 +3119,7 @@ rocket_conv2d_int8_pack_rk3576(int fd, const rocket_conv2d_desc *d,
 
     h->resident = 1;
     r76_w_sums(h, W);
+    if (r76_pc_accept(entry, h) != ROCKET_OK) { r76_w_free(h); return NULL; }
     if (r76_w_tiles(h) != ROCKET_OK) { r76_w_free(h); return NULL; }
 
     for (t = 0; t < h->ntile; t++) {
@@ -2915,6 +3209,18 @@ static int r76_cube_shape_ok(const char *entry, const r76_w *h, int pitch_ok)
         ROCKET_LOGE("%s: this handle splits its %u output channels across %u tiles, and "
                     "each tile owns its own surface — several buffers are not one cube\n",
                     entry, h->OC, h->ntile);
+        return 0;
+    }
+    /* THE CHANNEL ORDER IS THE LAYOUT. A per-axis handle that sorted its output channels
+     * by scale writes them to the surface in THAT order, and a consumer reading this
+     * surface as its feature cube has no way to be told a permutation — it would compute a
+     * full, correctly sized, entirely plausible surface from the wrong channels. The sort
+     * is dropped wherever there is one tile (see r76_w_sums), so this cannot fire today;
+     * it is here because the invariant belongs at the place that depends on it. */
+    if (h->perm) {
+        ROCKET_LOGE("%s: this handle's %u output channels are sorted by scale, so its "
+                    "surface is not in the model's channel order and no consumer can read "
+                    "it as a cube\n", entry, h->OC);
         return 0;
     }
     return 1;
@@ -5074,7 +5380,8 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
     unsigned char stamp;
     int rc;
 
-    rc = r76_conv_check(entry, fd, d, d && d->depthwise, 1, &ow, &oh);
+    if (fd < 0) return ROCKET_E_SHAPE;
+    rc = r76_conv_check(entry, d, d && d->depthwise, 1, &ow, &oh);
     if (rc != ROCKET_OK) return rc;
     if (!in || !W || !out) return ROCKET_E_SHAPE;
     if (r76_desc_asym(d)) {

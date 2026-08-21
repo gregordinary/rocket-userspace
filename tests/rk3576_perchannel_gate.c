@@ -53,6 +53,16 @@ typedef struct {
     unsigned ic, oc, iw, ih, k, stride, pad;
     float    spread;      /* w_scale[oc] spans [base, base*spread] */
     int      dw;          /* depthwise: oc == ic, one filter per channel */
+    /* PRUNED CHANNELS — the last `dead` of them get an all-zero filter, the quantizer's
+     * floor scale and `dead_bias`. This is the shape that actually clamps in a real
+     * per-axis model: an all-zero filter is quantized against an all-zero tensor, so its
+     * scale sits at the floor while its bias keeps the layer's magnitude, and its C falls
+     * below the int16 field's floor of 1. Its accumulator is the fold ALONE at every
+     * output position, so what the clamp does to it is exactly decidable — which is why
+     * these cells come in a pair that differs only in `dead_bias`. */
+    unsigned dead;
+    int32_t  dead_bias;
+    int      expect_refuse;   /* the clamp reaches the surface: assert the entry refuses */
 } pc_shape;
 
 static const pc_shape SHAPES[] = {
@@ -84,6 +94,34 @@ static const pc_shape SHAPES[] = {
     { "dw-k5",       32,  32,  16, 16,  5, 1, 2,   10.0f,   1 },
     { "dw-deep",    256, 256,   8,  8,  3, 1, 1,   100.0f,  1 },
     { "dw-1000x",    64,  64,  14, 14,  3, 1, 1,   1000.0f, 1 },
+    /* PRUNED CHANNELS, as a PAIR. Both carry four all-zero filters at the quantizer's
+     * floor scale, so both have channels whose C clamps to the field's floor of 1 and
+     * whose gain is then the tile's base rather than their own. What differs is only the
+     * fold those channels carry:
+     *
+     *   -5e8 drives it past the LOW saturation rail under either gain (-284 counts
+     *   exactly, -877 clamped, against a rail at -139), so the surface is identical and
+     *   the layer is ACCEPTED — the assertion is that the part's bytes on those channels
+     *   equal an EXACT per-axis requant's, not merely the chip model's;
+     *
+     *   +1e8 lands inside the range (68 exactly, 127 saturated clamped), so the clamp
+     *   reaches the surface and the entry must REFUSE.
+     *
+     * Nothing else about the two cells differs. A model that only sweeps the scale spread
+     * cannot produce either: its channels all carry live filters. */
+    { "pruned",      32,  64,  16, 16,  3, 1, 1,   100.0f,  0, 4, -500000000, 0 },
+    { "dw-pruned",   64,  64,  16, 16,  3, 1, 1,   100.0f,  1, 4, -500000000, 0 },
+    { "pruned-live", 32,  64,  16, 16,  3, 1, 1,   100.0f,  0, 4,  100000000, 1 },
+    /* NARROW input channel counts, on the DIRECT datapath — the shape a per-axis model's
+     * STEM is, and one no cell here reached while every such layer was refused for its
+     * gain ramp. Four or fewer channels is where the library's other routing lives (the
+     * packed-image first conv, which refuses a per-axis quantization outright), so the
+     * ordinary encoding is the only one a per-axis stem can take and it is driven here.
+     * `pc-stem` is EfficientDet-Lite0's own geometry. */
+    { "pc-narrow3",   3,  32,  16, 16,  3, 1, 1,   100.0f,  0 },
+    { "pc-narrow4",   4,  64,  16, 16,  3, 1, 1,   100.0f,  0 },
+    { "pc-narrow1",   1,  32,  16, 16,  3, 1, 1,    10.0f,  0 },
+    { "pc-stem",      3,  32, 320,320,  3, 2, 1,   100.0f,  0 },
 };
 #define N_SHAPES ((int)(sizeof SHAPES / sizeof *SHAPES))
 
@@ -183,7 +221,7 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
     unsigned oc_tile = 0;
     unsigned seed = 0x2545F491u ^ (ic * 31 + oc * 17 + iw * 7 + k);
     int exact = 0, worst = 0, rc, fail = 0;
-    double ref_worst = 0.0, ref_sum = 0.0;
+    double ref_worst = 0.0, ref_sum = 0.0, dead_worst = 0.0;
 
     if (!in || !W || !got || !want || !bias || !A || !sum_w || !sum_abs_w ||
         !w_scale || !C || !Aslot || !perm || !slot_of || !tile_mul || !tile_shift) {
@@ -206,6 +244,16 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
         w_scale[c] = (float)(0.0009 *
             pow((double)s->spread, oc > 1 ? (double)c / (double)(oc - 1) : 0.0));
     }
+    /* The pruned channels, written over the draw above. TFLite's own floor for an
+     * all-zero tensor is 1e-6, and the filter is zeroed rather than made small: a
+     * channel with no live weight reaches ONE accumulator. */
+    for (c = oc - s->dead; c < oc && s->dead; c++) {
+        size_t base = dw ? (size_t)c * k * k : (size_t)c * ic * k * k;
+        size_t n_w  = dw ? (size_t)k * k : (size_t)ic * k * k;
+        memset(W + base, 0, n_w);
+        w_scale[c] = 1e-6f;
+        bias[c] = s->dead_bias;
+    }
 
     d.ic = (int)ic; d.oc = (int)oc;
     d.ih = (int)ih; d.iw = (int)iw;
@@ -214,12 +262,39 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
     d.pad_top = (int)pad; d.pad_left = (int)pad;
     d.dil_y = 1; d.dil_x = 1;
     d.depthwise = dw;
+    /* Exactly what a frontend hands a narrow per-axis convolution: the packed-image first
+     * conv refuses a per-axis quantization, so the ordinary encoding is the only route and
+     * the flag says so rather than letting the entry route by channel count. */
+    d.direct_datapath = (!dw && ic <= 4) ? 1 : 0;
+
+    /* THE PRUNED-CHANNEL CELLS ARE ABOUT A KNOB, so they set it EXPLICITLY IN BOTH
+     * DIRECTIONS rather than relying on the default — the acceptance ships ON now, and a
+     * cell that reads the default asserts whatever the default happens to be rather than
+     * the behaviour it was written for. The refusing half runs with it ON too: what it
+     * asserts is that the rule refuses a clamp that reaches the surface even when enabled. */
+    setenv("ROCKET_RK3576_PC_INERT", s->dead ? "1" : "0", 1);
 
     /* The tile is bookkeeping — one task, one OUT_CVT shift — not the arithmetic
      * under test, so the model asks the library where it split rather than
      * re-deriving a CBUF rule. Everything downstream of it is modelled independently. */
+    /* A cell whose pruned channels' clamp REACHES the surface asserts the refusal and
+     * nothing else — there is no surface to score, and one computed anyway would be the
+     * defect this refuses. The pair's other half is what says the refusal is not simply
+     * refusing everything with a clamp in it. */
+    if (s->expect_refuse) {
+        rc = rocket_conv2d_int8_perchannel_rk3576(fd, &d, in, W, bias, in_scale,
+                                                  w_scale, out_scale, in_zp, out_zp, got);
+        fail = (rc != ROCKET_E_UNSUPPORTED);
+        printf("  %-4s %-11s ic=%-4u oc=%-4u %2ux%-2u k%u s%u  %u pruned channel(s) whose "
+               "clamp reaches the surface: returned %d, wanted %d\n",
+               fail ? "FAIL" : "PASS", s->name, ic, oc, iw, ih, k, st, s->dead,
+               rc, ROCKET_E_UNSUPPORTED);
+        goto done;
+    }
+
     oc_tile = rocket_conv2d_int8_perchannel_oc_tile_rk3576(&d, W, bias, in_scale,
-                                                           w_scale, out_scale, in_zp);
+                                                           w_scale, out_scale, in_zp,
+                                                           out_zp);
     if (!oc_tile) {
         printf("  %-11s ic=%-4u oc=%-4u  the entry refuses this descriptor\n",
                s->name, ic, oc);
@@ -314,6 +389,11 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
                     double e = fabs(ref - (double)got[((size_t)c * oh + y) * ow + x]);
                     if (e > ref_worst) ref_worst = e;
                     ref_sum += e;
+                    /* On a PRUNED channel the distance to an exact per-axis requant is
+                     * ASSERTED and not reported: that is the whole claim the layer was
+                     * accepted on, and it is the one number a bit-exact comparison
+                     * against the chip's own arithmetic cannot make. */
+                    if (s->dead && c >= oc - s->dead && e > dead_worst) dead_worst = e;
                 }
             }
         }
@@ -326,12 +406,17 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
         else if (diff > worst) worst = diff;
     }
     if (exact != (int)out_n) fail = 1;
+    if (s->dead && dead_worst > 0.5) fail = 1;
 
     printf("  %-4s %-11s ic=%-4u oc=%-4u %2ux%-2u k%u s%u  %7d/%-7zu  "
-           "C[%d..%d] tile=%-4u vs exact per-axis: max %.1f mean %.2f\n",
+           "C[%d..%d] tile=%-4u vs exact per-axis: max %.1f mean %.2f",
            fail ? "FAIL" : "PASS", s->name, ic, oc, iw, ih, k, st,
            exact, out_n, C[0], C[oc - 1], oc_tile,
            ref_worst, ref_sum / (double)out_n);
+    if (s->dead)
+        printf("  [%u pruned, clamp inert, exact-per-axis distance on them %.1f]",
+               s->dead, dead_worst);
+    printf("\n");
     if (fail && verbose) {
         int shown = 0;
         for (i = 0; i < out_n && shown < 8; i++)

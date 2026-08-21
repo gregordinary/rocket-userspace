@@ -482,6 +482,86 @@ int rocket_conv2d_int8_act_rk3576(int fd, const rocket_conv2d_desc *d,
                                   int in_zp, int w_zp, int out_zp,
                                   int kind, int8_t *out);
 
+/* WHETHER EVERY CHANNEL'S GAIN IS A VALUE THE C RAMP HOLDS, and the output-channel tile
+ * this path would use — both from the weights and the quant contract alone, with no device
+ * and no submit. Pure, so a frontend can ask it while deciding what to CLAIM, where a
+ * refusal costs one node the framework runs itself rather than the whole model.
+ *
+ * A tile is one task and a task carries one OUT_CVT shift, so a channel reaches its own
+ * scale through the int16 C in its coefficient group and nothing else. The base gain is
+ * already the smallest the tile admits, so a channel whose scale sits below HALF the base
+ * wants a C under one and the field's floor is one: it then computes at the BASE's gain
+ * instead of its own — wrong by a factor, not by a count, on a surface that is still full,
+ * correctly sized and entirely plausible.
+ *
+ * That clamp is the boundary, and it is the ramp's own rather than a chosen threshold:
+ * above it C is an integer and the resolution is 0.5/C, which is what the tile search
+ * spends submits to improve; below it there is no C to choose. Measured through a
+ * frontend on EfficientDet-Lite0, which carries clamped channels in 7 layers of 182:
+ * computing them anyway scores mAP 0.2395 against the CPU's 0.2823, where refusing them
+ * scores 0.2809.
+ *
+ * BUT A CLAMP IS ONLY A DEFECT WHERE IT REACHES THE SURFACE, and that is asked rather than
+ * assumed. A channel whose filter is entirely ZERO reaches exactly one accumulator — the
+ * zero-point fold — at every output position, so whether the wrong gain changes its byte
+ * is decidable exactly; where both gains drive that fold past the same saturation rail by
+ * more than a count, the surface is identical and the layer is ACCEPTED. That is what a
+ * pruned channel looks like after quantization (an all-zero filter quantizes against an
+ * all-zero tensor, so its scale sits at the quantizer's floor while its bias keeps the
+ * layer's magnitude), and it is 3 of EfficientDet-Lite0's 7 refusals — its stem included.
+ * A LIVE channel is refused without asking: its accumulator ranges over the whole filter's
+ * reach and a gain wrong by a factor is wrong somewhere in it.
+ *
+ * Accepting them is worth +0.0023 mAP over refusing (0.2826 against 0.2809, CPU 0.2823,
+ * 500 val2017 images) and 16.5 ms of a 99.3 ms inference: a refused layer is a host
+ * fallback, and in this graph it also SPLITS the partition it sits in, so accepting turns
+ * EfficientDet-Lite0's head from a 12-layer plus a 28-layer partition into one 43-layer
+ * partition and takes the delegate from 1.23x to 1.47x of CPU TFLite. `ROCKET_RK3576_PC_INERT`
+ * is the knob: on by default, `0` refuses every clamped channel, `dw` accepts only on the
+ * depthwise path (90.3 ms, the middle of the three).
+ *
+ * The pack and run entries refuse on the same prediction, so a claim made here cannot fail
+ * there. DEPTHWISE is where it bites: one task whatever the channel count, so no tile
+ * lever at all. ROCKET_RK3576_PC_ALLOW_CLAMP=1 computes anyway.
+ *
+ * Returns ROCKET_OK, ROCKET_E_UNSUPPORTED where a channel's gain is off the ramp AND its
+ * clamp reaches the surface, or ROCKET_E_SHAPE for a descriptor this path does not take.
+ * `oc_tile` and `max_rel_err` may be NULL; both are filled even when the answer is a
+ * refusal. The error is the GAIN's, over every clamped channel including the inert ones,
+ * so an ACCEPTED layer can report one above 100%; it is a REPORTED quantity at every
+ * accepted shape, not an asserted one. [HW sweep, H96 MAX M9] */
+/* WHETHER THE INT8 CONVOLUTION PATH TAKES THIS GEOMETRY AT ALL — from the descriptor
+ * alone, with no weights, no fd and no submit. Pure, so a frontend can ask it while
+ * deciding what to CLAIM: a refusal costs one node the framework runs itself, where the
+ * same refusal at pack or run time fails the caller's whole model.
+ *
+ * It answers the bounds that are a function of SHAPE rather than of values, and those are
+ * the ones no per-node inspection can predict: the descriptor checks (dilation, a
+ * depthwise oc != ic, a trailing pad of a whole kernel, the 8-bit pad fields), the
+ * resident WEIGHT SLICE — past `ic*kh*kw` 4608 the part drops trailing output-channel
+ * groups with a full surface still written, so it is refused — and the ROW WINDOW, which
+ * is where a large plane at a deep channel count lands: a plane past the CBUF allowance
+ * has to be cut into row tasks, and a shape for which no window fits at all is refused
+ * rather than run wrong. The recourse for both is an input-channel split, which is the
+ * caller's to choose.
+ *
+ * Four or fewer input channels are priced on the DIRECT datapath, whatever the descriptor
+ * says: the packed-image first conv is attempted rather than predicted by the pack, and a
+ * refusal there falls back to the direct encoding, so the direct one is what decides
+ * whether the pack succeeds.
+ *
+ * NOT asked here, because they are questions about VALUES and have their own entries: the
+ * per-axis gain ramp (rocket_conv2d_int8_perchannel_plan_rk3576, below) and the quant
+ * scales. Returns ROCKET_OK, ROCKET_E_SHAPE or ROCKET_E_UNSUPPORTED.
+ * [HW sweep, H96 MAX M9, tests/rk3576_conv_lib_gate.c claimplan] */
+int rocket_conv2d_int8_plan_rk3576(const rocket_conv2d_desc *d);
+
+int rocket_conv2d_int8_perchannel_plan_rk3576(const rocket_conv2d_desc *d,
+                                              const int8_t *W, const int32_t *bias,
+                                              float in_scale, const float *w_scale,
+                                              float out_scale, int in_zp, int out_zp,
+                                              unsigned *oc_tile, double *max_rel_err);
+
 /* The output-channel tile rocket_conv2d_int8_perchannel_rk3576() will use, without
  * running it — which is also
  * its submit count, `ceil(oc/tile)` row-task sets at the part's per-submit floor.
@@ -501,7 +581,8 @@ unsigned rocket_conv2d_int8_perchannel_oc_tile_rk3576(const rocket_conv2d_desc *
                                                       const int32_t *bias,
                                                       float in_scale,
                                                       const float *w_scale,
-                                                      float out_scale, int in_zp);
+                                                      float out_scale, int in_zp,
+                                                      int out_zp);
 
 /* ---- the residual add, as a convolution's weights --------------------------
  * The DPU's elementwise stage takes exactly ONE operand — every register in its

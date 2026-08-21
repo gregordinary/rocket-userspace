@@ -2416,7 +2416,7 @@ static int pass_peraxis(int fd)
 
         tile = rocket_conv2d_int8_perchannel_oc_tile_rk3576(
                    &d, pw ? pw : P[i].w, P[i].bias, L->in_scale, P[i].wsc,
-                   L->out_scale, L->in_zp);
+                   L->out_scale, L->in_zp, L->out_zp);
         rc = rocket_conv2d_int8_perchannel_rk3576(
                  fd, &d, pin ? pin : in, pw ? pw : P[i].w, P[i].bias,
                  L->in_scale, P[i].wsc, L->out_scale, L->in_zp, L->out_zp, dst);

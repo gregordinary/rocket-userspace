@@ -760,6 +760,26 @@ static uint32_t r76_zero_value(uint16_t reg, const uint32_t *zval)
  * own validation. See rockchip-npu-notes/chips/rk3576-regcmd.md.
  * ==========================================================================*/
 #define R76_GRANULE_BYTES        64u
+/* THE ROW ALLOWANCE IS NOT ONE BUDGET — IT IS A LADDER, AND A RUNG THE PART DOES NOT
+ * HONOUR DELIVERS THE BOTTOM OF IT.
+ *
+ * That makes the failure NON-MONOTONE in the window height, which is the trap: the
+ * surface is exact below the rung's reach, wrong across the band of windows that SELECT
+ * an unhonoured rung, and exact again above. Walked at 160x160 ic = oc = 32 k3
+ * depthwise, one task per height, the shipped planner choosing:
+ *
+ *   45..51 rows  F=0     exact        (4096 granules covers a 51-row window at 80/row)
+ *   52..54       F=256   WRONG        first row past 4096/entries in every window
+ *   55..57       F=512   WRONG
+ *   58..64       F=1024  exact
+ *   65..76       F=2048  exact
+ *
+ * The same walk on the DIRECT path at the same plane and the same entries per row is
+ * exact at every height. So a probe that BISECTS the window — which is what a capacity
+ * bound would justify — reports whichever edge of the band it walks into, and a plan
+ * whose windows straddle it fails on some tasks and not others.
+ * [HW sweep, H96 MAX M9, `rk3576_conv_lib_gate rowmap`] */
+
 #define R76_CBUF_BASE_GRANULES   4096u        /* what F=0 buys                      */
 #define R76_CBUF_MAX_GRANULES    6144u        /* the data-side cap                  */
 #define R76_CBUF_POOL_GRANULES   7168u        /* data + weight together, ~448 KiB   */
@@ -792,13 +812,17 @@ static uint32_t r76_zero_value(uint16_t reg, const uint32_t *zval)
  * program at F=1024, and an ic=128 plane is bit-exact at F=1024 where it is wrong at 256
  * and 512 — so this is the two low rungs and not the field.
  *
- * Stated as a BOUND at the measured-live point rather than as the law, in TWO ways. The
- * threshold between 16 and 32 granules is bracketed, not pinned. And whether the quantity
- * is one group's SLICE or the WHOLE CUBE is not separated — every cell that reached a rung
- * had oc 32, one output-channel group, where the two are the same number — so the rule is
- * taken over the whole cube, which is the smaller envelope and is exactly the geometry the
- * measurement covers. Being UNDER costs the next rung up (the same CBUF, no extra submits)
- * or a shorter row window (one more task); being OVER computes a silently wrong surface.
+ * THE QUANTITY IS ONE GROUP'S SLICE, and this charges the WHOLE CUBE anyway. Holding the
+ * slice at the measured-live 16 granules and raising the group count separates the two: at
+ * oc 64 and 96 — cubes of 32 and 48 granules — both low rungs still deliver. Charging the
+ * cube is therefore conservative rather than wrong, and it stays because relaxing it buys
+ * NOTHING: the rung it declines is replaced by a strictly larger one that also delivers, at
+ * the same CBUF and with no extra submit. Being UNDER costs the next rung up or a shorter
+ * row window (one more task); being OVER computes a silently wrong surface.
+ *
+ * The threshold between 16 and 32 granules stays bracketed, and this harness cannot narrow
+ * it: ic is padded to a multiple of 32, so 32*ic*kh*kw moves in 1024-byte steps at every
+ * shape a square kernel and a whole ic can build. A non-square kernel is what lands between.
  * Nothing in the corpus is affected either way: a rung is reachable only where the plane is
  * 4097-4608 granules AND the weights are under 1 KiB, and the matmul's own row planner is
  * past that at every K it runs. ROCKET_RK3576_CBUF_RUNGS is a comma-separated override,
@@ -810,11 +834,46 @@ static unsigned r76_cbuf_f_nrungs = 5u;
 /* The resident weight footprint at which the two low rungs were measured to deliver. */
 #define R76_RUNG_WEIGHT_MAX_GRANULES 16u
 
+/* THE FOOTPRINT ABOVE IS A DIRECT-PATH QUANTITY AND IT DOES NOT CARRY TO DEPTHWISE.
+ *
+ * Forcing each rung under one fixed window that F=0 does not buy — the direct question,
+ * asked on both paths — says the two paths do not share a threshold, and that no
+ * threshold on the depthwise weight footprint fits at all:
+ *
+ *   path      kernel  oc     footprint          F=256 / F=512
+ *   direct    1x1     32     1024 B = 16 gran   deliver
+ *   direct    1x1     64     2048 B = 32 gran   fall back to 4096
+ *   depthwise 1x1     32       64 B =  1 gran   deliver
+ *   depthwise 1x1    256      512 B =  8 gran   deliver
+ *   depthwise 1x1   1024     2048 B = 32 gran   deliver
+ *   depthwise 2x2     32      256 B =  4 gran   fall back to 4096
+ *   depthwise 3x3     32      576 B =  9 gran   fall back to 4096
+ *   depthwise 5x5     32     1600 B = 25 gran   fall back to 4096
+ *
+ * On the depthwise path 4 granules is dead where 32 is live, so the shipped predicate is
+ * refuted in BOTH directions and the surviving description is the TAP COUNT: every
+ * single-tap cell delivers at three channel counts spanning 32x, and every multi-tap one
+ * falls back. A 64-channel-group footprint (the int8 depthwise cube's own group) against
+ * the direct path's 16-granule threshold fits the k1, k3 and k5 cells and is refuted by
+ * the 2x2 one, which is why that cell is in the probe.
+ *
+ * SO THE LOW RUNGS ARE SIMPLY NOT USED ON THIS PATH, rather than gated on a fitted
+ * quantity. It costs nothing measurable to decline them: the planner takes the smallest
+ * live rung that covers the window, 1024 and 2048 deliver at every footprint tried on
+ * both paths, and 1024 is strictly larger — so the fallback is the same CBUF, the same
+ * window, the same submit, and the pool check it must pass has room for any depthwise
+ * cube a real shape carries (it would need oc*kh*kw past 65536 to bite).
+ *
+ * What a rung the part does NOT honour costs, in contrast, is a full, correctly sized
+ * surface whose rows past 4096/entries are wrong, with nothing to fault on.
+ * [HW sweep, H96 MAX M9, `rk3576_conv_lib_gate rowmap`] */
+
 /* Whether this rung may be programmed beside a resident weight cube of this many granules.
  * Zero is "not weighed" rather than "none", so the rung is refused there too. */
-static int r76_rung_live(unsigned f, unsigned wgran)
+static int r76_rung_live(unsigned f, unsigned wgran, int dw)
 {
     if (f != 256u && f != 512u) return 1;
+    if (dw) return 0;
     return wgran && wgran <= R76_RUNG_WEIGHT_MAX_GRANULES;
 }
 
@@ -958,7 +1017,7 @@ static int r76_plan_cbuf(unsigned entries, unsigned ih, unsigned oc, unsigned wb
     /* The lowest rung whose budget covers the plane. */
     f = r76_cbuf_f_rungs[r76_cbuf_f_nrungs - 1u];
     for (r = 0; r < r76_cbuf_f_nrungs; r++) {
-        if (!r76_rung_live(r76_cbuf_f_rungs[r], wres)) continue;
+        if (!r76_rung_live(r76_cbuf_f_rungs[r], wres, dw)) continue;
         if (R76_CBUF_BASE_GRANULES + r76_cbuf_f_rungs[r] >= need) {
             f = r76_cbuf_f_rungs[r];
             break;
@@ -1111,7 +1170,7 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
         unsigned cand = r76_cbuf_f_rungs[r];
         if (R76_CBUF_BASE_GRANULES + cand > R76_CBUF_MAX_GRANULES) break;
         if (R76_CBUF_BASE_GRANULES + cand + wgran > R76_CBUF_POOL_GRANULES) break;
-        if (!r76_rung_live(cand, wres)) continue;
+        if (!r76_rung_live(cand, wres, dw)) continue;
         f = cand;
     }
 

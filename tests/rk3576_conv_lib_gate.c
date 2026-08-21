@@ -31,9 +31,12 @@
  *   rk3576_conv_lib_gate [group ...]   groups: envelope window surface weight dw zp fq
  *                                      nic fc  (default: all)
  *   rk3576_conv_lib_gate -l            list without running
+ *   rk3576_conv_lib_gate rowbound|rowlaw|rowmap    the row-allowance probes; these
+ *                                      MEASURE and print a map, they do not assert
  *
  * Env: ROCKET_LG_FILTER=<substr>   run only shapes whose name contains this
  *      ROCKET_LG_VERBOSE=1         per-shape detail and the first mismatches
+ *      ROCKET_LG_MAP_LO/_HI        narrow rowmap's height walk
  *
  * Exit: 0 all pass, 1 a shape failed, 2 no NPU or the wrong chip (skip).
  */
@@ -666,26 +669,48 @@ done:
  * which is what a capacity bound means; a shape whose two agree costs one run, and a
  * failing one costs eight power cycles per probe, so a linear walk is not affordable.
  */
-struct rowbound_case { const char *name; unsigned ic, oc, iw, ih, k, stride; int same; };
+struct rowbound_case { const char *name; unsigned ic, oc, iw, ih, k, stride; int same, dw; };
 
 static const struct rowbound_case ROWBOUND[] = {
     /* The ResNet-18 stem, as the graph runs it (three image channels widened to eight)
      * and with a full 32 behind it, so the deficit can be read against `entries`. */
-    { "stem-k7-ic8",     8,  64, 224, 224, 7, 2, 1 },
-    { "stem-k7-ic32",   32,  64, 224, 224, 7, 2, 1 },
-    { "k7-s1-112",      32,  32, 112, 112, 7, 1, 1 },
-    { "k7-s1-56-ic64",  64,  64,  56,  56, 7, 1, 1 },
-    { "k5-s1-112",      32,  32, 112, 112, 5, 1, 1 },
-    { "k3-s1-112",      32,  32, 112, 112, 3, 1, 1 },
-    { "k3-s1-224",      32,  32, 224, 224, 3, 1, 1 },
-    { "k1-s1-224",      32,  32, 224, 224, 1, 1, 0 },
+    { "stem-k7-ic8",     8,  64, 224, 224, 7, 2, 1, 0 },
+    { "stem-k7-ic32",   32,  64, 224, 224, 7, 2, 1, 0 },
+    { "k7-s1-112",      32,  32, 112, 112, 7, 1, 1, 0 },
+    { "k7-s1-56-ic64",  64,  64,  56,  56, 7, 1, 1, 0 },
+    { "k5-s1-112",      32,  32, 112, 112, 5, 1, 1, 0 },
+    { "k3-s1-112",      32,  32, 112, 112, 3, 1, 1, 0 },
+    { "k3-s1-224",      32,  32, 224, 224, 3, 1, 1, 0 },
+    { "k1-s1-224",      32,  32, 224, 224, 1, 1, 0, 0 },
     /* The axes that separate the stem from every shape above it, one at a time: the
      * STRIDE, the output-channel group count, the plane width, and the kernel. */
-    { "k3-s2-224",      32,  32, 224, 224, 3, 2, 1 },
-    { "k5-s2-224",      32,  32, 224, 224, 5, 2, 1 },
-    { "k7-s2-224-oc32", 32,  32, 224, 224, 7, 2, 1 },
-    { "k7-s1-224",      32,  32, 224, 224, 7, 1, 1 },
-    { "k7-s2-112",      32,  32, 112, 112, 7, 2, 1 },
+    { "k3-s2-224",      32,  32, 224, 224, 3, 2, 1, 0 },
+    { "k5-s2-224",      32,  32, 224, 224, 5, 2, 1, 0 },
+    { "k7-s2-224-oc32", 32,  32, 224, 224, 7, 2, 1, 0 },
+    { "k7-s1-224",      32,  32, 224, 224, 7, 1, 1, 0 },
+    { "k7-s2-112",      32,  32, 112, 112, 7, 2, 1, 0 },
+    /* THE DEPTHWISE AXIS, which nothing above varies and which a real model reaches.
+     * `dw-k3-s1-160` is EfficientDet-Lite0's `blocks_0` and `dw-k3-s1-150` SSD MobileNet
+     * V2's first depthwise, at the same channels and kernel; the rest walk the plane at a
+     * fixed ic and the ic at a fixed plane.
+     *
+     * WHAT THESE TEN CELLS MEASURE IS THE PLAN, NOT THE SHAPE, and reading them the other
+     * way is what cost a session. A cell's window is the planner's even spread and not its
+     * cap — `dw-k3-s1-112` stages 3192 granules against a cap of 6104, so it never reaches
+     * a rung at all — and the two that failed were the only two whose window selected a
+     * CBUF rung the depthwise path does not honour. `dw-k5-s1-160` was read as refuting a
+     * capacity bound because it needs MORE and computes; it computes BECAUSE it needs more,
+     * which pushed it up one rung. The rung question itself is `rowmap`. */
+    { "dw-k3-s1-112",   32,  32, 112, 112, 3, 1, 1, 1 },
+    { "dw-k3-s1-150",   32,  32, 150, 150, 3, 1, 1, 1 },
+    { "dw-k3-s1-160",   32,  32, 160, 160, 3, 1, 1, 1 },
+    { "dw-k3-s1-176",   32,  32, 176, 176, 3, 1, 1, 1 },
+    { "dw-k3-s1-224",   32,  32, 224, 224, 3, 1, 1, 1 },
+    { "dw-k3-s1-160-ic64",  64,  64, 160, 160, 3, 1, 1, 1 },
+    { "dw-k3-s1-160-ic96",  96,  96, 160, 160, 3, 1, 1, 1 },
+    { "dw-k3-s1-160-ic128",128, 128, 160, 160, 3, 1, 1, 1 },
+    { "dw-k5-s1-160",   32,  32, 160, 160, 5, 1, 1, 1 },
+    { "dw-k3-s2-160",   32,  32, 160, 160, 3, 2, 1, 1 },
 };
 #define N_ROWBOUND ((int)(sizeof ROWBOUND / sizeof *ROWBOUND))
 
@@ -698,17 +723,17 @@ static int rowbound(int fd)
     for (i = 0; i < N_ROWBOUND; i++) {
         const struct rowbound_case *s = &ROWBOUND[i];
         unsigned predicted = rocket_rk3576_max_task_rows(s->iw, s->ic, s->oc,
-                                                         s->k, s->k, 0);
+                                                         s->k, s->k, s->dw);
         unsigned entries = (s->iw * s->ic + 63u) / 64u;
         unsigned cap, measured = 0;
         struct lg_stat st;
 
-        if (!predicted) { printf("  %-16s the planner refuses the shape\n", s->name);
+        if (!predicted) { printf("  %-20s the planner refuses the shape\n", s->name);
                           continue; }
         {
             unsigned lo = s->k, hi = predicted;
             int rc = run_one(fd, s->name, s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
-                             s->same, 0, hi, 0, 0, 0, &st);
+                             s->same, s->dw, hi, 0, 0, 0, &st);
             /* A BISECTION OVER AN INTERMITTENT FAILURE REPORTS THE WRONG BOUND, and the
              * atom-drop hazard makes one here: a single unlucky probe at the top sends
              * the search down and it never comes back. Two shapes have swung 4.5x and
@@ -716,18 +741,19 @@ static int rowbound(int fd)
              * the search starts, and only a twice-confirmed failure is believed. */
             if (rc != 0)
                 rc = run_one(fd, s->name, s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
-                             s->same, 0, hi, 0, 0, 0, &st);
+                             s->same, s->dw, hi, 0, 0, 0, &st);
             if (rc == 0) measured = hi;
             else while (lo <= hi) {                       /* the largest cap that works */
                 cap = lo + (hi - lo) / 2u;
                 rc = run_one(fd, s->name, s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
-                             s->same, 0, cap, 0, 0, 0, &st);
+                             s->same, s->dw, cap, 0, 0, 0, &st);
                 if (rc == 0) { measured = cap; lo = cap + 1u; }
                 else { if (cap == s->k) break; hi = cap - 1u; }
             }
         }
-        printf("  %-16s ic=%-3u oc=%-3u %ux%u k%u s%u  entries %-4u  planner %-4u  "
-               "part %-4u  %s\n", s->name, s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
+        printf("  %-20s %-6s ic=%-3u oc=%-3u %ux%u k%u s%u  entries %-4u  planner %-4u  "
+               "part %-4u  %s\n", s->name, s->dw ? "dw" : "direct",
+               s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
                entries, predicted, measured,
                measured == predicted ? "agree"
                : measured ? "THE PLANNER IS OVER" : "nothing computed");
@@ -885,6 +911,257 @@ static int rowlaw(int fd)
     return 0;
 }
 
+/* ---- which CBUF rung the part honours, on the path the caller is on -----------------
+ * `rowbound` and `rowlaw` both BISECT, which assumes a smaller window is never worse.
+ * That is what a capacity bound means, and it is why neither can see the failure the
+ * depthwise path actually has: the F rungs are a LADDER, the planner picks the smallest
+ * one that covers the window, and a rung the part does not honour delivers the F=0
+ * budget instead. So the surface is exact below the rung's reach, WRONG across the band
+ * of windows that select it, and exact again above — non-monotone, and a bisection over
+ * a band reports whichever edge it walks into.
+ *
+ * Two readouts, both linear, both printing the map:
+ *
+ *   rungs  fixes one window that needs more than F=0 buys and FORCES each rung under it
+ *          (ROCKET_RK3576_CBUF_F). This is the measurement — it asks the part directly
+ *          which rungs deliver on this path, the same question tests/rk3576_conv_sym.c
+ *          `rung` asked on the DIRECT path, asked again where the footprint differs.
+ *   map    walks the plane height over the whole reachable range with the SHIPPED
+ *          planner choosing F, so the band is read where a caller would meet it.
+ *
+ * Each case is a plane of exactly the probed height, VALID at stride one, which lays out
+ * as ONE task whose feature footprint is exactly `ih * entries` granules — the same
+ * construction `rowlaw` uses, and for the same reason: a forced cap on a tall plane is
+ * spread evenly and the footprint under test is never staged.
+ */
+struct rowmap_case { const char *name; unsigned ic, oc, iw, k; int dw; };
+
+static const struct rowmap_case ROWMAP[] = {
+    /* EfficientDet-Lite0's `blocks_0` geometry. Depthwise resident footprint
+     * oc*kh*kw*2 = 576 B = 9 granules, which passes the <=16-granule liveness the
+     * DIRECT path measured, so the shipped planner programs F=512 here. */
+    { "dw-160-ic32-k3",  32,  32, 160, 3, 1 },
+    /* The same plane and channels at ONE tap: 64 B = 1 granule. Separates "the low
+     * rungs are dead on the depthwise path" from "the depthwise footprint is larger
+     * than the shipped one" — the second predicts this cell delivers. */
+    { "dw-160-ic32-k1",  32,  32, 160, 1, 1 },
+    /* 1600 B = 25 granules, past the liveness bound under either reading. The cell
+     * `rowbound` reports as agreeing, because its SHIPPED window needs 4640 granules
+     * and lands on F=1024 — which is a property of the plan, not of the shape. */
+    { "dw-160-ic32-k5",  32,  32, 160, 5, 1 },
+    /* THE CONTROL, and it is the exact point the low rungs were measured LIVE at:
+     * direct, slice 32*ic*kh*kw = 1024 B = 16 granules, same plane, same entries per
+     * row, same rung sequence. A band here would mean the reading is about neither
+     * path and the instrument is the suspect. */
+    { "dir-160-ic32-k1", 32,  32, 160, 1, 0 },
+    /* The direct path one step past its own measured threshold — 2048 B = 32 granules,
+     * recorded dead by tests/rk3576_conv_sym.c `rung`. Here so the two instruments are
+     * known to agree about the same point before either is read about a new one. */
+    { "dir-160-ic64-k1", 64,  64, 160, 1, 0 },
+    /* ---- what the depthwise footprint IS, over the three models the four cells above
+     * leave standing. The shipped one, `oc*kh*kw*2`, is already refuted: 9 granules is
+     * dead where the direct path's 16 is live.
+     *
+     *   A  one channel GROUP of 64, 2-byte coefficients: 64*kh*kw*2, threshold 16
+     *      granules — the same threshold as the direct path, and 64 is the int8
+     *      depthwise cube's own group (R76_DW_W_GROUP_INT8)
+     *   B  the low rungs are live on this path only at a single tap
+     *   C  the shipped footprint with a lower threshold, somewhere in 2..8 granules
+     *
+     * A 2x2 kernel separates B from the other two: 8 granules under A, 4 under C, and
+     * more than one tap under B. */
+    { "dw-160-ic32-k2",  32,  32, 160, 2, 1 },
+    /* And the CHANNEL count separates A from C, because A does not depend on it. Both
+     * planes are 160 granules a row, so the window under test is the same 26 rows.
+     * 256 channels: 2 granules under A, 8 under C — both live, so this one only
+     * brackets C's threshold. 1024 channels: still 2 under A, 32 under C, which is the
+     * direct path's own measured-dead point. That cell is the discriminator. */
+    { "dw-40-ic256-k1", 256, 256,  40, 1, 1 },
+    { "dw-10-ic1024-k1",1024,1024, 10, 1, 1 },
+    /* ---- and the DIRECT path's own unpinned half: is the quantity one output-channel
+     * GROUP's slice, or the whole resident CUBE? Every cell that ever reached a rung had
+     * oc 32 — one group, where the two are the same number — so the shipped rule takes
+     * the cube, which is the smaller envelope. These hold the slice at the measured-live
+     * 16 granules and raise the group count, so the cube alone moves: 32 granules at
+     * oc 64 and 48 at oc 96, both past the threshold if the cube is what is charged.
+     * The planner would decline these rungs on its own, so only the FORCED readout
+     * reaches them. */
+    { "dir-160-ic32-k1-oc64", 32,  64, 160, 1, 0 },
+    { "dir-160-ic32-k1-oc96", 32,  96, 160, 1, 0 },
+};
+#define N_ROWMAP ((int)(sizeof ROWMAP / sizeof *ROWMAP))
+
+/* One plane height at a forced F. `f_force` of ~0u leaves the planner its own choice.
+ * Returns 0 exact, 1 wrong, 2 skip, 3 refused. */
+static int rowmap_try(int fd, const struct rowmap_case *s, unsigned ih, unsigned f_force,
+                      struct lg_stat *st)
+{
+    char buf[32];
+    int rc;
+
+    snprintf(buf, sizeof buf, "%u", ih);
+    setenv("ROCKET_RK3576_ROW_CAP_PROBE", buf, 1);
+    if (f_force != ~0u) {
+        snprintf(buf, sizeof buf, "%u", f_force);
+        setenv("ROCKET_RK3576_CBUF_F", buf, 1);
+    }
+    rc = run_one(fd, s->name, s->ic, s->oc, s->iw, ih, s->k, 1, 0 /*VALID*/, s->dw,
+                 0, 0, 0, 0, st);
+    unsetenv("ROCKET_RK3576_CBUF_F");
+    unsetenv("ROCKET_RK3576_ROW_CAP_PROBE");
+    return rc;
+}
+
+static const unsigned ROWMAP_RUNGS[] = { 0u, 256u, 512u, 1024u, 2048u };
+#define N_ROWMAP_RUNGS ((int)(sizeof ROWMAP_RUNGS / sizeof *ROWMAP_RUNGS))
+
+static int rowmap(int fd)
+{
+    const char *filter = getenv("ROCKET_LG_FILTER");
+    int i, r;
+
+#define ROWMAP_SKIP(s) (filter && *filter && !strstr((s)->name, filter))
+    printf("rowmap: which CBUF F rung the part honours on this path, and where the\n"
+           "        shipped planner's own choice lands. `need` is ih*entries granules;\n"
+           "        a rung that delivers covers a window up to 4096+F.\n");
+
+    printf("\n-- rungs: ONE window, each rung FORCED under it --\n");
+    for (i = 0; i < N_ROWMAP; i++) {
+        const struct rowmap_case *s = &ROWMAP[i];
+        unsigned entries, resident;
+
+        if (ROWMAP_SKIP(s)) continue;
+        entries = (s->iw * s->ic + 63u) / 64u;
+        resident = s->dw ? (s->oc * s->k * s->k * 2u)
+                                  : (32u * s->ic * s->k * s->k);
+        /* The shortest window F=0 does NOT buy, so every rung above it is separable:
+         * a rung that delivers computes and one that falls back to 4096 does not. */
+        unsigned ih = 4096u / entries + 1u;
+        struct lg_stat st;
+
+        if (ih < s->k) ih = s->k;
+        printf("  %-16s %s ic=%-4u k%u  entries %u/row  resident %u B = %u granule(s)\n",
+               s->name, s->dw ? "dw    " : "direct", s->ic, s->k, entries,
+               resident, (resident + 63u) / 64u);
+        printf("      window %u rows = %u granules, which needs a rung of at least %u\n",
+               ih, ih * entries,
+               ih * entries > 4096u ? ih * entries - 4096u : 0u);
+        for (r = 0; r < N_ROWMAP_RUNGS; r++) {
+            unsigned f = ROWMAP_RUNGS[r];
+            int rc = rowmap_try(fd, s, ih, f, &st);
+            /* A BISECTION IS NOT THE ONLY THING AN INTERMITTENT FOOLS. Confirm a
+             * failure twice before printing it, the same rule the two probes above use. */
+            if (rc == 1) rc = rowmap_try(fd, s, ih, f, &st);
+            printf("        F=%-5u budget %-5u  %s", f, 4096u + f,
+                   rc == 0 ? "EXACT — the rung delivers"
+                   : rc == 3 ? "the entry refused"
+                   : rc == 2 ? "skipped" : "WRONG");
+            if (rc == 1)
+                printf(" — %d/%d exact, %d never emitted, %d wrong-valued, rows %d-%d",
+                       st.exact, st.total, st.wrong_zero, st.wrong_val,
+                       st.span_y0, st.span_y1);
+            printf("\n");
+        }
+    }
+
+    /* The band as a caller meets it: the planner choosing, the height walking. Linear,
+     * because the whole point is that the failing region has an upper edge. */
+    printf("\n-- map: the shipped planner choosing F, plane height walking --\n");
+    for (i = 0; i < N_ROWMAP; i++) {
+        const struct rowmap_case *s = &ROWMAP[i];
+        unsigned entries, hi, ih;
+
+        if (ROWMAP_SKIP(s)) continue;
+        entries = (s->iw * s->ic + 63u) / 64u;
+        hi = 6144u / entries;
+        unsigned lo = env_int("ROCKET_LG_MAP_LO", 0) > 0
+                          ? (unsigned)env_int("ROCKET_LG_MAP_LO", 0) : s->k;
+        struct lg_stat st;
+
+        if (env_int("ROCKET_LG_MAP_HI", 0) > 0 &&
+            (unsigned)env_int("ROCKET_LG_MAP_HI", 0) < hi)
+            hi = (unsigned)env_int("ROCKET_LG_MAP_HI", 0);
+        printf("  %-16s %s entries %u/row, reachable heights %u..%u\n",
+               s->name, s->dw ? "dw    " : "direct", entries, lo, hi);
+        for (ih = lo; ih <= hi; ih++) {
+            unsigned f = 0;
+            int planned = rocket_rk3576_cbuf_f(s->iw, s->ic, ih, s->oc, s->k, s->k,
+                                               s->dw, &f);
+            int rc = rowmap_try(fd, s, ih, ~0u, &st);
+            if (rc == 1) rc = rowmap_try(fd, s, ih, ~0u, &st);
+            printf("      ih %-4u need %-5u  planner F=%-5u  %s\n", ih, ih * entries,
+                   planned < 0 ? 0u : f,
+                   rc == 0 ? "exact"
+                   : rc == 3 ? "refused" : rc == 2 ? "skip" : "WRONG");
+        }
+    }
+    printf("== rowmap MEASURES; the assertion is in the conv and net gates ==\n");
+#undef ROWMAP_SKIP
+    return 0;
+}
+
+/* ---- the CLAIM-TIME plan against the RUN's own verdict -----------------------------
+ *
+ * rocket_conv2d_int8_plan_rk3576() exists so a frontend can decline a shape while it is
+ * still deciding what to CLAIM, where the cost is one node the framework runs itself —
+ * against a refusal at pack or run time, which fails the caller's whole model. That is
+ * only worth anything if the two agree, and they are separate code: the plan reads the
+ * descriptor, the run reaches the same bound through the emitter's per-task allowance.
+ *
+ * So this asserts the agreement over the WHOLE envelope table rather than over cells
+ * written for it. `lib_refuse` is the run's own verdict, gated on the part by every other
+ * cell in this file, so the table is already the ground truth and needs no new column.
+ *
+ * The two failures are not the same failure. A plan that ACCEPTS what the run refuses is
+ * the defect this entry exists to prevent — a claim that fails Prepare. A plan that
+ * REFUSES what the run computes costs a claim and nothing else, so it is reported as an
+ * over-refusal rather than a failure; a pure predicate that is conservative in that
+ * direction is doing its job, and one that drifts far enough to matter shows up as a
+ * count here rather than as a silent loss of coverage in a frontend.
+ *
+ * Pure: no submit, no device work, no allocation past one row-task array.
+ */
+static int claimplan(void)
+{
+    int i, fail = 0, over = 0, n = 0;
+
+    printf("== the pure claim-time plan against the run's own verdict, %d shapes ==\n",
+           N_SHAPES);
+    for (i = 0; i < N_SHAPES; i++) {
+        const shape_t *s = &SHAPES[i];
+        rocket_conv2d_desc d;
+        int rc, refused;
+
+        memset(&d, 0, sizeof d);
+        d.ic = (int)s->ic; d.oc = (int)s->oc;
+        d.ih = (int)s->ih; d.iw = (int)s->iw;
+        d.kh = (int)s->k;  d.kw = (int)s->k;
+        d.stride_y = (int)s->stride; d.stride_x = (int)s->stride;
+        d.pad_top = s->same ? (int)(s->k / 2u) : 0;
+        d.pad_left = d.pad_top;
+        d.dil_y = 1; d.dil_x = 1;
+        d.depthwise = s->dw;
+
+        rc = rocket_conv2d_int8_plan_rk3576(&d);
+        refused = rc != ROCKET_OK;
+        n++;
+        if (refused && !s->lib_refuse) {
+            printf("  OVER   %-9s %-20s the plan refuses (%d) a shape the library "
+                   "computes — a lost claim, not a wrong answer\n",
+                   s->group, s->name, rc);
+            over++;
+        } else if (!refused && s->lib_refuse) {
+            printf("  FAIL   %-9s %-20s the plan ACCEPTS a shape the library refuses — "
+                   "a claim that fails Prepare\n", s->group, s->name);
+            lg_note_failure(s->group, s->name, NULL, "claim-time plan accepts a refusal");
+            fail++;
+        }
+    }
+    printf("== claimplan: %d shapes, %d accept-a-refusal, %d over-refusal ==\n",
+           n, fail, over);
+    return fail ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *filter = getenv("ROCKET_LG_FILTER");
@@ -898,11 +1175,13 @@ int main(int argc, char **argv)
     const char *groups[16];
     int ngroups = 0;
 
-    int want_rowbound = 0, want_rowlaw = 0;
+    int want_rowbound = 0, want_rowlaw = 0, want_rowmap = 0, want_claimplan = 0;
     for (a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-l")) list = 1;
         else if (!strcmp(argv[a], "rowbound")) want_rowbound = 1;
         else if (!strcmp(argv[a], "rowlaw")) want_rowlaw = 1;
+        else if (!strcmp(argv[a], "rowmap")) want_rowmap = 1;
+        else if (!strcmp(argv[a], "claimplan")) want_claimplan = 1;
         else if (!strcmp(argv[a], "all")) ngroups = 0;
         else if (ngroups < 16) groups[ngroups++] = argv[a];
     }
@@ -923,6 +1202,10 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /* The claim-time plan is PURE, so it runs before the device is opened and on a host
+     * with no NPU at all — which is where a frontend asks it. */
+    if (want_claimplan) return claimplan();
+
     fd = rocket_open();
     if (fd < 0) { printf("no /dev/accel — SKIP\n"); return 2; }
     {
@@ -934,9 +1217,10 @@ int main(int argc, char **argv)
         }
     }
 
-    if (want_rowbound || want_rowlaw) {
+    if (want_rowbound || want_rowlaw || want_rowmap) {
         int rc = want_rowbound ? rowbound(fd) : 0;
         if (want_rowlaw) rc |= rowlaw(fd);
+        if (want_rowmap) rc |= rowmap(fd);
         rocket_close(fd);
         return rc;
     }

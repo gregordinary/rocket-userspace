@@ -513,6 +513,16 @@ int rocket_rk3576_fp16_accumulate(float *acc, const void *surface,
  * combination of allowance bits delivers LESS than their sum, so an arbitrary F would
  * program a budget the hardware does not honour and corrupt silently.
  *
+ * AND THE TWO LOW RUNGS ARE PATH-CONDITIONAL. 256 and 512 deliver on the direct path
+ * only where the resident slice is at or under 1 KiB, and on the DEPTHWISE path they
+ * are not used at all — no threshold on the depthwise footprint fits the measurements,
+ * which have 4 granules dead and 32 live. A rung the part does not honour delivers the
+ * F=0 budget instead, so the surface is exact, then WRONG across the band of windows
+ * that select that rung, then exact again above it: the failure is not monotone in the
+ * window height, and a probe that bisects the window cannot see it. Declining the low
+ * rungs costs nothing — 1024 is strictly larger, always live, and needs no extra
+ * submit. [HW sweep, H96 MAX M9]
+ *
  * The pool arithmetic is characterised at ONE output-channel group, and a conv driving
  * SEVERAL loses the trailing ones well before the slice reaches what the pool leaves —
  * one group at a time as the slice grows, with the leading groups bit-exact and a full
