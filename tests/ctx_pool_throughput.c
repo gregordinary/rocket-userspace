@@ -105,7 +105,7 @@ static double now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&t
 /* mode: 0 = library default (every 1-thread ctx pins worker0 -> big[0]; pools COLLIDE);
  *       1 = legacy harness hack (ROCKET_CPU_AFFINITY=off + harness pins the pool thread);
  *       2 = per-ctx affinity base API: rocket_affinity_set_base(id) so the library spreads
- *           each pool's worker to big[id % n_big] (the P1.18(b) feature under test). */
+ *           each pool's worker to big[id % n_big] (the feature under test). */
 typedef struct { long id; int mode; } warg;
 
 static void *worker(void *a)
@@ -202,12 +202,12 @@ int main(int argc, char**argv)
         return 0;
     }
 
-    /* DEFAULT: the P1.18(b) gate — in-process A/B in ONE process (so the library's
+    /* DEFAULT: the per-ctx affinity gate — in-process A/B in ONE process (so the library's
      * affinity auto-detect runs once, in its normal auto mode):
      *   mode 0 = today's behaviour (no set_base -> every pool's worker0 -> big[0], COLLIDE)
      *   mode 2 = rocket_affinity_set_base(id) (the new API -> pools SPREAD across big[])
      * If the API works, mode 2 scales with P while mode 0 stays flat/collided. */
-    printf("# P1.18(b) per-ctx affinity gate: shape %dx%dx%d, %d ops/inf, %d infs/worker; %d big cores",
+    printf("# per-ctx affinity gate: shape %dx%dx%d, %d ops/inf, %d infs/worker; %d big cores",
            MM_M,MM_K,MM_N, OPS_PER_INF, INFS_PER_WORKER, g_nbig);
     for (int i=0;i<g_nbig;i++) printf(" %d", g_big[i]);
     printf("\n# each worker = 1 ctx (1 fd/core) + resident weight; per-op = A-pack+submit+readback\n");

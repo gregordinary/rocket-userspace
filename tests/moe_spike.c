@@ -8,7 +8,7 @@
  * in-model handler pays a per-expert host dequant every micro-batch that this bench
  * excludes. The built ggml-rocket MUL_MAT_ID handler is bit-faithful but a net LOSS on
  * quant experts (gpt-oss 0.40-0.90x, DeepSeek 0.25-0.59x CPU even at -ub 2048) -> ships
- * OPT-IN (ROCKET_MOE=1, default off). See ggml-rocket + NPU_SETTLED.md. Kept as the
+ * OPT-IN (ROCKET_MOE=1, default off). See ggml-rocket. Kept as the
  * F16-GEMM-throughput reference (which does hold); it just isn't the whole in-model cost.
  *
  * MoE routed-expert prefill lowers to many SMALL matmuls: one [M_e,K]x[N,K]^T

@@ -84,6 +84,19 @@ void rocket_close(int fd);
 void rocket_affinity_set_base(int base);
 int  rocket_affinity_get_base(void);
 
+/* Pin the CALLING thread to a big (A76) core; worker_idx selects which by round-robin over
+ * the detected big cluster (+ this thread's affinity base). The NPU fan-out workers use this;
+ * host-side worker pools (dequant, encoder glue) should too, so they are not scattered onto
+ * the A55 little cores where a join barrier stalls on the slow straggler. No-op if pinning is
+ * disabled or no distinct big cluster is found. Never changes numerics. */
+void rocket_pin_worker(int worker_idx);
+
+/* Number of big (A76) cores, or 0 if pinning is disabled / no distinct big cluster. Size a
+ * host worker pool to this instead of hardware_concurrency: the A55 little cores are a
+ * ~7x-slower straggler on fp16 dequant, so an equal-chunk fan-out that includes them runs
+ * several times slower than one confined to the big cluster. */
+int  rocket_num_big_cores(void);
+
 /* ============================================================================
  * SECTION — Buffer allocation, cache management & fence polling
  * ==========================================================================*/

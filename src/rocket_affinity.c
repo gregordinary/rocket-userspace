@@ -137,6 +137,12 @@ static void detect_once(void)
  * SECTION — Worker pinning
  * ==========================================================================*/
 
+int rocket_num_big_cores(void)
+{
+    pthread_once(&g_once, detect_once);
+    return g_n_big < 0 ? 0 : g_n_big;
+}
+
 void rocket_pin_worker_based(int worker_idx, int core_base)
 {
     pthread_once(&g_once, detect_once);
