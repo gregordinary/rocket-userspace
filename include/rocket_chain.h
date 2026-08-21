@@ -49,6 +49,29 @@ void rkt_chain_pack(int chained, rocket_bo *rcbo, rocket_task_desc *tasks,
                     int nb, const uint64_t *src, uint32_t count,
                     size_t gapped_stride);
 
+/* THE SAME LINK, AT AN EXPLICIT OFFSET, for a chain whose programs are NOT all the same
+ * length. rkt_chain_pack above derives task nb's slot from nb and this task's own count,
+ * which is only a position when every program is the same size — true for a tile's row
+ * tasks (they write the same registers with different values) and false across LAYERS,
+ * where a depthwise program and a direct one differ.
+ *
+ * BOTH TRAILER FIELDS DESCRIBE THE NEXT SEGMENT, and a uniform-length chain cannot tell.
+ * The kernel programs PC_BASE_ADDRESS and PC_REGISTER_AMOUNTS from task 0 alone, so for
+ * every program after it the PREVIOUS program's trailer supplies the address to fetch from
+ * AND how much to fetch — which is why `next_count` is a parameter and not `count`. Get it
+ * wrong and the chain fetches a short segment as a long one: the affected program executes
+ * partially or not at all, with nothing to fault on.
+ *
+ * `word_off` is where this program goes in the BO and `next_word_off` where the PC should
+ * continue; pass next_word_off == word_off to mark the LAST program, whose forward link is
+ * cleared instead (the hardware stops there on TASK_NUMBER, but a live address would have
+ * the PC prefetch past the chain) and whose next_count is ignored. Fills tasks[idx].
+ * Returns 0, or -1 if the trailer shape is not the one the chain claims — in which case the
+ * caller must NOT submit the batch. */
+int rkt_chain_pack_at(rocket_bo *rcbo, rocket_task_desc *tasks, int idx,
+                      size_t word_off, size_t next_word_off,
+                      const uint64_t *src, uint32_t count, uint32_t next_count);
+
 /* Close a chained batch of `nb` tasks: the last task has no successor, so point
  * its embedded PC_BASE_ADDRESS link at 0 (TASK_NUMBER halts the PC after the last
  * OP_ENABLE, so this link is never followed — but a live address there would have

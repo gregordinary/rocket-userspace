@@ -45,6 +45,7 @@
 #ifndef DRM_ROCKET_JOB_BATCHED
 #define DRM_ROCKET_JOB_BATCHED (1u << 0)
 #define DRM_ROCKET_JOB_NO_DPU_DONE (1u << 1)
+#define DRM_ROCKET_JOB_PPU_DONE (1u << 2)
 struct rocket_job_flagged {
     struct drm_rocket_job job;
     __u32 flags;
@@ -59,8 +60,13 @@ _Static_assert(offsetof(struct rocket_job_flagged, flags) ==
 #ifndef DRM_ROCKET_JOB_NO_DPU_DONE
 #define DRM_ROCKET_JOB_NO_DPU_DONE (1u << 1)
 #endif
+/* A header that has the completion-class bit but predates the PPU one. */
+#ifndef DRM_ROCKET_JOB_PPU_DONE
+#define DRM_ROCKET_JOB_PPU_DONE (1u << 2)
+#endif
 _Static_assert(ROCKET_JOB_BATCHED == DRM_ROCKET_JOB_BATCHED &&
-               ROCKET_JOB_NO_DPU_DONE == DRM_ROCKET_JOB_NO_DPU_DONE,
+               ROCKET_JOB_NO_DPU_DONE == DRM_ROCKET_JOB_NO_DPU_DONE &&
+               ROCKET_JOB_PPU_DONE == DRM_ROCKET_JOB_PPU_DONE,
                "the library's ROCKET_JOB_* bits are passed to the kernel verbatim");
 
 /*
@@ -112,6 +118,15 @@ static void rkt_job_init(rkt_job *j, struct drm_rocket_task *dt, uint32_t n_task
     j->flags = job_flags;
 }
 
+/* Every ROCKET_SUBMIT this process issues, and the tasks it carried. Counted at the
+ * two ioctl sites so no caller can bypass them. See rocket_submit_ioctl_count(). */
+static uint64_t rkt_ioctl_submits;
+static uint64_t rkt_submitted_tasks;
+
+uint64_t rocket_submit_ioctl_count(void) { return rkt_ioctl_submits; }
+uint64_t rocket_submit_task_count(void)  { return rkt_submitted_tasks; }
+void     rocket_submit_counters_reset(void) { rkt_ioctl_submits = 0; rkt_submitted_tasks = 0; }
+
 /* Submit one job (n_tasks tasks) on `fd`, optionally with the per-job batched
  * flag set. Returns 0 / negative errno. */
 static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tasks,
@@ -127,6 +142,8 @@ static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tas
         .job_count       = 1,
         .job_struct_size = sizeof(jx),
     };
+    rkt_ioctl_submits++;
+    rkt_submitted_tasks += n_tasks;
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
         ROCKET_LOGE("ROCKET_SUBMIT(%u tasks, flags=0x%x): %s\n",
                     n_tasks, job_flags, strerror(errno));
@@ -192,6 +209,85 @@ int rocket_batched_submit_supported(void)
         if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
             c = (dv.version_major > 1 ||
                  (dv.version_major == 1 && dv.version_minor >= 1)) ? 1 : 0;
+        rocket_close(fd);
+    }
+    atomic_store(&cached, c);
+    return c;
+}
+
+/*
+ * Does the running kernel honor DRM_ROCKET_JOB_PPU_DONE?
+ *
+ * NOT a nicety either, and for the opposite reason to the batched flag: the submit
+ * ioctl REJECTS a flag word it does not recognise. A kernel older than 1.3 does not
+ * silently ignore this bit, it fails the submit — so "advisory" is a property of the
+ * flag's MEANING (a wrong class costs the grace period, not correctness) and not of
+ * sending it to a kernel that predates it. Ask the interface version first.
+ *
+ * There is no module parameter to key on here, because the flag does not gate a
+ * behaviour the kernel can be told to force off — it names which completion bits a
+ * job's last program raises. The version is the only signal, and it is enough: 1.3 is
+ * the version in which the flag appears.
+ *
+ * Returns 1 if it is safe to set, 0 otherwise.
+ */
+int rocket_ppu_done_supported(void)
+{
+    static _Atomic int cached = -1;
+    int c = atomic_load(&cached);
+    if (c >= 0)
+        return c;
+
+    c = 0;
+    int fd = rocket_open();
+    if (fd >= 0) {
+        struct drm_version dv = {0};
+        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
+            c = (dv.version_major > 1 ||
+                 (dv.version_major == 1 && dv.version_minor >= 3)) ? 1 : 0;
+        rocket_close(fd);
+    }
+    atomic_store(&cached, c);
+    return c;
+}
+
+/*
+ * Does the running kernel arm a BATCHED job's completion wait on the task counter?
+ *
+ * This gates a REFUSAL rather than a flag. The RK3576 driver retires a job when the
+ * writing block raises its completion and, failing that, on a deadline — and PC_DONE,
+ * where that wait starts, is raised per TASK rather than per kick. On a chained stream
+ * the wait therefore starts a few tens of microseconds in and the deadline is covering
+ * the whole rest of the stream, not a drain. Past it the job retires with programs
+ * still to run: the caller reads a surface that never landed, and the next job is
+ * programmed into a core that has not finished the last one.
+ *
+ * Scaling that deadline by the task count is the obvious response and is not enough: it is a
+ * FITTED number, and a stream whose programs each take longer than dpu_grace_us outruns it
+ * (one 224x224 k3 convolution at 256 channels row-splits into 75 chained tasks and retires
+ * with 8 of them left). From 1.4 the driver reads PC_TASK_STATUS — a live count of the tasks
+ * a kick has started and completed — and holds the wait off until the whole kick has retired,
+ * which bounds a stream by nothing but the scheduler's job timeout.
+ *
+ * There is no flag to send and nothing to force off: the version is the only signal,
+ * and a wrong answer costs a shorter stream, not correctness.
+ *
+ * Returns 1 if the running kernel tracks it, 0 otherwise.
+ */
+int rocket_batch_completion_tracked(void)
+{
+    static _Atomic int cached = -1;
+    int c = atomic_load(&cached);
+    if (c >= 0)
+        return c;
+
+    c = 0;
+    int fd = rocket_open();
+    if (fd >= 0) {
+        struct drm_version dv = {0};
+        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
+            c = (dv.version_major > 1 ||
+                 (dv.version_major == 1 && dv.version_minor >= 4)) ? 1 : 0;
         rocket_close(fd);
     }
     atomic_store(&cached, c);
@@ -665,6 +761,8 @@ int rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs)
         .job_count       = n_jobs,
         .job_struct_size = sizeof(rkt_job),
     };
+    rkt_ioctl_submits++;
+    for (uint32_t j = 0; j < n_jobs; j++) rkt_submitted_tasks += jobs[j].n_tasks;
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
         ROCKET_LOGE("ROCKET_SUBMIT(%u jobs): %s\n", n_jobs, strerror(errno));
         r = -errno;

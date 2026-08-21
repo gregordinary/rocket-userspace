@@ -102,7 +102,54 @@ rather than raw int32. K past one task's contraction is split through
 `rocket_matmul_int8_rk3576_i32()`, which reads the DPU's raw 32-bit accumulator and sums the partials
 on the host — correct at any K, and a quarter of the int8 path's MACs per submit, because that writer
 delivers only the first eight output channels of every thirty-two and the way round it is to program
-four times as many. The rest of the
+four times as many.
+
+For a layer run repeatedly — a graph's forward pass, a video stream — `rocket_conv2d_int8_pack_rk3576()`
+packs the weights once and `rocket_conv2d_int8_prepacked_rk3576()` runs the packed handle per
+inference. Everything a per-call entry rebuilds from the weights alone (the per-output-channel filter
+sums, the coefficient group, the weight cube) and every buffer whose size follows the shape (the
+feature cube, the register program, each tile's output surface) is prepared once, so an inference
+allocates no buffers and does no weight arithmetic. On MobileNetV1-224 that is **98.8 ms to 33.6 ms
+per inference on the same 40 submits**, with the same result to the byte. The handle is bound to the
+`fd` it was packed on — a buffer belongs to the file that created it — and it freezes the
+output-channel tiling and the quantization contract it was packed for; it is not thread-safe, so pack
+per thread or serialize.
+
+A **residual add** is a convolution on this part, not an elementwise op: the DPU's elementwise stage
+takes exactly one operand, so a skip is lowered by concatenating the two operands along channels and
+convolving with a 1x1 kernel of two diagonal blocks. `rocket_residual_add_weights_rk3576()` fills that
+weight matrix, its bias and its weight scale and stops — pure, no hardware — and the caller runs the
+ordinary conv entries on the result. Two properties of the lowering beat a dedicated elementwise
+program: the operands may carry **different scales** (the ratio rides in the weights as a pair of
+int8s, and searching every denominator resolves it to about one part in 127², where anchoring the
+larger term at 127 gives one part in 127), and **both zero points ride exactly**, because
+`w2*(a_zp - b_zp)` is a per-output-channel constant and that is what the bias is. It also fuses: a
+block's last convolution can absorb its own skip by taking `C` more input channels and an identity
+block at the centre tap of its kernel, so the add costs no program at all — bounded by the weight
+slice rule `ic*kh*kw <= 4608`, which a 1x1 project convolution is nowhere near and a 3x3 reaches
+exactly at `C = 256`.
+
+A tensor can stay in CUBE LAYOUT between two layers, so neither host transpose runs at the join: a
+direct convolution's output surface is the next layer's feature cube byte for byte
+(`rocket_conv2d_int8_cube_of_rk3576()` / `_cube_in_` / `_cube_out_`), and a run of cube-linked layers
+goes out as ONE hardware kick (`rocket_conv2d_int8_chain_new_rk3576()`, with
+`_chain_plan_rk3576()` grouping already-linked handles into the longest legal runs).
+
+**A cube may be a SLICE of a larger buffer.** Its base is a plain address on both sides of a
+convolution, so a producer can be told to write its surface at a channel-group offset inside a
+caller's allocation (`rocket_rk3576_cube_alloc()`, `_cube_slice()`,
+`rocket_conv2d_int8_cube_out_at_rk3576()`). That is what makes a channel CONCATENATION free: two
+producers writing their own slices of one buffer already ARE the concatenated tensor, so a residual
+add's operands need no host copy and the layer that feeds the skip does not have to leave a row-major
+tensor behind for it. A slice starts every sixteen channels, which is the width one atom interleaves.
+
+Two whole networks run end to end: **MobileNetV1-224** (29 compute layers) and **MobileNetV2-224**
+(64, with ten residual skips), each layer bit-exact against a CPU model of the part's own arithmetic
+and each returning TFLite's own top-1. MobileNetV2 runs in **12.8-13.0 ms and 16 submits** with
+resident weights, cube layout, the concatenation buffers and the cross-layer kick, against 112.9 ms
+and 64 submits with none of them — the same answer to the byte at every step.
+
+The rest of the
 op library still emits the RK3588 encoding, and on this part the matmul entries **refuse** rather than
 submit a program the hardware will not run.
 

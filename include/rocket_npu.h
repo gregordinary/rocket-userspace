@@ -125,6 +125,20 @@ int  rocket_bo_fini(int fd, rocket_bo *bo);
  * ROCKET_BATCH_SUBMIT env var alone. */
 int  rocket_batched_submit_supported(void);
 
+/* 1 if the running kernel honors DRM_ROCKET_JOB_PPU_DONE (retire a pooling job on
+ * the PPU's own completion); 0 otherwise. Probed once and cached. Callers MUST gate
+ * on this: the submit ioctl REJECTS a flag word it does not recognise, so an older
+ * kernel fails the submit rather than ignoring the bit. */
+int  rocket_ppu_done_supported(void);
+
+/* 1 if the running kernel arms a BATCHED job's completion wait on the task counter,
+ * so the wait starts once the whole kick has retired (RK3576, interface 1.4); 0
+ * otherwise. Probed once and cached. Gates a REFUSAL, not a flag: on an older kernel
+ * PC_DONE is per task, so the wait starts at the FIRST program and a long chained
+ * stream can retire with programs still to run — the chain length a caller may build
+ * is capped there and is the part's own here. */
+int  rocket_batch_completion_tracked(void);
+
 /* Spin-poll the completion fence for up to `us` microseconds before a blocking
  * wait falls asleep (overrides the ROCKET_BUSY_POLL env, which sets the default;
  * us<=0 disables). A single-stream latency lever for tiny submit-bound jobs with
@@ -175,9 +189,21 @@ int  rocket_submit_matmul_flags(int fd,
  *   a completion that does arrive retires the job immediately whatever this
  *   says, so a wrong hint costs time and not correctness. Ignored by a kernel
  *   older than interface version 1.2.
+ *
+ * ROCKET_JOB_PPU_DONE: this job's last program is a PPU program (pooling),
+ *   whose completion is the PPU's own bit and not the DPU's. A pool enables no
+ *   DPU stage at all -- PC_OPERATION_ENABLE is a per-block bitmap and a pool
+ *   sets 0x60 against a convolution's 0x1d -- so the bits the driver waits on
+ *   by default can never set and every pooling job pays the whole grace period.
+ *   Setting it on a job whose last program is a convolution costs that job the
+ *   grace period and nothing else. Do NOT set it on a job that mixes DPU and
+ *   PPU programs: an interior program's PPU bit would retire the job while a
+ *   later DPU write was still draining. Ignored by a kernel older than
+ *   interface version 1.3.
  */
 #define ROCKET_JOB_BATCHED      (1u << 0)
 #define ROCKET_JOB_NO_DPU_DONE  (1u << 1)
+#define ROCKET_JOB_PPU_DONE     (1u << 2)
 
 /* One task = one register-command program. regcmd is the 32-bit NPU IOVA of that
  * program (e.g. a slot inside a shared regcmd BO), regcmd_count its word count. */
@@ -238,6 +264,17 @@ typedef struct {
 
 /* Submit N jobs in ONE ioctl. ASYNC: wait by PREP_BO'ing each job's output BO. */
 int  rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs);
+
+/* How many ROCKET_SUBMIT ioctls this process has issued, and the tasks they carried.
+ * The RK3576's wall is dominated by a per-submit floor (~439 us), so "how many submits
+ * did this call cost" is the first question about any layer's time — a chained job
+ * (ROCKET_JOB_BATCHED) is ONE submit carrying n tasks, an unchained one is n submits
+ * carrying one task each, and the two are told apart by reading both counters.
+ * Process-wide and NOT thread-safe (plain non-atomic counters, as with the rest of the
+ * context APIs); read them around a single-threaded call. */
+uint64_t rocket_submit_ioctl_count(void);
+uint64_t rocket_submit_task_count(void);
+void     rocket_submit_counters_reset(void);
 
 
 #ifdef __cplusplus

@@ -146,6 +146,35 @@ static int rkt_clear_trailer_base(uint64_t *rc, size_t words) {
     return -1;
 }
 
+int rkt_chain_pack_at(rocket_bo *rcbo, rocket_task_desc *tasks, int idx,
+                      size_t word_off, size_t next_word_off,
+                      const uint64_t *src, uint32_t count, uint32_t next_count) {
+    uint64_t *slot = (uint64_t *)rcbo->ptr + word_off;
+    int last = (next_word_off == word_off);
+    memcpy(slot, src, (size_t)count * sizeof(uint64_t));
+    /* The NEXT segment's length, because that is what this write is for — see the header.
+     * The last program has no next, so its own count goes in and is never read. */
+    if (rkt_set_trailer_amount(slot, count,
+                               rkt_amount_encode(last ? count : next_count)) < 0) {
+        chain_trailer_fail("rkt_chain_pack_at (amount)");
+        return -1;
+    }
+    if (!last) {
+        uint32_t next_addr = (uint32_t)(rcbo->dma_address +
+                                       next_word_off * sizeof(uint64_t));
+        if (rkt_set_trailer_base(slot, count, next_addr) < 0) {
+            chain_trailer_fail("rkt_chain_pack_at (base)");
+            return -1;
+        }
+    } else if (rkt_clear_trailer_base(slot, count) < 0) {
+        chain_trailer_fail("rkt_chain_pack_at (seal)");
+        return -1;
+    }
+    tasks[idx].regcmd = (uint32_t)(rcbo->dma_address + word_off * sizeof(uint64_t));
+    tasks[idx].regcmd_count = count;
+    return 0;
+}
+
 void rkt_chain_seal(int chained, rocket_bo *rcbo, int nb, uint32_t count) {
     if (!chained || nb < 1)
         return;

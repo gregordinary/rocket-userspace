@@ -1,0 +1,5 @@
+# Intermediates: mkadd.py rebuilds them from CASES, and only the .rknn is evidence.
+*.onnx
+*.npy
+cal_*.txt
+__pycache__/

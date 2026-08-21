@@ -798,6 +798,14 @@ typedef struct {
     int32_t  input_zero_point;   /* the average path's pad value; unused for max   */
     uint32_t input_dma, output_dma;
     uint16_t ppu_dst_reg;        /* 0 = the default candidate; see above           */
+    /* Elements per input channel group, i.e. the source surface stride in the units
+     * PPU_RDMA programs. 0 takes round4(iw*ih), which is what the vendor's own pooling
+     * programs carry and what a cube this emitter allocates for itself uses. A caller
+     * whose input cube comes from somewhere else — a convolution's OUTPUT SURFACE,
+     * whose stride is ow*oh exactly — passes that stride instead, and the join needs no
+     * copy. The field is honoured verbatim, so it is also the way to find out whether
+     * the PPU takes a stride that is not a multiple of four. */
+    uint32_t src_surf_elems;
     uint64_t *tasks;             /* at least RK3576_POOL_TASK_OPS words            */
     uint32_t task_count;         /* words written                                  */
 } pool_params_rk3576_t;
@@ -805,6 +813,111 @@ typedef struct {
 #define RK3576_POOL_TASK_OPS 40
 
 int gen_pool_rk3576(pool_params_rk3576_t *p);
+
+/* ---- The DPU LUT: loading the two tables --------------------------------------
+ *
+ * A nonlinear activation on this part is TWO programs. The first is DPU + DPU_RDMA
+ * only — no CNA, no CORE — and its work is loading the table rather than computing:
+ * it drives a 1x1x16 dummy cube and bursts 1026 entries through a two-register
+ * window. The second is an ordinary convolution with the LUT enabled, and that one
+ * computes. This emits the first.
+ *
+ * The window: `0x4100` (LUT_ACCESS_CFG) selects a table and the start offset, and
+ * every subsequent write to `0x4104` (LUT_ACCESS_DATA) stores one entry and advances.
+ * `0x00020000` selects the low table, `0x00030000` the high one, 513 entries each —
+ * 512 intervals with both endpoints, the shape a linear-interpolating LUT wants.
+ *
+ * The entries are the function's output; the vendor compiler writes Q15 of it and
+ * pairs that with an OUT_CVT that carries Q15 to the op's own quantization.
+ *
+ * `scratch_dma` is where the dummy cube's 16 bytes land. The vendor stores zero,
+ * which is a real IOVA on this stack — pass a BO of your own rather than inheriting
+ * whatever holds IOVA 0.
+ * [Manufactured capture, RKNN-Toolkit2 for rk3576] */
+#define RK3576_LUT_ENTRIES   513
+#define RK3576_LUT_TASK_OPS  1128   /* the emitted program is 1121, as the capture is */
+
+typedef struct {
+    const int16_t *lo;           /* RK3576_LUT_ENTRIES entries, table 0x00020000   */
+    const int16_t *hi;           /* RK3576_LUT_ENTRIES entries, table 0x00030000   */
+    uint32_t scratch_dma;        /* the dummy cube's destination and source        */
+    uint64_t *tasks;             /* at least RK3576_LUT_TASK_OPS words             */
+    uint32_t task_count;         /* words written                                  */
+} lut_load_params_rk3576_t;
+
+int gen_lut_load_rk3576(lut_load_params_rk3576_t *p);
+
+/* ---- The DPU LUT: applying a loaded table -------------------------------------
+ *
+ * The LUT is the EW stage, between BN and the OUT_CVT, so a convolution that carries
+ * this descriptor computes
+ *
+ *     out = OUT_CVT( LUT( (acc + A[oc] + B[oc]*sum(x)) * C[oc] ) )
+ *
+ * with the BN stage bypassed. Attach it to `conv_params_t.lut` and run
+ * gen_lut_load_rk3576()'s program as an EARLIER TASK OF THE SAME JOB: the tables live
+ * in the LUT RAM, and a separate submit can take a runtime-PM cycle in between.
+ *
+ * THE INPUT MAP IS `index = (value - le_start) / 2^sel`. The `0x00020000` table covers
+ * [le_start, 0] and the `0x00030000` one [0, lo_end), 512 intervals each, and the
+ * hardware INTERPOLATES LINEARLY between entries at the full resolution of the step.
+ * The domain is HALF-OPEN AT THE TOP: `value == lo_end` takes `clamp_hi`, while
+ * `value == le_start` is in domain and reads the low table's entry 0. A value below
+ * `le_start` takes `clamp_lo`.
+ *
+ * The vendor never moves this window — it scales the value into a fixed one with the
+ * BS stage's per-channel C instead, which is why every activation it compiles emits a
+ * register-identical program with different table CONTENTS. All three registers are
+ * live and this descriptor drives them.
+ * [HW sweep, H96 MAX M9, tests/rk3576_lut_probe.c — four spans, 8192 samples each,
+ *  bit-explained to at most one output count]
+ *
+ * A TRAP THAT LOOKS LIKE THE ANSWER: every vendor activation also carries BN_CFG
+ * `0x4060` = 0x20, the BN stage ACTIVE. Transcribing it pins the LUT at the table join
+ * for every input across twenty-two binades while the readout still tracks the table,
+ * so it reads as a working LUT with no input map in any register. This emitter leaves
+ * BN_CFG at 0x903 — bypassed — and the map appears. */
+typedef struct lut_rk3576 {
+    int32_t le_start;   /* the datapath value at the low table's entry 0            */
+    int32_t lo_end;     /* one past the high table's domain; >= it takes clamp_hi   */
+    uint8_t sel;        /* the index step is 2^sel                                  */
+    int16_t clamp_lo;   /* what a value below le_start reads                        */
+    int16_t clamp_hi;   /* what a value at or above lo_end reads                    */
+} lut_rk3576_t;
+
+/* The activations this part's table builder covers. Each is the function applied to
+ * the REAL input value; the builder owns the quantization on both sides.
+ *
+ * `exp`, `gelu` and `sqrt` are deliberately absent: no vendor capture emits a 513-entry
+ * table for any of them, so they lower some other way and a table for them here would
+ * be an invention rather than a transcription. */
+enum {
+    ROCKET_RK3576_ACT_SIGMOID = 0,   /* 1/(1+e^-x)                                  */
+    ROCKET_RK3576_ACT_TANH,
+    ROCKET_RK3576_ACT_SWISH,         /* x*sigmoid(x)  (SiLU)                        */
+    ROCKET_RK3576_ACT_HARDSWISH,     /* x*relu6(x+3)/6                              */
+    ROCKET_RK3576_ACT_HARDSIGMOID,   /* relu6(x+3)/6                                */
+    ROCKET_RK3576_ACT_ELU,           /* x >= 0 ? x : e^x - 1                        */
+    ROCKET_RK3576_ACT_KINDS
+};
+
+/* The name, for a log line or a gate's table. NULL for an unknown kind. */
+const char *rocket_rk3576_act_name(int kind);
+
+/* Build the two tables and the window for `kind` over a datapath whose value `v` means
+ * the real number `v * value_scale`, with the entries encoding the op's output in units
+ * of `entry_scale` — that is, entry = f(v*value_scale) / entry_scale.
+ *
+ * `le` and `lo` are RK3576_LUT_ENTRIES each and `w` receives the window. `sel` picks the
+ * step; the window is then the symmetric [-512*2^sel, 512*2^sel). The clamps are set to
+ * the tables' own endpoints, which is the vendor's convention and what makes the
+ * saturating tails of sigmoid/tanh exact outside the table.
+ *
+ * Returns 0, or <0 for an unknown kind or a null argument. Entries saturate at int16
+ * rather than wrapping, so a caller that picked `entry_scale` too small gets a clamped
+ * curve and not a folded one. */
+int rocket_rk3576_lut_build(int kind, double value_scale, double entry_scale,
+                            unsigned sel, int16_t *le, int16_t *lo, lut_rk3576_t *w);
 
 /* The fp32 conv scale -> the OUT_CVT pair the emitter programs: `mul` is the uint16
  * multiplier and `shift` the REGISTER value (already pre-decremented). Exposed because
@@ -863,7 +976,15 @@ int rocket_rk3576_pack_coeff_perc(void *dst, size_t dst_bytes, const int32_t *bi
  * signature a wrong geometry register gives. [HW sweep, H96 MAX M9]
  *
  * There is nowhere in this group to put a weight zero point, so there is no
- * asymmetric form: an asymmetric depthwise weight has to be folded into the bias.
+ * asymmetric form. It does not need one: this part's int8 depthwise cube gives every
+ * (channel, tap) two live bytes and the datapath ADDS them, so `w - w_zp` is carried
+ * exactly in the CUBE over [-256, 254].
+ *
+ * C is per output channel here exactly as it is in the 64-byte group, so a per-axis
+ * weight quantization rides on this path too: rocket_rk3576_pack_coeff_dw_perc() takes
+ * the ramp, and the two scalar entries are it with `c_term = NULL`. C must never be
+ * left at 0 — a zero multiplier gates the whole 8-channel group's BS stage and the DPU
+ * writes a full but entirely empty surface with no fault.
  *
  * Size the buffer with rocket_rk3576_coeff_bytes_dw() — it is SMALLER than the direct
  * one for the same channel count, and the emitter points BS_BASE_ADDR1 at the zeroed
@@ -874,6 +995,103 @@ int rocket_rk3576_pack_coeff_dw(void *dst, size_t dst_bytes, const int32_t *bias
                                 unsigned oc);
 int rocket_rk3576_pack_coeff_dw_prec(void *dst, size_t dst_bytes, const int32_t *bias,
                                      unsigned oc, unsigned prec);
+int rocket_rk3576_pack_coeff_dw_perc(void *dst, size_t dst_bytes, const int32_t *bias,
+                                     unsigned oc, const int16_t *c_term,
+                                     int16_t multiplier);
+
+/* ---- The DPU's elementwise stage: one cube in, requantized ---------------------
+ *
+ * On this part the vendor's elementwise op is a program of its own: DPU + DPU_RDMA
+ * only, no CNA and no CORE, the same shape as the LUT table load, with
+ * PC_OPERATION_ENABLE at 0x18. What it computes, MEASURED on silicon:
+ *
+ *     out = sat8( ((ew + ew_offset) * ew_scale >> ew_shift) * out_scale >> out_shift )
+ *
+ * ONE operand — an affine requantization of a cube, in the NC1HWC2 layout the conv
+ * path already packs. Bit-exact over channel counts 16-320 and planes 1x1 to 28x28
+ * (`tests/rk3576_add_probe.c gate`, 10 shapes). The final shift ROUNDS HALF TO EVEN,
+ * the same rule the direct path's OUT_CVT uses.
+ *
+ * A SECOND OPERAND IS NOT REACHABLE through this register set, and the search is
+ * EXHAUSTIVE rather than an untried direction — six sweeps, set out in
+ * tests/rk3576_add_probe.c: every register the program leaves at zero CROSSED with the
+ * whole output gain ladder (17 x 32; only 0x5024 does anything, and it injects a
+ * constant — it is the DPU shift word, a live operand), every register the program
+ * never writes appended to it (29 candidates; the register file is not cleared between
+ * jobs here, so this is not an empty set), the main DMA feed at every gain from 2^14
+ * down to 2^-31, two joint mode grids, destination accumulation with 0x40C0 swept over
+ * 29 values, and a delta probe showing the program reads exactly the addressed cube and
+ * nothing within two cubes either side of it.
+ *
+ * SO A RESIDUAL ADD IS LOWERED ONTO THE CONVOLUTION DATAPATH, where it computes
+ * bit-exactly: concatenate the two operands along channels and convolve with a 1x1
+ * kernel of two diagonal blocks. That form carries different per-operand scales (the
+ * ratio rides in the weights) and both zero points (the second's in the bias), neither
+ * of which this stage can express, and it FUSES into a producing convolution — see
+ * tests/rk3576_residual_add.c. This entry stays for what it is: a cheap standalone
+ * requantization of one cube.
+ *
+ * TRAPS, both of which cost a round of the probe:
+ *   - Every base the program leaves at zero READS IOVA 0, which is a real buffer on
+ *     this stack (per-fd IOVA starts at zero). Allocate a guard BO first or the first
+ *     operand allocated IS what those bases read.
+ *   - DPU 0x40D0 must be the captured 0x0040FFFF verbatim. Reading it as a clamp pair
+ *     left exactly half of every 16-channel group unwritten, silently. The clamps are
+ *     OUT_CLAMP_MIN/MAX (0x40A4/0x40A8), and the no-clamp pair is INT32_MIN/MAX.
+ *   - OUT_CVT_SCALE is a SIGNED 16-bit field: 32768 flips the output's sign.
+ *   - `Add(Conv(x), x)` IS NOT A CAPTURE OF THIS. The vendor compiler folds an identity
+ *     skip into the convolution's own kernel — the centre tap of the diagonal — so six
+ *     such ONNX graphs compiled to a program indistinguishable from a plain conv, and
+ *     two convs into an add fold as well. A capture needs an operand the compiler
+ *     cannot reach: a graph input, a constant tensor, or a real bottleneck whose skip
+ *     crosses three convolutions.
+ *
+ * `mode` selects the vendor's ADD or MUL word; the two differ in four registers. Only
+ * ADD's arithmetic is gated.
+ * [Manufactured capture + HW sweep, H96 MAX M9, 2026-07-31] */
+enum {
+    ROCKET_RK3576_EW_ADD = 0,
+    ROCKET_RK3576_EW_MUL          /* emitted, not gated */
+};
+
+typedef struct {
+    uint16_t w, h, c;            /* the plane and channel count; c a multiple of 16 */
+    uint8_t  mode;               /* ROCKET_RK3576_EW_*                             */
+    uint32_t src_dma;            /* programmed, and MEASURED NOT TO BE READ        */
+    uint32_t ew_dma;             /* the operand cube, NC1HWC2                      */
+    uint32_t dst_dma;            /* the output surface                             */
+    /* Elements per channel group. 0 takes w*h, which is both what the vendor's own
+     * programs carry and what a convolution's output surface has, so a cube-linked
+     * requantization needs no copy at either end. There is ONE source-side stride
+     * register on this part; the output has its own. */
+    uint32_t surf_elems, dst_surf_elems;
+    int32_t  ew_offset;          /* added to the operand BEFORE its scale          */
+    uint16_t ew_scale;
+    uint8_t  ew_shift;
+    int32_t  out_offset;         /* OUT_CVT_OFFSET; emitted, not gated             */
+    uint16_t out_scale;          /* SIGNED 16-bit in the hardware                  */
+    uint8_t  out_shift;
+    /* OUT_CLAMP_MIN/MAX, applied before the int8 saturation — where a fused ReLU6's
+     * clamp goes. The capture's no-clamp pair is INT32_MIN/INT32_MAX. */
+    int32_t  clamp_lo, clamp_hi;
+    uint64_t *tasks;             /* at least RK3576_EW_TASK_OPS words              */
+    uint32_t task_count;
+} ew_params_rk3576_t;
+
+#define RK3576_EW_TASK_OPS 96    /* the emitted program is 93: the capture's 89 plus
+                                  * the four-word PC trailer it stores apart        */
+
+int gen_ew_int8_rk3576(ew_params_rk3576_t *p);
+
+/* Split one requantization gain across the two converters.
+ *
+ * The overall gain is (ew_scale >> ew_shift) * out_scale / 2^out_shift, so the two
+ * pairs are redundant and together reach a finer grid than either alone. Fills all
+ * four and returns the relative error scaled by 1e9 (0 is exact), or <0 if no
+ * representable pair reaches the gain. Pure; nothing here touches the hardware. */
+int64_t rocket_rk3576_ew_params(double gain,
+                                uint16_t *ew_scale, uint8_t *ew_shift,
+                                uint16_t *out_scale, uint8_t *out_shift);
 
 #ifdef __cplusplus
 }

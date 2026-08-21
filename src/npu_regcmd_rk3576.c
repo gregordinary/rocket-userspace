@@ -83,6 +83,8 @@
 #include "npu_regcmd_rk3576.h"
 #include "rocket_log.h"
 
+#include <math.h>
+
 #define OP_REG_DPU_RDMA (BLOCK_DPU_RDMA | PC_OP_01)   /* 0x2001 */
 
 /* ============================================================================
@@ -170,6 +172,9 @@
 #define R76_DPU_EW_MIN2        0x4074
 #define R76_DPU_EW_MAX2        0x4078
 #define R76_DPU_EW_CFG         0x407C
+/* EW_CFG with the stage's own bypass (bit 0) and EW_LUT_BYPASS (bit 7) cleared — the
+ * RK3588's field layout at a moved offset. This is what turns the LUT on. */
+#define R76_DPU_EW_CFG_LUT     0x01004140u
 #define R76_DPU_EW_CVT_OFFSET  0x4080
 #define R76_DPU_EW_CVT_SCALE   0x4084
 #define R76_DPU_EW_CLAMP_MIN   0x4088
@@ -182,6 +187,26 @@
 #define R76_DPU_OUT_CVT_OFFSET 0x40AC  /* RK3588 DPU_OUT_CVT_OFFSET is 0x4080  */
 #define R76_DPU_OUT_CVT_SCALE  0x40B0  /* RK3588 0x4084                        */
 #define R76_DPU_OUT_CVT_SHIFT  0x40B4  /* RK3588 0x4088                        */
+/* ---- the DPU LUT bank ----
+ * `0x4100` selects a table and a start offset and every write to `0x4104` stores one
+ * entry and advances — the load program's window. The rest carry the input map a
+ * consuming convolution reads: the index step, the two tables' domains (four lanes
+ * each) and the two overflow clamps. */
+#define R76_LUT_ACCESS_CFG     0x4100
+#define R76_LUT_ACCESS_DATA    0x4104
+#define R76_LUT_CFG            0x4108
+#define R76_LUT_INFO           0x410C  /* two index selects: the step is 2^sel  */
+#define R76_LUT_LE_START       0x4110  /* four lanes, 0x4110-0x411C             */
+#define R76_LUT_LO_END         0x4140  /* four lanes, 0x4140-0x414C             */
+#define R76_LUT_UNDERFLOW      0x4188  /* the value below LE_START, and 0x418C  */
+#define R76_LUT_OVERFLOW       0x4190  /* the value at or above LO_END, + 0x4194*/
+#define R76_LUT_SELECT_LO      0x00020000u
+#define R76_LUT_SELECT_HI      0x00030000u
+/* The load program's own LUT_CFG: the table is open for writing, not for reading. */
+#define R76_LUT_CFG_LOAD       0x00ff0000u
+/* A consuming convolution's LUT_CFG. [Manufactured capture, every activation] */
+#define R76_LUT_CFG_USE        0x02000006u
+
 #define R76_DPU_SURFACE_ADD    0x40B8  /* RK3588 DPU_SURFACE_ADD is 0x40C0     */
 #define R76_DPU_ZERO_40BC      0x40BC
 #define R76_DPU_CONST_40C0     0x40C0
@@ -1037,7 +1062,26 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
                 (uint64_t)((oc + 31u) / 32u) * wbytes > R76_MAX_WEIGHT_CUBE))
         return 0;                     /* the output-channel-axis bounds; see r76_plan_cbuf */
 
-    /* The highest rung the weight slice still leaves room for, inside the data cap. */
+    /* THE WEIGHT SIDE IS THE WHOLE CUBE, NOT ONE GROUP'S SLICE. `wgran` is
+     * `32*ic*kh*kw` and does not depend on `oc` at all, so charging it alone leaves the
+     * data side an allowance the part does not honour once a conv drives more than one
+     * output-channel group: a 224x224 k7 s2 at oc 64 computes to 48 input rows per task
+     * and this said 54, and the task past the real allowance writes NOTHING — spending
+     * the surface guard's eight power cycles before the entry gives up.
+     *
+     * Charging every group brings that to 45, which is under the measurement rather
+     * than over it. It is a BOUND rather than the law: the exact budget is not pinned
+     * (48 rows is 5376 granules where this model allows 5120 and the one-slice model
+     * 6144), and it is applied only where it still leaves a rung, because a cube past
+     * the pool at F=0 would otherwise refuse shapes that compute today. Both directions
+     * are safe: this can only ever SHRINK a window, and a shorter window is a submit,
+     * not a wrong answer. [HW sweep, `rk3576_conv_lib_gate rowbound`] */
+    if (!dw) {
+        unsigned cube = ((oc + 31u) / 32u) * wgran;
+        if (R76_CBUF_BASE_GRANULES + cube <= R76_CBUF_POOL_GRANULES) wgran = cube;
+    }
+
+    /* The highest rung the weight cube still leaves room for, inside the data cap. */
     for (r = 0; r < r76_cbuf_f_nrungs; r++) {
         unsigned cand = r76_cbuf_f_rungs[r];
         if (R76_CBUF_BASE_GRANULES + cand > R76_CBUF_MAX_GRANULES) break;
@@ -1268,7 +1312,8 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
                                   const npu_core_desc *core, const npu_dpu_desc *dpu,
                                   int dw, int argb, unsigned ih_full, unsigned oh_full,
                                   unsigned pad_right, unsigned pad_bottom,
-                                  unsigned cbuf_f, const struct r76_reuse *reuse)
+                                  unsigned cbuf_f, const struct r76_reuse *reuse,
+                                  const lut_rk3576_t *lut, unsigned in_surf_elems)
 {
     int i = 0;
     unsigned iw  = cna->datain_width,  ih  = cna->datain_height;
@@ -1350,12 +1395,16 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     }
 
     /* Interleaved S_POINTER preamble, verbatim from the vendor stream. The early
-     * 0x1038 write is the vendor's; it is rewritten in place inside the CNA block. */
-    ops[i++] = NPUOP(OP_REG_CNA,      0xE,  R76_CNA_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_CORE,     0xE,  R76_CORE_S_POINTER);
+     * 0x1038 write is the vendor's; it is rewritten in place inside the CNA block.
+     *
+     * A LUT-consuming task carries 0x30 in all four instead of 0xE — the one thing
+     * outside the DPU's own LUT bank that separates a vendor activation from its
+     * bare-conv control, and it is in every one of them. */
+    ops[i++] = NPUOP(OP_REG_CNA,      lut ? 0x30u : 0xEu,  R76_CNA_S_POINTER);
+    ops[i++] = NPUOP(OP_REG_CORE,     lut ? 0x30u : 0xEu,  R76_CORE_S_POINTER);
     ops[i++] = NPUOP(OP_REG_CNA,      0x07, R76_CNA_WEIGHT_SIZE2);
-    ops[i++] = NPUOP(OP_REG_DPU,      0xE,  R76_DPU_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE,  R76_RDMA_S_POINTER);
+    ops[i++] = NPUOP(OP_REG_DPU,      lut ? 0x30u : 0xEu,  R76_DPU_S_POINTER);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, lut ? 0x30u : 0xEu,  R76_RDMA_S_POINTER);
 
     /* ---- CNA ----
      * Precision joins conv_mode in this word at the RK3588's CNA_CONV_CON1 offsets;
@@ -1482,8 +1531,14 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * over the FULL plane and over this task's window, in 16-byte atoms. The ARGB
      * image has ONE surface — there is no second channel group to jump to — so both
      * carry the same quantity, the task's own packed rows: all twelve ARGB captures
-     * hold line_stride*ih in both, at three window heights of the same image. */
-    ops[i++] = NPUOP(OP_REG_CNA, argb ? line_stride * ih : iw * ih_full,
+     * hold line_stride*ih in both, at three window heights of the same image.
+     *
+     * The DDR one is a caller-supplied quantity when the feature cube is somebody
+     * else's surface with a padded stride; `in_surf_elems` is zero everywhere else and
+     * the derived plane stands. */
+    ops[i++] = NPUOP(OP_REG_CNA,
+                     argb ? line_stride * ih
+                          : (in_surf_elems ? in_surf_elems : iw * ih_full),
                      R76_CNA_SURF_FULL);
     ops[i++] = NPUOP(OP_REG_CNA,
                      argb ? line_stride * fetch_rows
@@ -1580,12 +1635,21 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
                      R76_DPU_BS_CFG);
     ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BN_MIN);
     ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BN_MAX);
+    /* BN STAYS BYPASSED even with the LUT on. Every vendor activation carries 0x20
+     * here — the stage active — and copying that pins the LUT at the table join for
+     * every input, because BN then multiplies by an operand register no vendor program
+     * writes and this register file is not cleared between jobs. The readout still
+     * tracks the table, so it reads as a working LUT with no input map anywhere. */
     ops[i++] = NPUOP(OP_REG_DPU, 0x903u, R76_DPU_BN_CFG);
     ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN);
     ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX);
     ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN2);
     ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX2);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x010041C1u, R76_DPU_EW_CFG);
+    /* The LUT is the EW stage: EW_LUT_BYPASS is bit 7 here — the RK3588's field layout
+     * at a moved offset — and clearing it, with bit 0 (the stage's own bypass), is what
+     * turns the table on. */
+    ops[i++] = NPUOP(OP_REG_DPU, lut ? R76_DPU_EW_CFG_LUT : 0x010041C1u,
+                     R76_DPU_EW_CFG);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_CVT_OFFSET);
     ops[i++] = NPUOP(OP_REG_DPU, 0x1u, R76_DPU_EW_CVT_SCALE);
     ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_CLAMP_MIN);
@@ -1638,17 +1702,42 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40C8);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40CC);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0040FFFFu, R76_DPU_CONST_40D0);
-    /* LUT / spare register banks, all zero in every capture. */
-    for (unsigned r = 0x4100; r <= 0x4120; r += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, r);
+    /* The LUT bank. Zero throughout in every convolution capture, which is the LUT
+     * bypassed; a task that carries a window writes it here, and the WHOLE bank is
+     * written either way so a stale value from the previous job cannot survive into
+     * this one. LE_START and LO_END each occupy four consecutive lanes. */
+    for (unsigned r = 0x4100; r <= 0x4120; r += 4) {
+        uint32_t v = 0;
+        if (lut) {
+            if (r == R76_LUT_CFG)                    v = R76_LUT_CFG_USE;
+            else if (r == R76_LUT_INFO)              v = ((uint32_t)lut->sel << 16) |
+                                                         ((uint32_t)lut->sel << 8);
+            else if (r >= R76_LUT_LE_START && r <= R76_LUT_LE_START + 0xC)
+                                                     v = (uint32_t)lut->le_start;
+        }
+        ops[i++] = NPUOP(OP_REG_DPU, v, r);
+    }
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4130);
     for (unsigned r = 0x4140; r <= 0x4154; r += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, r);
+        ops[i++] = NPUOP(OP_REG_DPU,
+                         (lut && r <= R76_LUT_LO_END + 0xC) ? (uint32_t)lut->lo_end : 0u,
+                         r);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4160);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4170);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4174);
-    for (unsigned r = 0x4184; r <= 0x4194; r += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, r);
+    /* The two overflow clamps, in the vendor's own packing: the value alone in the
+     * high half of the first register and doubled across the second. */
+    for (unsigned r = 0x4184; r <= 0x4194; r += 4) {
+        uint32_t v = 0;
+        if (lut) {
+            uint32_t c = (uint32_t)(uint16_t)(r <= R76_LUT_UNDERFLOW + 4
+                                              ? lut->clamp_lo : lut->clamp_hi);
+            if (r == R76_LUT_UNDERFLOW || r == R76_LUT_OVERFLOW)     v = c << 16;
+            else if (r == R76_LUT_UNDERFLOW + 4 || r == R76_LUT_OVERFLOW + 4)
+                                                                     v = (c << 16) | c;
+        }
+        ops[i++] = NPUOP(OP_REG_DPU, v, r);
+    }
 
     /* ---- DPU_RDMA ---- */
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, ow - 1u, R76_RDMA_CUBE_WIDTH);
@@ -1672,7 +1761,7 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     ops[i++] = NPUOP(OP_REG_DPU_RDMA,
                      dpu->bias_base_addr + (uint32_t)r76_shift_offset_p(oc, dw),
                      R76_RDMA_BS_BASE_ADDR1);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_NRDMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, lut ? 0x1Au : 0x0u, R76_RDMA_NRDMA_CFG);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BN_BASE_ADDR);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5030);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, is_float ? R76_RDMA_ERDMA_FLOAT : 0x41u,
@@ -1859,6 +1948,23 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
         IC > 0xFFFFu || OC > 0xFFFFu) {
         ROCKET_LOGE("rk3576 conv: a geometry term exceeds the 16-bit register half\n");
         return -1;
+    }
+    /* A caller-supplied feature group stride only ever describes a buffer whose groups
+     * sit FURTHER apart than the plane. A smaller one would make the groups overlap,
+     * which is not a layout anything on this part produces, and the ARGB program has a
+     * single surface with no group jump at all. */
+    if (p->in_surf_elems) {
+        if (argb) {
+            ROCKET_LOGE("rk3576 conv: the first-conv ARGB datapath has one surface and "
+                        "no channel-group stride to set\n");
+            return -1;
+        }
+        if (p->in_surf_elems < IW * ih_full) {
+            ROCKET_LOGE("rk3576 conv: a feature group stride of %u elements is shorter "
+                        "than the %ux%u plane it walks\n",
+                        p->in_surf_elems, IW, ih_full);
+            return -1;
+        }
     }
     /* 0x1028 packs entries*ih in its high half. Against the SCALED entry count, which
      * is what the task programs — a 2-byte element reaches the field twice as fast. */
@@ -2060,7 +2166,7 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
     {
         int rc = gen_conv2d_task_rk3576(p->tasks, &cna, &core, &dpu, dw, argb,
                                         ih_full, oh_full, pad_right, pad_bottom,
-                                        cbuf_f, reuse);
+                                        cbuf_f, reuse, p->lut, p->in_surf_elems);
         if (rc < 0) return rc;
         r76_apply_overrides(p->tasks, rc);
         r76_dump_program(p->tasks, rc);
@@ -2791,18 +2897,22 @@ int rocket_rk3576_pack_coeff(void *dst, size_t dst_bytes, const int32_t *bias, u
  * clip. [HW sweep, H96 MAX M9]
  *
  * There is nowhere to put a weight zero point here, so there is no asymmetric form:
- * an asymmetric depthwise weight has to be corrected in the bias.
+ * an asymmetric depthwise weight is carried in the CUBE instead, whose two live bytes
+ * per (channel, tap) the datapath adds.
+ *
+ * C is per output channel here exactly as it is in the 64-byte group, so a per-axis
+ * weight quantization is expressible on this path too — rocket_rk3576_pack_coeff_dw_perc()
+ * is that form and the two entries below are it with a single multiplier.
  * ------------------------------------------------------------------------- */
 size_t rocket_rk3576_coeff_bytes_dw(unsigned oc)
 {
     return r76_shift_offset_p(oc, 1) + R76_COEFF_GROUP_BYTES_DW;
 }
 
-int rocket_rk3576_pack_coeff_dw_prec(void *dst, size_t dst_bytes, const int32_t *bias,
-                                     unsigned oc, unsigned prec)
+int rocket_rk3576_pack_coeff_dw_perc(void *dst, size_t dst_bytes, const int32_t *bias,
+                                     unsigned oc, const int16_t *c_term,
+                                     int16_t multiplier)
 {
-    int16_t unit = (prec == precision_float16 || prec == precision_bfloat16)
-                   ? R76_COEFF_C_UNIT_FP16 : (int16_t)1;
     uint8_t *b = (uint8_t *)dst;
     unsigned c;
 
@@ -2811,15 +2921,36 @@ int rocket_rk3576_pack_coeff_dw_prec(void *dst, size_t dst_bytes, const int32_t 
                     dst_bytes, oc, rocket_rk3576_coeff_bytes_dw(oc));
         return -1;
     }
+    if (!c_term && multiplier == 0) {
+        ROCKET_LOGE("rk3576 dw coeff: multiplier 0 gates the BS stage off — the DPU "
+                    "would write a full but entirely empty surface\n");
+        return -1;
+    }
     memset(b, 0, rocket_rk3576_coeff_bytes_dw(oc));
     for (c = 0; c < oc; c++) {
         uint8_t *g = b + (size_t)(c / R76_COEFF_GROUP_OC) * R76_COEFF_GROUP_BYTES_DW;
         int32_t a = bias ? bias[c] : 0;
+        int16_t mul = c_term ? c_term[c] : multiplier;
+        if (mul == 0) {
+            ROCKET_LOGE("rk3576 dw coeff: C[%u] is 0 — that gates the BS stage off for "
+                        "the whole 8-channel group and the DPU writes an empty surface "
+                        "with no fault\n", c);
+            return -1;
+        }
         memcpy(g + (c % R76_COEFF_GROUP_OC) * 4, &a, sizeof a);
         memcpy(g + R76_COEFF_C_OFFSET_DW + (c % R76_COEFF_GROUP_OC) * 2,
-               &unit, sizeof unit);
+               &mul, sizeof mul);
     }
     return 0;
+}
+
+int rocket_rk3576_pack_coeff_dw_prec(void *dst, size_t dst_bytes, const int32_t *bias,
+                                     unsigned oc, unsigned prec)
+{
+    int16_t unit = (prec == precision_float16 || prec == precision_bfloat16)
+                   ? R76_COEFF_C_UNIT_FP16 : (int16_t)1;
+
+    return rocket_rk3576_pack_coeff_dw_perc(dst, dst_bytes, bias, oc, NULL, unit);
 }
 
 int rocket_rk3576_pack_coeff_dw(void *dst, size_t dst_bytes, const int32_t *bias,
@@ -3063,17 +3194,25 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
         ops[i++] = NPUOP(OP_REG_PPU, 0x10000u / p->kw, R76_PPU_RECIP_W);
         ops[i++] = NPUOP(OP_REG_PPU, 0x10000u / p->kh, R76_PPU_RECIP_H);
     }
-    /* Four pad nibbles. The END pads sit in the two LOW nibbles: a SAME k3 s2 over 16
-     * needs pad_right = pad_bottom = 1 and nothing on the leading edges, and the
-     * capture carries 0x0011 — so the low half is right and bottom, not top and left.
-     * A symmetric pad cannot tell the two apart, and every other captured pad is
-     * symmetric. Which of the low pair is right and which is bottom is still open;
-     * they are equal in every shape this emits. */
+    /* Four pad nibbles, and the LEADING pads sit in the two LOW ones: bits [3:0] are the
+     * LEFT pad and bits [7:4] the TOP. Measured, not read off a capture — every capture's
+     * pool is padded symmetrically, and a symmetric pad cannot distinguish this map from
+     * its transpose, which is why an asymmetric one computed a full and plausible surface
+     * that was wrong nearly everywhere.
+     *
+     * What pins it is a ONE-DIMENSIONAL sweep (`rk3576_pool_probe pad`): a single row,
+     * a unit kernel on the other axis, and the part's line scored against the window grid
+     * each candidate leading pad implies. The grid follows the nibble written here at
+     * [3:0] on x and [7:4] on y, at pads 0, 1 and 2 on both axes.
+     *
+     * The trailing pads are the high pair. Nothing this emitter produces depends on them
+     * — the window count is programmed explicitly in OUT_WIDTH/OUT_HEIGHT and the span in
+     * IN_WIDTH/IN_HEIGHT — so they are written for the part's benefit, not read back. */
     ops[i++] = NPUOP(OP_REG_PPU,
-                     ((uint32_t)(p->pad_top    & 0xf) << 12) |
-                     ((uint32_t)(p->pad_left   & 0xf) << 8) |
-                     ((uint32_t)(p->pad_bottom & 0xf) << 4) |
-                      (uint32_t)(p->pad_right  & 0xf), R76_PPU_PAD_CFG);
+                     ((uint32_t)(p->pad_bottom & 0xf) << 12) |
+                     ((uint32_t)(p->pad_right  & 0xf) << 8) |
+                     ((uint32_t)(p->pad_top    & 0xf) << 4) |
+                      (uint32_t)(p->pad_left   & 0xf), R76_PPU_PAD_CFG);
     /* The four pad values. Max pads with the minimum so a padded window never wins;
      * average pads with the input zero point, scaled 1..4 — the capture's own ramp. */
     if (p->mode == ROCKET_RK3576_POOL_MAX) {
@@ -3111,7 +3250,9 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
     ops[i++] = NPUOP(OP_REG_PPU_RDMA, creg - 1u, R76_PPUR_IN_CHANNEL);
     ops[i++] = NPUOP(OP_REG_PPU_RDMA, p->input_dma, R76_PPUR_SRC_BASE);
     ops[i++] = NPUOP(OP_REG_PPU_RDMA, iw * 16u, R76_PPUR_SRC_LINE);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, r76_round4(iw * ih) * 16u, R76_PPUR_SRC_SURF);
+    ops[i++] = NPUOP(OP_REG_PPU_RDMA,
+                     (p->src_surf_elems ? p->src_surf_elems : r76_round4(iw * ih)) * 16u,
+                     R76_PPUR_SRC_SURF);
     ops[i++] = NPUOP(OP_REG_PPU_RDMA, 0x40, R76_PPUR_CONST_7030);
 
     /* The same four-word PC trailer every program on this part ends with — and the
@@ -3133,4 +3274,366 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
 
     p->task_count = (uint32_t)i;
     return 0;
+}
+
+/* ============================================================================
+ * SECTION — the DPU LUT table load
+ *
+ * Transcribed from a manufactured activation capture (`tests/data/rk3576-vendor-
+ * capture/lut/`). The program is DPU + DPU_RDMA only and computes nothing: it
+ * configures a 1x1x16 cube so the DPU has a shape to be idle in, then bursts the two
+ * tables through the access window. PC_OPERATION_ENABLE takes 0x18 — DPU and
+ * DPU_RDMA — which is neither the convolution's 0x1D nor the pool's 0x60.
+ * ==========================================================================*/
+
+/* DPU + DPU_RDMA. [Manufactured capture] */
+#define R76_LUT_ENABLE_WORD  0x18
+
+int gen_lut_load_rk3576(lut_load_params_rk3576_t *p)
+{
+    uint64_t *ops = p ? p->tasks : NULL;
+    unsigned e;
+    int i = 0;
+
+    if (!p || !ops || !p->lo || !p->hi) return -1;
+
+    ops[i++] = NPUOP(OP_REG_DPU,      0xE, R76_DPU_S_POINTER);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE, R76_RDMA_S_POINTER);
+
+    /* The dummy cube: one pixel, sixteen channels, all-int8 precision. Nothing here
+     * is arithmetic — the surface exists so the DPU has a well-formed job while the
+     * table burst goes through. */
+    ops[i++] = NPUOP(OP_REG_DPU, 0x5u, R76_DPU_FEATURE_MODE);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_DATA_FORMAT);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OFFSET_PEND);
+    ops[i++] = NPUOP(OP_REG_DPU, p->scratch_dma, R76_DPU_DST_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x1u, R76_DPU_DST_SURF);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_WIDTH);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_HEIGHT);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_NOTCH);
+    ops[i++] = NPUOP(OP_REG_DPU, 0xFu, R76_DPU_CUBE_CHANNEL);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x000F0F00u, R76_DPU_WDMA_SIZE0);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_WDMA_SIZE1);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x00000053u, R76_DPU_NOTCH_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_403C);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x2u, R76_DPU_BS_ALU_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BS_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BS_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x00020000u, R76_DPU_BS_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BN_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BN_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x903u, R76_DPU_BN_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN2);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX2);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x010041C1u, R76_DPU_EW_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_CVT_OFFSET);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x1u, R76_DPU_EW_CVT_SCALE);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_CLAMP_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_CLAMP_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE0);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE1);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_409C);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_OUT_CLAMP_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_OUT_CLAMP_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OUT_CVT_OFFSET);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x00010001u, R76_DPU_OUT_CVT_SCALE);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OUT_CVT_SHIFT);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_SURFACE_ADD);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40BC);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x04440000u, R76_DPU_CONST_40C0);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40C8);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40CC);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0040FFFFu, R76_DPU_CONST_40D0);
+
+    /* The preamble: one write through the window at offset zero, then LUT_CFG into
+     * its load value. The order is the capture's. */
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_LUT_ACCESS_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_LUT_ACCESS_DATA);
+    ops[i++] = NPUOP(OP_REG_DPU, R76_LUT_CFG_LOAD, R76_LUT_CFG);
+    for (e = 0x410C; e <= 0x4120; e += 4)
+        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4130);
+    for (e = 0x4140; e <= 0x4154; e += 4)
+        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4160);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4170);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4174);
+    for (e = 0x4184; e <= 0x4194; e += 4)
+        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
+
+    /* ---- DPU_RDMA: the dummy cube's source ---- */
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_CUBE_WIDTH);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_CUBE_HEIGHT);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xFu, R76_RDMA_CUBE_CHANNEL);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, p->scratch_dma, R76_RDMA_SRC_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BRDMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BS_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BS_BASE_ADDR1);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_NRDMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BN_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5030);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x1u, R76_RDMA_ERDMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_SURF);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x9u, R76_RDMA_FEATURE_MODE);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SRC_DMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x504C);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x5064);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x506C);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x5078);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x507C);
+
+    /* The two bursts. The select word carries the table and the start offset; each
+     * data write stores one entry and advances, so the 513 writes are consecutive
+     * and their order IS the table order. */
+    ops[i++] = NPUOP(OP_REG_DPU, R76_LUT_SELECT_LO, R76_LUT_ACCESS_CFG);
+    for (e = 0; e < RK3576_LUT_ENTRIES; e++)
+        ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)(uint16_t)p->lo[e], R76_LUT_ACCESS_DATA);
+    ops[i++] = NPUOP(OP_REG_DPU, R76_LUT_SELECT_HI, R76_LUT_ACCESS_CFG);
+    for (e = 0; e < RK3576_LUT_ENTRIES; e++)
+        ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)(uint16_t)p->hi[e], R76_LUT_ACCESS_DATA);
+
+    ops[i++] = NPUOP(OP_NONE, 0x0, 0x0);
+    ops[i++] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
+    ops[i++] = NPUOP(OP_40, 0x0, 0x0);
+    ops[i++] = NPUOP(OP_ENABLE, R76_LUT_ENABLE_WORD, PC_OPERATION_ENABLE);
+
+    r76_apply_overrides(ops, i);
+    r76_dump_program(ops, i);
+
+    p->task_count = (uint32_t)i;
+    return 0;
+}
+
+/* ============================================================================
+ * SECTION — the elementwise binary op
+ *
+ * Transcribed from manufactured captures (`tests/data/rk3576-vendor-capture/add/`).
+ * The program is DPU + DPU_RDMA only, 89 writes, PC_OPERATION_ENABLE 0x18 — the LUT
+ * load's shape, but this one computes. Five captures over two geometries emit it
+ * IDENTICALLY apart from the plane, the channel count and the two converters, which
+ * is what says the shape is the op rather than one graph's accident.
+ *
+ * The DPU reads its primary operand from DPU_RDMA's own source (BRDMA_CFG 0x1a, where
+ * a convolution carries 0x710 and takes the CNA pipe instead) and the second from the
+ * EW base (ERDMA_CFG 0x40000044 against a convolution's 0x41).
+ * ==========================================================================*/
+
+/* DPU + DPU_RDMA, as the LUT load. [Manufactured capture] */
+#define R76_EW_ENABLE_WORD   0x18
+
+/* EW_CFG. Add: the stage on (bit 0 clear), the LUT bypassed (bit 7), the operand from
+ * memory (bit 6). Mul carries a different word entire — emitted, not decomposed, since
+ * two captures do not pin nine bits. [Manufactured capture] */
+#define R76_EW_CFG_ADD       0x8002C0C0u
+#define R76_EW_CFG_MUL       0x810F4094u
+#define R76_EW_BRDMA_ADD     0x1Au
+#define R76_EW_BRDMA_MUL     0x2u
+#define R76_EW_BS_ALU_MUL    0x2u
+#define R76_EW_BS_CFG_MUL    0x00020000u
+#define R76_EW_NOTCH_CFG     0x00100012u
+#define R76_EW_ERDMA_CFG     0x40000044u
+#define R76_EW_FEATURE_MODE  0x9u
+
+int gen_ew_int8_rk3576(ew_params_rk3576_t *p)
+{
+    uint64_t *ops = p ? p->tasks : NULL;
+    unsigned w, h, c, e, surf, dst_surf;
+    int mul;
+    int i = 0;
+
+    if (!p || !ops) return -1;
+    w = p->w; h = p->h; c = p->c;
+    if (!w || !h || !c) return -1;
+    if (p->mode != ROCKET_RK3576_EW_ADD && p->mode != ROCKET_RK3576_EW_MUL) return -1;
+    /* The cube's channel granule. Every capture programs c-1 with no rounding, and a
+     * count that is not a whole number of granules would leave the tail group's lanes
+     * reading whatever the caller left there. */
+    if (c % 16u) return -1;
+    if (p->ew_shift > 31 || p->out_shift > 31) return -1;
+    mul = (p->mode == ROCKET_RK3576_EW_MUL);
+
+    /* ONE source-side stride register exists (0x5040), and every capture carries the
+     * plane in it while both operands ARE the plane — so nothing here says whether it
+     * is the EW operand's stride, the primary's, or both. It is programmed as one and
+     * the two operands are required to agree, rather than inventing a second register
+     * the vendor never writes. */
+    surf = p->surf_elems ? p->surf_elems : (unsigned)w * h;
+    dst_surf = p->dst_surf_elems ? p->dst_surf_elems : (unsigned)w * h;
+
+    ops[i++] = NPUOP(OP_REG_DPU,      0xE, R76_DPU_S_POINTER);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE, R76_RDMA_S_POINTER);
+
+    ops[i++] = NPUOP(OP_REG_DPU, 0x5u, R76_DPU_FEATURE_MODE);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_DATA_FORMAT);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OFFSET_PEND);
+    ops[i++] = NPUOP(OP_REG_DPU, p->dst_dma, R76_DPU_DST_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU, dst_surf, R76_DPU_DST_SURF);
+    ops[i++] = NPUOP(OP_REG_DPU, w - 1u, R76_DPU_CUBE_WIDTH);
+    ops[i++] = NPUOP(OP_REG_DPU, h - 1u, R76_DPU_CUBE_HEIGHT);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_NOTCH);
+    ops[i++] = NPUOP(OP_REG_DPU, c - 1u, R76_DPU_CUBE_CHANNEL);
+    ops[i++] = NPUOP(OP_REG_DPU, ((c - 1u) << 16) | 0x0F00u, R76_DPU_WDMA_SIZE0);
+    ops[i++] = NPUOP(OP_REG_DPU, ((h - 1u) << 16) | (w - 1u), R76_DPU_WDMA_SIZE1);
+    ops[i++] = NPUOP(OP_REG_DPU, R76_EW_NOTCH_CFG, R76_DPU_NOTCH_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_403C);
+    ops[i++] = NPUOP(OP_REG_DPU, mul ? R76_EW_BS_ALU_MUL : 0x0, R76_DPU_BS_ALU_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BS_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BS_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, mul ? R76_EW_BS_CFG_MUL : 0x0, R76_DPU_BS_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BN_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BN_MAX);
+    /* 0x903 here as everywhere: the vendor's 0x20 pins the LUT at its table join and
+     * makes the BN stage multiply by an operand no program writes. */
+    ops[i++] = NPUOP(OP_REG_DPU, 0x903u, R76_DPU_BN_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN2);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX2);
+    ops[i++] = NPUOP(OP_REG_DPU, mul ? R76_EW_CFG_MUL : R76_EW_CFG_ADD,
+                     R76_DPU_EW_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->ew_offset, R76_DPU_EW_CVT_OFFSET);
+    ops[i++] = NPUOP(OP_REG_DPU,
+                     ((uint32_t)p->ew_shift << 16) | p->ew_scale,
+                     R76_DPU_EW_CVT_SCALE);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_CLAMP_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_CLAMP_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE0);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE1);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_409C);
+    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->clamp_lo, R76_DPU_OUT_CLAMP_MIN);
+    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->clamp_hi, R76_DPU_OUT_CLAMP_MAX);
+    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->out_offset, R76_DPU_OUT_CVT_OFFSET);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x00010000u | p->out_scale, R76_DPU_OUT_CVT_SCALE);
+    ops[i++] = NPUOP(OP_REG_DPU, p->out_shift, R76_DPU_OUT_CVT_SHIFT);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_SURFACE_ADD);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40BC);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x04440000u, R76_DPU_CONST_40C0);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40C8);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40CC);
+    /* Verbatim. Every capture of every op class on this part carries this word, and
+     * its sub-bits are not pinned by any of them — reading it as a clamp pair and
+     * writing 0x00407F80 instead saturated the whole surface to +127. */
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0040FFFFu, R76_DPU_CONST_40D0);
+
+    /* The LUT bank, written to zero exactly as the capture does. The tables are not
+     * loaded for this op and the bank must not carry a previous program's map: the
+     * register file is NOT cleared between jobs on this part. */
+    for (e = 0x4100; e <= 0x4120; e += 4)
+        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4130);
+    for (e = 0x4140; e <= 0x4154; e += 4)
+        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4160);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4170);
+    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4174);
+    for (e = 0x4184; e <= 0x4194; e += 4)
+        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
+
+    /* ---- DPU_RDMA: both operands ---- */
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, w - 1u, R76_RDMA_CUBE_WIDTH);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, h - 1u, R76_RDMA_CUBE_HEIGHT);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, c - 1u, R76_RDMA_CUBE_CHANNEL);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, p->src_dma, R76_RDMA_SRC_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, mul ? R76_EW_BRDMA_MUL : R76_EW_BRDMA_ADD,
+                     R76_RDMA_BRDMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BS_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BS_BASE_ADDR1);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_NRDMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BN_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5030);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, R76_EW_ERDMA_CFG, R76_RDMA_ERDMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, p->ew_dma, R76_RDMA_EW_BASE_ADDR);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, surf, R76_RDMA_EW_SURF);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, R76_EW_FEATURE_MODE, R76_RDMA_FEATURE_MODE);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SRC_DMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SURF_NOTCH);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_PAD_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_SURF_NOTCH);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5078);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_507C);
+
+    ops[i++] = NPUOP(OP_NONE, 0x0, 0x0);
+    ops[i++] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
+    ops[i++] = NPUOP(OP_40, 0x0, 0x0);
+    ops[i++] = NPUOP(OP_ENABLE, R76_EW_ENABLE_WORD, PC_OPERATION_ENABLE);
+
+    r76_apply_overrides(ops, i);
+    r76_dump_program(ops, i);
+
+    p->task_count = (uint32_t)i;
+    return 0;
+}
+
+/* Solve the two converter pairs. Pure arithmetic; see the header for the model.
+ *
+ * The primary gain is 16384 * out_scale >> out_shift and the EW gain is that times
+ * (ew_scale >> ew_shift) / 16384, so out_* is fixed by sa/so alone and ew_* then only
+ * has to reach sb/sa. Both scales are 16-bit and both shifts 5-bit fields; the search
+ * is over the shift, taking the scale that rounds best at each. */
+static int64_t r76_ew_fit(double gain, unsigned scale_bits, unsigned max_shift,
+                          uint16_t *scale_out, uint8_t *shift_out)
+{
+    double best_err = -1.0;
+    unsigned sh;
+    /* The hardware field is SIGNED 16-bit: 32768 reads back as -32768 and flips the
+     * output's sign, measured. So the usable maximum is 32767, not 65535. */
+    uint32_t lim = (1u << (scale_bits - 1)) - 1u;
+
+    if (!(gain > 0.0)) return -1;
+    for (sh = 0; sh <= max_shift; sh++) {
+        double s = gain * (double)(1u << sh);
+        double got, err;
+        uint32_t si;
+
+        if (s < 1.0 || s > (double)lim) continue;
+        si = (uint32_t)(s + 0.5);
+        if (si < 1u || si > lim) continue;
+        got = (double)si / (double)(1u << sh);
+        err = fabs(got - gain) / gain;
+        if (best_err < 0.0 || err < best_err) {
+            best_err = err;
+            *scale_out = (uint16_t)si;
+            *shift_out = (uint8_t)sh;
+        }
+    }
+    if (best_err < 0.0) return -1;
+    return (int64_t)(best_err * 1e9 + 0.5);
+}
+
+int64_t rocket_rk3576_ew_params(double gain,
+                                uint16_t *ew_scale, uint8_t *ew_shift,
+                                uint16_t *out_scale, uint8_t *out_shift)
+{
+    int64_t best = -1;
+    unsigned esh;
+
+    if (!ew_scale || !ew_shift || !out_scale || !out_shift) return -1;
+    if (!(gain > 0.0)) return -1;
+
+    /* The EW pair can only scale by a whole number over a power of two, so it is the
+     * coarse step; OUT then carries the remainder. Sweeping the EW shift and fitting
+     * OUT to what is left reaches a finer grid than either pair alone. */
+    for (esh = 0; esh <= 15; esh++) {
+        uint16_t es = 0, os = 0;
+        uint8_t osh = 0;
+        double eg;
+        int64_t err;
+
+        /* Keep the EW factor near unity so the operand is not crushed before OUT. */
+        double want = (double)(1u << esh);
+        if (want < 1.0 || want > 65535.0) continue;
+        es = (uint16_t)want;
+        eg = (double)es / (double)(1u << esh);          /* == 1, by construction */
+        err = r76_ew_fit(gain / eg / 16384.0, 16, 31, &os, &osh);
+        if (err < 0) continue;
+        if (best < 0 || err < best) {
+            best = err;
+            *ew_scale = es; *ew_shift = (uint8_t)esh;
+            *out_scale = os; *out_shift = osh;
+        }
+    }
+    return best;
 }

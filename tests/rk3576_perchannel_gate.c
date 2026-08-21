@@ -23,6 +23,13 @@
  * wide, so the table sweeps it explicitly rather than taking whatever a random weight
  * draw produces.
  *
+ * DEPTHWISE shapes are in the table too, and they are the interesting half: a real
+ * per-axis model is mostly depthwise, and this path is both cheaper and closer there.
+ * A depthwise task's accumulator is bounded by kh*kw taps rather than ic*kh*kw, so the
+ * C ramp reaches the int16 field's own ceiling and one OUT_CVT shift covers the whole
+ * layer -- one task, no output-channel split, and a spread of 1000x still lands inside
+ * a count of an exact per-axis requant.
+ *
  * Usage:  rk3576_perchannel_gate [name-substring]
  * Exit:   0 every shape bit-exact, 1 a shape failed, 2 no NPU (skip).
  */
@@ -45,22 +52,38 @@ typedef struct {
     const char *name;
     unsigned ic, oc, iw, ih, k, stride, pad;
     float    spread;      /* w_scale[oc] spans [base, base*spread] */
+    int      dw;          /* depthwise: oc == ic, one filter per channel */
 } pc_shape;
 
 static const pc_shape SHAPES[] = {
-    /* name          ic   oc   iw  ih   k  s  pad  spread */
-    { "flat",        32,  32,  16, 16,  1, 1, 0,   1.0f  },
-    { "narrow",      32,  32,  16, 16,  3, 1, 1,   2.0f  },
-    { "decade",      32,  64,  16, 16,  3, 1, 1,   10.0f },
-    { "wide",        32,  64,  16, 16,  3, 1, 1,   100.0f},
-    { "k1-64",       64,  64,   8,  8,  1, 1, 0,   10.0f },
-    { "s2",          64,  32,  16, 16,  3, 2, 1,   10.0f },
-    { "deep",       128,  64,   8,  8,  3, 1, 1,   10.0f },
-    { "deep-wide",  128, 128,   8,  8,  3, 1, 1,   100.0f},
-    { "big-plane",   32,  32,  28, 28,  3, 1, 1,   10.0f },
-    { "k5",          32,  32,  16, 16,  5, 1, 2,   10.0f },
-    { "oc-tile",     64, 256,   8,  8,  3, 1, 1,   10.0f },
-    { "huge-fanin", 256, 128,   8,  8,  3, 1, 1,   10.0f },
+    /* name          ic   oc   iw  ih   k  s  pad  spread   dw */
+    { "flat",        32,  32,  16, 16,  1, 1, 0,   1.0f,    0 },
+    { "narrow",      32,  32,  16, 16,  3, 1, 1,   2.0f,    0 },
+    { "decade",      32,  64,  16, 16,  3, 1, 1,   10.0f,   0 },
+    { "wide",        32,  64,  16, 16,  3, 1, 1,   100.0f,  0 },
+    { "k1-64",       64,  64,   8,  8,  1, 1, 0,   10.0f,   0 },
+    { "s2",          64,  32,  16, 16,  3, 2, 1,   10.0f,   0 },
+    { "deep",       128,  64,   8,  8,  3, 1, 1,   10.0f,   0 },
+    { "deep-wide",  128, 128,   8,  8,  3, 1, 1,   100.0f,  0 },
+    { "big-plane",   32,  32,  28, 28,  3, 1, 1,   10.0f,   0 },
+    { "k5",          32,  32,  16, 16,  5, 1, 2,   10.0f,   0 },
+    { "oc-tile",     64, 256,   8,  8,  3, 1, 1,   10.0f,   0 },
+    { "huge-fanin", 256, 128,   8,  8,  3, 1, 1,   10.0f,   0 },
+    /* DEPTHWISE. The 48-byte coefficient group carries the same per-channel C, and a
+     * depthwise task's accumulator is bounded by kh*kw taps rather than ic*kh*kw — so
+     * the C ramp reaches the int16 field's own ceiling and a single OUT_CVT shift is
+     * enough for the whole layer. A depthwise conv is one task by construction here:
+     * output channel c is bound to input channel c, so there is no output-channel
+     * window to program and no scale sort to make. A MobileNet is mostly depthwise,
+     * which is what a per-axis model needs from this path. */
+    { "dw-flat",     32,  32,  16, 16,  3, 1, 1,   1.0f,    1 },
+    { "dw-decade",   32,  32,  16, 16,  3, 1, 1,   10.0f,   1 },
+    { "dw-wide",     64,  64,  16, 16,  3, 1, 1,   100.0f,  1 },
+    { "dw-k1",       32,  32,  16, 16,  1, 1, 0,   10.0f,   1 },
+    { "dw-s2",       64,  64,  16, 16,  3, 2, 1,   10.0f,   1 },
+    { "dw-k5",       32,  32,  16, 16,  5, 1, 2,   10.0f,   1 },
+    { "dw-deep",    256, 256,   8,  8,  3, 1, 1,   100.0f,  1 },
+    { "dw-1000x",    64,  64,  14, 14,  3, 1, 1,   1000.0f, 1 },
 };
 #define N_SHAPES ((int)(sizeof SHAPES / sizeof *SHAPES))
 
@@ -137,7 +160,9 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
     unsigned st = s->stride, pad = s->pad;
     unsigned ow = (iw + 2 * pad - k) / st + 1;
     unsigned oh = (ih + 2 * pad - k) / st + 1;
-    size_t in_n = (size_t)ic * ih * iw, w_n = (size_t)oc * ic * k * k;
+    int dw = s->dw;
+    size_t in_n = (size_t)ic * ih * iw;
+    size_t w_n = dw ? (size_t)oc * k * k : (size_t)oc * ic * k * k;
     size_t out_n = (size_t)oc * oh * ow;
     int8_t  *in = malloc(in_n), *W = malloc(w_n), *got = malloc(out_n);
     int8_t  *want = malloc(out_n);
@@ -188,6 +213,7 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
     d.stride_y = (int)st; d.stride_x = (int)st;
     d.pad_top = (int)pad; d.pad_left = (int)pad;
     d.dil_y = 1; d.dil_x = 1;
+    d.depthwise = dw;
 
     /* The tile is bookkeeping — one task, one OUT_CVT shift — not the arithmetic
      * under test, so the model asks the library where it split rather than
@@ -211,16 +237,28 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
      * epilogue in the order the part was measured to apply it. */
     for (c = 0; c < oc; c++) {
         int64_t sw = 0, sa = 0;
-        for (i = 0; i < ic; i++)
+        if (dw) {
             for (ky = 0; ky < k; ky++)
                 for (kx = 0; kx < k; kx++) {
-                    int64_t v = W[(((size_t)c * ic + i) * k + ky) * k + kx];
+                    int64_t v = W[((size_t)c * k + ky) * k + kx];
                     sw += v; sa += v < 0 ? -v : v;
                 }
+        } else {
+            for (i = 0; i < ic; i++)
+                for (ky = 0; ky < k; ky++)
+                    for (kx = 0; kx < k; kx++) {
+                        int64_t v = W[(((size_t)c * ic + i) * k + ky) * k + kx];
+                        sw += v; sa += v < 0 ? -v : v;
+                    }
+        }
         sum_w[c] = sw; sum_abs_w[c] = sa;
         A[c] = (int32_t)((int64_t)bias[c] - (int64_t)in_zp * sw);
     }
-    sort_by_scale(perm, oc, w_scale);
+    /* Depthwise binds output channel c to INPUT channel c, so the library cannot
+     * reorder the output channels and does not try: the model reads the coefficient
+     * slots in natural order there. */
+    if (dw) { for (i = 0; i < oc; i++) perm[i] = i; }
+    else    sort_by_scale(perm, oc, w_scale);
     /* A and C are per SLOT, in the permuted order the library packs the coefficient
      * group in, so the model builds both that way and maps back through slot_of. */
     for (i = 0; i < oc; i++) {
@@ -246,7 +284,7 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
                 double  ref;
                 int32_t v;
                 int m;
-                for (i = 0; i < ic; i++)
+                for (i = dw ? c : 0; i < (dw ? c + 1 : ic); i++)
                     for (ky = 0; ky < k; ky++)
                         for (kx = 0; kx < k; kx++) {
                             long iy = (long)(y * st + ky) - (long)pad;
@@ -257,7 +295,8 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
                             else
                                 fv = in[((size_t)i * ih + (size_t)iy) * iw + (size_t)ix];
                             acc += (int64_t)fv *
-                                   W[(((size_t)c * ic + i) * k + ky) * k + kx];
+                                   (dw ? W[((size_t)c * k + ky) * k + kx]
+                                       : W[(((size_t)c * ic + i) * k + ky) * k + kx]);
                         }
                 acc -= (int64_t)in_zp * sum_w[c];
                 acc += bias[c];

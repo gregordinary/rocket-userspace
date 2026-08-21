@@ -28,8 +28,8 @@
  * together, scored against a CPU model that applies them the caller's way.
  *
  * Usage:
- *   rk3576_conv_lib_gate [group ...]   groups: envelope window surface weight dw zp fc
- *                                      (default: all)
+ *   rk3576_conv_lib_gate [group ...]   groups: envelope window surface weight dw zp fq
+ *                                      nic fc  (default: all)
  *   rk3576_conv_lib_gate -l            list without running
  *
  * Env: ROCKET_LG_FILTER=<substr>   run only shapes whose name contains this
@@ -49,6 +49,7 @@
 #include "rocket_conv.h"
 #include "rocket_hw_profile.h"
 #include "requant_model.h"
+#include "npu_regcmd_rk3576.h"
 #include "rk3576_conv_shapes.h"
 
 /* The zero-point group. Same driving logic, three quant parameters that the symmetric
@@ -143,6 +144,65 @@ static const fq_shape_t FQ_SHAPES[] = {
 };
 #define N_FQ ((int)(sizeof FQ_SHAPES / sizeof FQ_SHAPES[0]))
 
+/* The NARROW-IC group: four or fewer input channels on the DIRECT datapath, which is
+ * what rocket_conv2d_desc.direct_datapath asks for.
+ *
+ * The int8 direct cube is a 32-channel MAC group at every count — rocket_rk3576_pad_ic(3)
+ * and _pad_ic(32) are both 32 — so the register program, the weight-cube size and the
+ * feature-cube size at ic 3 are the ones at ic 32, and channels 3..31 are the cube's own
+ * zero padding. What could still be wrong is the ARITHMETIC: the zero-point fold is over
+ * the LIVE tap count, ic*kh*kw, and getting that count from the register value instead
+ * would be wrong by in_zp*w_zp*(32-ic)*kh*kw — invisible at a symmetric quantization,
+ * which is why this group carries zero points rather than only shapes.
+ *
+ * It also carries the geometry the PACKED-IMAGE path refuses, because that is the reason
+ * to want this at all: a zero leading pad, an output width that is not iw/stride, and one
+ * that is not a multiple of 16. And `ext` asks for TFLite's own SAME extent, so a TFLite
+ * stem is gated here directly rather than by resemblance. */
+typedef struct {
+    const char *name;
+    unsigned ic, oc, iw, ih, k, stride, pad;
+    int ext;                       /* TFLite's SAME extent, so the trailing pad is derived */
+    int in_zp, w_zp, out_zp;
+} nic_shape_t;
+
+static const nic_shape_t NIC_SHAPES[] = {
+    {"nic-rgb-k3",       3, 32,  32,  32, 3, 1, 1, 0,   0,   0,   0},
+    {"nic-rgb-k3-valid", 3, 32,  32,  32, 3, 1, 0, 0,   0,   0,   0}, /* pad 0: fq refuses */
+    {"nic-rgb-k1",       3, 32,  32,  32, 1, 1, 0, 0,   0,   0,   0}, /* fq refuses        */
+    {"nic-rgb-iw24",     3, 32,  24,  32, 3, 1, 1, 0,   0,   0,   0}, /* iw%16: fq refuses */
+    {"nic-rgb-oc16",     3, 16,  32,  32, 3, 1, 1, 0,   0,   0,   0}, /* fq refuses        */
+    {"nic-gray-k3",      1, 32,  32,  32, 3, 1, 1, 0,   0,   0,   0}, /* one live channel  */
+    {"nic-2ch-k3",       2, 32,  32,  32, 3, 1, 1, 0,   0,   0,   0},
+    {"nic-rgba-k3",      4, 32,  32,  32, 3, 1, 1, 0,   0,   0,   0},
+    {"nic-rgb-k5",       3, 32,  32,  32, 5, 1, 2, 0,   0,   0,   0},
+    {"nic-rgb-k7",       3, 32,  32,  32, 7, 1, 3, 0,   0,   0,   0},
+    {"nic-rgb-s2",       3, 32,  32,  32, 3, 2, 1, 0,   0,   0,   0},
+    {"nic-rgb-oc96",     3, 96,  32,  32, 3, 1, 1, 0,   0,   0,   0}, /* an oc split       */
+    /* THE ZERO POINTS, which is where a tap count taken from the register value shows. */
+    {"nic-zp-in",        3, 32,  32,  32, 3, 1, 1, 0, -17,   0,   0},
+    {"nic-zp-w",         3, 32,  32,  32, 3, 1, 1, 0,   0,  23,   0},
+    {"nic-zp-all",       3, 32,  32,  32, 3, 1, 1, 0, -21,  13,  -9},
+    {"nic-zp-all-k1",    3, 64,  32,  32, 1, 1, 0, 0, -128, 127,  0},
+    {"nic-zp-gray",      1, 32,  32,  32, 3, 1, 1, 0,  40, -37,   5},
+    /* ic ABOVE FOUR, which already reached the direct path before the flag existed and
+     * is padded to the same 32-channel group. These say whether a padded channel count
+     * with both zero points is a property of the group or of the packed-image boundary:
+     * if the pad substitution covers the whole PROGRAMMED group, every one of these is
+     * wrong on its border too and the flag merely found it. */
+    {"nic-ic8-zp",       8, 32,  32,  32, 3, 1, 1, 0, -21,  13,  -9},
+    {"nic-ic16-zp",     16, 32,  32,  32, 3, 1, 1, 0, -21,  13,  -9},
+    {"nic-ic24-zp",     24, 32,  32,  32, 3, 1, 1, 0, -21,  13,  -9},
+    /* THE TFLITE STEM's own geometry: an even plane at stride two, so the leading pad is
+     * zero and the extent is one larger than it derives. The packed-image path cannot
+     * express this at all — it is the whole reason the flag exists. */
+    {"nic-tfl-s2",       3, 32,  32,  32, 3, 2, 0, 1,   0,   0,   0},
+    {"nic-tfl-s2-zp",    3, 32,  32,  32, 3, 2, 0, 1, -31,  11,  -5},
+    {"nic-tfl-224",      3, 32, 224, 224, 3, 2, 0, 1,   0,   0,   0}, /* the stem, rows too */
+    {"nic-tfl-224-oc64", 3, 64, 224, 224, 3, 2, 0, 1, -21,   0,   7},
+};
+#define N_NIC ((int)(sizeof NIC_SHAPES / sizeof NIC_SHAPES[0]))
+
 /* The FIRST CONV group at fp16. A packed image of four or fewer channels runs the
  * CNA's own sub-encoding; this group is the float form of it, and the int8 form is
  * the group above.
@@ -216,6 +276,9 @@ struct lg_stat {
 #define LG_MAX_FAILED 64
 static char lg_failed[LG_MAX_FAILED][96];
 static int  lg_nfailed;
+/* How many shapes went through the resident A/B, so a run that silently skipped it cannot
+ * read as one that passed it. */
+static int  lg_resident_ab;
 
 static void lg_note_failure(const char *group, const char *name,
                             const struct lg_stat *st, const char *reason)
@@ -259,11 +322,14 @@ static void lg_print_signature(const struct lg_stat *st)
 }
 
 /* One shape, end to end, through the public per-chip entry.
+ * `direct` sets rocket_conv2d_desc.direct_datapath; `extent` asks for TFLite's SAME
+ * output extent (ceil(in/stride)) rather than the one the leading pad derives, which is
+ * how an asymmetric pad is expressed.
  * Returns 0 exact, 1 wrong, 2 skip, 3 refused by the library. */
 static int run_one_pad(int fd, const char *name, unsigned ic, unsigned oc, unsigned iw,
                        unsigned ih, unsigned k, unsigned stride, int same, int dw,
                        unsigned max_rows, int in_zp, int w_zp, int out_zp,
-                       int pad_override, struct lg_stat *st)
+                       int pad_override, int direct, int extent, struct lg_stat *st)
 {
     rocket_conv2d_desc d = {0};
     int8_t *in = NULL, *W = NULL, *out = NULL;
@@ -296,6 +362,14 @@ static int run_one_pad(int fd, const char *name, unsigned ic, unsigned oc, unsig
     d.pad_top = pad_lead; d.pad_left = pad_lead;
     d.dil_y = 1; d.dil_x = 1;
     d.depthwise = dw;
+    d.direct_datapath = direct;
+    /* TFLite's SAME at an even plane and stride two: the odd row and column go at the END,
+     * so the leading pad is zero and the extent is one larger than that pad derives. The
+     * CNA takes the pad its last window CONSUMES, so the extent is all it needs told. */
+    if (extent) {
+        d.oh = (int)((ih + stride - 1) / stride);
+        d.ow = (int)((iw + stride - 1) / stride);
+    }
     ow = (unsigned)rocket_conv2d_ow(&d);
     oh = (unsigned)rocket_conv2d_oh(&d);
     if (!ow || !oh) return 2;
@@ -411,6 +485,53 @@ static int run_one_pad(int fd, const char *name, unsigned ic, unsigned oc, unsig
             }
     rc = (st->exact == st->total) ? 0 : 1;
 
+    /* ---- the RESIDENT path, against the transient one element for element ----
+     *
+     * The two share their arithmetic by construction (one packing routine, one submit
+     * loop), so what this actually asks is whether HOLDING the operands across calls is
+     * safe: the feature cube is filled without its zeroing memset from the second call on,
+     * and each tile's output surface carries the previous call's result when the DPU starts
+     * writing. TWICE for that reason — a single prepacked call would not notice either.
+     *
+     * ROCKET_LG_RESIDENT=1. Off by default so the shape table's own timings stay
+     * comparable run to run. */
+    if (!rc && env_int("ROCKET_LG_RESIDENT", 0) &&
+        /* ic<=4 without the flag is the packed-image conv; no handle packs that cube. */
+        (dw || ic > 4 || direct)) {
+        rocket_conv2d_int8_weights_rk3576 *h;
+        int8_t *out2 = calloc((size_t)oc * oh * ow, 1);
+        int pass;
+
+        lg_resident_ab++;
+
+        if (!out2) { rc = 2; goto done; }
+        h = rocket_conv2d_int8_pack_rk3576(fd, &d, W, bias, 1.0f, 1.0f, NULL,
+                                           (float)divisor, in_zp, w_zp, out_zp);
+        if (!h) {
+            printf("  %s: the transient call computed but pack refused\n", name);
+            free(out2); rc = 1; goto done;
+        }
+        for (pass = 0; pass < 2 && !rc; pass++) {
+            int prc;
+            memset(out2, 0x5A, (size_t)oc * oh * ow);
+            prc = rocket_conv2d_int8_prepacked_rk3576(fd, h, in, out2);
+            if (prc != ROCKET_OK) {
+                printf("  %s: prepacked pass %d returned %d\n", name, pass + 1, prc);
+                rc = 1;
+            } else if (memcmp(out, out2, (size_t)oc * oh * ow)) {
+                size_t n = (size_t)oc * oh * ow, j, bad = 0, first = 0;
+                for (j = 0; j < n; j++)
+                    if (out[j] != out2[j]) { if (!bad) first = j; bad++; }
+                printf("  %s: resident pass %d differs from transient on %zu of %zu "
+                       "elements, first at %zu (transient %d, resident %d)\n",
+                       name, pass + 1, bad, n, first, out[first], out2[first]);
+                rc = 1;
+            }
+        }
+        rocket_conv2d_int8_weights_free_rk3576(fd, h);
+        free(out2);
+    }
+
 #undef INP
 #undef WD
 #undef WW
@@ -425,7 +546,7 @@ static int run_one(int fd, const char *name, unsigned ic, unsigned oc, unsigned 
                    struct lg_stat *st)
 {
     return run_one_pad(fd, name, ic, oc, iw, ih, k, stride, same, dw, max_rows,
-                       in_zp, w_zp, out_zp, -1, st);
+                       in_zp, w_zp, out_zp, -1, 0, 0, st);
 }
 
 /* One first-conv shape, through rocket_conv2d_fp16_rk3576() with row-major CHW fp16
@@ -532,6 +653,97 @@ done:
     return rc;
 }
 
+/* ---- the row allowance the part actually honours ---------------------------------
+ * rocket_rk3576_max_task_rows() says how many INPUT rows one row task may hold, and
+ * every shape that has ever gated it has a kernel of 1, 3 or 5. A 7x7 stem does not:
+ * the planner's answer is too large there, the task past the real allowance writes
+ * NOTHING at all — deterministically, and with the whole surface guard's eight power
+ * cycles spent on it — and the conv falls back to the host.
+ *
+ * So this measures the allowance instead of asserting it. For each geometry it BISECTS
+ * the forced cap and reports the largest value that computes bit-exactly, next to what
+ * the planner predicted. Bisection assumes only that a smaller window is never worse,
+ * which is what a capacity bound means; a shape whose two agree costs one run, and a
+ * failing one costs eight power cycles per probe, so a linear walk is not affordable.
+ */
+struct rowbound_case { const char *name; unsigned ic, oc, iw, ih, k, stride; int same; };
+
+static const struct rowbound_case ROWBOUND[] = {
+    /* The ResNet-18 stem, as the graph runs it (three image channels widened to eight)
+     * and with a full 32 behind it, so the deficit can be read against `entries`. */
+    { "stem-k7-ic8",     8,  64, 224, 224, 7, 2, 1 },
+    { "stem-k7-ic32",   32,  64, 224, 224, 7, 2, 1 },
+    { "k7-s1-112",      32,  32, 112, 112, 7, 1, 1 },
+    { "k7-s1-56-ic64",  64,  64,  56,  56, 7, 1, 1 },
+    { "k5-s1-112",      32,  32, 112, 112, 5, 1, 1 },
+    { "k3-s1-112",      32,  32, 112, 112, 3, 1, 1 },
+    { "k3-s1-224",      32,  32, 224, 224, 3, 1, 1 },
+    { "k1-s1-224",      32,  32, 224, 224, 1, 1, 0 },
+    /* The axes that separate the stem from every shape above it, one at a time: the
+     * STRIDE, the output-channel group count, the plane width, and the kernel. */
+    { "k3-s2-224",      32,  32, 224, 224, 3, 2, 1 },
+    { "k5-s2-224",      32,  32, 224, 224, 5, 2, 1 },
+    { "k7-s2-224-oc32", 32,  32, 224, 224, 7, 2, 1 },
+    { "k7-s1-224",      32,  32, 224, 224, 7, 1, 1 },
+    { "k7-s2-112",      32,  32, 112, 112, 7, 2, 1 },
+};
+#define N_ROWBOUND ((int)(sizeof ROWBOUND / sizeof *ROWBOUND))
+
+static int rowbound(int fd)
+{
+    int i, bad = 0;
+
+    printf("rowbound: the largest forced row cap that computes, against the planner's\n"
+           "          own answer. `entries` is the feature row's granule count.\n");
+    for (i = 0; i < N_ROWBOUND; i++) {
+        const struct rowbound_case *s = &ROWBOUND[i];
+        unsigned predicted = rocket_rk3576_max_task_rows(s->iw, s->ic, s->oc,
+                                                         s->k, s->k, 0);
+        unsigned entries = (s->iw * s->ic + 63u) / 64u;
+        unsigned cap, measured = 0;
+        struct lg_stat st;
+
+        if (!predicted) { printf("  %-16s the planner refuses the shape\n", s->name);
+                          continue; }
+        {
+            unsigned lo = s->k, hi = predicted;
+            int rc = run_one(fd, s->name, s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
+                             s->same, 0, hi, 0, 0, 0, &st);
+            /* A BISECTION OVER AN INTERMITTENT FAILURE REPORTS THE WRONG BOUND, and the
+             * atom-drop hazard makes one here: a single unlucky probe at the top sends
+             * the search down and it never comes back. Two shapes have swung 4.5x and
+             * 1.6x between runs this way. So the top of the range is probed TWICE before
+             * the search starts, and only a twice-confirmed failure is believed. */
+            if (rc != 0)
+                rc = run_one(fd, s->name, s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
+                             s->same, 0, hi, 0, 0, 0, &st);
+            if (rc == 0) measured = hi;
+            else while (lo <= hi) {                       /* the largest cap that works */
+                cap = lo + (hi - lo) / 2u;
+                rc = run_one(fd, s->name, s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
+                             s->same, 0, cap, 0, 0, 0, &st);
+                if (rc == 0) { measured = cap; lo = cap + 1u; }
+                else { if (cap == s->k) break; hi = cap - 1u; }
+            }
+        }
+        printf("  %-16s ic=%-3u oc=%-3u %ux%u k%u s%u  entries %-4u  planner %-4u  "
+               "part %-4u  %s\n", s->name, s->ic, s->oc, s->iw, s->ih, s->k, s->stride,
+               entries, predicted, measured,
+               measured == predicted ? "agree"
+               : measured ? "THE PLANNER IS OVER" : "nothing computed");
+        if (measured != predicted) bad++;
+    }
+    /* THIS MEASURES; IT DOES NOT ASSERT. One geometry is KNOWN to be over and the
+     * shipped bound deliberately does not reach it — `56x56 k7 ic 64 oc 64` has a weight
+     * cube past the CBUF pool at F=0, where charging every group would refuse a shape
+     * that computes, so it keeps the one-slice allowance. Failing here would make that
+     * open item a standing red rather than a tracked one; what asserts the allowance is
+     * the conv and net gates, which run real shapes. */
+    printf("== %d geometr%s where the planner is over; this probe MEASURES, the "
+           "assertion is in the conv and net gates ==\n", bad, bad == 1 ? "y" : "ies");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *filter = getenv("ROCKET_LG_FILTER");
@@ -545,8 +757,10 @@ int main(int argc, char **argv)
     const char *groups[16];
     int ngroups = 0;
 
+    int want_rowbound = 0;
     for (a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-l")) list = 1;
+        else if (!strcmp(argv[a], "rowbound")) want_rowbound = 1;
         else if (!strcmp(argv[a], "all")) ngroups = 0;
         else if (ngroups < 16) groups[ngroups++] = argv[a];
     }
@@ -576,6 +790,12 @@ int main(int argc, char **argv)
             rocket_close(fd);
             return 2;
         }
+    }
+
+    if (want_rowbound) {
+        int rc = rowbound(fd);
+        rocket_close(fd);
+        return rc;
     }
 
     printf("== the RK3576 conv envelope, through the library entries ==\n");
@@ -669,7 +889,7 @@ int main(int argc, char **argv)
                 int rc;
                 if (filter && *filter && !strstr(q->name, filter)) continue;
                 rc = run_one_pad(fd, q->name, q->ic, q->oc, q->iw, q->ih, q->k,
-                                 q->stride, 0, 0, 0, 0, 0, 0, (int)q->pad, &st);
+                                 q->stride, 0, 0, 0, 0, 0, 0, (int)q->pad, 0, 0, &st);
                 if (rc == 2) { printf("  SKIP   %-9s %-20s\n", "fq", q->name); skipped++; }
                 else if (rc == 3 || q->refuse) {
                     /* Both directions: a shape past the measured boundary must be
@@ -696,6 +916,40 @@ int main(int argc, char **argv)
                            q->name, st.exact, st.total, st.maxdiff);
                     lg_print_signature(&st);
                     lg_note_failure("fq", q->name, &st, NULL);
+                    failed++;
+                }
+            }
+    }
+
+    {
+        int want_nic = (ngroups == 0);
+        for (a = 0; a < ngroups; a++) if (!strcmp(groups[a], "nic")) want_nic = 1;
+        if (want_nic)
+            for (i = 0; i < N_NIC; i++) {
+                const nic_shape_t *n = &NIC_SHAPES[i];
+                struct lg_stat st;
+                int rc;
+                if (filter && *filter && !strstr(n->name, filter)) continue;
+                rc = run_one_pad(fd, n->name, n->ic, n->oc, n->iw, n->ih, n->k,
+                                 n->stride, 0, 0, 0, n->in_zp, n->w_zp, n->out_zp,
+                                 (int)n->pad, 1, n->ext, &st);
+                if (rc == 2) { printf("  SKIP   %-9s %-20s\n", "nic", n->name); skipped++; }
+                else if (rc == 3) {
+                    printf("  FAIL   %-9s %-20s REFUSED (ic=%u, and the direct cube is a "
+                           "32-channel group at every count)\n", "nic", n->name, n->ic);
+                    lg_note_failure("nic", n->name, NULL, "REFUSED");
+                    failed++;
+                } else if (rc == 0) {
+                    printf("  PASS   %-9s %-20s %d/%d exact  zp %d/%d/%d  %.1f ms\n",
+                           "nic", n->name, st.exact, st.total, n->in_zp, n->w_zp,
+                           n->out_zp, st.ms);
+                    passed++;
+                } else {
+                    printf("  FAIL   %-9s %-20s %d/%d exact, maxdiff %d  zp %d/%d/%d\n",
+                           "nic", n->name, st.exact, st.total, st.maxdiff,
+                           n->in_zp, n->w_zp, n->out_zp);
+                    lg_print_signature(&st);
+                    lg_note_failure("nic", n->name, &st, NULL);
                     failed++;
                 }
             }
@@ -738,6 +992,10 @@ int main(int argc, char **argv)
     if (wrong_refusal)
         printf("   (%d of those computed where the table says the part cannot)\n",
                wrong_refusal);
+    if (env_int("ROCKET_LG_RESIDENT", 0))
+        printf("   resident A/B: %d shape(s) also run through pack + 2 prepacked calls "
+               "and compared to the transient output element for element\n",
+               lg_resident_ab);
     /* The count alone cannot be chased; the names can. Printed last so a captured
      * tail carries them, and with the drop-vs-arithmetic signature attached. */
     if (lg_nfailed) {

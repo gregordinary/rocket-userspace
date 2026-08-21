@@ -116,6 +116,89 @@ int rocket_pool_int8_rk3576(int fd, const rocket_pool_desc *d, int in_zp,
 void rocket_pool_ref_int8_rk3576(const rocket_pool_desc *d, int in_zp,
                                  const int8_t *in, int8_t *out);
 
+/* ---- the resident form ------------------------------------------------------
+ * A pool run repeatedly on the same shape — a graph's forward pass, a video stream —
+ * allocates three BOs, generates one register program and frees the three again on
+ * every call, and none of that depends on the input. A handle holds them:
+ *
+ *   h = rocket_pool_int8_pack_rk3576(fd, &d, in_zp);
+ *   ... per inference: rocket_pool_int8_prepacked_rk3576(fd, h, in, out);
+ *   rocket_pool_int8_free_rk3576(fd, h);
+ *
+ * rocket_pool_int8_rk3576() above IS this sequence, so a prepacked call is bit-identical
+ * to a transient one by construction rather than by agreement.
+ *
+ * A handle freezes the fd (a BO belongs to its file and an IOVA is per-fd, so a foreign
+ * fd is refused rather than submitted against addresses that mean nothing there), the
+ * geometry, and the input zero point — the average path's pad value, which is folded into
+ * the register program. NOT thread-safe: one handle carries the scratch a call writes
+ * through.
+ *
+ * CUBE INPUT. The PPU reads the same NC1HWC2 cube the convolution path packs, and a
+ * direct convolution's output surface stride is `ow*oh` exactly — so a producer's surface
+ * IS this pool's input cube, byte for byte, and the scatter and its cache maintenance do
+ * not have to be paid at all. The PPU's source surface stride is a register and is
+ * programmed from the cube verbatim, so a plane whose element count is not a multiple of
+ * four joins as readily as one that is. [HW sweep, H96 MAX M9]
+ *
+ *   rocket_conv2d_int8_cube_out_rk3576(prod, 1);
+ *   rocket_conv2d_int8_cube_of_rk3576(prod, &c);
+ *   rocket_pool_int8_cube_in_rk3576(h, &c);      // `in` may then be NULL
+ *
+ * The cube is BORROWED and must outlive the calls that read it; `src` NULL restores the
+ * row-major input. Refuses a foreign fd, a mismatched plane or channel count, a buffer
+ * too short for the channel groups the PPU walks, and a channel count that is not a
+ * multiple of 16 (below that the handle's own cube carries padding channels a producer
+ * does not write). */
+typedef struct rocket_pool_int8_rk3576_handle rocket_pool_int8_rk3576_handle;
+struct rocket_rk3576_cube;
+
+rocket_pool_int8_rk3576_handle *
+rocket_pool_int8_pack_rk3576(int fd, const rocket_pool_desc *d, int in_zp);
+
+int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
+                                      const int8_t *in, int8_t *out);
+
+int rocket_pool_int8_cube_in_rk3576(rocket_pool_int8_rk3576_handle *h,
+                                    const struct rocket_rk3576_cube *src);
+
+/* CUBE OUTPUT, the other side of the same join. A pool between two convolutions is a
+ * producer like any other: leave its output surface where the PPU wrote it and the next
+ * convolution reads it as its feature cube. The PPU's own surface stride is `round4(ow*oh)`
+ * rather than the plane, which is not a bound on the consumer — the CNA's DDR channel-group
+ * jump is a register the emitter fills and the part honours it at any value at or above the
+ * plane [HW sweep, H96 MAX M9, tests/rk3576_surf_stride.c] — so the cube carries that stride
+ * and the join is available at any plane.
+ *
+ *   rocket_pool_int8_cube_out_rk3576(h, 1);            // no de-scatter
+ *   rocket_pool_int8_cube_of_rk3576(h, &c);
+ *   rocket_conv2d_int8_cube_in_rk3576(cons, &c);
+ *   rocket_pool_int8_prepacked_rk3576(fd, h, in, NULL);   // out may be NULL
+ *
+ * `_cube_of_` refuses a channel count that is not a multiple of 16: pooling reduces WITHIN
+ * a channel, so a partial group's channels hold whatever the input cube's padding held and
+ * the tail cannot be declared. */
+int rocket_pool_int8_cube_out_rk3576(rocket_pool_int8_rk3576_handle *h, int on);
+
+int rocket_pool_int8_cube_of_rk3576(const rocket_pool_int8_rk3576_handle *h,
+                                    struct rocket_rk3576_cube *out);
+
+/* Write this handle's output surface into `dst` — a caller's buffer, at `dst`'s channel-group
+ * offset — instead of into its own, which is what puts a pool's output beside another
+ * producer's as one concatenated operand. Implies cube-out. `dst` NULL restores the handle's
+ * own surface. The buffer is BORROWED and must outlive the calls that write it.
+ *
+ * REFUSES A SLICE WHOSE CHANNEL-GROUP STRIDE IS NOT round4(ow*oh). The pooling program's
+ * destination stride is derived from the output plane and is not a field a caller can move,
+ * so a buffer at any other stride would be written at the wrong offsets; a plane whose
+ * element count is already a multiple of four needs nothing. Also refuses a foreign fd, a
+ * plane that is not this handle's, a slice too short for the channel groups the PPU writes,
+ * and an offset that is not a whole group. */
+int rocket_pool_int8_cube_out_at_rk3576(rocket_pool_int8_rk3576_handle *h,
+                                        const struct rocket_rk3576_cube *dst);
+
+void rocket_pool_int8_free_rk3576(int fd, rocket_pool_int8_rk3576_handle *h);
+
 #ifdef __cplusplus
 }
 #endif

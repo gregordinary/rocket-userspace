@@ -322,6 +322,19 @@ int rocket_conv2d_plan(const rocket_conv2d_desc *d)
         return -1;
     if (d->stride_x <= 0 || d->stride_y <= 0 || d->dil_x <= 0 || d->dil_y <= 0)
         return -1;
+    /* An EXPLICIT output extent is the RK3576 int8 path's way of asking for a trailing
+     * pad. This planner serves the RK3588 fp16 generator, whose pad registers this library
+     * has only ever driven symmetrically, so an extent it did not derive is refused rather
+     * than programmed on an untested encoding. */
+    if ((d->oh && d->oh != rocket_conv_out_dim(d->ih, d->kh, d->stride_y, d->pad_top,
+                                               d->dil_y)) ||
+        (d->ow && d->ow != rocket_conv_out_dim(d->iw, d->kw, d->stride_x, d->pad_left,
+                                               d->dil_x)))
+        return -1;
+    /* `direct_datapath` is satisfied by construction here rather than ignored: this
+     * generator has one convolution encoding, and IC < 32 on it is zero-padded up to 32
+     * exactly as the flag asks for. It is the RK3576 that has a second, packed-image
+     * encoding for four or fewer channels and so needs to be told which one. */
     /* direct: OC need NOT be a multiple of 16 — OC%16!=0 (e.g. an SSD box/class head,
      * OC=24) is zero-padded up to 16 by the driver (extra OC kernels contribute 0 and
      * the extra output channels are sliced off), mirroring the IC<32 first-layer pad.

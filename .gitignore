@@ -34,4 +34,8 @@ tests/data/rk3576-net/*.rnet
 tests/data/rk3576-net/*.tflite
 tests/data/rk3576-net/*.bmp
 tests/data/rk3576-net/labels.txt
+tests/data/rk3576-net/*.safetensors
+tests/data/rk3576-net/calib/
 tests/data/rk3576-net/pylibs/
+tests/data/rk3576-net/.venv/
+tests/data/rk3576-net/.venv-build/

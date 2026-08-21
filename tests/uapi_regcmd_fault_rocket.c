@@ -45,6 +45,16 @@
  * rk_iommu stall lines and no WARNING, so the two parts differ in the consequence
  * rather than in the trigger.
  *
+ * THAT IS WHAT THIS PROBE IS FOR NOW, and it is the A/B for patches/rocket/088
+ * (reset the core before detaching its IOMMU group). Count the stall timeouts,
+ * not the WARNINGs: the stall failure is deterministic -- exactly two lines per
+ * faulting job, one per MMU bank -- while the WARN needs the SECOND handshake,
+ * the one behind the default domain, to fail as well, and it is intermittent
+ * enough to sit out 30 consecutive faults. On the RK1 with 081-087, 30 faults
+ * (both modes, 15 rounds each) give 30 "NPU job timed out" and 60 stall
+ * timeouts; with 088 on top, the same 30 timeouts and ZERO stall lines.
+ * A run that reports 0 WARNINGs has therefore measured nothing on its own.
+ *
  * This is a PROBE, not a gate: it deliberately faults the NPU, which costs a job
  * timeout and a core reset. Run it by hand on a board you are willing to reboot.
  * It prints the dmesg delta itself so the WARN, if any, is attributed.

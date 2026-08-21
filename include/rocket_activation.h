@@ -245,6 +245,35 @@ const char *rocket_activation_name(int kind);
  * LOSLOPE/LOSHIFT) apply here too. Returns 0, or <0 if kind is not single-pass. */
 int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep);
 
+/* ============================================================================
+ * SECTION — RK3576: the int8 nonlinear activation, on the DPU LUT
+ * ==========================================================================*/
+
+/* out[c][y][x] = f(in[c][y][x]), int8 in and int8 out, computed entirely on the NPU.
+ * Both tensors are row-major [C][H][W] — the layout the RK3576 convolution entries
+ * take — and the quantization is per-tensor with model-domain signed zero points.
+ *
+ * `kind` is a ROCKET_RK3576_ACT_* from npu_regcmd_rk3576.h. exp, gelu and sqrt are NOT
+ * among them: no vendor capture emits a 513-entry table for any of the three, so they
+ * lower some other way and a table for them here would be an invention.
+ *
+ * IT IS EXACT FOR EVERY INT8 INPUT, not an interpolation of one. The op lowers onto a
+ * depthwise 1x1 identity convolution whose weight is the LUT's own index step, which
+ * puts each of the 256 possible inputs on its own table entry — so the only error
+ * against an exact f() is the entry's own quantization, and the hardware's linear
+ * interpolation between entries never runs. What the gate asserts is the chip's
+ * arithmetic against a CPU model of it; the distance to an exact f() is reported.
+ *
+ * TWO PROGRAMS, ONE JOB. The tables live in the LUT RAM and are burst there by a
+ * DPU-only program that runs as an earlier task of the same submit — a second submit
+ * could take a runtime-PM cycle in between and lose them.
+ *
+ * Available on the RK3576 only; refuses elsewhere. Returns 0 or a negative rocket error.
+ * [HW sweep, H96 MAX M9, tests/rk3576_act_gate.c] */
+int rocket_act_int8_rk3576(int fd, int kind, unsigned c, unsigned h, unsigned w,
+                           const int8_t *in, float in_scale, int in_zp,
+                           int8_t *out, float out_scale, int out_zp);
+
 
 #ifdef __cplusplus
 }

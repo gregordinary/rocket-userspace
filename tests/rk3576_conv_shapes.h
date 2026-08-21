@@ -61,6 +61,14 @@ static const shape_t SHAPES[] = {
 {"window",   "split-valid",      32,  32,  32,  32, 3, 1, 0, 0,  8, 0, 0},
 {"window",   "split-112",        32,  32, 112, 112, 3, 1, 1, 0,  0, 0, 0},
 {"window",   "split-224",        32,  32, 224, 224, 3, 1, 1, 0,  0, 0, 0},
+/* MANY row tasks in ONE kick, which no other shape here reaches: the natural plans are
+ * two to ten windows and the forced ones eight. With chaining on these go out as one
+ * hardware kick of 28 and 56 programs, which is where a bound on the LENGTH of a chained
+ * stream would show — and one does, on a graph, at 35 programs of mixed length. These are
+ * UNIFORM length, so together with that they say whether the bound is the program COUNT or
+ * something about the mix. */
+{"window",   "split-forced-28",  32,  32, 112, 112, 3, 1, 1, 0,  4, 0, 0},
+{"window",   "split-forced-38",  32,  32, 112, 112, 3, 1, 1, 0,  3, 0, 0},
 
 /* ---- surface: 0x40B8, the channel-group jump, across shape ----------------
  * The form ow*(2*oh_full - oh_task) was pinned at oc=64, k=3, one plane. It is

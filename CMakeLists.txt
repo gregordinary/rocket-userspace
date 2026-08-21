@@ -53,6 +53,7 @@ set(ROCKETNPU_SOURCES
     src/rocket_resize.c       # nearest/bilinear upsample via depthwise ConvTranspose
     src/rocket_pool.c         # on-NPU MaxPool / AveragePool via the PPU
     src/rocket_pool_rk3576.c  # the RK3576 PPU pooling entry (its own program, half-to-even avg)
+    src/rocket_lut_rk3576.c   # the RK3576 DPU LUT table builder (the activation grid)
     src/rocket_reduce.c       # on-NPU GlobalAvgPool / Mean (multi-pass PPU reduction) + feature-axis reduce
     src/rocket_norm.c         # on-NPU RMSNorm + per-row broadcast scale
     src/rocket_normvision.c   # on-NPU BatchNorm/GroupNorm/InstanceNorm/L2Norm (vision normalization)
@@ -285,7 +286,18 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_coeff_c         # RK3576 board: what the coefficient group's C multiplier multiplies (per-axis quant)
             rk3576_perchannel_gate # RK3576 board GATE: per-output-channel int8 conv vs the chip's own arithmetic
             rk3576_pool_probe      # RK3576 board: make the PPU write (the destination base no capture carries)
+            rk3576_add_probe       # RK3576 board: the DPU's elementwise stage — does it compute, and to what model
+            rk3576_residual_add    # RK3576 board: the residual add, lowered onto the convolution datapath
+            rk3576_lut_probe       # RK3576 board: the DPU LUT's input map, off our own table-load program
+            rk3576_act_gate        # RK3576 board: the int8 LUT activation entry, against a model of the chip
+            rk3576_argb_pad        # RK3576 board: is a TFLite stem reachable on the int8 first conv
             rk3576_net_gate        # RK3576 board GATE: a whole quantized classifier, layer by layer
+            rk3576_chain_raw       # RK3576 board: does a chained stream honour RAW between its programs?
+            rk3576_chain_pool      # RK3576 board: may a POOL program sit inside a chained convolution stream?
+            rk3576_chain_len       # RK3576 board: how long a chained stream may be, and what the bound follows
+            rk3576_offset_cube     # RK3576 board: is a cube base a plain address (a channel-group offset)?
+            rk3576_pad_channels    # RK3576 board: what a producer leaves past its live output channels
+            rk3576_surf_stride     # RK3576 board: will the CNA read a cube whose groups sit further apart than the plane?
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
             uapi_regcmd_fault_rocket # probe, NOT a gate: a client-requested NPU DMA fault (faults the NPU on purpose)
             hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure
@@ -374,6 +386,25 @@ if(ROCKETNPU_BUILD_TESTS)
     # is the probe that settled it rather than a check on anything.
     add_test(NAME rk3576_pool_probe COMMAND rk3576_pool_probe gate)
     set_tests_properties(rk3576_pool_probe PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME rk3576_add_probe COMMAND rk3576_add_probe gate)
+    set_tests_properties(rk3576_add_probe PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME rk3576_residual_add COMMAND rk3576_residual_add gate)
+    set_tests_properties(rk3576_residual_add PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME rk3576_lut_probe COMMAND rk3576_lut_probe gate)
+    set_tests_properties(rk3576_lut_probe PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME rk3576_act_gate COMMAND rk3576_act_gate gate)
+    set_tests_properties(rk3576_act_gate PROPERTIES SKIP_RETURN_CODE 2)
+    # Two producers writing slices of one buffer, against the row-major path they replace.
+    add_test(NAME rk3576_offset_cube COMMAND rk3576_offset_cube gate)
+    set_tests_properties(rk3576_offset_cube PROPERTIES SKIP_RETURN_CODE 2)
+    # What a producer leaves past its live output channels, which is what an unaligned join
+    # reads as its border constant.
+    add_test(NAME rk3576_pad_channels COMMAND rk3576_pad_channels)
+    set_tests_properties(rk3576_pad_channels PROPERTIES SKIP_RETURN_CODE 2)
+    # A feature cube whose channel groups sit further apart than the plane, which is what a
+    # depthwise producer's surface is.
+    add_test(NAME rk3576_surf_stride COMMAND rk3576_surf_stride)
+    set_tests_properties(rk3576_surf_stride PROPERTIES SKIP_RETURN_CODE 2)
     # A whole quantized classifier, layer by layer against TFLite's own intermediates.
     # It skips without the model blob, which is not committed — build it once with
     # tests/data/rk3576-net/fetch.sh + mknet.py. ROCKET_SRC_DIR is how it finds the blob

@@ -117,6 +117,11 @@ typedef struct {
  * untouched; gen_conv2d_* are self-contained siblings with their own task emitter
  * (gen_conv2d_task) that additionally programs the CONV_CON3 dilation fields and
  * (depthwise) the CORE_MISC_CFG DW_EN / conv_mode=3 grouping. */
+
+/* The RK3576's DPU LUT window descriptor; defined in npu_regcmd_rk3576.h, which is
+ * the only place that reads the field below. */
+struct lut_rk3576;
+
 typedef struct {
   uint16_t ic;   /* input channels  (require %32==0 for the direct path)        */
   uint16_t ih;   /* input height                                                */
@@ -165,6 +170,13 @@ typedef struct {
    * is fp16. Build with rocket_lut_epilogue_build. SMOOTH single-pass kinds only
    * (SiLU/tanh/GELU); see lut_epilogue_t. */
   const lut_epilogue_t *act;
+  /* The RK3576's DPU LUT, when this convolution's EW stage is to apply a loaded
+   * table to its BS output. NULL (default) leaves the LUT bank zeroed and the stage
+   * bypassed, which is byte-identical to every program emitted before it existed.
+   * Read ONLY by the RK3576 generators; the RK3588 path has its own `act` above and
+   * a different field layout. The two tables themselves are loaded by a SEPARATE
+   * program (gen_lut_load_rk3576) that must run in the same job. */
+  const struct lut_rk3576 *lut;
   /* Full-plane feature/output height, when this task covers only a row window of a
    * taller plane. 0 (default) == "this task is the whole plane" == ih / oh. Read
    * ONLY by the RK3576 generators (npu_regcmd_rk3576.c), whose stream carries the
@@ -172,6 +184,14 @@ typedef struct {
    * never look at them, so every existing path is byte-identical. */
   uint16_t  ih_full;
   uint16_t  oh_full;
+  /* The FEATURE cube's channel-group stride, in elements. 0 (default) == the plane,
+   * iw*ih_full, which is what a cube this library packs itself carries. A non-zero
+   * value LARGER than the plane says the input is somebody else's surface laid out
+   * with a padded stride — a depthwise producer writes round4(ow*oh) per group — and
+   * goes to the CNA's DDR group stride (0x1094) in place of the derived quantity.
+   * Read ONLY by the RK3576 generators; the RK3588 ones never look at it, so every
+   * existing path is byte-identical. A stride SMALLER than the plane is refused. */
+  uint32_t  in_surf_elems;
   uint32_t  task_count;   /* OUT: number of NPUOP words written      */
 } conv_params_t;
 
