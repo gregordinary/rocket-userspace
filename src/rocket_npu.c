@@ -21,6 +21,8 @@
 #include <time.h>
 
 #include <stddef.h>         /* offsetof */
+#include <dirent.h>         /* the bound-core count */
+#include <sys/stat.h>
 #include <stdatomic.h>      /* the cached capability probe */
 
 #include <libdrm/drm.h>
@@ -42,6 +44,7 @@
  */
 #ifndef DRM_ROCKET_JOB_BATCHED
 #define DRM_ROCKET_JOB_BATCHED (1u << 0)
+#define DRM_ROCKET_JOB_NO_DPU_DONE (1u << 1)
 struct rocket_job_flagged {
     struct drm_rocket_job job;
     __u32 flags;
@@ -52,6 +55,13 @@ _Static_assert(offsetof(struct rocket_job_flagged, flags) ==
                "appended flags must sit exactly at the stock drm_rocket_job end");
 #define ROCKET_JOB_FLAGS_VENDORED 1
 #endif
+/* A header that has @flags but predates the completion-class bit. */
+#ifndef DRM_ROCKET_JOB_NO_DPU_DONE
+#define DRM_ROCKET_JOB_NO_DPU_DONE (1u << 1)
+#endif
+_Static_assert(ROCKET_JOB_BATCHED == DRM_ROCKET_JOB_BATCHED &&
+               ROCKET_JOB_NO_DPU_DONE == DRM_ROCKET_JOB_NO_DPU_DONE,
+               "the library's ROCKET_JOB_* bits are passed to the kernel verbatim");
 
 /*
  * rkt_job — the ABI-complete job struct: drm_rocket_job plus its trailing
@@ -87,7 +97,7 @@ typedef struct drm_rocket_job rkt_job;
 static void rkt_job_init(rkt_job *j, struct drm_rocket_task *dt, uint32_t n_tasks,
                          const uint32_t *in_handles,  uint32_t n_in,
                          const uint32_t *out_handles, uint32_t n_out,
-                         int batched)
+                         uint32_t job_flags)
 {
     memset(j, 0, sizeof(*j));
     RKT_JOB_BASE(*j) = (struct drm_rocket_job){
@@ -99,7 +109,7 @@ static void rkt_job_init(rkt_job *j, struct drm_rocket_task *dt, uint32_t n_task
         .out_bo_handles      = (uint64_t)(uintptr_t)out_handles,
         .out_bo_handle_count = n_out,
     };
-    j->flags = batched ? DRM_ROCKET_JOB_BATCHED : 0u;
+    j->flags = job_flags;
 }
 
 /* Submit one job (n_tasks tasks) on `fd`, optionally with the per-job batched
@@ -107,10 +117,10 @@ static void rkt_job_init(rkt_job *j, struct drm_rocket_task *dt, uint32_t n_task
 static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tasks,
                               const uint32_t *in_handles,  uint32_t n_in,
                               const uint32_t *out_handles, uint32_t n_out,
-                              int batched)
+                              uint32_t job_flags)
 {
     rkt_job jx;
-    rkt_job_init(&jx, dt, n_tasks, in_handles, n_in, out_handles, n_out, batched);
+    rkt_job_init(&jx, dt, n_tasks, in_handles, n_in, out_handles, n_out, job_flags);
 
     struct drm_rocket_submit submit = {
         .jobs            = (uint64_t)(uintptr_t)&jx,
@@ -118,8 +128,8 @@ static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tas
         .job_struct_size = sizeof(jx),
     };
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
-        ROCKET_LOGE("ROCKET_SUBMIT(%u tasks, batched=%d): %s\n",
-                    n_tasks, batched, strerror(errno));
+        ROCKET_LOGE("ROCKET_SUBMIT(%u tasks, flags=0x%x): %s\n",
+                    n_tasks, job_flags, strerror(errno));
         return -errno;
     }
     return 0;
@@ -192,6 +202,58 @@ int rocket_batched_submit_supported(void)
  * SECTION — Device lifecycle (open / close)
  * ==========================================================================*/
 
+/* ---- RK3576: two cores in flight at once compute wrong answers ---------------
+ *
+ * On this part two NPU jobs EXECUTING simultaneously corrupt each other's results —
+ * 96-100% of calls, grossly, over as much as 94% of the surface. The condition is
+ * simultaneity, not scheduling: the same two fds driven through a mutex are exact. The
+ * resource is the convolution buffer's feature staging path, which the two cores share
+ * and which no register program can partition, so there is no encoding that avoids it
+ * and no fix on this side of the kernel. [HW sweep, H96 MAX M9]
+ *
+ * A caller cannot see it coming. With both cores bound, the kernel fans one client's
+ * work across them with no userspace change, so the sanctioned way to get the ~1.5x of
+ * multiple worker fds is exactly the pattern that corrupts — and a second core buys
+ * nothing anyway, since that 1.5x is submit pipelining across fds and is already there
+ * with one core bound.
+ *
+ * So the library refuses to hand out the second fd that would make it possible. The
+ * hazard crosses PROCESSES, which this cannot cover; what it does cover is a single
+ * process quietly building itself a fan-out on a machine whose DTS enables core 1.
+ * The real fix is `status = "disabled"` on the core 1 node.
+ *
+ * ROCKET_RK3576_ALLOW_MULTI_FD=1 lifts the refusal, for the probes that provoke the
+ * corruption on purpose and for anyone who has serialized submits themselves.
+ */
+static int rocket_bound_core_count(void)
+{
+    static const char *dir = "/sys/bus/platform/drivers/rocket";
+    static int cached = -1;
+    DIR *d;
+    struct dirent *e;
+    int n = 0;
+
+    if (cached >= 0) return cached;
+    d = opendir(dir);
+    if (!d) { cached = 0; return 0; }
+    while ((e = readdir(d))) {
+        char path[256];
+        struct stat st;
+        if (e->d_name[0] == '.') continue;
+        /* The directory also holds bind/unbind/uevent and a `module` link; a bound
+         * device is whatever carries a power/ subdirectory. */
+        if (snprintf(path, sizeof path, "%s/%s/power", dir, e->d_name) >= (int)sizeof path)
+            continue;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) n++;
+    }
+    closedir(d);
+    cached = n;
+    return n;
+}
+
+/* fds this library currently has open, so the guard fires on the SECOND one. */
+static atomic_int rocket_open_fds = 0;
+
 int rocket_open(void)
 {
     /* Default device, overridable via ROCKET_DEV for multi-NPU boxes / test rigs. */
@@ -222,11 +284,39 @@ int rocket_open(void)
     /* Resolve the hardware profile here, at the one point every user of the device
      * passes through, so a chip we have no profile for warns once per process even
      * on a path (single-task generator, dump tools) that never reads ctx->hw. */
-    (void)rocket_hw_current();
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+
+    if (hw && strcmp(hw->name, "rk3576") == 0 && rocket_bound_core_count() > 1) {
+        const char *allow = getenv("ROCKET_RK3576_ALLOW_MULTI_FD");
+        static atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (!atomic_flag_test_and_set(&warned))
+            ROCKET_LOGW("rk3576: %d NPU cores are bound. Two jobs running at once on "
+                        "this part compute WRONG ANSWERS (a shared CBUF feature path, "
+                        "not partitionable from a register program), and the kernel "
+                        "spreads work across bound cores by itself. Unbind core 1 "
+                        "(echo <dev> > /sys/bus/platform/drivers/rocket/unbind) or set "
+                        "status=\"disabled\" on its DT node.\n",
+                        rocket_bound_core_count());
+        if (atomic_load(&rocket_open_fds) > 0 && !(allow && *allow && *allow != '0')) {
+            ROCKET_LOGE("rk3576: refusing a second device fd while %d cores are bound — "
+                        "two fds is what puts two jobs in flight at once. Serialize your "
+                        "submits and set ROCKET_RK3576_ALLOW_MULTI_FD=1 to override.\n",
+                        rocket_bound_core_count());
+            close(fd);
+            return -EBUSY;
+        }
+    }
+
+    atomic_fetch_add(&rocket_open_fds, 1);
     return fd;
 }
 
-void rocket_close(int fd) { if (fd >= 0) close(fd); }
+void rocket_close(int fd)
+{
+    if (fd < 0) return;
+    close(fd);
+    if (atomic_load(&rocket_open_fds) > 0) atomic_fetch_sub(&rocket_open_fds, 1);
+}
 
 /* ============================================================================
  * SECTION — Buffer-object allocation and teardown
@@ -439,14 +529,12 @@ int rocket_bo_fini(int fd, rocket_bo *bo)
  * SECTION — Job submission
  * ==========================================================================*/
 
-int rocket_submit_matmul(int fd,
-                         const rocket_bo *regcmd_bo, uint32_t regcmd_count,
-                         const uint32_t *in_handles,  uint32_t n_in,
-                         const uint32_t *out_handles, uint32_t n_out,
-                         uint32_t timeout_ms)
+int rocket_submit_matmul_flags(int fd,
+                               const rocket_bo *regcmd_bo, uint32_t regcmd_count,
+                               const uint32_t *in_handles,  uint32_t n_in,
+                               const uint32_t *out_handles, uint32_t n_out,
+                               uint32_t job_flags)
 {
-    (void)timeout_ms; /* CONFIRMED: drm_rocket_submit/job carry no timeout field;
-                         the driver applies its own internal job timeout. */
 
     /* drm_rocket_task.regcmd is __u32 — the NPU PC's BASE_ADDRESS register is
      * 32-bit, so the regcmd BO must live in the low 4GB of NPU IOVA space. Fail
@@ -464,7 +552,19 @@ int rocket_submit_matmul(int fd,
 
     /* Goes through rkt_submit_one_job so this path declares the same
      * job_struct_size as every other submit site (see rkt_job). */
-    return rkt_submit_one_job(fd, &task, 1, in_handles, n_in, out_handles, n_out, 0);
+    return rkt_submit_one_job(fd, &task, 1, in_handles, n_in, out_handles, n_out,
+                              job_flags);
+}
+
+int rocket_submit_matmul(int fd,
+                         const rocket_bo *regcmd_bo, uint32_t regcmd_count,
+                         const uint32_t *in_handles,  uint32_t n_in,
+                         const uint32_t *out_handles, uint32_t n_out,
+                         uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return rocket_submit_matmul_flags(fd, regcmd_bo, regcmd_count, in_handles, n_in,
+                                      out_handles, n_out, 0u);
 }
 
 /* Scratch (bytes) a caller must provide to rocket_submit_tasks_pre for up to
@@ -485,7 +585,7 @@ int rocket_submit_tasks_pre(int fd, void *scratch,
                             const rocket_task_desc *tasks, uint32_t n_tasks,
                             const uint32_t *in_handles,  uint32_t n_in,
                             const uint32_t *out_handles, uint32_t n_out,
-                            int batched)
+                            uint32_t job_flags)
 {
     struct drm_rocket_task *dt = (struct drm_rocket_task *)scratch;
     for (uint32_t i = 0; i < n_tasks; i++) {
@@ -495,7 +595,7 @@ int rocket_submit_tasks_pre(int fd, void *scratch,
         };
     }
     return rkt_submit_one_job(fd, dt, n_tasks, in_handles, n_in,
-                              out_handles, n_out, batched);
+                              out_handles, n_out, job_flags);
 }
 
 /* Public shim: allocates the per-submit task array and calls the no-alloc core.
@@ -513,6 +613,26 @@ int rocket_submit_tasks(int fd,
      * path is opt-in via rocket_submit_tasks_pre's batched arg on the hot path. */
     int r = rocket_submit_tasks_pre(fd, dt, tasks, n_tasks,
                                     in_handles, n_in, out_handles, n_out, 0);
+    free(dt);
+    return r;
+}
+
+/* Public shim: as rocket_submit_tasks, with a ROCKET_JOB_* bitmask. ROCKET_JOB_BATCHED
+ * is only valid when the caller has laid the tasks' regcmds out contiguously and
+ * self-chained (rocket_chain.c) AND rocket_batched_submit_supported() is true — a
+ * chained layout run down the stock per-task path stalls, so that bit does not degrade
+ * gracefully on an older kernel. ROCKET_JOB_NO_DPU_DONE is advisory and always safe. */
+int rocket_submit_tasks_flags(int fd,
+                              const rocket_task_desc *tasks, uint32_t n_tasks,
+                              const uint32_t *in_handles,  uint32_t n_in,
+                              const uint32_t *out_handles, uint32_t n_out,
+                              uint32_t job_flags)
+{
+    if (n_tasks == 0) return 0;   // nothing to submit; calloc(0) may return NULL
+    struct drm_rocket_task *dt = calloc(n_tasks, sizeof(*dt));
+    if (!dt) return -ENOMEM;
+    int r = rocket_submit_tasks_pre(fd, dt, tasks, n_tasks,
+                                    in_handles, n_in, out_handles, n_out, job_flags);
     free(dt);
     return r;
 }

@@ -21,8 +21,14 @@
  * time: with `power/control` = `on` no amount of idle clears it at all, and the working
  * gap tracks `power/autosuspend_delay_ms` one for one. So the delay is read from the
  * driver rather than fixed, and a system that lowers it gets a cheaper path for free.
- * ROCKET_RK3576_MM_GAP_MS overrides it outright. [HW sweep, H96 MAX M9] */
-void rocket_rk3576_power_idle(void);
+ * ROCKET_RK3576_MM_GAP_MS overrides it outright. [HW sweep, H96 MAX M9]
+ *
+ * Returns 1 when the domain was OBSERVED to reach `suspended`, 0 when the call fell
+ * back to a blind idle (no write access to the sysfs delay, or the domain did not
+ * collapse inside the budget). A caller that retries on "wrote nothing" needs that
+ * distinction: a redo after a confirmed cycle that still writes nothing is a
+ * different fact from a redo after an idle that may never have cleared anything. */
+int rocket_rk3576_power_idle(void);
 
 /* Whether an output BO is stamped with a sentinel before the tasks that write it.
  *
@@ -38,5 +44,19 @@ void rocket_rk3576_power_idle(void);
 int rocket_rk3576_sentinel_on(void);
 
 #define ROCKET_RK3576_SENTINEL_BYTE 0xA5u
+
+/* Where in the CBUF a task stages, as a granule offset added to the window base and
+ * the fetch base together — a bring-up knob, zero for every shipped path.
+ *
+ * The two NPU cores share one CBUF and both stage from granule 0, which is why two
+ * jobs executing at once compute wrong answers. This is the one field a userspace
+ * encoder emits that looks like an address into that pool, so it is the one candidate
+ * for expressing a partition. Set PER THREAD, because a concurrency probe has to give
+ * two workers different bases inside one process and ROCKET_RK3576_CBUF_BIAS is
+ * process-wide; the environment variable is the fallback when it is never called.
+ *
+ * See tests/rk3576_cbuf_base.c — a bias the hardware IGNORES is invisible on a solo
+ * job, so "it still computes" is not evidence that the base moved. */
+void rocket_rk3576_set_cbuf_bias(unsigned granules);
 
 #endif /* ROCKET_RK3576_INTERNAL_H */

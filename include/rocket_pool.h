@@ -89,6 +89,32 @@ int rocket_pool_uint8(int fd, const rocket_pool_desc *d, const uint8_t *in, uint
  * the PPU). Matches the HW the two entry points drive. Pure host, no hardware. */
 void rocket_pool_ref_int8(const rocket_pool_desc *d, const int8_t *in, int8_t *out);
 
+/* ---- RK3576: the part's own pooling entry ----------------------------------------
+ * Same descriptor, same row-major [C][IH][IW] -> [C][OH][OW] int8 layouts, and a
+ * different function — so it is a separate entry rather than a dispatch, the same
+ * answer rocket_conv2d_int8() and rocket_matmul_int8() give on this part:
+ *
+ *   THE AVERAGE ROUNDS HALF TO EVEN here, where rocket_pool_int8() above truncates
+ *   toward zero. Two roundings are two functions.
+ *
+ *   THE PAD VALUE IS THE INPUT ZERO POINT on the average path, so this entry takes one.
+ *   Max pads with -128 and ignores it.
+ *
+ * The divisor is the WINDOW (kh*kw), not the tap count — TFLite's count-include-pad =
+ * TRUE — because the PPU has no divider and multiplies by a per-axis Q16 reciprocal.
+ * That reciprocal is TRUNCATED, so whether the result is the exactly-rounded average is
+ * a property of the window size: rocket_pool_int8_rk3576_exact() answers it for a
+ * descriptor, from the reciprocal the emitter will program and the worst-case int8
+ * window sum, without running anything.
+ *
+ * Bit-exact against rocket_pool_ref_int8_rk3576() over tests/rk3576_pool_probe.c.
+ * [HW sweep, H96 MAX M9] */
+int rocket_pool_int8_rk3576_plan(const rocket_pool_desc *d);
+int rocket_pool_int8_rk3576_exact(const rocket_pool_desc *d);
+int rocket_pool_int8_rk3576(int fd, const rocket_pool_desc *d, int in_zp,
+                            const int8_t *in, int8_t *out);
+void rocket_pool_ref_int8_rk3576(const rocket_pool_desc *d, int in_zp,
+                                 const int8_t *in, int8_t *out);
 
 #ifdef __cplusplus
 }

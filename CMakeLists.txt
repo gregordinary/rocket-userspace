@@ -52,6 +52,7 @@ set(ROCKETNPU_SOURCES
     src/rocket_conv_transpose.c # ConvTranspose2d (deconv) lowered onto the forward conv
     src/rocket_resize.c       # nearest/bilinear upsample via depthwise ConvTranspose
     src/rocket_pool.c         # on-NPU MaxPool / AveragePool via the PPU
+    src/rocket_pool_rk3576.c  # the RK3576 PPU pooling entry (its own program, half-to-even avg)
     src/rocket_reduce.c       # on-NPU GlobalAvgPool / Mean (multi-pass PPU reduction) + feature-axis reduce
     src/rocket_norm.c         # on-NPU RMSNorm + per-row broadcast scale
     src/rocket_normvision.c   # on-NPU BatchNorm/GroupNorm/InstanceNorm/L2Norm (vision normalization)
@@ -207,6 +208,7 @@ if(ROCKETNPU_BUILD_TESTS)
             conv2d_fp16_rocket     # general fp16 CONV_2D: cube-layout self-check + HW oracle
             conv1d_rocket          # Whisper conv1d front-end (height-1 conv2d lowering) bit-exact
             conv_transpose_rocket  # ConvTranspose2d: lowering self-check + HW oracle (vs scatter ref)
+            deconv_mode_probe      # RK3588 board: is CNA_CONV_CON1 bit 16 (DECONV) a live hardware mode?
             resize_rocket          # nearest/bilinear upsample (depthwise transpose) vs independent gather refs
             pool_fp16_rocket       # on-NPU MaxPool/AvgPool (PPU): cube self-check + HW oracle
             pool_int8_rocket       # on-NPU int8/uint8 MaxPool/AvgPool (PPU C2=16): cube self-check + HW oracle
@@ -249,6 +251,8 @@ if(ROCKETNPU_BUILD_TESTS)
             ctx_pool_throughput    # multi-instance context-pool throughput sweep (detection)
             moe_gw_bench           # resident group-wise int8 at the MoE expert shape (hand-run, not a gate)
             uapi_selftest_rocket   # rocket uAPI conformance gate (BO/deadline/IOVA contracts)
+            uapi_submit_errpath_rocket # rocket uAPI GATE: a rejected submit returns an errno, it does not oops
+            uapi_bo_lifetime_rocket # rocket uAPI GATE: a BO referenced by an in-flight job survives its file's close
             prep_signal_robust_rocket # PREP_BO wait: EINTR-retry + UINT64_MAX-deadline saturation gate
             submit_overhead_rocket # per-job dispatch floor (us/submit) A/B probe for IOMMU keep-attach
             x0_glitch_probe        # RE: does the x≈0 LE/LO mux glitch fire for a shifted table straddling 0?
@@ -270,6 +274,21 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_fc_vendor       # RK3576 board: submit a vendor capture VERBATIM — does it write?
             rk3576_cost_table      # RK3576 board: what the library entries cost, against a CPU reference
             rk3576_poison_probe    # RK3576 board: which programs poison the NEXT submit, and what carries it
+            rk3576_argb_ic1        # RK3576 board: why the int8 first conv writes nothing at one image channel
+            rk3576_fp16_split_cost # RK3576 board: where the fp16 ic split spends its wall
+            rk3576_multicore       # RK3576 board: what a second NPU core buys, across W worker fds
+            rk3576_i32_height_bound # RK3576 board: is the plane width in the wide int32 writer's bound?
+            rk3576_i32_zero_run    # RK3576 board: what selects the wide int32 writer's zero-emission runs
+            rk3576_core_pair       # RK3576 board: what makes two cores in flight compute wrong answers
+            rk3576_core_asym       # RK3576 board: is the shared resource a CAPACITY or a control path?
+            rk3576_cbuf_base       # RK3576 board: is the CBUF base an address, and does biasing it partition the cores?
+            rk3576_coeff_c         # RK3576 board: what the coefficient group's C multiplier multiplies (per-axis quant)
+            rk3576_perchannel_gate # RK3576 board GATE: per-output-channel int8 conv vs the chip's own arithmetic
+            rk3576_pool_probe      # RK3576 board: make the PPU write (the destination base no capture carries)
+            rk3576_net_gate        # RK3576 board GATE: a whole quantized classifier, layer by layer
+            requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
+            uapi_regcmd_fault_rocket # probe, NOT a gate: a client-requested NPU DMA fault (faults the NPU on purpose)
+            hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure
             membench               # DRAM bandwidth + NPU readback de-tile microbench
             fabench)               # flash-attention QK/AV submit-chaining A/B (ROCKET_FA_CHAIN 0 vs 1)
         add_executable(${t} tests/${t}.c)
@@ -278,7 +297,7 @@ if(ROCKETNPU_BUILD_TESTS)
     endforeach()
     # the shared-scratch prototype + the cross-op chain probe drive the internal
     # tiled-matmul primitives directly
-    foreach(t prototype_shared_scratch_rocket crossop_chain_rocket)
+    foreach(t prototype_shared_scratch_rocket crossop_chain_rocket rk3576_cbuf_base)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
@@ -345,8 +364,25 @@ if(ROCKETNPU_BUILD_TESTS)
     set_tests_properties(rk3576_conv_gate PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME rk3576_conv_lib_gate COMMAND rk3576_conv_lib_gate)
     set_tests_properties(rk3576_conv_lib_gate PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME rk3576_argb_ic1 COMMAND rk3576_argb_ic1)
+    set_tests_properties(rk3576_argb_ic1 PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME rk3576_matmul_gate COMMAND rk3576_matmul_gate)
     set_tests_properties(rk3576_matmul_gate PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME rk3576_perchannel_gate COMMAND rk3576_perchannel_gate)
+    set_tests_properties(rk3576_perchannel_gate PROPERTIES SKIP_RETURN_CODE 2)
+    # The PPU. `gate` and not `sweep`: the destination base is settled, and the sweep
+    # is the probe that settled it rather than a check on anything.
+    add_test(NAME rk3576_pool_probe COMMAND rk3576_pool_probe gate)
+    set_tests_properties(rk3576_pool_probe PROPERTIES SKIP_RETURN_CODE 2)
+    # A whole quantized classifier, layer by layer against TFLite's own intermediates.
+    # It skips without the model blob, which is not committed — build it once with
+    # tests/data/rk3576-net/fetch.sh + mknet.py. ROCKET_SRC_DIR is how it finds the blob
+    # from a build directory.
+    add_test(NAME rk3576_net_gate COMMAND rk3576_net_gate all)
+    set_tests_properties(rk3576_net_gate PROPERTIES SKIP_RETURN_CODE 2
+        ENVIRONMENT "ROCKET_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME rk3576_coeff_c COMMAND rk3576_coeff_c all)
+    set_tests_properties(rk3576_coeff_c PROPERTIES SKIP_RETURN_CODE 2)
     # A datapath with no encoder for the running part must fail loudly rather than emit
     # the RK3588 program, which that part completes without writing anything.
     add_test(NAME rk3576_refusal_gate COMMAND rk3576_refusal_gate)
@@ -480,6 +516,19 @@ if(ROCKETNPU_BUILD_TESTS)
     # The cross-kernel canary — a kernel that drifts fails here, not deep in matmul.
     add_test(NAME uapi_selftest_rocket COMMAND uapi_selftest_rocket)
     set_tests_properties(uapi_selftest_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    # Every rejection site in rocket_ioctl_submit_job() is reached BEFORE the job's
+    # IOMMU domain reference is taken, and rocket_job_cleanup() puts that reference
+    # unconditionally — so a malformed submit from any client holding /dev/accel/accel0
+    # (group `render`) oopses the kernel. Each case runs in a forked child, so the
+    # gate reports which site did it instead of dying with it, and stops at the first.
+    add_test(NAME uapi_submit_errpath_rocket COMMAND uapi_submit_errpath_rocket)
+    set_tests_properties(uapi_submit_errpath_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    # The per-context IOVA allocator is freed in rocket_postclose(), but a BO's IOVA
+    # node is removed in its GEM free path — which the drm_sched free worker can run
+    # after that close. Submitting and closing without waiting races the two on
+    # purpose; the verdict is the kernel log, since the defect fails no syscall.
+    add_test(NAME uapi_bo_lifetime_rocket COMMAND uapi_bo_lifetime_rocket 64)
+    set_tests_properties(uapi_bo_lifetime_rocket PROPERTIES SKIP_RETURN_CODE 2)
     # PREP_BO wait robustness: a SIGUSR1 storm (handler without SA_RESTART) must not turn the
     # interruptible kernel wait into a spurious timeout (EINTR retry), and a UINT64_MAX
     # "wait forever" timeout must saturate rather than wrap the signed deadline negative into an

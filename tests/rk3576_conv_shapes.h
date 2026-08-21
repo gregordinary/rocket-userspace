@@ -155,6 +155,91 @@ static const shape_t SHAPES[] = {
 {"dw",       "dw-c32-k7",        32,  32,  16,  16, 7, 1, 1, 1,  0, 0, 0},
 {"dw",       "dw-c128-s2",      128, 128,  16,  16, 3, 2, 1, 1,  0, 0, 0},
 {"dw",       "dw-c128-k3-valid",128, 128,  16,  16, 3, 1, 0, 1,  0, 0, 0},
+/* A STRIDE-2 DEPTHWISE OVER A PLANE THAT NEEDS A ROW SPLIT. The stride-2 entries above
+ * all fit one row task, so nothing in this table exercised the depthwise row window at
+ * stride 2 until a real network asked for one: the second block of a MobileNet is a
+ * 64-channel 3x3 stride-2 depthwise over 113 rows, which splits. Odd planes deliberately
+ * — TFLite's asymmetric SAME padding is materialised by the caller and arrives as a
+ * VALID convolution over an odd extent. */
+/* The plane and channel axes, swept, because the failure above follows neither the row
+ * window (forcing it from 8 rows to natural moves nothing) nor the stride. */
+{"dwbig",    "dwb-c64-40",       64,  64,  40,  40, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-48",       64,  64,  48,  48, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-56",       64,  64,  56,  56, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-60",       64,  64,  60,  60, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-62",       64,  64,  62,  62, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-64",       64,  64,  64,  64, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-65",       64,  64,  65,  65, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-66",       64,  64,  66,  66, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-68",       64,  64,  68,  68, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-72",       64,  64,  72,  72, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-80",       64,  64,  80,  80, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-96",       64,  64,  96,  96, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-112",      64,  64, 112, 112, 3, 1, 0, 1,  0, 0, 0},
+/* Wide and SHORT against tall and NARROW at the same element count: the plane's own
+ * width is a different axis from the rows it has. */
+{"dwbig",    "dwb-c64-113x8",    64,  64, 113,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-8x113",    64,  64,   8, 113, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-65x8",     64,  64,  65,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-64x8",     64,  64,  64,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-66x8",     64,  64,  66,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-72x8",     64,  64,  72,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c64-80x8",     64,  64,  80,   8, 3, 1, 0, 1,  0, 0, 0},
+/* And the channel axis at a width that fails. */
+{"dwbig",    "dwb-c16-113x8",    16,  16, 113,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c32-113x8",    32,  32, 113,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c48-113x8",    48,  48, 113,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c80-113x8",    80,  80, 113,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c96-113x8",    96,  96, 113,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c128-113x8",  128, 128, 113,   8, 3, 1, 0, 1,  0, 0, 0},
+{"dwbig",    "dwb-c256-113x8",  256, 256, 113,   8, 3, 1, 0, 1,  0, 0, 0},
+/* DIRECT convolutions sized onto the same rungs, which is what says whether the two dead
+ * rungs are a property of the depthwise path or of the CBUF. At ic=32 one feature row is
+ * iw/2 granules, so a square plane of n needs n*n/2: 90 sits at F=0, 92 at F=256, 96 at
+ * F=512 and 100 at F=1024. Every direct shape in the table above is small enough to sit
+ * at F=0, which is why nothing reached them. */
+{"dwbig",    "dwb-dir-f0",       32,  32,  90,  90, 3, 1, 0, 0,  0, 0, 0},
+{"dwbig",    "dwb-dir-f256",     32,  32,  92,  92, 3, 1, 0, 0,  0, 0, 0},
+{"dwbig",    "dwb-dir-f512",     32,  32,  96,  96, 3, 1, 0, 0,  0, 0, 0},
+{"dwbig",    "dwb-dir-f1024",    32,  32, 100, 100, 3, 1, 0, 0,  0, 0, 0},
+/* THE SAME GRANULE TOTAL AT FIVE PLANE WIDTHS. The F=256 rung was characterised by
+ * growing a 16-wide plane until it broke, and it delivered 4352 granules there; the
+ * shapes above need the same 4352 and do not get it. So the budget the rung delivers is
+ * not a function of the granule count alone, and this is the sweep that separates the
+ * two: k=1 so the output height is the input height, ic=32 so one row is iw/2 granules,
+ * and ih chosen to put every one of them at need = 4352. */
+{"rung256",  "r256-w16",         32,  32,  16, 544, 1, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-w32",         32,  32,  32, 272, 1, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-w64",         32,  32,  64, 136, 1, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-w128",        32,  32, 128,  68, 1, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-w272",        32,  32, 272,  32, 1, 1, 0, 0,  0, 0, 0},
+/* And the F=0 controls one row below each, which must be exact either way. */
+{"rung256",  "r0-w16",           32,  32,  16, 512, 1, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r0-w64",           32,  32,  64, 128, 1, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r0-w272",          32,  32, 272,  30, 1, 1, 0, 0,  0, 0, 0},
+/* THE SAME GRANULE TOTALS AT k=3 AND k=5. The k=1 set above is exact at every width on
+ * the 256 rung, so the axis that separates it from the failures is the KERNEL and not
+ * the plane: what the rung has to cover is evidently more than `entries * rows` once the
+ * kernel has vertical extent. Same widths, same 4352, k=3 then k=5. */
+{"rung256",  "r256-k3-w16",      32,  32,  16, 544, 3, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-k3-w32",      32,  32,  32, 272, 3, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-k3-w64",      32,  32,  64, 136, 3, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-k3-w128",     32,  32, 128,  68, 3, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-k3-w272",     32,  32, 272,  32, 3, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r256-k5-w64",      32,  32,  64, 136, 5, 1, 0, 0,  0, 0, 0},
+/* k=3 one row UNDER the F=0 budget, which must be exact: it says the k=3 failures are
+ * the rung and not the kernel's own extra rows. */
+{"rung256",  "r0-k3-w64",        32,  32,  64, 128, 3, 1, 0, 0,  0, 0, 0},
+{"rung256",  "r0-k3-w16",        32,  32,  16, 512, 3, 1, 0, 0,  0, 0, 0},
+{"dw",       "dw-c64-s2-33",     64,  64,  33,  33, 3, 2, 0, 1,  0, 0, 0},
+{"dw",       "dw-c64-s2-57",     64,  64,  57,  57, 3, 2, 0, 1,  0, 0, 0},
+{"dw",       "dw-c64-s2-65",     64,  64,  65,  65, 3, 2, 0, 1,  0, 0, 0},
+{"dw",       "dw-c64-s2-81",     64,  64,  81,  81, 3, 2, 0, 1,  0, 0, 0},
+{"dw",       "dw-c64-s2-97",     64,  64,  97,  97, 3, 2, 0, 1,  0, 0, 0},
+{"dw",       "dw-c64-s2-113",    64,  64, 113, 113, 3, 2, 0, 1,  0, 0, 0},
+{"dw",       "dw-c32-s2-113",    32,  32, 113, 113, 3, 2, 0, 1,  0, 0, 0},
+{"dw",       "dw-c64-s1-113",    64,  64, 113, 113, 3, 1, 0, 1,  0, 0, 0},
+{"dw",       "dw-c64-s2-114",    64,  64, 114, 114, 3, 2, 0, 1,  0, 0, 0},
 {"dw",       "dw-c256-k3",      256, 256,  16,  16, 3, 1, 1, 1,  0, 0, 0},
 /* The 0x401C round-up to four elements is DEPTHWISE-ONLY and invisible at every
  * plane whose ow*oh_full is already a multiple of four — which is every row above and

@@ -193,6 +193,33 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                                   const int8_t *A, const int8_t *B,
                                   const int32_t *bias, int32_t *C);
 
+/* What the wide writer's detector saw during the last int32 matmul on this thread.
+ *
+ * The entry repairs both of its failure modes silently, so a caller that wants to know
+ * what it paid — or a probe asking which shapes provoke the wide writer's zero-emission
+ * runs — has to read it out. Counted per ROW TASK, which is the unit both defects and
+ * both repairs work in.
+ *
+ * `empty` and `zeroed` are different hazards with different repairs: an atom still
+ * holding the sentinel was never emitted, which is the wide-output poisoning and needs a
+ * power cycle, while a stretch of the emission stream coming back zero is the writer's
+ * own defect and is repaired by an immediate redo.
+ *
+ * Not thread-safe and not per-fd: this is the last call on this thread, and it is
+ * overwritten by the next one. Zeroed at the top of every call, so it reads as all-zero
+ * after a call that ran the narrow writer or refused. */
+typedef struct rocket_rk3576_i32_stats {
+    unsigned submits;       /* submits the call issued, retries included */
+    unsigned tasks;         /* row tasks it ran */
+    unsigned redo_empty;    /* task attempts redone for atoms never emitted */
+    unsigned redo_zeroed;   /* task attempts redone for a zero-emission run */
+    unsigned atoms_empty;   /* atoms still holding the sentinel, summed over attempts */
+    unsigned atoms_zeroed;  /* atoms inside a detected zero run, summed the same way */
+    unsigned accepted_zero; /* tasks whose zero atoms reproduced and were taken as data */
+    unsigned refused;       /* tasks that exhausted their attempts */
+} rocket_rk3576_i32_stats;
+void rocket_rk3576_i32_last_stats(rocket_rk3576_i32_stats *out);
+
 int rocket_matmul_plan_int8(int M, int K, int N, int *Mt, int *Kt, int *Nt);
 int rocket_matmul_int8(int fd, int M, int K, int N,
                        const int8_t *A, const int8_t *B, int32_t *C);

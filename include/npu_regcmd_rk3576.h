@@ -760,6 +760,93 @@ int rocket_rk3576_pack_coeff_asym(void *dst, size_t dst_bytes, const int32_t *bi
                                   unsigned oc, const int16_t *b_term,
                                   int16_t multiplier);
 
+/* ---- The PPU: pooling ---------------------------------------------------------
+ *
+ * Pooling is its OWN program on this part, not a convolution epilogue: 23 PPU writes
+ * and 8 PPU_RDMA, no CNA, no CORE, no DPU. It reads and writes the same NC1HWC2 cube
+ * (16-byte channel atom) the convolution path already packs, so a caller that has a
+ * feature cube has a pool input.
+ *
+ * `GlobalAveragePool` is NOT this — it lowers onto convolutions, the same way the
+ * RK3588 lowers a reduce. `GlobalMaxPool` IS pooling, as two cascaded passes.
+ *
+ * THE INPUT EXTENT IS WHAT THE WINDOWS CONSUME. The emitter derives it; a caller
+ * passes the real plane in `iw`/`ih` and the real output in `ow`/`oh`. The strides are
+ * the plane's and are the only place the full plane appears.
+ *
+ * THE DESTINATION BASE REGISTER IS NOT DECODED. Every capture stores zero for it,
+ * exactly as it does for the feature, weight, output and bias bases, because the
+ * vendor runtime patches those at load time — so which of the five PPU registers that
+ * read zero in every capture receives it has to be read off the part. `ppu_dst_reg`
+ * is that register; 0 takes the current best candidate. Until it is settled, this
+ * emitter builds a program that is register-identical to the vendor's everywhere the
+ * captures constrain it and is not yet known to write anything.
+ * [Manufactured capture, RKNN-Toolkit2 for rk3576, 23 shapes] */
+enum {
+    ROCKET_RK3576_POOL_MAX = 0,
+    ROCKET_RK3576_POOL_AVG,
+    ROCKET_RK3576_POOL_AVG_NOPAD   /* average with the pad excluded from the divisor */
+};
+
+typedef struct {
+    uint16_t iw, ih, c;          /* input plane and channels (the real plane)      */
+    uint16_t ow, oh;             /* output plane                                   */
+    uint8_t  kw, kh;             /* window; 4-bit fields, so at most 16            */
+    uint8_t  stride_x, stride_y; /* likewise                                       */
+    uint8_t  pad_left, pad_right, pad_top, pad_bottom;
+    uint8_t  mode;               /* ROCKET_RK3576_POOL_*                           */
+    int32_t  input_zero_point;   /* the average path's pad value; unused for max   */
+    uint32_t input_dma, output_dma;
+    uint16_t ppu_dst_reg;        /* 0 = the default candidate; see above           */
+    uint64_t *tasks;             /* at least RK3576_POOL_TASK_OPS words            */
+    uint32_t task_count;         /* words written                                  */
+} pool_params_rk3576_t;
+
+#define RK3576_POOL_TASK_OPS 40
+
+int gen_pool_rk3576(pool_params_rk3576_t *p);
+
+/* The fp32 conv scale -> the OUT_CVT pair the emitter programs: `mul` is the uint16
+ * multiplier and `shift` the REGISTER value (already pre-decremented). Exposed because
+ * a per-channel requant has to size its C multipliers against the gain the emitter will
+ * actually program, and re-deriving it independently is how the two drift apart. */
+void rocket_rk3576_requant_params(float conv_scale, unsigned *mul, unsigned *shift);
+
+/*
+ * The PER-OUTPUT-CHANNEL form: `c_term[oc]` is that channel's C multiplier, and
+ * `multiplier` is what a NULL `c_term` falls back to. This is the field a per-axis
+ * weight quantization rides on.
+ *
+ * THE BS STAGE ADDS A AND THEN MULTIPLIES BY C: the surface is
+ * `(acc + A[oc] + B[oc]*sum(x)) * C[oc]`, so a bias quantized in the accumulator domain
+ * rides the per-channel gain for free and must NOT be pre-divided by it. The two
+ * orders are the same buffer and different arithmetic, and the wrong one produces a
+ * bias scaled by the wrong channel gain — a plausible surface, not a fault. Read off
+ * the part at C=1 against C=2 with a known accumulator and a known A: `(acc + A)*C`
+ * explains 32 of 32 channels and `acc*C + A` explains only the 16 where C is 1.
+ *
+ * THAT PRODUCT IS INT32 AND SATURATES. Walking it across 2^31 at a fixed accumulator,
+ * every inexact cell implies the same ceiling — 2.147e9 to 2.158e9 against 2^31 =
+ * 2.1475e9 — and none of them wraps. So a planner sizing C has a bound to stay inside
+ * rather than a cliff: `|(acc + A) * C| <= INT32_MAX`.
+ *
+ * WHAT C CAN EXPRESS. The OUT_CVT then applies ONE `(v*MUL)>>SHIFT` to every channel,
+ * so the composite per-channel gain is `C[oc]*MUL/2^SHIFT`. A per-channel SCALE is
+ * therefore expressible and a per-channel SHIFT is not — TFLite per-axis requant
+ * carries both, so this reproduces a per-axis model closely and not bit-exactly. Two
+ * things bound the fidelity: C is an integer, so a channel's gain resolution is
+ * 0.5/C[oc], and the int32 clamp caps C[oc] at `INT32_MAX / max|acc + A|`, which falls
+ * as the layer's fan-in grows.
+ *
+ * No entry may be 0: a zero C gates the BS stage off for that channel's whole 8-channel
+ * group and the DPU writes a full, correctly sized, entirely EMPTY surface with nothing
+ * to fault on. Rejected here rather than submitted.
+ * [HW sweep, H96 MAX M9, tests/rk3576_coeff_c.c]
+ */
+int rocket_rk3576_pack_coeff_perc(void *dst, size_t dst_bytes, const int32_t *bias,
+                                  unsigned oc, const int16_t *b_term,
+                                  const int16_t *c_term, int16_t multiplier);
+
 /*
  * THE DEPTHWISE PATH READS A DIFFERENT GROUP, and this is the one to hand it. Same 8
  * output channels, but 48 bytes and no B field:

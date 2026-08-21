@@ -113,6 +113,7 @@
 #include "npu_hw.h"
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
+#include "requant_model.h"
 
 #define C2   16                 /* int8 cube channel atom */
 #define SENTINEL 0xAA
@@ -143,36 +144,15 @@ static double now_ms(void)
 }
 
 /* The requant the emitter programs. The register holds `shift`; the DPU computes
- * out = sat8( (acc * scale) >> shift ) + offset. The emitter derives scale and the
- * pre-decrement shift from the fp32 conv scale exactly as the vendor (QNNPACK)
- * does and writes shift-1, so the CPU model shifts by that same register value. */
-static void requant_params(float conv_scale, unsigned *scale, unsigned *shift_reg)
-{
-    union { float f; uint32_t u; } cv;
-    uint32_t bits;
-    cv.f = conv_scale;
-    bits = cv.u;
-    *shift_reg = 127u + 31u - 32u - (bits >> 23) + 16u - 1u;
-    *scale = ((bits >> 9) & 0x7FFFu) + 1u;
-    if (*scale < (1u << 14)) *scale |= (1u << 14);
-}
-
-/* The DPU rounds to nearest rather than truncating: a pad-probe border whose exact
- * value is -10.0006 comes back as -10, not the -11 an arithmetic shift gives. Adding
- * half an LSB before the shift reproduces every border pixel of that probe exactly. */
+ * out = sat8( round(acc * scale >> shift) + offset ), rounding to nearest with ties
+ * to EVEN — a pad-probe border whose exact value is -10.0006 comes back as -10, not
+ * the -11 an arithmetic shift gives. tests/requant_model.h carries the rule; this
+ * probe also wants the UNSATURATED value, to name a saturated lane's magnitude. */
 static int64_t requant_raw(int64_t acc, unsigned scale, unsigned shift_reg, int offset)
 {
-    int64_t half = shift_reg ? ((int64_t)1 << (shift_reg - 1)) : 0;
-    return ((acc * (int64_t)scale + half) >> shift_reg) + offset;
+    return requant_round_shift(acc * (int64_t)scale, shift_reg) + offset;
 }
 
-static int requant_apply(int64_t acc, unsigned scale, unsigned shift_reg, int offset)
-{
-    int64_t v = requant_raw(acc, scale, shift_reg, offset);
-    if (v >  127) v =  127;
-    if (v < -128) v = -128;
-    return (int)v;
-}
 
 /* The two candidate saturation domains for the writer, as the byte the probe reads
  * back through an int8 pointer. A signed writer clamps to [-128,127]; an unsigned
@@ -816,7 +796,7 @@ int main(int argc, char **argv)
             for (oc = 0; oc < OC && !expect_nonzero; oc++)
                 for (y = 0; y < OH && !expect_nonzero; y++)
                     for (x = 0; x < OW && !expect_nonzero; x++)
-                        if (requant_apply(model_acc(in_plain, w_plain, bias, pad_val,
+                        if (requant_apply_zp(model_acc(in_plain, w_plain, bias, pad_val,
                                                     oc, y, x), scale, shift_reg, 0))
                             expect_nonzero = 1;
             for (t = 0; t < tries; t++) {
@@ -869,7 +849,7 @@ int main(int argc, char **argv)
                                 acc += (int64_t)tap * WP(oc, ic, kh, kw);
                             }
                     raw  = requant_raw(acc, scale, shift_reg, 0);
-                    want = requant_apply(acc, scale, shift_reg, 0);
+                    want = requant_apply_zp(acc, scale, shift_reg, 0);
                     got  = out[0][feature_data(OC, OH, OW, C2, oc + 1, y + 1, x + 1)];
                     /* Which saturation domain reproduces this pixel. Counted over
                      * every pixel, not just the mismatches, because the two rules
@@ -933,8 +913,8 @@ int main(int argc, char **argv)
                 printf("    c%2d: acc %8lld  raw %6lld  want %4d  got %4d%s\n", oc,
                        (long long)acc,
                        (long long)requant_raw(acc, scale, shift_reg, 0),
-                       requant_apply(acc, scale, shift_reg, 0), got,
-                       got == requant_apply(acc, scale, shift_reg, 0) ? "" : "   <-");
+                       requant_apply_zp(acc, scale, shift_reg, 0), got,
+                       got == requant_apply_zp(acc, scale, shift_reg, 0) ? "" : "   <-");
             }
         }
         /* The transfer curve, printed as runs of (raw -> got). With ROCKET_FL_FEAT=10
@@ -1035,7 +1015,7 @@ int main(int argc, char **argv)
                                       ? INP(ic, iy, ix) : pad_val;
                             acc += (int64_t)tap * WP(0, ic, kh, kw);
                         }
-                printf("%5d", requant_apply(acc, scale, shift_reg, 0));
+                printf("%5d", requant_apply_zp(acc, scale, shift_reg, 0));
             }
             printf("\n");
         }

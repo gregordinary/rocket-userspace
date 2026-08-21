@@ -59,6 +59,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <math.h>
 
 #include "rocket_npu.h"
 #include "rocket_conv.h"
@@ -68,6 +70,7 @@
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
 #include "rocket_rk3576_internal.h"
+#include "rocket_chain.h"
 
 #define C2     16u      /* int8 feature/output channel atom */
 #define C2F     8u      /* fp16 feature/output channel atom */
@@ -179,24 +182,220 @@ static int r76_task_wrote(const unsigned char *o, const struct r76_task_extent *
     return 0;
 }
 
-/* Submit one row task and satisfy ourselves that it wrote. The retry is what covers the
+/* Env-gated phase timing for the fp16 input-channel split. On-chip accumulation across
+ * the slices would remove the READBACK and nothing else — the slice count, and so the
+ * wide-output submits and the poisoning retries they carry, is set by the sixteen-channel
+ * contraction either way. So the lever is only worth building if the readback is a real
+ * share of the wall, and this is what says. ROCKET_RK3576_FP16_PROF=1 logs one line per
+ * call, at ROCKET_LOG_INFO. */
+struct r76_fp16_prof {
+    int      on;
+    unsigned slices;
+    double   pack_us, stamp_us, submit_us, read_us;
+};
+
+static double r76_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec * 1e-3;
+}
+
+static int r76_fp16_prof_on(void)
+{
+    const char *e = getenv("ROCKET_RK3576_FP16_PROF");
+    return (e && *e && *e != '0');
+}
+
+/* How long to let a surface drain before calling it unwritten, in microseconds.
+ * ROCKET_RK3576_DRAIN_US sets it; DEFAULT 0, because it is a MEASURED NEGATIVE — see
+ * r76_task_wrote_late() below. */
+static int r76_drain_us(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("ROCKET_RK3576_DRAIN_US");
+        cached = (e && *e) ? (int)strtol(e, NULL, 0) : 0;
+        if (cached < 0) cached = 0;
+    }
+    return cached;
+}
+
+/* How many times to redo a row task that wrote nothing. ROCKET_RK3576_TASK_ATTEMPTS.
+ *
+ * THE POWER CYCLE THE REDO WAITS FOR CLEARS THE POISONING ABOUT 87% OF THE TIME, so the
+ * count is what makes the guard reliable, not a better cycle. Over twelve fp16 gate runs
+ * the redo fired on 358 row tasks and the attempt that failed next was attempt 2 for 45
+ * of them, 3 for 10, 4 for 2, 5 for 1 and 6 for none — every one of them recovering, and
+ * each cycle CONFIRMED to have taken the domain to `suspended` first. At four attempts
+ * that is about 0.6% of retried tasks returned as a device error, which is the rate the
+ * conv gate saw. Eight matches the matmul path's R76_I32_TASK_ATTEMPTS, and costs
+ * nothing on a task that succeeds. [HW sweep, H96 MAX M9] */
+static unsigned r76_task_attempts(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("ROCKET_RK3576_TASK_ATTEMPTS");
+        cached = (e && *e) ? (int)strtol(e, NULL, 0) : 8;
+        if (cached < 1) cached = 1;
+    }
+    return (unsigned)cached;
+}
+
+/* Ask the surface again after a settle. A task whose DPU output element is wider than
+ * one byte raises no DPU completion on this part, so the driver retires it on PC_DONE
+ * plus a blind grace — and PC_DONE means the program counter finished ISSUING, not that
+ * the writes have landed. The fence can therefore signal while the surface is still
+ * draining, and a surface that arrives late is a completion-visibility fact rather than
+ * the poisoning. It is asked BEFORE the power cycle because the cycle cannot fix it and
+ * costs four orders of magnitude more.
+ *
+ * IT RESCUES NOTHING, and that is the result: at a 2 ms settle, 0 of 67 row tasks that
+ * read unwritten had arrived by the time it looked again, while the power cycle behind
+ * it recovered all 67. So a task that reads unwritten on this path really is unwritten,
+ * the fence is not signalling ahead of the writes, and the 14% wall this costs when it
+ * is on buys nothing. Off by default; the knob is kept because it is the instrument
+ * that settled it. [HW sweep, H96 MAX M9] */
+/* 1 if every task's own rows landed. `first_missing` names the earliest that did not,
+ * which is what separates "the stream was poisoned" (none of them) from "the program
+ * counter ran one task and stopped" (all but the first). */
+static int r76_all_wrote(const unsigned char *o, const struct r76_task_extent *e,
+                         unsigned ne, unsigned char stamp, unsigned *first_missing)
+{
+    unsigned i, missing = 0;
+    int ok = 1;
+    for (i = 0; i < ne; i++)
+        if (!r76_task_wrote(o, &e[i], stamp)) {
+            if (ok) missing = i;
+            ok = 0;
+        }
+    if (first_missing) *first_missing = missing;
+    return ok;
+}
+
+static int r76_task_wrote_late(int fd, struct r76_conv_bos *b,
+                               const struct r76_task_extent *e, unsigned ne,
+                               unsigned char stamp)
+{
+    struct timespec ts;
+    int us = r76_drain_us(), wrote;
+
+    if (!us) return 0;
+    ts.tv_sec = us / 1000000;
+    ts.tv_nsec = (long)(us % 1000000) * 1000L;
+    nanosleep(&ts, NULL);
+
+    rocket_bo_prep(fd, &b->out, 0, 0);
+    wrote = r76_all_wrote((const unsigned char *)b->out.ptr, e, ne, stamp, NULL);
+    rocket_bo_fini(fd, &b->out);
+    return wrote;
+}
+
+/* Whether the row tasks of one output-channel tile go out as ONE submit.
+ *
+ * The per-submit floor on this part is ~439 us and a row-windowed convolution is one
+ * submit per window, so a plane that plans into n windows pays it n times for work the
+ * program counter could issue back to back. The row tasks of one tile are independent by
+ * construction — each writes its own rows of the same surface, reads its own window of
+ * the same feature cube, and the weight and coefficient buffers do not change across
+ * them — so concatenating their programs into one regcmd stream is arithmetically sound.
+ *
+ * A CONCATENATED STREAM IN ONE DRM TASK DOES NOT RUN, and the mechanism is decoded. A
+ * drm task descriptor carries ONE PC program however many the stream holds: the driver
+ * programs PC_TASK_CON with TASK_NUMBER = 1 per descriptor, so the program counter
+ * executes the first task and stops with the rest of the stream unexecuted. Measured
+ * with a per-task write check that names the earliest task missing: at 3 tasks and at 6,
+ * task 0 lands and task 1 is the first missing, on every one of eight attempts with the
+ * power domain confirmed cycled between them — deterministic, and not the poisoning.
+ *
+ * WHAT COLLECTS IT IS THE JOINT LAYOUT CONTRACT the RK3588 already uses: userspace lays
+ * the n programs out contiguously at a fixed stride and rewrites each trailer to point
+ * the PC at the next (rocket_chain.c), submits them as n drm task descriptors with
+ * DRM_ROCKET_JOB_BATCHED, and the kernel programs TASK_NUMBER = n so the PC streams them
+ * from ONE kick and raises ONE completion. That is what makes it a lever rather than an
+ * ioctl saving — the completion poll IS the ~439 us floor, and n row tasks then pay it
+ * once. The kernel half is patches/rk3576/npu/0015 (extensible submit descriptors) and
+ * 0016 (the flag); rocket_batched_submit_supported() refuses to self-chain without it,
+ * because a chained layout run down the per-task path stalls.
+ *
+ * ROCKET_RK3576_BATCH_TASKS=1 turns it on. [HW sweep, H96 MAX M9] */
+static int r76_batch_on(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("ROCKET_RK3576_BATCH_TASKS");
+        int want = (e && *e) ? (*e != '0') : 0;
+        if (want && !rocket_batched_submit_supported()) {
+            ROCKET_LOGW("ROCKET_RK3576_BATCH_TASKS=1 but this kernel does not honor "
+                        "DRM_ROCKET_JOB_BATCHED (needs patches/rk3576/npu/0015-0016; "
+                        "the driver must report >= 1.1). One submit per row task.\n");
+            want = 0;
+        }
+        cached = want;
+    }
+    return cached;
+}
+
+/* The row tasks one chained job may carry. Every plan on this part is bounded by the
+ * output height, so this is far above anything the row planner emits; a shape that
+ * somehow exceeded it runs one submit per task instead. */
+#define R76_MAX_CHAIN_TASKS 512u
+
+/* Lay `ne` programs of `task_ops` words each out in the regcmd BO as ONE chained stream
+ * and describe them as ne drm tasks. The host buffer holds each program at the fixed
+ * RK3576_CONV_TASK_OPS stride (the generator's upper bound); the BO gets them at the
+ * chain's own even-word stride with each trailer rewritten to point the PC at the next,
+ * and the last task's forward link cleared. The kernel then programs TASK_NUMBER = ne so
+ * the PC streams all of them from one kick and raises one completion. */
+static void r76_chain_stream(struct r76_conv_bos *b, rocket_task_desc *td,
+                             const uint64_t *ops, uint32_t task_ops, unsigned ne)
+{
+    unsigned t;
+    for (t = 0; t < ne; t++)
+        rkt_chain_pack(1, &b->rc, td, (int)t,
+                       ops + (size_t)t * RK3576_CONV_TASK_OPS, task_ops, 0);
+    rkt_chain_seal(1, &b->rc, (int)ne, task_ops);
+}
+
+/* Submit one tile's row tasks and satisfy ourselves that each wrote. `ops` holds `ne`
+ * programs of `task_ops` words; they go out as one chained job when batching is on and
+ * as one submit each when it is not (ne is then 1). The retry is what covers the
  * poisoning an int32-output job leaves behind — it crosses calls and processes, so a
  * conv inherits it from whatever ran before — and the idle in front of the redo is the
  * NPU power domain cycling rather than a settling time. */
-static int r76_submit_task(int fd, struct r76_conv_bos *b, const conv_params_t *q,
-                           const uint64_t *ops, const uint32_t *in_h, unsigned n_in,
-                           const uint32_t *out_h, const struct r76_task_extent *e,
-                           unsigned char stamp, const char *entry)
+static int r76_submit_ops(int fd, struct r76_conv_bos *b, const uint64_t *ops,
+                          uint32_t task_ops, const uint32_t *in_h, unsigned n_in,
+                          const uint32_t *out_h, const struct r76_task_extent *e,
+                          unsigned ne, unsigned char stamp, uint32_t job_flags,
+                          const char *entry)
 {
-    unsigned attempt;
+    unsigned attempt, attempts = r76_task_attempts(), missing = 0;
+    int cycled = 0, cycles_confirmed = 0;
+    int chained = ne > 1u;
+    rocket_task_desc td[R76_MAX_CHAIN_TASKS];
 
-    for (attempt = 0; attempt < 4u; attempt++) {
+    if (chained && ne > R76_MAX_CHAIN_TASKS) {
+        ROCKET_LOGE("%s: %u chained tasks exceeds the %u this path lays out\n",
+                    entry, ne, (unsigned)R76_MAX_CHAIN_TASKS);
+        return ROCKET_E_SHAPE;
+    }
+
+    for (attempt = 0; attempt < attempts; attempt++) {
+        int srv;
+
         rocket_bo_prep(fd, &b->rc, 1, 0);
-        memcpy(b->rc.ptr, ops, q->task_count * sizeof(uint64_t));
+        if (chained)
+            r76_chain_stream(b, td, ops, task_ops, ne);
+        else
+            memcpy(b->rc.ptr, ops, (size_t)task_ops * sizeof(uint64_t));
         rocket_bo_fini(fd, &b->rc);
 
-        if (rocket_submit_matmul(fd, &b->rc, q->task_count, in_h, n_in, out_h, 1,
-                                 4000) != 0) {
+        srv = chained
+            ? rocket_submit_tasks_flags(fd, td, ne, in_h, n_in, out_h, 1,
+                                        job_flags | ROCKET_JOB_BATCHED)
+            : rocket_submit_matmul_flags(fd, &b->rc, task_ops, in_h, n_in, out_h, 1,
+                                         job_flags);
+        if (srv != 0) {
             ROCKET_LOGE("%s: submit failed\n", entry);
             return ROCKET_E_DEVICE;
         }
@@ -206,16 +405,41 @@ static int r76_submit_task(int fd, struct r76_conv_bos *b, const conv_params_t *
         }
         if (!stamp) { rocket_bo_fini(fd, &b->out); return ROCKET_OK; }
         {
-            int wrote = r76_task_wrote((const unsigned char *)b->out.ptr, e, stamp);
+            /* EVERY task in the stream, not the stream as a whole: one dead task among
+             * several leaves its own rows stale while its siblings land, and a check
+             * that asks "did anything change" passes that hole straight to the caller. */
+            int wrote = r76_all_wrote((const unsigned char *)b->out.ptr, e, ne, stamp,
+                                      &missing);
             rocket_bo_fini(fd, &b->out);
             if (wrote) return ROCKET_OK;
         }
-        ROCKET_LOGD("%s: a row task wrote nothing, cycling the power domain and "
-                    "redoing it\n", entry);
-        rocket_rk3576_power_idle();
+        if (r76_task_wrote_late(fd, b, e, ne, stamp)) {
+            ROCKET_LOGD("%s: the surface arrived after the fence, not with it — a "
+                        "drain, not the poisoning (attempt %u)\n", entry, attempt + 1u);
+            return ROCKET_OK;
+        }
+        ROCKET_LOGD("%s: of %u row task(s) in this submit the first that wrote nothing "
+                    "is %u, on attempt %u; cycling the power domain and redoing it\n",
+                    entry, ne, missing, attempt + 1u);
+        cycled++;
+        cycles_confirmed += rocket_rk3576_power_idle();
     }
-    ROCKET_LOGE("%s: a row task wrote nothing over four attempts\n", entry);
+    /* Which of the two failures this was, rather than only that it failed: a redo after
+     * a CONFIRMED domain collapse that still wrote nothing is not the poisoning, and a
+     * redo after an unconfirmed one never had the guard the retry assumes. */
+    ROCKET_LOGE("%s: a row task wrote nothing over %u attempts (%d power cycles, "
+                "%d of them confirmed to reach suspended)\n",
+                entry, attempts, cycled, cycles_confirmed);
     return ROCKET_E_DEVICE;
+}
+
+static int r76_submit_task(int fd, struct r76_conv_bos *b, const conv_params_t *q,
+                           const uint64_t *ops, const uint32_t *in_h, unsigned n_in,
+                           const uint32_t *out_h, const struct r76_task_extent *e,
+                           unsigned char stamp, uint32_t job_flags, const char *entry)
+{
+    return r76_submit_ops(fd, b, ops, q->task_count, in_h, n_in, out_h, e, 1, stamp,
+                          job_flags, entry);
 }
 
 /* ============================================================================
@@ -261,41 +485,263 @@ static unsigned r76_conv_oc_tile(unsigned icreg, unsigned kh, unsigned kw, unsig
  *
  * with sum_w the sum of that output channel's whole filter and N its tap count. Both
  * corrections are pixel-independent, which is what makes them foldable at all. */
+/* The output channel a tile's slot j actually carries. Identity unless a per-channel
+ * requant has reordered them; see r76_sort_by_scale. */
+static unsigned r76_oc_of(const unsigned *perm, unsigned i)
+{
+    return perm ? perm[i] : i;
+}
+
+/*
+ * Sort the output channels by their weight scale, ascending.
+ *
+ * Every output-channel TILE is its own task and so carries its own OUT_CVT shift, and
+ * the C ramp inside a tile only has to span THAT tile's range of scales. Left in model
+ * order a tile sees the whole layer's spread; sorted, each tile sees roughly the
+ * spread's n-th root. That is the difference between a usable per-axis requant and a
+ * useless one on a layer with both a wide scale spread and a large fan-in, where the
+ * int32 clamp already caps the largest C at a couple of hundred.
+ *
+ * The permutation is a relabelling of the output axis and nothing else: the weight
+ * cube, the bias fold, the C ramp and the de-scatter all read the same slot, so the
+ * caller's `out` comes back in the caller's channel order.
+ *
+ * An insertion sort, because oc is at most a few thousand and this runs once.
+ */
+static void r76_sort_by_scale(unsigned *perm, unsigned oc, const float *w_scale)
+{
+    unsigned i, j;
+    for (i = 0; i < oc; i++) perm[i] = i;
+    for (i = 1; i < oc; i++) {
+        unsigned v = perm[i];
+        float    s = w_scale[v];
+        j = i;
+        while (j > 0 && w_scale[perm[j - 1]] > s) { perm[j] = perm[j - 1]; j--; }
+        perm[j] = v;
+    }
+}
+
 static void r76_fold_coeff(int32_t *A, const int32_t *bias, unsigned oc0,
                            unsigned tile_oc, const int64_t *sum_w, int in_zp, int w_zp,
-                           unsigned taps)
+                           unsigned taps, const unsigned *perm)
 {
     unsigned j;
     for (j = 0; j < tile_oc; j++) {
-        int64_t a = bias ? (int64_t)bias[oc0 + j] : 0;
-        a -= (int64_t)in_zp * sum_w[oc0 + j];
+        unsigned c = r76_oc_of(perm, oc0 + j);
+        int64_t a = bias ? (int64_t)bias[c] : 0;
+        a -= (int64_t)in_zp * sum_w[c];
         a += (int64_t)in_zp * w_zp * taps;
         A[j] = (int32_t)a;
+    }
+}
+
+/*
+ * The per-output-channel requant plan.
+ *
+ * The DPU's epilogue is `(acc + A[oc]) * C[oc]` in saturating int32, then ONE
+ * `(v*MUL)>>SHIFT` for the whole task. So a per-axis weight quantization rides on
+ * C, and the job here is to pick the one (MUL, SHIFT) and the C ramp that together
+ * approximate every channel's own `in_scale*w_scale[oc]/out_scale` as closely as the
+ * two hardware bounds allow:
+ *
+ *   - C is an integer, so channel oc's gain resolution is 0.5/C[oc]. Bigger is better.
+ *   - `(acc + A) * C` saturates at INT32_MAX, so C[oc] is capped by that channel's own
+ *     worst-case accumulator. Bigger is not free.
+ *
+ * The cap is computed from the ACTUAL weights rather than from the int8 envelope,
+ * because 127*sum|w| over a real filter is one to two orders of magnitude below
+ * ic*kh*kw*127*127 and the difference is most of the available precision.
+ *
+ * Returns the worst-case relative gain error over the channels in `*max_rel_err`.
+ */
+static int r76_plan_perchannel(const char *entry, unsigned oc0, unsigned tile_oc,
+                               unsigned ocreg, const int32_t *A,
+                               const int64_t *sum_abs_w, float in_scale,
+                               const float *w_scale, float out_scale,
+                               const unsigned *perm,
+                               int16_t *C, float *base_scale, double *max_rel_err)
+{
+    double best_base = 0.0;
+    unsigned j;
+
+    /* The tightest base gain: every channel must reach its own scale with a C that
+     * neither exceeds the int16 field nor saturates the int32 product. */
+    for (j = 0; j < tile_oc; j++) {
+        unsigned oc_j = r76_oc_of(perm, oc0 + j);
+        double cs = (double)in_scale * (double)w_scale[oc_j] / (double)out_scale;
+        /* |acc| <= 128*sum|w| (the input is signed int8), and A rides with it. */
+        double bound = 128.0 * (double)sum_abs_w[oc_j] + fabs((double)A[j]) + 1.0;
+        double cmax = (double)INT32_MAX / bound;
+        double need;
+        if (!(cs > 0.0)) {
+            ROCKET_LOGE("%s: w_scale[%u] is %g — every per-channel scale must be "
+                        "positive\n", entry, oc_j, (double)w_scale[oc_j]);
+            return -1;
+        }
+        if (cmax > 32767.0) cmax = 32767.0;
+        if (cmax < 1.0)     cmax = 1.0;
+        need = cs / cmax;
+        if (need > best_base) best_base = need;
+    }
+    if (!(best_base > 0.0)) return -1;
+
+    /* Quantize the base into the pair the emitter will actually program, then read it
+     * back: the C ramp has to be built against the gain the hardware gets, not the one
+     * the planner asked for. */
+    {
+        unsigned mul, shift;
+        double base_actual;
+        rocket_rk3576_requant_params((float)best_base, &mul, &shift);
+        base_actual = (double)mul / (double)((uint64_t)1 << shift);
+        *base_scale = (float)best_base;
+        *max_rel_err = 0.0;
+        for (j = 0; j < ocreg; j++) {
+            double cs, want, err;
+            long long c;
+            if (j >= tile_oc) { C[j] = 1; continue; }   /* a padded channel computes nothing */
+            cs   = (double)in_scale * (double)w_scale[r76_oc_of(perm, oc0 + j)] /
+                   (double)out_scale;
+            want = cs / base_actual;
+            c = (long long)(want + 0.5);
+            if (c < 1)     c = 1;
+            if (c > 32767) c = 32767;
+            C[j] = (int16_t)c;
+            err = fabs((double)c * base_actual - cs) / cs;
+            if (err > *max_rel_err) *max_rel_err = err;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Pick the output-channel tile on the per-channel path.
+ *
+ * Everywhere else the tile is a CBUF-fit decision. Here it is also an ACCURACY one,
+ * because a tile is one task and a task carries one OUT_CVT shift: the C ramp inside a
+ * tile only spans that tile's range of scales, so halving the tile roughly halves the
+ * spread the ramp has to cover and the worst channel's gain resolution improves with
+ * it. Measured on the part at ic=128 oc=128 with a 100x spread: 26.6 counts of
+ * deviation from an exact per-axis requant in one tile, 2.7 at 64 channels, 1.0 at 32.
+ *
+ * The cost is submits — one row-task set per tile at the part's ~439 us floor — so
+ * this takes the LARGEST tile that meets the error target rather than the smallest
+ * tile that would fit. The error is predicted from the plan alone, with no submits.
+ *
+ * ROCKET_RK3576_PC_MAX_ERR sets the target (default 1%); ROCKET_RK3576_PC_OC_TILE
+ * forces a tile and skips the search.
+ */
+static double r76_pc_err_at(unsigned OC, unsigned tile, const unsigned *perm,
+                            const int64_t *sum_abs_w, const int32_t *bias,
+                            const int64_t *sum_w, int in_zp, int w_zp, unsigned taps,
+                            float in_scale, const float *w_scale, float out_scale)
+{
+    double worst = 0.0;
+    unsigned oc0;
+    for (oc0 = 0; oc0 < OC; oc0 += tile) {
+        unsigned n = OC - oc0 < tile ? OC - oc0 : tile, j;
+        double best_base = 0.0, base_actual;
+        unsigned mul, shift;
+        for (j = 0; j < n; j++) {
+            unsigned c = r76_oc_of(perm, oc0 + j);
+            double cs = (double)in_scale * (double)w_scale[c] / (double)out_scale;
+            double A  = (double)(bias ? bias[c] : 0)
+                      - (double)in_zp * (double)sum_w[c]
+                      + (double)in_zp * w_zp * taps;
+            double bound = 128.0 * (double)sum_abs_w[c] + fabs(A) + 1.0;
+            double cmax = (double)INT32_MAX / bound;
+            double need;
+            if (!(cs > 0.0)) return 1e30;
+            if (cmax > 32767.0) cmax = 32767.0;
+            if (cmax < 1.0)     cmax = 1.0;
+            need = cs / cmax;
+            if (need > best_base) best_base = need;
+        }
+        if (!(best_base > 0.0)) return 1e30;
+        rocket_rk3576_requant_params((float)best_base, &mul, &shift);
+        base_actual = (double)mul / (double)((uint64_t)1 << shift);
+        for (j = 0; j < n; j++) {
+            unsigned c = r76_oc_of(perm, oc0 + j);
+            double cs = (double)in_scale * (double)w_scale[c] / (double)out_scale;
+            long long v = (long long)(cs / base_actual + 0.5);
+            double err;
+            if (v < 1)     v = 1;
+            if (v > 32767) v = 32767;
+            err = fabs((double)v * base_actual - cs) / cs;
+            if (err > worst) worst = err;
+        }
+    }
+    return worst;
+}
+
+static unsigned r76_pc_oc_tile(unsigned OC, unsigned cbuf_tile, const unsigned *perm,
+                               const int64_t *sum_abs_w, const int32_t *bias,
+                               const int64_t *sum_w, int in_zp, int w_zp, unsigned taps,
+                               float in_scale, const float *w_scale, float out_scale)
+{
+    const char *e = getenv("ROCKET_RK3576_PC_OC_TILE");
+    double target = 0.01;
+    unsigned tile;
+
+    if (e && *e) {
+        long v = strtol(e, NULL, 0);
+        if (v > 0) return (unsigned)v < cbuf_tile ? (unsigned)v : cbuf_tile;
+    }
+    e = getenv("ROCKET_RK3576_PC_MAX_ERR");
+    if (e && *e) {
+        double v = strtod(e, NULL);
+        if (v > 0.0) target = v;
+    }
+    /* Largest first, so the search stops at the fewest submits that will do. The floor
+     * is the 32-channel MAC group; below it a tile is not a shape the emitter takes. */
+    for (tile = cbuf_tile; ; tile = tile / 2u > 32u ? tile / 2u : 32u) {
+        if (r76_pc_err_at(OC, tile, perm, sum_abs_w, bias, sum_w, in_zp, w_zp, taps,
+                          in_scale, w_scale, out_scale) <= target)
+            return tile;
+        if (tile <= 32u) return 32u;   /* nothing narrower to try */
     }
 }
 
 static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc *d,
                              int dw, const int8_t *in, const int8_t *W,
                              const int32_t *bias, float in_scale, float w_scale,
+                             const float *w_scale_oc,
                              float out_scale, int in_zp, int w_zp, int out_zp,
                              int8_t *out)
 {
     struct r76_conv_bos b = {0};
     uint64_t *ops = NULL;
+    struct r76_task_extent *ext = NULL;
     rocket_rk3576_row_task *plan = NULL;
     int32_t *A = NULL;
     int64_t *sum_w = NULL;
+    int64_t *sum_abs_w = NULL;
     int16_t *B = NULL;
+    int16_t *Cmul = NULL;
+    unsigned *perm = NULL;
+    double   worst_rel_err = 0.0;
     unsigned IC, OC, IH, IW, KH, KW, SY, SX, PT, PL;
     unsigned ow, oh, icreg, icpad, surf_elems, oc_tile, oc0, max_tasks, taps;
     size_t in_bytes;
     unsigned char stamp;
-    int rc;
+    int rc, batch;
 
     rc = r76_conv_check(entry, fd, d, dw, 0, &ow, &oh);
     if (rc != ROCKET_OK) return rc;
     if (!in || !W || !out) return ROCKET_E_SHAPE;
-    if (!(in_scale > 0.0f) || !(w_scale > 0.0f) || !(out_scale > 0.0f)) {
+    if (w_scale_oc && dw) {
+        ROCKET_LOGE("%s: the depthwise coefficient group's C is the only per-channel "
+                    "field it has and the direct path's planner is not wired to it\n",
+                    entry);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    if (w_scale_oc && w_zp) {
+        ROCKET_LOGE("%s: a per-axis weight quantization is symmetric by construction; "
+                    "a non-zero weight zero point with per-channel scales is not a "
+                    "shape this path models\n", entry);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    if (!(in_scale > 0.0f) || !(out_scale > 0.0f) ||
+        (!w_scale_oc && !(w_scale > 0.0f))) {
         ROCKET_LOGE("%s: the quant scales must be positive — the DPU's OUT_CVT gates "
                     "the whole BS stage off at zero and writes an empty surface\n", entry);
         return ROCKET_E_SHAPE;
@@ -303,11 +749,26 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
     if (in_zp < -128 || in_zp > 127 || w_zp < -128 || w_zp > 127 ||
         out_zp < -128 || out_zp > 127)
         return ROCKET_E_SHAPE;
+    /* A DEPTHWISE WEIGHT ZERO POINT RIDES IN THE CUBE, not in the coefficient group.
+     * That group really has no B field and the correction really is not a per-channel
+     * constant, so folding it into the bias is impossible — but it does not have to be
+     * folded at all. This part's int8 depthwise cube gives every (channel, tap) TWO live
+     * bytes and the datapath ADDS them, so the effective weight is a nine-bit value and
+     * `w - w_zp` is carried exactly by splitting it across the pair. The coefficient A
+     * already computes `-in_zp*(sum_w - w_zp*taps)`, which is the fold this pre-centred
+     * cube wants, so nothing downstream changes. r76_dw_split() below is that split.
+     *
+     * What bounds it is the pair's own range: two signed bytes reach [-256, 254], and a
+     * `w - w_zp` outside that is refused rather than clamped. It cannot arise from an
+     * int8 weight and an int8 zero point without one of them being out of domain.
+     * [HW sweep, H96 MAX M9, tests/rk3576_conv_lib_gate.c dwzp] */
     if (dw && w_zp) {
-        ROCKET_LOGE("%s: the depthwise coefficient group has no B field, and a weight "
-                    "zero point's correction is not a per-channel constant, so it "
-                    "cannot be folded into the bias either\n", entry);
-        return ROCKET_E_UNSUPPORTED;
+        int lo = -128 - w_zp, hi = 127 - w_zp;
+        if (lo < -256 || hi > 254) {
+            ROCKET_LOGE("%s: a depthwise weight zero point of %d puts w-w_zp outside "
+                        "the [-256, 254] the cube's two live bytes reach\n", entry, w_zp);
+            return ROCKET_E_UNSUPPORTED;
+        }
     }
 
     IC = (unsigned)d->ic; OC = (unsigned)d->oc;
@@ -332,29 +793,56 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
     oc_tile = dw ? OC : r76_conv_oc_tile(icreg, KH, KW, rocket_rk3576_pad_oc(OC));
     if (!oc_tile) return ROCKET_E_SHAPE;
 
-    ops   = calloc(RK3576_CONV_TASK_OPS, sizeof *ops);
+    /* Room for every row task's program at once when they go out as one stream, and
+     * one task's when they do not — the plan is bounded by max_tasks either way. */
+    batch = r76_batch_on() && max_tasks <= R76_MAX_CHAIN_TASKS;
+    ops   = calloc((size_t)(batch ? max_tasks : 1u) * RK3576_CONV_TASK_OPS, sizeof *ops);
+    ext   = calloc(max_tasks, sizeof *ext);
     plan  = calloc(max_tasks, sizeof *plan);
     sum_w = calloc(OC, sizeof *sum_w);
-    if (!ops || !plan || !sum_w) { rc = ROCKET_E_NOMEM; goto done; }
+    if (w_scale_oc) {
+        sum_abs_w = calloc(OC, sizeof *sum_abs_w);
+        perm      = calloc(OC, sizeof *perm);
+    }
+    if (!ops || !ext || !plan || !sum_w || (w_scale_oc && (!sum_abs_w || !perm))) {
+        rc = ROCKET_E_NOMEM; goto done;
+    }
+    /* Sorted by scale, so each output-channel tile — its own task, its own OUT_CVT
+     * shift — spans as little of the layer's scale range as the tiling allows. */
+    if (perm) r76_sort_by_scale(perm, OC, w_scale_oc);
 
-    /* Each output channel's whole filter, for the input zero point's fold. */
+    /* Each output channel's whole filter, for the input zero point's fold — and its
+     * absolute sum, which is what bounds that channel's accumulator and so how large a
+     * per-channel C multiplier it can carry. */
     {
         unsigned c, i, y, x;
         for (c = 0; c < OC; c++) {
-            int64_t s = 0;
+            int64_t s = 0, sa = 0;
             if (dw) {
                 for (y = 0; y < KH; y++)
-                    for (x = 0; x < KW; x++)
-                        s += W[((size_t)c * KH + y) * KW + x];
+                    for (x = 0; x < KW; x++) {
+                        int64_t v = W[((size_t)c * KH + y) * KW + x];
+                        s += v; sa += v < 0 ? -v : v;
+                    }
             } else {
                 for (i = 0; i < IC; i++)
                     for (y = 0; y < KH; y++)
-                        for (x = 0; x < KW; x++)
-                            s += W[(((size_t)c * IC + i) * KH + y) * KW + x];
+                        for (x = 0; x < KW; x++) {
+                            int64_t v = W[(((size_t)c * IC + i) * KH + y) * KW + x];
+                            s += v; sa += v < 0 ? -v : v;
+                        }
             }
             sum_w[c] = s;
+            if (sum_abs_w) sum_abs_w[c] = sa;
         }
     }
+
+    /* AFTER the filter sums, which is what the accumulator bound is built from: on
+     * this path the output-channel tile is an ACCURACY parameter as well as a CBUF
+     * one, because a tile is one task and a task carries one OUT_CVT shift. */
+    if (w_scale_oc)
+        oc_tile = r76_pc_oc_tile(OC, oc_tile, perm, sum_abs_w, bias, sum_w,
+                                 in_zp, w_zp, taps, in_scale, w_scale_oc, out_scale);
 
     /* The FEATURE cube is packed once and shared by every output-channel tile: the
      * tiling is on the output axis, which the feature side does not see. */
@@ -377,7 +865,10 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
     }
     rocket_bo_fini(fd, &b.in);
 
-    if (rocket_bo_alloc(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
+    /* One extra word per task: the chain lays each program out at an EVEN word stride
+     * (rkt_chain_words), which rounds an odd program length up by one. */
+    if (rocket_bo_alloc(fd, (size_t)(batch ? max_tasks : 1u) *
+                        (RK3576_CONV_TASK_OPS + 1u) * sizeof(uint64_t), &b.rc) < 0) {
         rc = ROCKET_E_NOMEM; goto done;
     }
 
@@ -391,9 +882,10 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
                                 : rocket_rk3576_coeff_bytes(ocreg);
         size_t obytes = (size_t)((ocreg + C2 - 1u) / C2) * surf_elems * C2;
         conv_params_t p = {0};
-        struct r76_task_extent e;
         uint32_t in_h[4], out_h[1];
         unsigned ntask = 1u, t;
+        uint32_t task_ops;
+        float tile_base_scale = w_scale;
 
         if (b.w.ptr)     rocket_bo_free(fd, &b.w);
         if (b.coeff.ptr) rocket_bo_free(fd, &b.coeff);
@@ -414,15 +906,22 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
             int8_t *cube = (int8_t *)b.w.ptr;
             unsigned c, i, y, x;
             if (dw) {
-                /* This part's own depthwise cube: channels grouped by 32, tap-major
+                /* This part's own depthwise cube: channels grouped by 64, tap-major
                  * inside a group, two byte slots per weight — and at int8 the byte a
-                 * channel owns inside a tap block is 4*(c/2) + (c%2). Neither the direct
-                 * path's cube nor the RK3588's 64-channel single-byte one. */
+                 * channel owns inside a tap block is 4*(c/2) + (c%2), with its SECOND
+                 * two further on. Neither the direct path's cube nor the RK3588's
+                 * single-byte one. Both bytes contribute, so the pair carries the
+                 * zero-point-centred weight when one byte cannot. */
                 for (c = 0; c < tile_oc; c++)
                     for (y = 0; y < KH; y++)
-                        for (x = 0; x < KW; x++)
-                            cube[rocket_rk3576_weight_dw_int8(ocreg, KH, KW, c, y, x)] =
-                                W[(((size_t)(oc0 + c) * KH) + y) * KW + x];
+                        for (x = 0; x < KW; x++) {
+                            int v = W[(((size_t)r76_oc_of(perm, oc0 + c) * KH) + y) * KW
+                                      + x] - w_zp;
+                            int lo = v > 127 ? 127 : (v < -128 ? -128 : v);
+                            int at = rocket_rk3576_weight_dw_int8(ocreg, KH, KW, c, y, x);
+                            cube[at]      = (int8_t)lo;
+                            cube[at + 2]  = (int8_t)(v - lo);
+                        }
             } else {
                 /* The same hoist. weight_conv_int8() at these groups is
                  * (c/32)*nIC1*KH*KW*1024 + (i/32)*KH*KW*1024 + (y*KW + x)*1024 +
@@ -435,7 +934,8 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
                     for (i = 0; i < IC; i++) {
                         int8_t *dst = cube + cbase
                                     + (size_t)(i / 32u) * taps * 1024u + (i % 32u);
-                        const int8_t *src = W + ((size_t)(oc0 + c) * IC + i) * taps;
+                        const int8_t *src =
+                            W + ((size_t)r76_oc_of(perm, oc0 + c) * IC + i) * taps;
                         for (t = 0; t < taps; t++) dst[(size_t)t * 1024u] = src[t];
                     }
                 }
@@ -447,22 +947,40 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
          * zeroed one makes the DPU write a full but entirely empty surface whatever the
          * MAC did — the C term gates the BS stage. The tail channels of a partial group
          * get a zero A term so they carry a C term too. */
-        free(A); free(B);
+        free(A); free(B); free(Cmul);
         A = calloc(ocreg, sizeof *A);
-        B = w_zp ? calloc(ocreg, sizeof *B) : NULL;
-        if (!A || (w_zp && !B)) { rc = ROCKET_E_NOMEM; goto done; }
-        r76_fold_coeff(A, bias, oc0, tile_oc, sum_w, in_zp, w_zp, taps);
+        /* B is the DIRECT path's weight-zero-point term. The depthwise group has no such
+         * field and does not need one: its cube is pre-centred above. */
+        B = (w_zp && !dw) ? calloc(ocreg, sizeof *B) : NULL;
+        Cmul = w_scale_oc ? calloc(ocreg, sizeof *Cmul) : NULL;
+        if (!A || (w_zp && !dw && !B) || (w_scale_oc && !Cmul)) {
+            rc = ROCKET_E_NOMEM; goto done;
+        }
+        r76_fold_coeff(A, bias, oc0, tile_oc, sum_w, in_zp, w_zp, taps, perm);
         if (B) {
             unsigned j;
             /* An asymmetric weight is w_true = w_stored - w_zp, whose correction is
              * -w_zp*sum(x), and the DPU ADDS the B term. */
             for (j = 0; j < ocreg; j++) B[j] = (int16_t)(-w_zp);
         }
+        /* The per-channel gain is planned per TILE, because the one (MUL, SHIFT) the
+         * OUT_CVT carries is per task and each output-channel tile is its own task. */
+        if (w_scale_oc) {
+            double err = 0.0;
+            if (r76_plan_perchannel(entry, oc0, tile_oc, ocreg, A, sum_abs_w,
+                                    in_scale, w_scale_oc, out_scale, perm,
+                                    Cmul, &tile_base_scale, &err) != 0) {
+                rc = ROCKET_E_SHAPE; goto done;
+            }
+            if (err > worst_rel_err) worst_rel_err = err;
+        }
         rocket_bo_prep(fd, &b.coeff, 1, 0);
-        if (dw)      rocket_rk3576_pack_coeff_dw(b.coeff.ptr, coeff_bytes, A, ocreg);
-        else if (B)  rocket_rk3576_pack_coeff_asym(b.coeff.ptr, coeff_bytes, A, ocreg,
-                                                   B, 1);
-        else         rocket_rk3576_pack_coeff(b.coeff.ptr, coeff_bytes, A, ocreg);
+        if (dw)          rocket_rk3576_pack_coeff_dw(b.coeff.ptr, coeff_bytes, A, ocreg);
+        else if (Cmul)   rocket_rk3576_pack_coeff_perc(b.coeff.ptr, coeff_bytes, A, ocreg,
+                                                       B, Cmul, 1);
+        else if (B)      rocket_rk3576_pack_coeff_asym(b.coeff.ptr, coeff_bytes, A, ocreg,
+                                                       B, 1);
+        else             rocket_rk3576_pack_coeff(b.coeff.ptr, coeff_bytes, A, ocreg);
         rocket_bo_fini(fd, &b.coeff);
 
         p.ic = (uint16_t)icreg; p.ih = (uint16_t)IH; p.iw = (uint16_t)IW;
@@ -472,7 +990,14 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
         p.pad_top  = (uint8_t)PT; p.pad_left = (uint8_t)PL;
         p.ih_full = (uint16_t)IH; p.oh_full = (uint16_t)oh;
         p.int8_out = 1;
-        p.in_scale = in_scale; p.w_scale = w_scale; p.out_scale = out_scale;
+        /* Per-channel: the C multipliers carry every channel's gain RELATIVE to one
+         * base, and the base is what the OUT_CVT programs — so it is handed over whole
+         * rather than as the in/w/out triple the per-tensor path decomposes into. */
+        if (w_scale_oc) {
+            p.in_scale = tile_base_scale; p.w_scale = 1.0f; p.out_scale = 1.0f;
+        } else {
+            p.in_scale = in_scale; p.w_scale = w_scale; p.out_scale = out_scale;
+        }
         /* Both zero points reach the registers uint8-centered: the emitter programs the
          * border constant as (input_zero_point & 0xff) - 0x80 and the output offset as
          * output_zero_point - 0x80, so a model-domain signed zero point is that value
@@ -508,6 +1033,11 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
             rocket_bo_fini(fd, &b.out);
         }
 
+        /* The row tasks of this tile, as one stream when batching is on and as one
+         * submit each when it is not. Independent by construction: task t reads its own
+         * window of the shared feature cube and writes its own rows of the shared
+         * surface, and the weight and coefficient buffers do not change across them. */
+        task_ops = 0;
         for (t = 0; t < ntask; t++) {
             conv_params_t q = p;
             q.ih = plan[t].ih; q.oh = plan[t].oh;
@@ -521,15 +1051,34 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
              * WINDOW, so every group past the first reads at the wrong offset and the
              * surface comes back unrelated to the input, with nothing to fault on. */
             q.ih_full = (uint16_t)IH; q.oh_full = (uint16_t)oh;
+            q.tasks = ops + (size_t)(batch ? t : 0u) * RK3576_CONV_TASK_OPS;
             if ((dw ? gen_conv2d_dw_int8_rk3576(&q) : gen_conv2d_int8_rk3576(&q)) != 0) {
                 ROCKET_LOGE("%s: the generator refused task %u of %u\n", entry, t, ntask);
                 rc = ROCKET_E_UNSUPPORTED; goto done;
             }
-            e.groups      = (ocreg + C2 - 1u) / C2;
-            e.group_bytes = (size_t)surf_elems * C2;
-            e.row_off     = (size_t)plan[t].oy0 * ow * C2;
-            e.span        = (size_t)plan[t].oh * ow * C2;
-            rc = r76_submit_task(fd, &b, &q, ops, in_h, 4u, out_h, &e, stamp, entry);
+            /* The chain lays every program out at ONE stride, so a tile whose tasks
+             * somehow differ in length cannot be chained. They do not differ — the row
+             * tasks of a tile write the same registers with different values — but
+             * ROCKET_RK3576_ADD can lengthen a program, so check rather than assume. */
+            if (!t) task_ops = q.task_count;
+            else if (batch && q.task_count != task_ops) {
+                ROCKET_LOGE("%s: task %u is %u ops against task 0's %u, so this tile "
+                            "cannot be chained\n", entry, t, q.task_count, task_ops);
+                rc = ROCKET_E_UNSUPPORTED; goto done;
+            }
+            ext[t].groups      = (ocreg + C2 - 1u) / C2;
+            ext[t].group_bytes = (size_t)surf_elems * C2;
+            ext[t].row_off     = (size_t)plan[t].oy0 * ow * C2;
+            ext[t].span        = (size_t)plan[t].oh * ow * C2;
+            if (!batch) {
+                rc = r76_submit_ops(fd, &b, ops, q.task_count, in_h, 4u, out_h,
+                                    &ext[t], 1u, stamp, 0u, entry);
+                if (rc != ROCKET_OK) goto done;
+            }
+        }
+        if (batch) {
+            rc = r76_submit_ops(fd, &b, ops, task_ops, in_h, 4u, out_h, ext, ntask,
+                                stamp, 0u, entry);
             if (rc != ROCKET_OK) goto done;
         }
 
@@ -543,7 +1092,7 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
             unsigned c;
             for (c = 0; c < tile_oc; c++) {
                 const int8_t *src = o + (size_t)(c / C2) * surf_elems * C2 + (c % C2);
-                int8_t *dst = out + (size_t)(oc0 + c) * px;
+                int8_t *dst = out + (size_t)r76_oc_of(perm, oc0 + c) * px;
                 for (p = 0; p < px; p++) dst[p] = src[p * C2];
             }
         }
@@ -552,7 +1101,11 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
     rc = ROCKET_OK;
 
 done:
-    free(ops); free(plan); free(A); free(B); free(sum_w);
+    free(ops); free(ext); free(plan); free(A); free(B); free(Cmul);
+    free(sum_w); free(sum_abs_w); free(perm);
+    if (w_scale_oc && rc == ROCKET_OK)
+        ROCKET_LOGI("%s: per-channel requant, worst-case gain error %.3g%%\n",
+                    entry, worst_rel_err * 100.0);
     r76_conv_free(fd, &b);
     return rc;
 }
@@ -596,6 +1149,18 @@ static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_des
     int64_t *sum_w = NULL;
     int8_t *wtile = NULL;
     unsigned IC = (unsigned)d->ic, OC = (unsigned)d->oc;
+    /* ONE image channel is programmed as TWO. The int8 first conv writes nothing at
+     * ic=1 — an untouched surface, not a wrong one — and what gates it is the feature
+     * DMA's row width: the emitted `line_stride - 1` is correct from ic=2 up, and at
+     * ic=1 the program only writes when that field is raised to `line_stride`, at
+     * which point the DMA reads past the packed row and nothing is exact. So the row
+     * is widened rather than the register: a second interleaved channel of zero
+     * samples against zero weights. The arithmetic is untouched by it — the MAC term
+     * is zero because the weight is, `sum_w` is unchanged so the coefficient A is,
+     * and the asymmetric B multiplies a sum of RAW samples that gains only zeros — so
+     * `taps` below stays the caller's count. The cost is one byte per pixel of host
+     * packing and a doubled feature read. */
+    unsigned ICP = ((unsigned)d->ic == 1u) ? 2u : (unsigned)d->ic;
     unsigned IH = (unsigned)d->ih, IW = (unsigned)d->iw;
     unsigned KH = (unsigned)d->kh, KW = (unsigned)d->kw;
     unsigned SY = (unsigned)d->stride_y, SX = (unsigned)d->stride_x;
@@ -629,12 +1194,6 @@ static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_des
      * its low bits clear, and the fp16 form of the same conv computes at ic=1 — so
      * this is an int8-side gap rather than a property of the packed datapath. Refused
      * rather than left to write an untouched surface. */
-    if (IC < 2u) {
-        ROCKET_LOGE("%s: the int8 first conv writes nothing at one image channel "
-                    "(ic=%u); two, three and four compute. The fp16 form has no such "
-                    "bound: rocket_conv2d_fp16_rk3576()\n", entry, IC);
-        return ROCKET_E_UNSUPPORTED;
-    }
     /* The OUTPUT width has its own granule, and it is not implied by the input's: at
      * ow 24 and 56 — both from an iw that is a multiple of 16 — output row 0 is exact
      * and every row after it is wrong, while ow 16, 32, 48, 64, 80, 112 are exact.
@@ -661,13 +1220,13 @@ static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_des
         return ROCKET_E_UNSUPPORTED;
     }
 
-    in_bytes = (size_t)IH * IW * IC;
+    in_bytes = (size_t)IH * IW * ICP;
     stamp = rocket_rk3576_sentinel_on() ? (unsigned char)ROCKET_RK3576_SENTINEL_BYTE : 0;
 
     ops   = calloc(RK3576_CONV_TASK_OPS, sizeof *ops);
     rows  = calloc(max_tasks, sizeof *rows);
     sum_w = calloc(OC, sizeof *sum_w);
-    wtile = calloc((size_t)tile * IC * KH * KW, 1);
+    wtile = calloc((size_t)tile * ICP * KH * KW, 1);
     if (!ops || !rows || !sum_w || !wtile) { rc = ROCKET_E_NOMEM; goto done; }
 
     /* Each output channel's whole filter, for the input zero point's fold. */
@@ -686,7 +1245,7 @@ static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_des
     /* The row window, on the same planner as every other path. Told the precision
      * because the offsets come back in PACKED-IMAGE row units here — an int8 packed
      * image is `ic` interleaved bytes per pixel where a float one is halfwords. */
-    plan.ic = (uint16_t)IC; plan.ih = (uint16_t)IH; plan.iw = (uint16_t)IW;
+    plan.ic = (uint16_t)ICP; plan.ih = (uint16_t)IH; plan.iw = (uint16_t)IW;
     plan.oc = (uint16_t)tile; plan.oh = (uint16_t)oh; plan.ow = (uint16_t)ow;
     plan.kh = (uint16_t)KH; plan.kw = (uint16_t)KW;
     plan.stride_y = (uint8_t)SY; plan.stride_x = (uint8_t)SX;
@@ -720,9 +1279,9 @@ static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_des
         unsigned c, y, x;
         for (y = 0; y < IH; y++)
             for (x = 0; x < IW; x++)
-                for (c = 0; c < IC; c++)
-                    img[((size_t)y * IW + x) * IC + c] =
-                        in[((size_t)c * IH + y) * IW + x];
+                for (c = 0; c < ICP; c++)
+                    img[((size_t)y * IW + x) * ICP + c] =
+                        c < IC ? in[((size_t)c * IH + y) * IW + x] : 0;
     }
     rocket_bo_fini(fd, &b.in);
 
@@ -746,9 +1305,18 @@ static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_des
             rocket_bo_alloc(fd, obytes, &b.out) < 0) { rc = ROCKET_E_NOMEM; goto done; }
 
         /* This tile's channels renumbered from zero — its own whole convolution. */
-        memcpy(wtile, W + (size_t)oc0 * IC * KH * KW, (size_t)n * IC * KH * KW);
+        if (ICP == IC) {
+            memcpy(wtile, W + (size_t)oc0 * IC * KH * KW, (size_t)n * IC * KH * KW);
+        } else {
+            unsigned j, t;
+            memset(wtile, 0, (size_t)tile * ICP * KH * KW);
+            for (j = 0; j < n; j++)
+                for (t = 0; t < IC * KH * KW; t++)
+                    wtile[(size_t)j * ICP * KH * KW + t] =
+                        W[(size_t)(oc0 + j) * IC * KH * KW + t];
+        }
         rocket_bo_prep(fd, &b.w, 1, 0);
-        rc = rocket_rk3576_argb_int8_pack_weights(b.w.ptr, w_bytes, wtile, n, IC, KH, KW);
+        rc = rocket_rk3576_argb_int8_pack_weights(b.w.ptr, w_bytes, wtile, n, ICP, KH, KW);
         rocket_bo_fini(fd, &b.w);
         if (rc < 0) { rc = ROCKET_E_SHAPE; goto done; }
 
@@ -756,14 +1324,14 @@ static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_des
         A = calloc(n, sizeof *A);
         B = w_zp ? calloc(n, sizeof *B) : NULL;
         if (!A || (w_zp && !B)) { rc = ROCKET_E_NOMEM; goto done; }
-        r76_fold_coeff(A, bias, oc0, n, sum_w, in_zp, w_zp, taps);
+        r76_fold_coeff(A, bias, oc0, n, sum_w, in_zp, w_zp, taps, NULL);
         if (B) { unsigned j; for (j = 0; j < n; j++) B[j] = (int16_t)(-w_zp); }
         rocket_bo_prep(fd, &b.coeff, 1, 0);
         if (B) rocket_rk3576_pack_coeff_asym(b.coeff.ptr, coeff_bytes, A, n, B, 1);
         else   rocket_rk3576_pack_coeff(b.coeff.ptr, coeff_bytes, A, n);
         rocket_bo_fini(fd, &b.coeff);
 
-        p.ic = (uint16_t)IC; p.iw = (uint16_t)IW; p.ih = (uint16_t)IH;
+        p.ic = (uint16_t)ICP; p.iw = (uint16_t)IW; p.ih = (uint16_t)IH;
         p.oc = (uint16_t)n;  p.ow = (uint16_t)ow; p.oh = (uint16_t)oh;
         p.kh = (uint16_t)KH; p.kw = (uint16_t)KW;
         p.stride_y = (uint8_t)SY; p.stride_x = (uint8_t)SX;
@@ -813,7 +1381,7 @@ static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_des
             e.group_bytes = (size_t)surf_elems * C2;
             e.row_off     = (size_t)rows[r].oy0 * ow * C2;
             e.span        = (size_t)rows[r].oh * ow * C2;
-            rc = r76_submit_task(fd, &b, &q, ops, in_h, 4u, out_h, &e, stamp, entry);
+            rc = r76_submit_task(fd, &b, &q, ops, in_h, 4u, out_h, &e, stamp, 0u, entry);
             if (rc != ROCKET_OK) goto done;
         }
 
@@ -864,7 +1432,76 @@ int rocket_conv2d_int8_rk3576(int fd, const rocket_conv2d_desc *d,
                                   out_scale, in_zp, w_zp, out_zp, out, ow, oh);
     }
     return r76_conv_int8_run(entry, fd, d, 0, in, W, bias,
-                             in_scale, w_scale, out_scale, in_zp, w_zp, out_zp, out);
+                             in_scale, w_scale, NULL, out_scale,
+                             in_zp, w_zp, out_zp, out);
+}
+
+unsigned rocket_conv2d_int8_perchannel_oc_tile_rk3576(const rocket_conv2d_desc *d,
+                                                      const int8_t *W,
+                                                      const int32_t *bias,
+                                                      float in_scale,
+                                                      const float *w_scale,
+                                                      float out_scale, int in_zp)
+{
+    unsigned IC, OC, KH, KW, icreg, taps, cbuf_tile, tile = 0;
+    int64_t *sum_w = NULL, *sum_abs_w = NULL;
+    unsigned *perm = NULL;
+    unsigned c, i, y, x;
+
+    if (!d || !W || !w_scale || d->depthwise || d->ic <= 4) return 0;
+    IC = (unsigned)d->ic; OC = (unsigned)d->oc;
+    KH = (unsigned)d->kh; KW = (unsigned)d->kw;
+    icreg = rocket_rk3576_pad_ic(IC);
+    taps  = IC * KH * KW;
+    cbuf_tile = r76_conv_oc_tile(icreg, KH, KW, rocket_rk3576_pad_oc(OC));
+    if (!cbuf_tile) return 0;
+
+    sum_w = calloc(OC, sizeof *sum_w);
+    sum_abs_w = calloc(OC, sizeof *sum_abs_w);
+    perm = calloc(OC, sizeof *perm);
+    if (!sum_w || !sum_abs_w || !perm) goto done;
+    for (c = 0; c < OC; c++) {
+        int64_t s = 0, sa = 0;
+        for (i = 0; i < IC; i++)
+            for (y = 0; y < KH; y++)
+                for (x = 0; x < KW; x++) {
+                    int64_t v = W[(((size_t)c * IC + i) * KH + y) * KW + x];
+                    s += v; sa += v < 0 ? -v : v;
+                }
+        sum_w[c] = s; sum_abs_w[c] = sa;
+    }
+    r76_sort_by_scale(perm, OC, w_scale);
+    tile = r76_pc_oc_tile(OC, cbuf_tile, perm, sum_abs_w, bias, sum_w,
+                          in_zp, 0, taps, in_scale, w_scale, out_scale);
+done:
+    free(sum_w); free(sum_abs_w); free(perm);
+    return tile;
+}
+
+int rocket_conv2d_int8_perchannel_rk3576(int fd, const rocket_conv2d_desc *d,
+                                         const int8_t *in, const int8_t *W,
+                                         const int32_t *bias, float in_scale,
+                                         const float *w_scale, float out_scale,
+                                         int in_zp, int out_zp, int8_t *out)
+{
+    const char *entry = "rocket_conv2d_int8_perchannel_rk3576";
+
+    if (!w_scale) return ROCKET_E_SHAPE;
+    if (d && d->depthwise) {
+        ROCKET_LOGE("%s: the depthwise coefficient group carries a C multiplier too, "
+                    "but this planner is wired to the direct path's 64-byte group\n",
+                    entry);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    if (d && d->ic <= 4) {
+        ROCKET_LOGE("%s: four or fewer input channels is the packed-image first conv, "
+                    "a different program whose coefficient path this planner does not "
+                    "drive\n", entry);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    return r76_conv_int8_run(entry, fd, d, 0, in, W, bias,
+                             in_scale, 1.0f, w_scale, out_scale,
+                             in_zp, 0, out_zp, out);
 }
 
 int rocket_conv2d_dw_int8_rk3576(int fd, const rocket_conv2d_desc *d,
@@ -873,7 +1510,8 @@ int rocket_conv2d_dw_int8_rk3576(int fd, const rocket_conv2d_desc *d,
                                  int in_zp, int w_zp, int out_zp, int8_t *out)
 {
     return r76_conv_int8_run("rocket_conv2d_dw_int8_rk3576", fd, d, 1, in, w, bias,
-                             in_scale, w_scale, out_scale, in_zp, w_zp, out_zp, out);
+                             in_scale, w_scale, NULL, out_scale,
+                             in_zp, w_zp, out_zp, out);
 }
 
 /* ============================================================================
@@ -1055,7 +1693,8 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
             e.row_off     = (size_t)oc0 * oh * ow * sizeof(_Float16)
                             + (size_t)rows[r].output_off;
             e.span        = (size_t)rows[r].oh * ow * C2F * sizeof(_Float16);
-            rc = r76_submit_task(fd, &b, &p, ops, in_h, 4u, out_h, &e, stamp, entry);
+            rc = r76_submit_task(fd, &b, &p, ops, in_h, 4u, out_h, &e, stamp,
+                             ROCKET_JOB_NO_DPU_DONE, entry);
             if (rc != ROCKET_OK) goto done;
         }
     }
@@ -1106,6 +1745,7 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
     size_t in_bytes, w_bytes, coeff_bytes, surf;
     conv_params_t base = {0};
     struct r76_task_extent e;
+    struct r76_fp16_prof prof = {0, 0, 0, 0, 0, 0};
     uint32_t in_h[4], out_h[1];
     unsigned char stamp;
     int rc;
@@ -1198,9 +1838,14 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
     in_h[2] = b.coeff.handle; in_h[3] = b.rc.handle;
     out_h[0] = b.out.handle;
 
+    prof.on = r76_fp16_prof_on();
+    prof.slices = nslice;
+
     for (s = 0; s < nslice; s++) {
         conv_params_t p = base;
+        double t0;
 
+        t0 = prof.on ? r76_now_us() : 0;
         rocket_bo_prep(fd, &b.w, 1, 0);
         if (rocket_rk3576_fp16_pack_slice_weights(b.w.ptr, w_bytes, W, OC, IC, KH, KW,
                                                   &slices[s]) < 0) {
@@ -1208,6 +1853,7 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
             rc = ROCKET_E_SHAPE; goto done;
         }
         rocket_bo_fini(fd, &b.w);
+        if (prof.on) prof.pack_us += r76_now_us() - t0;
 
         p.ic          = slices[s].ic;
         p.tasks       = ops;
@@ -1222,24 +1868,44 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
 
         /* Every slice rewrites the whole surface, so it is stamped per slice and read
          * back between submits. */
+        t0 = prof.on ? r76_now_us() : 0;
         if (stamp) {
             rocket_bo_prep(fd, &b.out, 1, 0);
             memset(b.out.ptr, stamp, surf);
             rocket_bo_fini(fd, &b.out);
         }
+        if (prof.on) prof.stamp_us += r76_now_us() - t0;
+
         e.groups      = (ocpad + C2F - 1u) / C2F;
         e.group_bytes = (size_t)ow * oh * C2F * sizeof(_Float16);
         e.row_off     = 0;
         e.span        = e.group_bytes;
-        rc = r76_submit_task(fd, &b, &p, ops, in_h, 4u, out_h, &e, stamp, entry);
+        t0 = prof.on ? r76_now_us() : 0;
+        rc = r76_submit_task(fd, &b, &p, ops, in_h, 4u, out_h, &e, stamp,
+                             ROCKET_JOB_NO_DPU_DONE, entry);
+        if (prof.on) prof.submit_us += r76_now_us() - t0;
         if (rc != ROCKET_OK) goto done;
 
+        t0 = prof.on ? r76_now_us() : 0;
         rocket_bo_prep(fd, &b.out, 0, 2000000000ull);
         if (rocket_rk3576_fp16_accumulate(acc, b.out.ptr, surf, OC, oh, ow) < 0) {
             rocket_bo_fini(fd, &b.out);
             rc = ROCKET_E_SHAPE; goto done;
         }
         rocket_bo_fini(fd, &b.out);
+        if (prof.on) prof.read_us += r76_now_us() - t0;
+    }
+
+    if (prof.on) {
+        double tot = prof.pack_us + prof.stamp_us + prof.submit_us + prof.read_us;
+        ROCKET_LOGI("rk3576 fp16 ic-split ic=%u oc=%u %ux%u k%ux%u: %u slices, %.2f ms"
+                    " -- weights %.2f (%.0f%%)  stamp %.2f (%.0f%%)  submit %.2f (%.0f%%)"
+                    "  readback %.2f (%.0f%%)\n",
+                    IC, OC, IW, IH, KW, KH, nslice, tot / 1e3,
+                    prof.pack_us / 1e3, 100.0 * prof.pack_us / (tot > 0 ? tot : 1),
+                    prof.stamp_us / 1e3, 100.0 * prof.stamp_us / (tot > 0 ? tot : 1),
+                    prof.submit_us / 1e3, 100.0 * prof.submit_us / (tot > 0 ? tot : 1),
+                    prof.read_us / 1e3, 100.0 * prof.read_us / (tot > 0 ? tot : 1));
     }
 
     {

@@ -154,10 +154,13 @@ int main(void)
         expect_refused("rocket_conv2d_int8_rk3576 first conv, pad_left 0",
                        rocket_conv2d_int8_rk3576(fd, &d, qin, qW, NULL,
                                                  1.0f, 1.0f, 64.0f, 0, 0, 0, qout));
+        /* One image channel is programmed as two, so it RUNS — the entry pads the
+         * packed row with a zero channel against zero weights rather than emitting a
+         * row width the feature DMA refuses to fetch. */
         d.pad_top = 1; d.pad_left = 1; d.ic = 1;
-        expect_refused("rocket_conv2d_int8_rk3576 first conv, one image channel",
-                       rocket_conv2d_int8_rk3576(fd, &d, qin, qW, NULL,
-                                                 1.0f, 1.0f, 64.0f, 0, 0, 0, qout));
+        expect_ran("rocket_conv2d_int8_rk3576 first conv, one image channel",
+                   rocket_conv2d_int8_rk3576(fd, &d, qin, qW, NULL,
+                                             1.0f, 1.0f, 64.0f, 0, 0, 0, qout));
     }
 
     /* Pooling, on the PPU. */

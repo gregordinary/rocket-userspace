@@ -302,12 +302,18 @@ void rocket_conv_transpose2d_ref_fp16(const rocket_conv_transpose2d_desc *d,
  * bias may be NULL. The input zero point and the weight zero point are folded into the
  * coefficient buffer exactly; the output zero point becomes the DPU's OUT_CVT offset.
  *
+ * A DEPTHWISE WEIGHT ZERO POINT is carried in the WEIGHT CUBE, not in the coefficient
+ * group. That group has no B field, and a depthwise zero point's correction is not a
+ * per-channel constant so it cannot ride the bias either — but the cube gives every
+ * (channel, tap) two live bytes and the datapath ADDS them, so `w - w_zp` is expressed
+ * exactly across the pair. It is the form every per-tensor TFLite depthwise filter
+ * carries. The bound is the pair's own range, [-256, 254].
+ *
  * Refused rather than approximated: dilation (no RK3576 shape has been run through the
  * rate fields); IC <= 4, which takes the CNA's ARGB first-conv sub-encoding whose
- * weight cube is not decoded; a weight zero point on the depthwise path, whose
- * coefficient group has no B field; and a shape whose resident weight slice does not
- * fit even one output-channel group, which needs an input-channel split that the
- * on-chip requant forecloses.
+ * weight cube is not decoded; and a shape whose resident weight slice does not fit even
+ * one output-channel group, which needs an input-channel split that the on-chip requant
+ * forecloses.
  *
  * Bit-exact against a CPU model over tests/rk3576_conv_lib_gate.c. [HW sweep, H96 MAX M9] */
 int rocket_conv2d_int8_rk3576(int fd, const rocket_conv2d_desc *d,
@@ -318,6 +324,59 @@ int rocket_conv2d_dw_int8_rk3576(int fd, const rocket_conv2d_desc *d,
                                  const int8_t *in, const int8_t *w, const int32_t *bias,
                                  float in_scale, float w_scale, float out_scale,
                                  int in_zp, int w_zp, int out_zp, int8_t *out);
+
+/* PER-OUTPUT-CHANNEL weight scales — `w_scale[oc]`, the form every TFLite int8 and ONNX
+ * QDQ model carries. Otherwise identical to rocket_conv2d_int8_rk3576(): same layouts,
+ * same tiling, same row window, int8 in and int8 out with the requant on chip.
+ *
+ * HOW IT IS EXPRESSED, AND WHAT THAT COSTS. The DPU's epilogue is
+ * `(acc + A[oc]) * C[oc]` in saturating int32 followed by ONE `(v*MUL)>>SHIFT` for the
+ * whole task, so the per-channel gain rides on the coefficient group's int16 C and the
+ * OUT_CVT carries a single base. That reproduces a per-axis model CLOSELY, not
+ * bit-exactly: TFLite's per-axis requant has a per-channel shift as well as a
+ * per-channel multiplier, and this datapath has only the multiplier. Two things bound
+ * the fidelity — C is an integer, so channel oc resolves its gain to 0.5/C[oc], and the
+ * int32 product saturates, which caps C[oc] at `INT32_MAX / max|acc + A|`. The planner
+ * takes the accumulator bound from the ACTUAL weights (128*sum|w[oc]|), not from the
+ * int8 envelope, because that is one to two orders of magnitude tighter and the
+ * difference is most of the available precision. It logs the worst-case relative gain
+ * error it settled for; a layer with a wide scale spread and a large fan-in is where
+ * that number gets big.
+ *
+ * So this is an ACCURACY decision, not a bit-exact one. What is gated bit-exactly is
+ * the chip arithmetic above against a CPU model of it; how far that sits from an exact
+ * per-axis reference is reported per shape rather than asserted.
+ *
+ * Refused rather than approximated: the depthwise path (its 48-byte coefficient group
+ * has a C field too, but this planner is wired to the direct path's 64-byte one), four
+ * or fewer input channels (the packed-image first conv is a different program), and a
+ * weight zero point (a per-axis quantization is symmetric by construction).
+ * [HW sweep, H96 MAX M9, tests/rk3576_coeff_c.c + tests/rk3576_perchannel_gate.c] */
+int rocket_conv2d_int8_perchannel_rk3576(int fd, const rocket_conv2d_desc *d,
+                                         const int8_t *in, const int8_t *W,
+                                         const int32_t *bias, float in_scale,
+                                         const float *w_scale, float out_scale,
+                                         int in_zp, int out_zp, int8_t *out);
+
+/* The output-channel tile the entry above will use, without running it — which is also
+ * its submit count, `ceil(oc/tile)` row-task sets at the part's per-submit floor.
+ *
+ * On this path the tile is an ACCURACY parameter as well as a CBUF one: a tile is one
+ * task and a task carries one OUT_CVT shift, so the C ramp inside a tile spans only
+ * that tile's range of scales. The channels are sorted by scale first, so halving the
+ * tile roughly halves the spread the ramp must cover. Measured at ic=128 oc=128 with a
+ * 100x spread: 26.6 counts of deviation from an exact per-axis requant in one tile,
+ * 2.7 at 64 channels, 1.0 at 32. The planner takes the LARGEST tile whose PREDICTED
+ * worst-case gain error meets ROCKET_RK3576_PC_MAX_ERR (default 1%), so a layer that
+ * does not need the split does not pay for it. ROCKET_RK3576_PC_OC_TILE forces one.
+ *
+ * Returns 0 for a descriptor this path refuses. [HW sweep, H96 MAX M9] */
+unsigned rocket_conv2d_int8_perchannel_oc_tile_rk3576(const rocket_conv2d_desc *d,
+                                                      const int8_t *W,
+                                                      const int32_t *bias,
+                                                      float in_scale,
+                                                      const float *w_scale,
+                                                      float out_scale, int in_zp);
 
 /* fp16 -> fp16 through the input-channel split: one fp16 task on this part contracts
  * exactly sixteen input channels, so an arbitrary count is ic/16 submits summed on the

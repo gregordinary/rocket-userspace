@@ -48,6 +48,7 @@
 #include "rocket_npu.h"
 #include "rocket_conv.h"
 #include "rocket_hw_profile.h"
+#include "requant_model.h"
 #include "rk3576_conv_shapes.h"
 
 /* The zero-point group. Same driving logic, three quant parameters that the symmetric
@@ -70,6 +71,18 @@ static const zp_shape_t ZP_SHAPES[] = {
     {"zp-dw-in",        32,  32, 16, 16, 3, 1, 1, 1,  -7,   0,   0},
     {"zp-dw-out",       32,  32, 16, 16, 3, 1, 1, 1,   0,   0,  23},
     {"zp-dw-all",       64,  64, 16, 16, 3, 1, 1, 1,  31,   0, -12},
+    /* A DEPTHWISE WEIGHT ZERO POINT, which the coefficient group cannot carry and the
+     * weight cube can: every (channel, tap) has two live bytes and the datapath adds
+     * them, so `w - w_zp` is exact across the pair. The group spans both signs, both
+     * channel-group boundaries (32 and 64), a kernel that is not 3, and the two ends of
+     * the range the pair reaches — a per-tensor TFLite depthwise filter always has one,
+     * so this is the form a real network hits rather than a corner. */
+    {"zp-dw-w",         32,  32, 16, 16, 3, 1, 1, 1,   0,  83,   0},
+    {"zp-dw-w-neg",     32,  32, 16, 16, 3, 1, 1, 1,   0, -34,   0},
+    {"zp-dw-w-all",     64,  64, 16, 16, 3, 1, 1, 1, -128, 45, -12},
+    {"zp-dw-w-g64",    128, 128, 14, 14, 3, 1, 1, 1, -128, -18,  7},
+    {"zp-dw-w-k5",      64,  64, 16, 16, 5, 1, 1, 1,  -9,  120, -3},
+    {"zp-dw-w-s2",      64,  64, 24, 24, 3, 2, 1, 1,  12, -127,  5},
 };
 #define N_ZP ((int)(sizeof ZP_SHAPES / sizeof ZP_SHAPES[0]))
 
@@ -80,6 +93,10 @@ static const zp_shape_t ZP_SHAPES[] = {
  *   the left pad must be NON-ZERO       at zero the DPU writes an untouched surface
  *   the output width must be iw/stride  anything else writes a surface sheared by one
  *                                       column per row
+ *
+ * ONE image channel is NOT one of them, though the emitted program will not fetch it:
+ * the entry programs a single-channel image as two, a zero lane against zero weights,
+ * so `fq-gray-*` must compute rather than refuse.
  *
  * Padding here is ONNX-style symmetric (k-1)/2 rather than the TFLite SAME the rest of
  * the gate uses, because TFLite puts the odd pad byte on the TRAILING edge and a 3x3
@@ -96,7 +113,8 @@ static const fq_shape_t FQ_SHAPES[] = {
     {"fq-rgb-k3-oc64",   3, 64,  32,  32, 3, 1, 1, 0}, /* two output-channel groups        */
     {"fq-rgb-k3-oc96",   3, 96,  32,  32, 3, 1, 1, 0}, /* past one program's 64            */
     {"fq-rgba-k3",       4, 32,  32,  32, 3, 1, 1, 0}, /* the fourth lane is the image's   */
-    {"fq-gray-k3",       1, 32,  32,  32, 3, 1, 1, 1}, /* ONE image channel writes nothing */
+    {"fq-gray-k3",       1, 32,  32,  32, 3, 1, 1, 0}, /* one channel, programmed as two   */
+    {"fq-gray-s2",       1, 32,  64,  64, 3, 2, 1, 0}, /* and through the row window       */
     {"fq-2ch-k3",        2, 32,  32,  32, 3, 1, 1, 0},
     {"fq-rgb-k5",        3, 32,  32,  32, 5, 1, 2, 0}, /* R = round16(4*kw) becomes 32     */
     {"fq-rgb-k7",        3, 32,  32,  32, 7, 1, 3, 0},
@@ -179,34 +197,66 @@ static double now_ms(void)
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
-/* The requant the emitter programs: out = sat8( (acc*scale + half) >> shift ). Derived
- * from the fp32 conv scale exactly as the vendor (QNNPACK) does, with shift-1 written to
- * the register, so the model shifts by the same value the DPU does. */
-static void requant_params(float conv_scale, unsigned *scale, unsigned *shift_reg)
-{
-    union { float f; uint32_t u; } cv;
-    uint32_t bits;
-    cv.f = conv_scale;
-    bits = cv.u;
-    *shift_reg = 127u + 31u - 32u - (bits >> 23) + 16u - 1u;
-    *scale = ((bits >> 9) & 0x7FFFu) + 1u;
-    if (*scale < (1u << 14)) *scale |= (1u << 14);
-}
-
-static int requant_apply(int64_t acc, unsigned scale, unsigned shift_reg, int out_zp)
-{
-    int64_t half = shift_reg ? ((int64_t)1 << (shift_reg - 1)) : 0;
-    int64_t v = ((acc * (int64_t)scale + half) >> shift_reg) + out_zp;
-    if (v >  127) v =  127;
-    if (v < -128) v = -128;
-    return (int)v;
-}
 
 struct lg_stat {
     int    exact, total, maxdiff;
     int    chans;      /* output channels exact over their whole plane */
     double ms;
+    /* What a wrong element LOOKS like, which is what separates the two hazards this
+     * path carries. An atom the DPU never emitted reads as the calloc'd zero, so a
+     * failure whose wrong elements are all zero-where-a-value-was-wanted is a DROP;
+     * one with wrong non-zero values is arithmetic. Both counted, plus the span, so
+     * an intermittent names itself rather than being re-run blind. */
+    int    wrong_zero, wrong_val;
+    int    span_c0, span_c1, span_y0, span_y1, span_x0, span_x1;
 };
+
+/* Every shape that failed, so a capture of the tail names them. An intermittent that
+ * shows up once in a few hundred shapes is otherwise a count. */
+#define LG_MAX_FAILED 64
+static char lg_failed[LG_MAX_FAILED][96];
+static int  lg_nfailed;
+
+static void lg_note_failure(const char *group, const char *name,
+                            const struct lg_stat *st, const char *reason)
+{
+    if (lg_nfailed >= LG_MAX_FAILED) { lg_nfailed++; return; }
+    if (st && st->total)
+        snprintf(lg_failed[lg_nfailed], sizeof lg_failed[0],
+                 "%s/%s  %d/%d exact, %d dropped-to-zero, %d wrong-valued",
+                 group, name, st->exact, st->total, st->wrong_zero, st->wrong_val);
+    else
+        snprintf(lg_failed[lg_nfailed], sizeof lg_failed[0], "%s/%s  %s",
+                 group, name, reason ? reason : "failed");
+    lg_nfailed++;
+}
+
+/* Record one wrong element: which kind, and how far the damage spreads. */
+static void lg_wrong(struct lg_stat *st, int got_is_zero, unsigned c, unsigned y, unsigned x)
+{
+    if (got_is_zero) st->wrong_zero++; else st->wrong_val++;
+    if (st->wrong_zero + st->wrong_val == 1) {
+        st->span_c0 = st->span_c1 = (int)c;
+        st->span_y0 = st->span_y1 = (int)y;
+        st->span_x0 = st->span_x1 = (int)x;
+        return;
+    }
+    if ((int)c < st->span_c0) st->span_c0 = (int)c;
+    if ((int)c > st->span_c1) st->span_c1 = (int)c;
+    if ((int)y < st->span_y0) st->span_y0 = (int)y;
+    if ((int)y > st->span_y1) st->span_y1 = (int)y;
+    if ((int)x < st->span_x0) st->span_x0 = (int)x;
+    if ((int)x > st->span_x1) st->span_x1 = (int)x;
+}
+
+/* The one line a chase needs: what kind of wrong, and where. */
+static void lg_print_signature(const struct lg_stat *st)
+{
+    if (!st->wrong_zero && !st->wrong_val) return;
+    printf("         %d dropped to zero, %d wrong-valued; c %d..%d y %d..%d x %d..%d\n",
+           st->wrong_zero, st->wrong_val, st->span_c0, st->span_c1,
+           st->span_y0, st->span_y1, st->span_x0, st->span_x1);
+}
 
 /* One shape, end to end, through the public per-chip entry.
  * Returns 0 exact, 1 wrong, 2 skip, 3 refused by the library. */
@@ -345,15 +395,18 @@ static int run_one_pad(int fd, const char *name, unsigned ic, unsigned oc, unsig
                                        (WD(c, i, kh, kw) - w_zp);
                         }
                     }
-                want = requant_apply(acc, scale, shift_reg, out_zp);
+                want = requant_apply_zp(acc, scale, shift_reg, out_zp);
                 got  = out[(((size_t)c * oh) + y) * ow + x];
                 diff = got > want ? got - want : want - got;
                 if (diff > st->maxdiff) st->maxdiff = diff;
                 if (got == want) st->exact++;
-                else if (verbose && shown < 8) {
-                    printf("    mism c=%u y=%u x=%u: want %d got %d (acc %lld)\n",
-                           c, y, x, want, got, (long long)acc);
-                    shown++;
+                else {
+                    lg_wrong(st, got == 0, c, y, x);
+                    if (verbose && shown < 8) {
+                        printf("    mism c=%u y=%u x=%u: want %d got %d (acc %lld)\n",
+                               c, y, x, want, got, (long long)acc);
+                        shown++;
+                    }
                 }
             }
     rc = (st->exact == st->total) ? 0 : 1;
@@ -460,6 +513,7 @@ static int run_fc(int fd, const fc_shape_t *s, struct lg_stat *st)
                     int dq = (int)(dv < 0 ? -dv : dv);
                     chan_exact = 0;
                     if (dq > st->maxdiff) st->maxdiff = dq;
+                    lg_wrong(st, (float)got == 0.0f, c, y, x);
                     if (verbose && shown < 8) {
                         printf("    mism c=%u y=%u x=%u: want %g got %g\n",
                                c, y, x, (double)(float)want, (double)(float)got);
@@ -482,6 +536,11 @@ int main(int argc, char **argv)
 {
     const char *filter = getenv("ROCKET_LG_FILTER");
     int fd, i, a, list = 0;
+
+    /* The library logs to stderr and this gate reports on stdout. Redirected to one
+     * file, a block-buffered stdout reorders the two and a diagnostic ends up filed
+     * under the wrong shape — which is exactly what an intermittent needs to survive. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     int passed = 0, failed = 0, skipped = 0, refused = 0, wrong_refusal = 0;
     const char *groups[16];
     int ngroups = 0;
@@ -542,6 +601,7 @@ int main(int argc, char **argv)
             } else {
                 printf("  FAIL   %-9s %-20s REFUSED and should compute\n",
                        s->group, s->name);
+                lg_note_failure(s->group, s->name, NULL, "REFUSED and should compute");
                 failed++;
             }
             continue;
@@ -549,6 +609,7 @@ int main(int argc, char **argv)
         if (s->lib_refuse) {
             printf("  FAIL   %-9s %-20s COMPUTED and should have refused\n",
                    s->group, s->name);
+            lg_note_failure(s->group, s->name, NULL, "COMPUTED and should have refused");
             wrong_refusal++; failed++;
             continue;
         }
@@ -559,6 +620,8 @@ int main(int argc, char **argv)
         } else {
             printf("  FAIL   %-9s %-20s %d/%d exact, maxdiff %d\n", s->group, s->name,
                    st.exact, st.total, st.maxdiff);
+            lg_print_signature(&st);
+            lg_note_failure(s->group, s->name, &st, NULL);
             failed++;
         }
     }
@@ -578,6 +641,7 @@ int main(int argc, char **argv)
                 else if (rc == 3) {
                     printf("  FAIL   %-9s %-20s REFUSED (zp %d/%d/%d)\n", "zp", z->name,
                            z->in_zp, z->w_zp, z->out_zp);
+                    lg_note_failure("zp", z->name, NULL, "REFUSED");
                     failed++;
                 } else if (rc == 0) {
                     printf("  PASS   %-9s %-20s %d/%d exact  zp %d/%d/%d  %.1f ms\n",
@@ -588,6 +652,8 @@ int main(int argc, char **argv)
                     printf("  FAIL   %-9s %-20s %d/%d exact, maxdiff %d  zp %d/%d/%d\n",
                            "zp", z->name, st.exact, st.total, st.maxdiff,
                            z->in_zp, z->w_zp, z->out_zp);
+                    lg_print_signature(&st);
+                    lg_note_failure("zp", z->name, &st, NULL);
                     failed++;
                 }
             }
@@ -617,7 +683,10 @@ int main(int argc, char **argv)
                                       : "REFUSED but the boundary says it computes")
                                    : "COMPUTED but the measured boundary says it cannot");
                     if (ok) { if (rc == 3) refused++; else passed++; }
-                    else    { failed++; wrong_refusal++; }
+                    else    { failed++; wrong_refusal++;
+                              lg_note_failure("fq", q->name, NULL,
+                                              rc == 3 ? "REFUSED and should compute"
+                                                      : "COMPUTED and should have refused"); }
                 } else if (rc == 0) {
                     printf("  PASS   %-9s %-20s %d/%d exact  %.1f ms\n", "fq",
                            q->name, st.exact, st.total, st.ms);
@@ -625,6 +694,8 @@ int main(int argc, char **argv)
                 } else {
                     printf("  FAIL   %-9s %-20s %d/%d exact, maxdiff %d\n", "fq",
                            q->name, st.exact, st.total, st.maxdiff);
+                    lg_print_signature(&st);
+                    lg_note_failure("fq", q->name, &st, NULL);
                     failed++;
                 }
             }
@@ -644,6 +715,7 @@ int main(int argc, char **argv)
                 else if (rc == 3) {
                     printf("  FAIL   %-9s %-20s REFUSED (ic=%u %ux%u k%u s%u)\n", "fc",
                            f->name, f->ic, f->iw, f->ih, f->k, f->stride);
+                    lg_note_failure("fc", f->name, NULL, "REFUSED");
                     failed++;
                 } else if (rc == 0) {
                     printf("  PASS   %-9s %-20s %d/%d exact  %.1f ms\n", "fc",
@@ -653,6 +725,8 @@ int main(int argc, char **argv)
                     printf("  FAIL   %-9s %-20s %d/%d exact, %d/%u whole channels, "
                            "maxdiff %d\n", "fc", f->name, st.exact, st.total,
                            st.chans, f->oc, st.maxdiff);
+                    lg_print_signature(&st);
+                    lg_note_failure("fc", f->name, &st, NULL);
                     failed++;
                 }
             }
@@ -664,5 +738,14 @@ int main(int argc, char **argv)
     if (wrong_refusal)
         printf("   (%d of those computed where the table says the part cannot)\n",
                wrong_refusal);
+    /* The count alone cannot be chased; the names can. Printed last so a captured
+     * tail carries them, and with the drop-vs-arithmetic signature attached. */
+    if (lg_nfailed) {
+        int n = lg_nfailed < LG_MAX_FAILED ? lg_nfailed : LG_MAX_FAILED;
+        printf("   failing shapes:\n");
+        for (i = 0; i < n; i++) printf("     %s\n", lg_failed[i]);
+        if (lg_nfailed > LG_MAX_FAILED)
+            printf("     ... and %d more\n", lg_nfailed - LG_MAX_FAILED);
+    }
     return failed ? 1 : 0;
 }

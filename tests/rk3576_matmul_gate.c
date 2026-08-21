@@ -31,6 +31,7 @@
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
 #include "rocket_hw_profile.h"
+#include "requant_model.h"
 
 typedef struct {
     const char *name;
@@ -52,6 +53,15 @@ static const mm_shape SHAPES[] = {
     {"wide-n",         64,   512, 1024, 0},
     {"n-tiled",        64,   512, 4096, 0},   /* several N tiles */
     {"n-tiled-deep",   32,  2048, 3072, 0},
+    /* The largest output surface one submit carries. These are the drain shapes: the
+     * DPU raises its completion tens to hundreds of microseconds after PC_DONE, scaling
+     * with the bytes in flight, and the driver's dpu_grace_us has to cover that or the
+     * job retires on PC_DONE with the tail of its surface still in flight. A 64 KiB
+     * surface already needs ~290 us of it, so the envelope wants shapes above that.
+     * [HW sweep, H96 MAX M9] */
+    {"surf-128k",      64,  1024, 2048, 0},
+    {"surf-256k",     128,   512, 2048, 0},
+    {"surf-512k",     256,   256, 2048, 0},
     /* awkward numbers: M with no even divisor, N and K off the round grid */
     {"m7",              7,    64,   32, 0},
     {"m13",            13,    96,   32, 0},
@@ -129,23 +139,11 @@ static void sleep_ms(int ms)
 
 /* The requant the emitter programs, in the caller's terms: scale/shift are derived
  * from the conv scale exactly as the vendor (QNNPACK) does and the DPU rounds to
- * nearest, so the model has to do the same arithmetic rather than a float multiply. */
+ * nearest with ties to EVEN, so the model has to do the same integer arithmetic
+ * rather than a float multiply. tests/requant_model.h carries the rule. */
 static int model_requant(int64_t acc, float scale)
 {
-    union { float f; uint32_t u; } cv;
-    uint32_t bits;
-    unsigned shift_reg, mul;
-    int64_t half, v;
-    cv.f = scale;
-    bits = cv.u;
-    shift_reg = 127u + 31u - 32u - (bits >> 23) + 16u - 1u;
-    mul = ((bits >> 9) & 0x7FFFu) + 1u;
-    if (mul < (1u << 14)) mul |= (1u << 14);
-    half = shift_reg ? ((int64_t)1 << (shift_reg - 1)) : 0;
-    v = (acc * (int64_t)mul + half) >> shift_reg;
-    if (v >  127) v =  127;
-    if (v < -128) v = -128;
-    return (int)v;
+    return requant_scale(acc, scale);
 }
 
 /* What the host does when K is split: the accumulator never reaches the DPU's OUT_CVT,
@@ -213,6 +211,16 @@ static int run_shape(int fd, const mm_shape *s, int verbose)
     rc = rocket_matmul_int8_rk3576(fd, M, K, N, A, B, bias, scale, C);
     ms = now_ms() - t0;
     if (rc != 0) {
+        /* A K past one task's contraction is split through the int32 entry, so a forced
+         * writer that cannot cover this plane refuses here too — the same result, one
+         * call further down. See the int32 runner for why that is a result. */
+        const char *forced = getenv("ROCKET_RK3576_I32_OC_MULT");
+        if (deep && rc == ROCKET_E_SHAPE && forced && *forced) {
+            printf("  %-6s %-14s %5dx%-5dx%-5d the K split's forced %s writer cannot "
+                   "cover this plane\n", "REFUSE", s->name, M, K, N,
+                   strtol(forced, NULL, 0) == 2 ? "wide" : "narrow");
+            rc = 0; goto done;
+        }
         printf("  %-6s %-14s %5dx%-5dx%-5d rocket_matmul_int8_rk3576 returned %d\n",
                "FAIL", s->name, M, K, N, rc);
         rc = 1; goto done;
@@ -279,13 +287,43 @@ static int run_i32_shape(int fd, const mm_shape *s, int verbose)
             seed = seed * 1103515245u + 12345u;
             B[(size_t)n * K + k] = (int8_t)((int)((seed >> 16) % 255u) - 127);
         }
+    /* ROCKET_MG_ZERO_ROWS=n zeroes every nth row of A, which makes a whole PIXEL of the
+     * output legitimately zero. That is what prices the wide writer's corruption
+     * detector: it fires on two adjacent zero emissions, a zero pixel is four of them in
+     * every super-group, and the redo cannot change the answer — so the task spends its
+     * whole retry budget and still returns the right result. Zero rows are not exotic:
+     * a padded batch, a masked token and an all-zero embedding all produce them. */
     for (n = 0; n < N; n++)
         bias[n] = (int32_t)((n - N / 2) * 1000);
+    {
+        int zr = getenv("ROCKET_MG_ZERO_ROWS")
+               ? atoi(getenv("ROCKET_MG_ZERO_ROWS")) : 0;
+        if (zr > 0) {
+            for (m = 0; m < M; m += zr)
+                memset(A + (size_t)m * K, 0, (size_t)K);
+            /* The bias goes with them: a zero row plus a bias is not a zero output,
+             * and it is the zero OUTPUT the detector reacts to. */
+            memset(bias, 0, (size_t)N * sizeof *bias);
+        }
+    }
 
     t0 = now_ms();
     rc = rocket_matmul_int8_rk3576_i32(fd, M, K, N, A, B, bias, C);
     ms = now_ms() - t0;
     if (rc != 0) {
+        /* A FORCED WRITER MAY REFUSE, and that is a result rather than a failure. The
+         * wide writer's surface bound is over the whole plane, so a shape whose plane is
+         * wider than one row task's budget cannot run on it at all — the planner avoids
+         * those by itself, and forcing it onto one is asking for the refusal. An
+         * unforced refusal is still a failure: the chooser must never pick a writer it
+         * cannot run. */
+        const char *forced = getenv("ROCKET_RK3576_I32_OC_MULT");
+        if (rc == ROCKET_E_SHAPE && forced && *forced) {
+            printf("  %-6s %-14s %5dx%-5dx%-5d the forced %s writer cannot cover this "
+                   "plane\n", "REFUSE", s->name, M, K, N,
+                   strtol(forced, NULL, 0) == 2 ? "wide" : "narrow");
+            rc = 0; goto done;
+        }
         printf("  %-6s %-14s %5dx%-5dx%-5d rocket_matmul_int8_rk3576_i32 returned %d\n",
                "FAIL", s->name, M, K, N, rc);
         rc = 1; goto done;
@@ -314,7 +352,7 @@ done:
 int main(int argc, char **argv)
 {
     const struct rocket_hw_profile *hw = rocket_hw_current();
-    int fd, i, fails = 0, verbose = getenv("ROCKET_MG_VERBOSE") != NULL;
+    int fd, i, fails = 0, ran = 0, verbose = getenv("ROCKET_MG_VERBOSE") != NULL;
     /* The FIRST shape is paced too, not just the gaps between them. An int32 job
      * poisons the next submit of any kind across PROCESSES, so a gate run started right
      * after another one can find its first int8 shape already dead — which reads as a
@@ -333,14 +371,18 @@ int main(int argc, char **argv)
         if (argc > 1 && !strstr(SHAPES[i].name, argv[1])) continue;
         sleep_ms(gap);
         fails += run_shape(fd, &SHAPES[i], verbose);
+        ran++;
     }
     printf("== the int32 output, exact ==\n");
     for (i = 0; i < N_I32_SHAPES; i++) {
         if (argc > 1 && !strstr(I32_SHAPES[i].name, argv[1])) continue;
         sleep_ms(gap);
         fails += run_i32_shape(fd, &I32_SHAPES[i], verbose);
+        ran++;
     }
-    printf("== %d passed, %d failed ==\n", N_SHAPES + N_I32_SHAPES - fails, fails);
+    /* Count what RAN, not what exists: a name filter otherwise reports the whole
+     * table as having passed, which reads as a full gate run. */
+    printf("== %d passed, %d failed ==\n", ran - fails, fails);
     rocket_close(fd);
     return fails ? 1 : 0;
 }

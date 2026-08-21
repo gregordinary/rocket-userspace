@@ -27,3 +27,11 @@ compile_commands.json
 
 # Tool dump output (dump_dw_regcmd et al. write into the cwd)
 *-regcmd.bin
+
+# The rk3576-net model blob and its inputs: rebuilt by tests/data/rk3576-net/fetch.sh
+# + mknet.py, ~9 MB, not worth carrying in the history.
+tests/data/rk3576-net/*.rnet
+tests/data/rk3576-net/*.tflite
+tests/data/rk3576-net/*.bmp
+tests/data/rk3576-net/labels.txt
+tests/data/rk3576-net/pylibs/

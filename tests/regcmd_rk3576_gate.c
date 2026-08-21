@@ -508,7 +508,14 @@ int main(int argc, char **argv)
      * 4096+F granules, only the rungs 0/256/512/1024/2048 deliver their face value,
      * the data side caps at 6144, and the weight path gets what is left of the ~448
      * KiB pool. A plane past its allowance computes WRONG with no fault to catch it,
-     * so these are the arithmetic that stands between a caller and silent corruption. */
+     * so these are the arithmetic that stands between a caller and silent corruption.
+     *
+     * AND 256 AND 512 DELIVER ONLY AT kh == 1, so the planner offers them only there.
+     * At kh > 1 each delivers 4096 granules — the F=0 budget — measured at one granule
+     * total across five plane widths: k=1 exact at every width, k=3 wrong at every one,
+     * k=5 wrong, and the F=0 controls exact at k=3. The pairs below assert both sides,
+     * because a planner that forgot the kernel would pass the k=1 half alone.
+     * [HW sweep, H96 MAX M9, tests/rk3576_conv_lib_gate.c rung256] */
     {
         struct { const char *what; unsigned iw, ic, ih, oc, kh, kw; int dw;
                  int want_ok; unsigned want_f; } pc[] = {
@@ -517,9 +524,14 @@ int main(int argc, char **argv)
             { "dw capture (5096 gr)",      112,  32,  91,  32, 3, 3, 1, 1, 1024 },
             /* rung selection: the lowest rung that covers the plane */
             { "4096 gr exactly",            16,  32, 512,  32, 1, 1, 0, 1,    0 },
-            { "4097 gr -> next rung",       16,  32, 513,  32, 1, 1, 0, 1,  256 },
-            { "4352 gr -> 256 exactly",     16,  32, 544,  32, 1, 1, 0, 1,  256 },
-            { "4608 gr -> 512",             16,  32, 576,  32, 1, 1, 0, 1,  512 },
+            { "4097 gr k1 -> 256",          16,  32, 513,  32, 1, 1, 0, 1,  256 },
+            { "4352 gr k1 -> 256 exactly",  16,  32, 544,  32, 1, 1, 0, 1,  256 },
+            { "4608 gr k1 -> 512",          16,  32, 576,  32, 1, 1, 0, 1,  512 },
+            /* the same totals at k=3, where those two rungs deliver only 4096 */
+            { "4097 gr k3 -> 1024 not 256", 16,  32, 513,  32, 3, 3, 0, 1, 1024 },
+            { "4352 gr k3 -> 1024 not 256", 16,  32, 544,  32, 3, 3, 0, 1, 1024 },
+            { "4608 gr k3 -> 1024 not 512", 16,  32, 576,  32, 3, 3, 0, 1, 1024 },
+            { "4096 gr k3 -> 0, unchanged", 16,  32, 512,  32, 3, 3, 0, 1,    0 },
             { "5120 gr -> 1024",            16,  32, 640,  32, 1, 1, 0, 1, 1024 },
             /* 5600 needs 1504, which is NOT a rung: 1536 would underdeliver on HW */
             { "5600 gr -> 2048 not 1536",   16,  32, 700,  32, 1, 1, 0, 1, 2048 },
@@ -560,7 +572,12 @@ int main(int argc, char **argv)
          * budget. ic=1472 k=2 is a 184 KiB slice: it fits beside F=0 (4096+2944 of
          * 7168 granules) but not beside the 256 rung (7296), so the window is
          * 4096/entries and not one row more. The neighbouring ic=1408 (176 KiB) DOES
-         * leave room for the 256 rung, which is the boundary this pins. */
+         * leave room for 256 — but both are k=2, where that rung delivers nothing, so
+         * both now hold at the base budget. That is the COST of the kernel rule,
+         * stated: a k>1 slice that used to buy 256 granules of window buys none, which
+         * is one more row task and not a wrong answer. The k=1 half of the rule is
+         * asserted by the 4352-granule pair in the table above, which is the same query
+         * with the kernel as the only variable. */
         {
             unsigned rows = rocket_rk3576_max_task_rows(16, 1472, 32, 2, 2, 0);
             unsigned entries = (16u * 1472u + 63u) / 64u;      /* 368 granules/row */
@@ -573,9 +590,9 @@ int main(int argc, char **argv)
         {
             unsigned rows = rocket_rk3576_max_task_rows(16, 1408, 32, 2, 2, 0);
             unsigned entries = (16u * 1408u + 63u) / 64u;      /* 352 granules/row */
-            if (rows != (4096u + 256u) / entries) {
-                printf("   FAIL max_task_rows(256 rung fits) expected %u, got %u\n",
-                       (4096u + 256u) / entries, rows);
+            if (rows != 4096u / entries) {
+                printf("   FAIL max_task_rows(k2, 256 rung dead) expected %u, got %u\n",
+                       4096u / entries, rows);
                 planner_fail++;
             }
         }

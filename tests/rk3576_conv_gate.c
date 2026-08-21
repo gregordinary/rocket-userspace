@@ -106,6 +106,7 @@ int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, i
  * is one task.
  * ==========================================================================*/
 #include "rk3576_conv_shapes.h"
+#include "requant_model.h"
 
 /* ============================================================================
  * SECTION — helpers shared with rk3576_first_light
@@ -132,36 +133,12 @@ static void sleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
-/* The requant the emitter programs: out = sat8( (acc*scale + half) >> shift ). The
- * emitter derives scale and the pre-decrement shift from the fp32 conv scale exactly
- * as the vendor (QNNPACK) does and writes shift-1, so the model shifts by the same
- * register value. The DPU rounds to nearest, which is the `half` term. */
 /* The output cube index. NOT feature_data(): that assumes surfaces sit exactly
  * ow*oh apart, and the depthwise writer advances by the plane rounded up to four. */
 static size_t out_index(unsigned surf_elems, unsigned ow, unsigned c,
                         unsigned y, unsigned x)
 {
     return (size_t)(c / C2) * surf_elems * C2 + (size_t)C2 * (y * ow + x) + (c % C2);
-}
-
-static void requant_params(float conv_scale, unsigned *scale, unsigned *shift_reg)
-{
-    union { float f; uint32_t u; } cv;
-    uint32_t bits;
-    cv.f = conv_scale;
-    bits = cv.u;
-    *shift_reg = 127u + 31u - 32u - (bits >> 23) + 16u - 1u;
-    *scale = ((bits >> 9) & 0x7FFFu) + 1u;
-    if (*scale < (1u << 14)) *scale |= (1u << 14);
-}
-
-static int requant_apply(int64_t acc, unsigned scale, unsigned shift_reg)
-{
-    int64_t half = shift_reg ? ((int64_t)1 << (shift_reg - 1)) : 0;
-    int64_t v = (acc * (int64_t)scale + half) >> shift_reg;
-    if (v >  127) v =  127;
-    if (v < -128) v = -128;
-    return (int)v;
 }
 
 /* ============================================================================

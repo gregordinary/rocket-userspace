@@ -25,7 +25,11 @@
  *                                             kernel changed this, every job wait
  *                                             would degrade to an immediate -EBUSY
  *                                             poll. We verify both directions on a
- *                                             real in-flight job.
+ *                                             real in-flight job — an fp16 matmul
+ *                                             where that generator has an encoder,
+ *                                             and a 1x1 int8 convolution where it
+ *                                             does not, so the guard covers every
+ *                                             kernel the library submits to.
  *   5. IOVA growth report                   — where successive BOs land (per-fd
  *                                             window); informational.
  *
@@ -49,6 +53,8 @@
 
 #include "rocket_npu.h"
 #include "npu_matmul.h"
+#include "rocket_hw_profile.h"      /* to pick the program this part runs */
+#include "npu_regcmd_rk3576.h"      /* the RK3576's own conv generator    */
 
 static int fails = 0, checks = 0;
 #define CHECK(cond, msg) do { checks++; if (cond) { printf("  ok   : %s\n", msg); } \
@@ -57,6 +63,106 @@ static int fails = 0, checks = 0;
 
 static int64_t mono_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     return (int64_t)ts.tv_sec*1000000000LL + ts.tv_nsec; }
+
+/* The two deadline checks themselves, on a job that is ALREADY in flight. Factored
+ * out because the regcmd in flight is per-chip and the contract under test is not:
+ * timeout_ns is an absolute CLOCK_MONOTONIC deadline in every kernel, whatever
+ * program the part happens to run. */
+static void deadline_checks(int fd, rocket_bo *out, rocket_bo *in)
+{
+    /* (a) ABSOLUTE-deadline canary: a RAW PREP_BO with a deadline 1 ms IN THE PAST.
+     * Absolute semantics => return promptly (not hang); a non-zero errno means the
+     * fence is unsignalled (job in flight) — the expected, healthy reading. A
+     * relative-duration kernel would instead WAIT ~0 and is indistinguishable here,
+     * so this branch is informational; check (b) is the hard regression guard. */
+    struct drm_rocket_prep_bo past = { .handle = out->handle,
+        .timeout_ns = mono_ns() - 1000000LL /* 1 ms ago */ };
+    int64_t t0 = mono_ns();
+    int prc = ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &past);
+    int64_t dt = mono_ns() - t0;
+    int e = prc < 0 ? errno : 0;
+    CHECK(dt < 500000000LL, "raw PREP_BO with a PAST absolute deadline returns promptly (no hang)");
+    if (prc < 0) INFO("  past-deadline poll -> errno %d (%s) = fence unsignalled, job in-flight",
+                      e, strerror(e));
+    else         INFO("  past-deadline poll -> 0 (job already completed; canary inconclusive)");
+
+    /* (b) HARD GUARD: the shim's relative->absolute conversion must let a generous
+     * relative wait actually complete the job. If the conversion regressed (passing
+     * a raw small value as absolute), the kernel would see a past deadline and
+     * return -EBUSY even though the job finishes fine. */
+    int wrc = rocket_bo_prep(fd, out, 0, 3000000000LL /* 3 s relative */);
+    CHECK(wrc == 0, "shim PREP_BO (relative 3s) completes the in-flight job (abs-deadline conversion OK)");
+    rocket_bo_fini(fd, out);
+
+    /* FINI_BO must always succeed. */
+    CHECK(rocket_bo_fini(fd, in) == 0, "FINI_BO succeeds");
+}
+
+/* The canary's RK3576 job. gen_matmul_fp16() refuses on this part — its
+ * geometry-register encoding is re-packed and the fp16 matmul has no encoder here —
+ * so the canary builds what the part DOES run: a 1x1 int8 convolution, which is the
+ * same thing a matmul is on this hardware. The arithmetic is irrelevant (the cubes
+ * are left zeroed); what the check needs is a well-formed program that occupies the
+ * NPU long enough to be caught in flight, and int8 output is the one width that does
+ * not poison the next submit.
+ *
+ * Returns 1 if a job was submitted and the checks ran, 0 if the part could not build
+ * one (never a failure — that is a fact about the encoder, not about the uAPI). */
+static int conv_canary(int fd)
+{
+    /* Small enough to be safely inside the envelope on every axis the emitter bounds
+     * (ic and oc multiples of 32, iw a multiple of 16, one row window), big enough
+     * that the job outlives the submit ioctl. */
+    const unsigned IC = 32, OC = 32, IW = 32, IH = 32;
+    rocket_bo in = {0}, wt = {0}, coeff = {0}, rc_bo = {0}, out = {0};
+    uint64_t ops[RK3576_CONV_TASK_OPS] = {0};
+    rocket_bo *all[] = { &in, &wt, &coeff, &rc_bo, &out };
+    size_t feat = (size_t)IC * IH * IW;
+    size_t surf = (size_t)OC * rocket_rk3576_out_surf_elems(IW, IH, 0);
+    int ran = 0;
+
+    if (rocket_bo_alloc(fd, feat, &in) || rocket_bo_alloc(fd, (size_t)OC * IC, &wt) ||
+        rocket_bo_alloc(fd, rocket_rk3576_coeff_bytes(OC), &coeff) ||
+        rocket_bo_alloc(fd, sizeof ops, &rc_bo) || rocket_bo_alloc(fd, surf, &out)) {
+        INFO("could not allocate the conv canary's BOs (skip)");
+        goto done;
+    }
+
+    conv_params_t p = {
+        .ic = IC, .ih = IH, .iw = IW, .oc = OC, .oh = IH, .ow = IW,
+        .kh = 1, .kw = 1, .stride_y = 1, .stride_x = 1, .dil_y = 1, .dil_x = 1,
+        .ih_full = IH, .oh_full = IH, .int8_out = 1, .tasks = ops,
+        .in_scale = 1.0f, .w_scale = 1.0f, .out_scale = 1.0f,
+        .input_dma   = (uint32_t)in.dma_address,
+        .weights_dma = (uint32_t)wt.dma_address,
+        .bias_dma    = (uint32_t)coeff.dma_address,
+        .output_dma  = (uint32_t)out.dma_address,
+    };
+    if (gen_conv2d_int8_rk3576(&p) != 0 || p.task_count == 0) {
+        INFO("the part's int8 conv generator refused too: canary skipped");
+        goto done;
+    }
+
+    rocket_bo_prep(fd, &rc_bo, 1, 0);
+    memcpy(rc_bo.ptr, ops, p.task_count * sizeof(uint64_t));
+    rocket_bo_fini(fd, &rc_bo);
+
+    INFO("canary job: a %ux%ux%u 1x1 int8 conv, %u regcmd ops", IC, IH, IW, p.task_count);
+    rocket_task_desc t = { (uint32_t)rc_bo.dma_address, p.task_count };
+    uint32_t inh[] = { in.handle, wt.handle, coeff.handle, rc_bo.handle };
+    uint32_t outh[] = { out.handle };
+    if (rocket_submit_tasks(fd, &t, 1, inh, 4, outh, 1)) {
+        CHECK(0, "rocket_submit_tasks (async job)");
+        goto done;
+    }
+    deadline_checks(fd, &out, &in);
+    ran = 1;
+
+done:
+    for (unsigned i = 0; i < sizeof all / sizeof all[0]; i++)
+        if (all[i]->handle) rocket_bo_free(fd, all[i]);
+    return ran;
+}
 
 /* DRM_IOCTL_VERSION lives in <drm/drm.h>, pulled in by rocket_accel.h. */
 #include <drm/drm.h>
@@ -140,6 +246,22 @@ int main(void)
                 .weights_dma=(uint32_t)wt.dma_address,.output_dma=(uint32_t)out.dma_address,
                 .tasks=ops,.fp32tofp16=1};
             int genrc = gen_matmul_fp16(&p);
+
+            /* The canary needs a REAL job in flight, and this datapath's generator
+             * refuses on a part it has no encoder for (the RK3576 runs a re-packed
+             * geometry-register encoding). Refusing is correct there, so it is not a
+             * failure of the uAPI — but the tasks below must not be submitted anyway.
+             * A task with regcmd_count == 0 is one of the malformed submits that a
+             * kernel without the rocket_job_cleanup NULL-domain fix OOPSES on
+             * (see uapi_submit_errpath_rocket), so building the job from a refused
+             * generate would crash the box it is meant to be conformance-testing. */
+            const int have_regcmd = (genrc == 0 && p.task_count > 0);
+            if (!have_regcmd) {
+                INFO("gen_matmul_fp16 refused on this part (%s): the canary needs a "
+                     "regcmd this part RUNS, so it builds a 1x1 int8 conv instead",
+                     rocket_hw_current()->name);
+                conv_canary(fd);
+            } else {
             CHECK(genrc == 0, "gen_matmul_fp16 (build a real regcmd)");
             rocket_bo_prep(fd,&rc_bo,1,0); memcpy(rc_bo.ptr,ops,p.task_count*sizeof(uint64_t));
             rocket_bo_fini(fd,&rc_bo);
@@ -148,38 +270,11 @@ int main(void)
             for(int i=0;i<NTASK;i++) tasks[i]=(rocket_task_desc){(uint32_t)rc_bo.dma_address,p.task_count};
             uint32_t inh[]={in.handle,wt.handle,rc_bo.handle}, outh[]={out.handle};
 
-            /* (a) ABSOLUTE-deadline canary: submit async, then a RAW PREP_BO with a
-             * deadline 1 ms IN THE PAST. Absolute semantics => return promptly
-             * (not hang); a non-zero errno means the fence is unsignalled (job in
-             * flight) — the expected, healthy reading. A relative-duration kernel
-             * would instead WAIT ~0 and is indistinguishable here, so this branch
-             * is informational; check (b) is the hard regression guard. */
-            if (!rocket_submit_tasks(fd,tasks,NTASK,inh,3,outh,1)) {
-                struct drm_rocket_prep_bo past = { .handle = out.handle,
-                    .timeout_ns = mono_ns() - 1000000LL /* 1 ms ago */ };
-                int64_t t0 = mono_ns();
-                int prc = ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO, &past);
-                int64_t dt = mono_ns() - t0;
-                int e = prc<0 ? errno : 0;
-                CHECK(dt < 500000000LL, "raw PREP_BO with a PAST absolute deadline returns promptly (no hang)");
-                if (prc < 0) INFO("  past-deadline poll -> errno %d (%s) = fence unsignalled, job in-flight",
-                                  e, strerror(e));
-                else         INFO("  past-deadline poll -> 0 (job already completed; canary inconclusive)");
-
-                /* (b) HARD GUARD: the shim's relative->absolute conversion must let
-                 * a generous relative wait actually complete the job. If the
-                 * conversion regressed (passing a raw small value as absolute), the
-                 * kernel would see a past deadline and return -EBUSY even though the
-                 * job finishes fine. */
-                int wrc = rocket_bo_prep(fd, &out, 0, 3000000000LL /* 3 s relative */);
-                CHECK(wrc == 0, "shim PREP_BO (relative 3s) completes the in-flight job (abs-deadline conversion OK)");
-                rocket_bo_fini(fd, &out);
-
-                /* FINI_BO must always succeed. */
-                CHECK(rocket_bo_fini(fd, &in) == 0, "FINI_BO succeeds");
-            } else {
+            if (!rocket_submit_tasks(fd,tasks,NTASK,inh,3,outh,1))
+                deadline_checks(fd, &out, &in);
+            else
                 CHECK(0, "rocket_submit_tasks (async job)");
-            }
+            }   /* have_regcmd */
         }
         rocket_bo_free(fd,&in); rocket_bo_free(fd,&wt);
         rocket_bo_free(fd,&rc_bo); rocket_bo_free(fd,&out);

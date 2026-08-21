@@ -42,6 +42,7 @@
  * over. So K past one task's contraction is SPLIT rather than refused, through that
  * path, and the requant moves to the host.
  */
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,13 @@
  * the same hazard through the same driver. Both live in rocket_rk3576_internal.h, and
  * the int32 section below is where they are documented and defined. */
 #define R76_SENTINEL_BYTE ROCKET_RK3576_SENTINEL_BYTE
+
+/* Attempts a row task gets before the call refuses. Each retry is one submit plus, when
+ * the failure is the poisoning, one power cycle — cheap against a wrong answer, and the
+ * measured need is real: on a 128-task shape the redo fires on 1-12 tasks a run and
+ * heals all of them, while at four attempts about one run in thirty had a task it did
+ * not recover. */
+#define R76_I32_TASK_ATTEMPTS 8
 
 int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
 int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
@@ -89,6 +97,20 @@ static void r76_mm_plane(unsigned M, unsigned K, unsigned *iw_out, unsigned *ih_
 {
     unsigned budget_px = r76_mm_feature_elems() / K;
     unsigned iw, best = 1;
+    /* ROCKET_RK3576_MM_IW forces the plane width, for probing questions whose answer
+     * depends on how the same M is cut — the wide int32 writer's surface-height bound
+     * among them, since a bound over rows and a bound over atoms are the same number
+     * until the plane changes. It is a probe knob: it skips the granule rule above, so
+     * a width that is not a whole number of granules wastes CBUF rather than failing. */
+    {
+        const char *e = getenv("ROCKET_RK3576_MM_IW");
+        unsigned forced = (e && *e) ? (unsigned)strtoul(e, NULL, 0) : 0u;
+        if (forced && forced <= M && M % forced == 0u) {
+            *iw_out = forced;
+            *ih_out = M / forced;
+            return;
+        }
+    }
 
     if (!budget_px) budget_px = 1;
     for (iw = 1; iw <= M; iw++) {
@@ -395,6 +417,7 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
 
         for (t = 0; t < ntask; t++) {
             unsigned tattempt;
+            int task_ok;
             conv_params_t q = p;
             q.ih = plan[t].ih; q.oh = plan[t].oh;
             q.pad_top = plan[t].pad_top;
@@ -408,7 +431,8 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
             /* PER TASK, not per tile. One poisoned submit among several leaves its own
              * rows stale while its siblings are full, so a check over the whole tile
              * reads "something was written" and passes the hole through. */
-            for (tattempt = 0; tattempt < 4; tattempt++) {
+            task_ok = 0;
+            for (tattempt = 0; tattempt < R76_I32_TASK_ATTEMPTS; tattempt++) {
                 rocket_bo_prep(fd, &b.rc, 1, 0);
                 memcpy(b.rc.ptr, ops, q.task_count * sizeof(uint64_t));
                 rocket_bo_fini(fd, &b.rc);
@@ -425,14 +449,24 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
                     int twrote = 0;
                     for (si = 0; si < tb; si++) if (sp[si] != blank) { twrote = 1; break; }
                     rocket_bo_fini(fd, &b.out);
-                    if (twrote) break;
+                    if (twrote) { task_ok = 1; break; }
                     ROCKET_LOGD("rk3576 matmul: n0=%u row task %u wrote nothing, idling "
                                 "and redoing it\n", n0, t);
                     rocket_rk3576_power_idle();
                     continue;
                 }
                 rocket_bo_fini(fd, &b.out);
+                task_ok = 1;
                 break;
+            }
+            /* A task the retries did not recover is a hole in the surface, and quietly
+             * de-scattering it hands the caller a matrix that is exactly one row task
+             * stale — no fault, normal timing, plausible values. Refuse instead. */
+            if (!task_ok) {
+                ROCKET_LOGE("rk3576 matmul: n0=%u row task %u wrote nothing after %d "
+                            "attempts — refusing to return a partial surface\n",
+                            n0, t, R76_I32_TASK_ATTEMPTS);
+                rc = ROCKET_E_DEVICE; goto done;
             }
         }
 
@@ -521,30 +555,77 @@ done:
  * gate still passes bit-exactly, the per-submit dispatch floor is unchanged (1079 -> 1104
  * us, which a back-to-back chain never lets the timer touch), and the fp16 first conv's
  * gate group falls from 122-513 ms a shape to 1.3-122: 224x224 k3 s2 goes 257 -> 20 ms.
+ * [HW sweep, H96 MAX M9]
+ *
+ * EVERY BOUND CORE HOLDS THE DOMAIN, so every one of them is driven. The part's two NPU
+ * cores are two platform devices with one shared power domain between them, and the
+ * domain collapses only once BOTH are runtime-suspended. On an image whose device tree
+ * enables core 1 the kernel fans an fd's work across both, so EITHER can be the active
+ * one at the moment the guard looks — sampled once a second through a matmul gate run,
+ * the two take turns. A guard that waited on the first device therefore returned while
+ * the other still held the domain up, and the next wide-output submit wrote nothing:
+ * measured as 21 of 163 library-conv cases failing with core 1 at the stock delay and 1
+ * with its delay forced to zero. So the devices are enumerated from the driver's sysfs
+ * directory rather than named, and the kick writes, waits on and restores all of them.
  * [HW sweep, H96 MAX M9] */
-static const char *const R76_PM_DELAY_PATHS[] = {
-    "/sys/bus/platform/drivers/rocket/27700000.npu/power/autosuspend_delay_ms",
-    "/sys/bus/platform/drivers/rocket/27f00000.npu/power/autosuspend_delay_ms",
-};
+#define R76_PM_MAX_DEVS 8
 
-/* The device whose delay was read, so the kick below writes the same one back. */
-static const char *r76_pm_delay_path;
+/* One "<dev>/power/" prefix per bound rocket device, discovered once. */
+static char r76_pm_dir[R76_PM_MAX_DEVS][192];
+static int r76_pm_ndev = -1;            /* -1 unprobed */
 
-static int r76_autosuspend_ms(void)
+/* Open `<r76_pm_dir[i]><leaf>`. */
+static FILE *r76_pm_open(int i, const char *leaf, const char *mode)
 {
-    unsigned i;
-    for (i = 0; i < sizeof R76_PM_DELAY_PATHS / sizeof R76_PM_DELAY_PATHS[0]; i++) {
-        FILE *fp = fopen(R76_PM_DELAY_PATHS[i], "r");
+    char path[256];
+    if (snprintf(path, sizeof path, "%s%s", r76_pm_dir[i], leaf) >= (int)sizeof path)
+        return NULL;
+    return fopen(path, mode);
+}
+
+/* Fill r76_pm_dir[] from /sys/bus/platform/drivers/rocket/<dev>, and return the delay the
+ * devices are set to (they share one policy, so the first readable one is it), or -1. */
+static int r76_pm_probe(void)
+{
+    static const char *dir = "/sys/bus/platform/drivers/rocket";
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    int delay = -1;
+
+    r76_pm_ndev = 0;
+    if (!d) return -1;
+    while ((e = readdir(d)) && r76_pm_ndev < R76_PM_MAX_DEVS) {
+        FILE *fp;
         long v;
+        if (e->d_name[0] == '.') continue;
+        /* The directory also holds bind/unbind/uevent and a `module` link; a device is
+         * whatever carries a readable power/autosuspend_delay_ms. */
+        if (snprintf(r76_pm_dir[r76_pm_ndev], sizeof r76_pm_dir[0], "%s/%s/power/",
+                     dir, e->d_name) >= (int)sizeof r76_pm_dir[0])
+            continue;
+        fp = r76_pm_open(r76_pm_ndev, "autosuspend_delay_ms", "r");
         if (!fp) continue;
         if (fscanf(fp, "%ld", &v) == 1 && v >= 0 && v < 10000) {
-            fclose(fp);
-            r76_pm_delay_path = R76_PM_DELAY_PATHS[i];
-            return (int)v;
+            if (delay < 0) delay = (int)v;
+            r76_pm_ndev++;
         }
         fclose(fp);
     }
-    return -1;
+    closedir(d);
+    return r76_pm_ndev ? delay : -1;
+}
+
+static int r76_autosuspend_ms(void)
+{
+    if (r76_pm_ndev < 0) return r76_pm_probe();
+    if (!r76_pm_ndev) return -1;
+    {
+        FILE *fp = r76_pm_open(0, "autosuspend_delay_ms", "r");
+        long v;
+        int got = fp && fscanf(fp, "%ld", &v) == 1 && v >= 0 && v < 10000;
+        if (fp) fclose(fp);
+        return got ? (int)v : -1;
+    }
 }
 
 /* ============================================================================
@@ -576,41 +657,41 @@ static int r76_autosuspend_ms(void)
  * ==========================================================================*/
 /* What mainline's rocket_core.c sets, and what an interrupted kick is healed to. */
 #define R76_PM_DELAY_DEFAULT_MS 50
+
+/* Write `ms` to every bound device. 1 only if all of them took it: one device left at
+ * the old delay is one core left holding the shared domain up. */
 static int r76_pm_write_delay(int ms)
 {
-    FILE *fp;
-    int ok;
-    if (!r76_pm_delay_path) return 0;
-    fp = fopen(r76_pm_delay_path, "w");
-    if (!fp) return 0;
-    ok = fprintf(fp, "%d\n", ms) > 0;
-    if (fclose(fp) != 0) ok = 0;
+    int i, ok = r76_pm_ndev > 0;
+    for (i = 0; i < r76_pm_ndev; i++) {
+        FILE *fp = r76_pm_open(i, "autosuspend_delay_ms", "w");
+        if (!fp) { ok = 0; continue; }
+        if (fprintf(fp, "%d\n", ms) <= 0) ok = 0;
+        if (fclose(fp) != 0) ok = 0;
+    }
     return ok;
 }
 
-/* 1 once the device reports `suspended`, 0 if it has not within `budget_ms`. */
+/* 1 once EVERY device reports `suspended`, 0 if they have not within `budget_ms`. The
+ * power domain is shared, so a single active core means it never collapsed. */
 static int r76_pm_wait_suspended(int budget_ms)
 {
-    char path[256];
-    const char *tail = "runtime_status";
-    size_t base;
     int waited = 0;
 
-    if (!r76_pm_delay_path) return 0;
-    base = strlen(r76_pm_delay_path) - strlen("autosuspend_delay_ms");
-    if (base + strlen(tail) >= sizeof path) return 0;
-    memcpy(path, r76_pm_delay_path, base);
-    strcpy(path + base, tail);
-
+    if (r76_pm_ndev <= 0) return 0;
     for (;;) {
-        FILE *fp = fopen(path, "r");
-        char st[32] = {0};
-        int got = 0;
-        if (fp) {
-            got = fscanf(fp, "%31s", st) == 1;
-            fclose(fp);
+        int i, all = 1;
+        for (i = 0; i < r76_pm_ndev && all; i++) {
+            FILE *fp = r76_pm_open(i, "runtime_status", "r");
+            char st[32] = {0};
+            int got = 0;
+            if (fp) {
+                got = fscanf(fp, "%31s", st) == 1;
+                fclose(fp);
+            }
+            if (!got || strcmp(st, "suspended")) all = 0;
         }
-        if (got && !strcmp(st, "suspended")) return 1;
+        if (all) return 1;
         if (waited >= budget_ms) return 0;
         {
             struct timespec ts = { 0, 500000L };   /* 0.5 ms */
@@ -620,7 +701,7 @@ static int r76_pm_wait_suspended(int budget_ms)
     }
 }
 
-void rocket_rk3576_power_idle(void)
+int rocket_rk3576_power_idle(void)
 {
     static int cached = -2;
     static int kick = -2;          /* -2 unprobed, -1 unavailable, else the delay to restore */
@@ -657,24 +738,28 @@ void rocket_rk3576_power_idle(void)
              * heal it rather than adopting it as the value to restore. */
             kick = d ? d : R76_PM_DELAY_DEFAULT_MS;
             ROCKET_LOGI("rk3576: the power-domain cycle the wide-output guard waits for is "
-                        "driven directly (autosuspend delay %d ms is writable), so the "
-                        "guard costs one cycle rather than the timer's worst case\n", kick);
+                        "driven directly on all %d bound core(s) (autosuspend delay %d ms "
+                        "is writable), so the guard costs one cycle rather than the "
+                        "timer's worst case\n", r76_pm_ndev, kick);
         }
     }
     if (kick >= 0) {
         if (r76_pm_write_delay(0)) {
             int done = r76_pm_wait_suspended(gms);
             r76_pm_write_delay(kick);
-            if (done) return;
+            if (done) return 1;
             /* It did not suspend inside the budget — fall through to the plain idle
              * rather than returning with the hazard possibly uncleared. */
+            ROCKET_LOGD("rk3576: the power domain did not report suspended within %d ms; "
+                        "falling back to a blind idle\n", gms);
         }
     }
 
-    if (gms <= 0) return;
+    if (gms <= 0) return 0;
     ts.tv_sec = gms / 1000;
     ts.tv_nsec = (long)(gms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
+    return 0;
 }
 
 /* How many programmed output channels one real channel costs.
@@ -706,10 +791,11 @@ void rocket_rk3576_power_idle(void)
  * The narrow writer is also the negative control for the wide one: a result that differs
  * between the two says one of the two output maps is wrong and takes the arithmetic out
  * of the question. */
-static unsigned r76_i32_oc_mult(void)
+static unsigned r76_i32_oc_mult_env(void)
 {
     const char *e = getenv("ROCKET_RK3576_I32_OC_MULT");
-    return (e && *e && strtol(e, NULL, 0) == 2) ? 2u : 4u;
+    if (!e || !*e) return 0u;                       /* unset: the planner chooses */
+    return strtol(e, NULL, 0) == 2 ? 2u : 4u;
 }
 
 /* Programmed output channel carrying real output channel n. Both writers deliver the
@@ -719,11 +805,53 @@ static unsigned r76_i32_prog_oc(unsigned n, unsigned mult)
 {
     return (mult == 4u ? 32u : 16u) * (n / 8u) + (n % 8u);
 }
+/* What the last int32 call's detector saw, for rocket_rk3576_i32_last_stats(). The
+ * entry repairs both of its failure modes silently, so without this the only record of
+ * what a shape actually cost is a log line. Thread-local so a multi-fd caller does not
+ * read another worker's call; the accessor documents that it is per thread. */
+static _Thread_local rocket_rk3576_i32_stats r76_i32_stats;
+
+void rocket_rk3576_i32_last_stats(rocket_rk3576_i32_stats *out)
+{
+    if (out) *out = r76_i32_stats;
+}
+
 /* One task's contraction is bounded by the resident weight slice, which the 4x oc
  * multiplier eats into directly. Slices descend by halves from this. */
 #define R76_I32_KS_MAX    4608u
-/* The wide writer's surface-height bound, as oh_full * oc. See where it is applied. */
-#define R76_I32_WIDE_OC_ROWS  4095u
+/* The wide writer's surface bound, as `iw * oh_full * oc_prog` — the whole PLANE times
+ * the programmed channel count, which is the surface in half-bytes, so this is 8 KiB per
+ * row task. Past it the writer emits zeros and the task comes back part right.
+ *
+ * IT IS THE PLANE AND NOT THE ROWS, and reading it as rows is a silent wrong answer
+ * rather than a lost bound. A plan's row split can only shorten `oh_full`; it cannot
+ * narrow `iw`, and the plane chooser takes the WIDEST divisor of M it can — so on a
+ * shape whose plane comes out `Mx1` a rows-only cap is satisfied by every task while the
+ * surface is M times over. Measured with the writer forced on eleven such shapes: wrong
+ * on ten of them at the planner's own plane, exact on all eleven at iw=1, where the two
+ * readings coincide. [HW sweep, H96 MAX M9] */
+#define R76_I32_WIDE_SURF  4095u
+
+
+/* The bound in force, so a probe can RAISE it and find where the map actually breaks.
+ * Honouring the bound is what keeps the wide writer correct, so the override exists to
+ * measure the boundary rather than to be set in anger: past it a tile comes back part
+ * right and silently. ROCKET_RK3576_I32_WIDE_SURF. */
+static unsigned r76_i32_wide_surf(void)
+{
+    const char *e = getenv("ROCKET_RK3576_I32_WIDE_SURF");
+    unsigned v = (e && *e) ? (unsigned)strtoul(e, NULL, 0) : 0u;
+    return v ? v : R76_I32_WIDE_SURF;
+}
+
+/* Rows one wide row task may cover at this plane width and programmed channel count, or
+ * 0 if the plane is already too wide for a single row — in which case the wide writer
+ * cannot run this tile at all, because there is no shorter task to split into. */
+static unsigned r76_i32_wide_rows(unsigned iw, unsigned oc_prog)
+{
+    unsigned per_row = oc_prog * (iw ? iw : 1u);
+    return per_row ? r76_i32_wide_surf() / per_row : 0u;
+}
 
 /* ROCKET_RK3576_I32_DIAG locates the wide writer's dropped atoms in the coordinates of
  * its OWN map rather than in (m, n).
@@ -807,6 +935,31 @@ static unsigned r76_i32_diag_task(const unsigned char *surf, unsigned A,
     return nzero;
 }
 
+/* One run of consecutive zero emissions, in the coordinates the signature is stated in.
+ * `tail=at-2A-2` is the predicted end; anything else is a counter-example to it. */
+static void r76_i32_run_log(unsigned sg, unsigned e0, unsigned e1, unsigned A)
+{
+    ROCKET_LOGD("rk3576 i32 wide: zero run super-group %u emissions %u..%u "
+                "(s %u..%u, lane groups %u..%u) len %u of %u | A=%u 2A-2=%u "
+                "tail=%s\n",
+                sg, e0, e1, e0 / 2u, e1 / 2u, e0 % 2u, e1 % 2u,
+                e1 - e0 + 1u, 4u * A, A, 2u * A - 2u,
+                e1 == 4u * A - 3u ? "at-2A-2" : "elsewhere");
+}
+
+/* The attempt from which a task whose only defect is zero atoms is settled EXACTLY, by
+ * asking the operands rather than the part.
+ *
+ * A dropped atom and a legitimately zero accumulator are the same bytes, and no property
+ * of the surface separates them: repetition does not, because the drop is correlated
+ * with the memory system and repeats often enough to leak a wrong answer — measured, its
+ * rate goes from 8.5% of row tasks to 42.5% under host streaming load while the
+ * never-emitted count barely moves. What does separate them is the arithmetic, and this
+ * entry has both operands. So the first attempt is simply redone (the drop usually does
+ * not survive one redo, and a redo is far cheaper than a dot product), and from the
+ * second the zero atoms are checked against the CPU. [HW sweep, H96 MAX M9] */
+#define R76_I32_CPU_CHECK_FROM 1u
+
 /* The wide writer's corruption signature, in the coordinates of its own emission order.
  *
  * WHAT THE DEFECT IS. On a minority of runs the wide writer emits a contiguous block of
@@ -831,7 +984,12 @@ static unsigned r76_i32_diag_task(const unsigned char *surf, unsigned A,
  * smallest corruption seen and is implausible as arithmetic — eight output channels at
  * one pixel, all exactly zero — so it is the signal, and the task is redone. A tile
  * whose data really does hold such a pair costs a wasted submit and stays correct.
- * Returns the number of atoms in runs of two or more consecutive zero emissions. */
+ * Returns the number of atoms in runs of two or more consecutive zero emissions.
+ *
+ * Each run's EXTENT is logged at debug level, in emission coordinates, against the
+ * signature's prediction that a run ends at s = 2A-2 (emission 4A-3). That is what a
+ * tighter detector would key on, so it is what has to be confirmed across shapes before
+ * one is written: run ROCKET_LOG_LEVEL=debug and read the "tail" field. */
 static unsigned r76_i32_wide_suspect(const unsigned char *surf, unsigned A,
                                      unsigned oc_prog)
 {
@@ -846,12 +1004,89 @@ static unsigned r76_i32_wide_suspect(const unsigned char *surf, unsigned A,
             unsigned i;
             for (i = 0; i < C2; i++) if (ap[i]) break;
             if (i == C2) { run++; continue; }
-            if (run >= 2u) total += run;
+            if (run >= 2u) { r76_i32_run_log(sg, e - run, e - 1u, A); total += run; }
             run = 0;
         }
-        if (run >= 2u) total += run;
+        if (run >= 2u) { r76_i32_run_log(sg, 4u * A - run, 4u * A - 1u, A); total += run; }
     }
     return total;
+}
+
+/* Are this task's all-zero atoms the arithmetic?
+ *
+ * Walks the same atoms the detector walks, and for every one that came back entirely
+ * zero computes the four accumulators it should hold — over THIS K slice only, since a
+ * task's surface carries one slice's partial and the host sums the slices. Returns 0 as
+ * soon as one of them should have been non-zero, which is a dropped atom; 1 if every
+ * zero atom is genuinely zero, which is data and the surface is correct.
+ *
+ * Both writers put four consecutive accumulators in an atom's 16 bytes, and on both of
+ * them every atom of the surface is delivered — what differs is which four:
+ *   narrow, the plain int32 cube — channel block `blk` holds real channels 4*blk..+3 at
+ *   pixel `px`, the blocks laid `surf_elems` pixels apart;
+ *   wide — the stream map, whose atom decomposition gives a programmed channel c0 and a
+ *   pixel, with c0 % 16 always below 8 so all four are delivered.
+ */
+static int r76_i32_zeros_are_data(const unsigned char *surf, unsigned mult,
+                                  unsigned iw, unsigned oy0, unsigned oh,
+                                  unsigned atoms_per_px, unsigned surf_elems,
+                                  unsigned n0, unsigned tile_n,
+                                  unsigned k0, unsigned kslice,
+                                  int K, const int8_t *A, const int8_t *B)
+{
+    unsigned px0 = oy0 * iw, npx = oh * iw;
+    unsigned a, natoms;
+
+    /* One accumulator, over this slice's K range. */
+#define R76_ACC_NONZERO(m_, n_)                                                        \
+    ({ int32_t acc_ = 0; unsigned k_;                                                  \
+       for (k_ = 0; k_ < kslice; k_++)                                                 \
+           acc_ += (int32_t)A[(size_t)(m_) * K + k0 + k_] *                            \
+                   (int32_t)B[(size_t)(n_) * K + k0 + k_];                             \
+       acc_ != 0; })
+
+    if (mult == 4u) {
+        unsigned blk, px;
+        for (blk = 0; blk < atoms_per_px; blk++)
+            for (px = 0; px < npx; px++) {
+                const unsigned char *ap =
+                    surf + ((size_t)blk * surf_elems + px0 + px) * C2;
+                unsigned i, jj;
+                for (i = 0; i < C2; i++) if (ap[i]) break;
+                if (i != C2) continue;                      /* not a zero atom */
+                for (jj = 0; jj < 4u; jj++) {
+                    unsigned n = 4u * blk + jj;
+                    if (n >= tile_n) break;                 /* past the tile: padding */
+                    if (R76_ACC_NONZERO(px0 + px, n0 + n)) return 0;
+                }
+            }
+        return 1;
+    }
+
+    natoms = atoms_per_px * rocket_rk3576_out_surf_elems(iw, oh, 0);
+    for (a = 0; a < natoms; a++) {
+        const unsigned char *ap = surf + (size_t)a * C2;
+        unsigned i, sg, rem, r, off, s, p, j, L, c0, jj, Aw = iw * oh;
+        for (i = 0; i < C2; i++) if (ap[i]) break;
+        if (i != C2) continue;
+        if (!Aw) return 0;
+        sg  = a / (4u * Aw);
+        rem = a - sg * 4u * Aw;
+        r   = rem / Aw;
+        off = rem % Aw;
+        L   = r % 2u;
+        s   = (r / 2u) * Aw + off;
+        p   = s / 2u;
+        j   = s % 2u;
+        c0  = 32u * sg + 16u * j + 4u * L;
+        for (jj = 0; jj < 4u; jj++) {
+            unsigned c = c0 + jj, n = 8u * (c / 16u) + (c % 16u);
+            if (n >= tile_n) break;
+            if (R76_ACC_NONZERO(px0 + p, n0 + n)) return 0;
+        }
+    }
+    return 1;
+#undef R76_ACC_NONZERO
 }
 
 /* The largest K slice this shape can run, or 0 if none can. The plane is chosen for
@@ -881,6 +1116,93 @@ static unsigned r76_i32_plan(unsigned M, unsigned K, unsigned N, unsigned mult,
     return 0;
 }
 
+/* How many submits a writer costs on this shape, from the plan alone and with nothing
+ * allocated on the device. Mirrors the tile loop below: K slices x N tiles x row tasks,
+ * with the wide writer's height bound splitting those tasks further. 0 = it cannot run
+ * this shape at all. */
+static unsigned r76_i32_submit_count(unsigned M, unsigned K, unsigned N, unsigned mult)
+{
+    unsigned iw = 0, ih = 0, nt = 0, ks, n0, per_slice = 0;
+    rocket_rk3576_row_task *plan;
+    unsigned max_tasks;
+
+    ks = r76_i32_plan(M, K, N, mult, &iw, &ih, &nt);
+    if (!ks) return 0;
+    max_tasks = ih + 1u;
+    plan = calloc(max_tasks, sizeof *plan);
+    if (!plan) return 0;
+
+    for (n0 = 0; n0 < N; n0 += nt) {
+        unsigned tile_n = N - n0 < nt ? N - n0 : nt;
+        unsigned oc_prog = rocket_rk3576_pad_oc(mult * tile_n);
+        unsigned ntask = 1;
+        conv_params_t q = {0};
+
+        q.ic = (uint16_t)((K < ks ? K : ks));
+        q.ih = (uint16_t)ih; q.iw = (uint16_t)iw;
+        q.oc = (uint16_t)oc_prog; q.oh = (uint16_t)ih; q.ow = (uint16_t)iw;
+        q.kh = 1; q.kw = 1; q.stride_y = 1; q.stride_x = 1;
+        q.ih_full = (uint16_t)ih; q.oh_full = (uint16_t)ih;
+        if (rocket_rk3576_plan_rows(&q, 0, plan, max_tasks, &ntask) < 0) {
+            free(plan);
+            return 0;
+        }
+        if (mult != 4u) {
+            /* A plane too wide for even a one-row task cannot be split into one, so the
+             * wide writer simply cannot run this shape — say so by costing it nothing,
+             * which is what makes the chooser fall back to the narrow writer instead of
+             * running a task the bound does not cover. */
+            unsigned cap = r76_i32_wide_rows(iw, oc_prog), src, split = 0;
+            if (!cap) { free(plan); return 0; }
+            for (src = 0; src < ntask; src++)
+                split += (plan[src].oh + cap - 1u) / cap;
+            ntask = split;
+        }
+        per_slice += ntask;
+    }
+    free(plan);
+    return per_slice * ((K + ks - 1u) / ks);
+}
+
+/* WHICH WRITER, chosen per shape rather than globally.
+ *
+ * The wide writer's whole benefit is submits: at PROC_PRECISION int32 the DPU's byte
+ * budget is two atoms per (16-channel block, pixel) instead of one, which doubles the N
+ * tile the weight-cube scatter can drive. Where that halves the tile count it is worth
+ * 1.2-1.4x; where the surface bound (iw * oh_full * oc_prog < 4096) forces the row tasks
+ * back apart it is worth nothing and costs an extra submit, and it also scans every atom
+ * of the surface on readback where the narrow writer stops at the first non-blank byte.
+ * Both effects are visible in the submit count, and that count is computable before
+ * anything is submitted — so the planner counts both and takes the cheaper.
+ *
+ * Ties go to the narrow writer, which needs a quarter of the wide one's row tasks at a
+ * wide output tile. Neither is the one without the dropped-atom defect — both drop, and
+ * both are checked per atom against a sentinel and redone.
+ *
+ * ONCE THE SURFACE BOUND IS STATED OVER THE PLANE, THE WIDE WRITER STOPS WINNING. The
+ * bound costs it exactly the submits its wider N tile was reached for, and it costs them
+ * on the N-heavy shapes where the tile would have paid: swept over 315 natural shapes,
+ * M 4-256, K 64-2048, N 32-2048, the chooser took the narrow writer on every one. It is
+ * kept because it is the instrument that decoded the 32-bit writer's map and because a
+ * shape outside that sweep may still reach it, not because the default path uses it.
+ * [HW sweep, H96 MAX M9]
+ * ROCKET_RK3576_I32_OC_MULT=2 or =4 forces either. [HW sweep, H96 MAX M9] */
+static unsigned r76_i32_oc_mult(unsigned M, unsigned K, unsigned N)
+{
+    unsigned forced = r76_i32_oc_mult_env(), narrow, wide;
+
+    if (forced) return forced;
+    narrow = r76_i32_submit_count(M, K, N, 4u);
+    wide   = r76_i32_submit_count(M, K, N, 2u);
+    if (!wide) return 4u;
+    if (!narrow || wide < narrow) {
+        ROCKET_LOGD("rk3576 matmul i32: wide writer chosen, %u submits against %u\n",
+                    wide, narrow);
+        return 2u;
+    }
+    return 4u;
+}
+
 int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                                   const int8_t *A, const int8_t *B,
                                   const int32_t *bias, int32_t *C)
@@ -892,7 +1214,7 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
     rocket_rk3576_row_task *plan = NULL, *wplan = NULL;
     size_t *task_off = NULL;
     unsigned iw = 0, ih = 0, nt = 0, ks, k0, n0, surf_elems, max_tasks;
-    unsigned mult = r76_i32_oc_mult();
+    unsigned mult;
     int diag = r76_i32_diag();
     unsigned diag_dropped = 0, heals = 0;
     unsigned char blank = 0;
@@ -900,6 +1222,7 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
     unsigned nslices = 1, submits = 0;
     int rc = ROCKET_E_SHAPE;
 
+    memset(&r76_i32_stats, 0, sizeof r76_i32_stats);
     if (fd < 0 || !A || !B || !C || M <= 0 || K <= 0 || N <= 0) return ROCKET_E_SHAPE;
     if (strcmp(hw->name, "rk3576") != 0) {
         ROCKET_LOGE("rocket_matmul_int8_rk3576_i32: this is the RK3576 encoding and the "
@@ -912,6 +1235,7 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
         return ROCKET_E_SHAPE;
     }
 
+    mult = r76_i32_oc_mult((unsigned)M, (unsigned)K, (unsigned)N);
     ks = r76_i32_plan((unsigned)M, (unsigned)K, (unsigned)N, mult, &iw, &ih, &nt);
     ROCKET_LOGI("rk3576 matmul i32: M=%d K=%d N=%d -> plane %ux%u, K slice %u "
                 "(%u slices, last %u), N tile %u (programmed oc %u, %ux writer)\n",
@@ -925,9 +1249,18 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
         return ROCKET_E_SHAPE;
     }
 
-    /* The sentinel is the wide path's; the narrow one is single-surface per task and has
-     * never dropped an atom, so it keeps the plain zeroed-BO signal. */
-    if (mult != 4u && rocket_rk3576_sentinel_on()) blank = (unsigned char)R76_SENTINEL_BYTE;
+    /* BOTH WRITERS GET THE SENTINEL. The narrow one drops atoms too — sparsely, and with
+     * the same signature: on M=128 K=256 N=2048 six calls in twelve came back with a
+     * handful of elements out of 262144 reading ZERO and the rest exact. Against a
+     * zeroed BO that is invisible, because the only question a zeroed surface can answer
+     * is "did this task write anything at all", and a task that wrote all but eight of
+     * its atoms answers yes. [HW sweep, H96 MAX M9]
+     *
+     * Every atom of a task's surface is a delivered atom on both paths — the narrow
+     * writer's cube is `tile_n/4` channel blocks of `surf_elems` pixels and the
+     * de-scatter reads every one of them — so "still the sentinel" is a per-atom fact on
+     * both, and the retry that already covers the poisoning covers this as well. */
+    if (rocket_rk3576_sentinel_on()) blank = (unsigned char)R76_SENTINEL_BYTE;
 
     surf_elems = rocket_rk3576_out_surf_elems(iw, ih, 0);
     /* One task per output ROW is the worst case the wide writer's height bound can
@@ -1021,20 +1354,66 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                 surf_bytes  = atoms_per_px * surf_elems * C2;
                 task_off[0] = 0;
             } else {
-                /* THE WIDE WRITER'S SURFACE HEIGHT IS BOUNDED, and past the bound its
-                 * map is not the one above — the delivered set starts drifting with the
-                 * pixel and a whole tile comes back part right, silently. Measured on
-                 * the part: it holds while oh_full * oc < 4096 and breaks at it, at both
-                 * ends tested (oc 192 breaks between oh 21 and 22, oc 64 between 48 and
-                 * 64). The mechanism is not decoded; only the boundary is.
+                /* THE WIDE WRITER'S SURFACE IS BOUNDED AT 8 KiB PER TASK, and this cap is
+                 * that bound exactly rather than a conservative stand-in for it.
+                 *
+                 * State it in the PROGRAMMED channel count: a task is correct while
+                 * `A * oc_prog < 4096`, where A = ow*oh_full. Since a wide task writes
+                 * `oc_prog/8` atoms a pixel at 16 bytes each, that product is the surface
+                 * in half-bytes — the bound is 8192 bytes, or 512 atoms, whichever way it
+                 * is read. Swept at K=32 with the cap lifted, the first wrong height is
+                 * the smallest oh with `oh*oc_prog >= 4096` at every one of the eight
+                 * programmed counts 64/128/192/256/320/384/448/512 — heights 64, 32, 22,
+                 * 16, 13, 11, 10 and 8, predicted and observed. [HW sweep, H96 MAX M9]
+                 *
+                 * The bound reads as a mispredicting rule if it is stated in the REAL
+                 * channel count, which is half the programmed one on this path, or if it
+                 * is swept at a single mid-range K.
+                 *
+                 * IT IS THE PLANE, NOT THE ROWS, and the difference is a wrong answer
+                 * rather than a lost bound. `A` carries `iw`, a row split can only
+                 * shorten `oh_full`, and the plane chooser takes the WIDEST divisor of M
+                 * that fits its granule rule — so on a shape whose plane comes out `Mx1`
+                 * a cap that divides only by `oc_prog` is met by every task while the
+                 * surface is M times over it. Forced onto eleven shapes whose planner
+                 * plane is `Mx1`, the writer was wrong on ten; at iw=1, where the two
+                 * readings coincide, all eleven are exact and every zero run disappears.
                  * [HW sweep, H96 MAX M9]
                  *
+                 * K RELAXES IT, and only ever outward. The same oc 128 that is wrong from
+                 * oh 16 at K <= 128 is wrong at only 31, 32 and 40 at K=512 and exact to
+                 * oh 40 at K=1024 and K=2048. So 8 KiB is the worst-case floor, reached
+                 * once K is small enough, and enforcing it unconditionally is what makes
+                 * the path correct for every K.
+                 *
+                 * WHAT THE FAILURE IS. Every wrong element comes back ZERO — over the
+                 * whole map, not one aliases another element's value and not one holds
+                 * anything else — so the writer emits empty atoms rather than misplacing
+                 * full ones. That is the same signature as the intermittent corruption
+                 * r76_i32_wide_suspect() repairs, and it is consistent with a fill/drain
+                 * race on a buffer of that size: past 8 KiB the producer laps the drain
+                 * unless a long contraction slows it down. Redoing the task does not help
+                 * once the surface is over the bound, because the timing repeats.
+                 *
                  * A row task here is a standalone 1x1 convolution with its own surface,
-                 * so honouring the bound costs nothing but submits: split the plan's
-                 * tasks further until each one's height fits. */
-                unsigned cap = R76_I32_WIDE_OC_ROWS / oc_prog;
+                 * so honouring the cap costs nothing but submits: split the plan's
+                 * tasks further until each one's height fits. What it costs in submits
+                 * is real — an honest cap is what makes the chooser prefer the narrow
+                 * writer on the N-heavy shapes the wide one was reached for. */
+                unsigned cap = r76_i32_wide_rows(iw, oc_prog);
                 unsigned src;
-                if (!cap) cap = 1u;
+                /* No row count fits, so there is nothing to split into. Refusing is the
+                 * only correct answer: the chooser already avoids this shape, and a
+                 * caller who forced the wide writer onto it would otherwise get a
+                 * silently part-right surface. */
+                if (!cap) {
+                    ROCKET_LOGE("rk3576 matmul i32: the wide writer's surface bound "
+                                "cannot be met at plane width %u with programmed oc %u "
+                                "(one row is already %u of %u) — use the narrow "
+                                "writer\n", iw, oc_prog, iw * oc_prog,
+                                r76_i32_wide_surf());
+                    rc = ROCKET_E_SHAPE; goto done;
+                }
                 surf_bytes = 0;
                 for (src = 0, t = 0; src < ntask; src++) {
                     unsigned done_rows = 0;
@@ -1166,7 +1545,8 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                * At the stock autosuspend delay this never fires; at a short one it does,
                * which is exactly the configuration that made it visible. */
               unsigned tattempt;
-              for (tattempt = 0; tattempt < 4; tattempt++) {
+              int task_ok = 0;
+              for (tattempt = 0; tattempt < R76_I32_TASK_ATTEMPTS; tattempt++) {
                 conv_params_t q = p;
                 q.ih = plan[t].ih; q.oh = plan[t].oh;
                 q.pad_top = plan[t].pad_top;
@@ -1249,10 +1629,16 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                  * nothing about the wide writer's zero-data defect either: 3 failures in
                  * 30 at no idle against 6 in 30 at 800 ms. [HW sweep, H96 MAX M9] */
                 if (submits++) rocket_rk3576_power_idle();
+                r76_i32_stats.submits = submits;
                 rocket_bo_prep(fd, &b.rc, 1, 0);
                 memcpy(b.rc.ptr, ops, q.task_count * sizeof(uint64_t));
                 rocket_bo_fini(fd, &b.rc);
-                if (rocket_submit_matmul(fd, &b.rc, q.task_count, in_h, 4, out_h, 1, 4000) != 0) {
+                /* The 32-bit writer's DPU output element is wider than one byte, so it
+                 * raises no DPU completion and the driver's wait past PC_DONE is a
+                 * blind settle. Naming the class lets it use the shorter one. */
+                if (rocket_submit_matmul_flags(fd, &b.rc, q.task_count, in_h, 4,
+                                               out_h, 1,
+                                               ROCKET_JOB_NO_DPU_DONE) != 0) {
                     rc = ROCKET_E_DEVICE; goto done;
                 }
                 if (rocket_bo_prep(fd, &b.out, 0, 2000000000ull) < 0) {
@@ -1271,9 +1657,10 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                      * task short, with no fault and normal timing.
                      *
                      * The region differs by writer. The wide one gives each task its own
-                     * surface, so it is that surface. The narrow one shares a cube, and
-                     * the task's rows of CHANNEL BLOCK 0 are the contiguous part of what
-                     * it wrote — enough to tell a dead submit from a live one. */
+                     * surface, so it is that surface. The narrow one shares a cube, so
+                     * its task occupies the same rows of every channel block and the
+                     * scan below walks them; the contiguous rows of CHANNEL BLOCK 0 are
+                     * only enough to tell a dead submit from a live one. */
                     size_t off = mult == 4u ? (size_t)plan[t].output_off : task_off[t];
                     size_t tb  = mult == 4u
                                ? (size_t)plan[t].oh * iw * C2
@@ -1283,7 +1670,37 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                     size_t si;
                     int twrote = 0;
                     unsigned holes = 0, unwritten = 0, suspect = 0;
-                    if (blank && mult != 4u) {
+                    if (blank && mult == 4u) {
+                        /* THE NARROW WRITER DROPS ATOMS TOO, a handful at a time, and
+                         * the only thing that sees them is a per-atom scan of every
+                         * channel block this task wrote into. Its cube is `atoms_per_px`
+                         * blocks of `surf_elems` pixels laid end to end, and a row task
+                         * owns pixels [oy0*iw, oy0*iw + oh*iw) of each block.
+                         *
+                         * Both failures land the same way here — the atom still holds
+                         * the sentinel — so the recovery is the conservative one: redo,
+                         * and idle first, because the poisoning is the failure that
+                         * needs it and idling a drop only costs time. */
+                        unsigned blk, px0 = (unsigned)plan[t].oy0 * iw;
+                        unsigned npx = (unsigned)plan[t].oh * iw;
+                        for (blk = 0; blk < atoms_per_px; blk++) {
+                            const unsigned char *bp =
+                                (const unsigned char *)b.out.ptr +
+                                ((size_t)blk * surf_elems + px0) * C2;
+                            for (unsigned px = 0; px < npx; px++) {
+                                const unsigned char *ap = bp + (size_t)px * C2;
+                                unsigned i, nz = 0;
+                                for (i = 0; i < C2; i++) {
+                                    if (ap[i] != blank) break;
+                                }
+                                if (i == C2) { unwritten++; continue; }
+                                for (i = 0; i < C2; i++) if (ap[i]) { nz = 1; break; }
+                                if (!nz) suspect++;
+                            }
+                        }
+                        holes  = unwritten + suspect;
+                        twrote = holes == 0;
+                    } else if (blank && mult != 4u) {
                         /* AGAINST A SENTINEL THE QUESTION IS PER ATOM, and that is what
                          * covers the wide writer's dropped atoms as well as a dead
                          * submit. The drop is a contiguous block in the writer's
@@ -1309,17 +1726,85 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                         for (si = 0; si < tb; si++)
                             if (sp[si] != blank) { twrote = 1; break; }
                     }
+                    /* SETTLE ZERO ATOMS AGAINST THE OPERANDS, not against the surface,
+                     * and while the mapping is still the CPU's. From the second attempt
+                     * on — the first redo is cheaper than a dot product and usually
+                     * enough — a task whose only defect is zero atoms is decided
+                     * exactly: if every one of them should be zero the surface is right
+                     * and this is data, and if any should not it is a drop and the task
+                     * is redone. A caller whose operands legitimately produce a zero
+                     * atom (a padded batch, a masked token, an all-zero embedding) is
+                     * answered on the arithmetic rather than made to spend its attempts.
+                     * An atom still holding the sentinel was never written at all, so it
+                     * is never data and does not reach this. */
+                    if (!twrote && !unwritten && tattempt >= R76_I32_CPU_CHECK_FROM &&
+                        r76_i32_zeros_are_data(mult == 4u
+                                                   ? (const unsigned char *)b.out.ptr
+                                                   : sp,
+                                               mult, iw, (unsigned)plan[t].oy0,
+                                               (unsigned)plan[t].oh,
+                                               (unsigned)atoms_per_px, surf_elems,
+                                               n0, tile_n, k0, kslice, K, A, B)) {
+                        ROCKET_LOGD("rk3576 matmul i32: k0=%u n0=%u row task %u — %u "
+                                    "zero atom(s) are the arithmetic; keeping the "
+                                    "surface\n", k0, n0, t, suspect);
+                        r76_i32_stats.accepted_zero++;
+                        twrote = 1;
+                    }
                     rocket_bo_fini(fd, &b.out);
-                    if (twrote) break;
+                    if (twrote) { task_ok = 1; break; }
+                    /* SETTLE ZERO ATOMS AGAINST THE OPERANDS, not against the surface.
+                     * From the second attempt on — the first redo is cheaper than a dot
+                     * product and usually enough — a task whose only defect is zero
+                     * atoms is decided exactly: if every one of them should be zero the
+                     * surface is right and this is data, and if any should not it is a
+                     * drop and the task is redone. An atom still holding the sentinel is
+                     * never data, so it does not reach this. */
+                    if (!unwritten && tattempt >= R76_I32_CPU_CHECK_FROM &&
+                        r76_i32_zeros_are_data(mult == 4u
+                                                   ? (const unsigned char *)b.out.ptr
+                                                   : sp,
+                                               mult, iw, (unsigned)plan[t].oy0,
+                                               (unsigned)plan[t].oh,
+                                               (unsigned)atoms_per_px, surf_elems,
+                                               n0, tile_n, k0, kslice, K, A, B)) {
+                        ROCKET_LOGD("rk3576 matmul i32: k0=%u n0=%u row task %u — %u "
+                                    "zero atom(s) are the arithmetic; keeping the "
+                                    "surface\n", k0, n0, t, suspect);
+                        r76_i32_stats.accepted_zero++;
+                        task_ok = 1;
+                        break;
+                    }
                     ROCKET_LOGD("rk3576 matmul i32: k0=%u n0=%u row task %u — %u atoms "
                                 "never emitted, %u emitted zero; redoing it\n",
                                 k0, n0, t, unwritten, suspect);
                     if (suspect) heals++;
+                    if (unwritten) r76_i32_stats.redo_empty++;
+                    if (suspect)   r76_i32_stats.redo_zeroed++;
+                    r76_i32_stats.atoms_empty  += unwritten;
+                    r76_i32_stats.atoms_zeroed += suspect;
                     /* Only the poisoning needs the power cycle. Idling on a zero-data
                      * redo would put 120 ms on a failure that does not care about it. */
                     if (unwritten) rocket_rk3576_power_idle();
                 }
               }
+              /* EXHAUSTING THE RETRIES IS AN ERROR, not a result. The sentinel makes
+               * "this atom was never written" a fact about the surface rather than an
+               * inference, so a task that still has holes after every attempt is a
+               * surface this call cannot stand behind — and returning it quietly is how
+               * one dead row task among a hundred reaches a caller as a plausible
+               * matrix. Measured on M=32 K=1024 N=4096, where the per-task redo fires on
+               * 1-12 of the 128 tasks a run and heals all of them: about one run in
+               * thirty had a task that four attempts did not recover, and that run was
+               * the only wrong answer in the set. [HW sweep, H96 MAX M9] */
+              if (!task_ok) {
+                  r76_i32_stats.refused++;
+                  ROCKET_LOGE("rk3576 matmul i32: k0=%u n0=%u row task %u still has "
+                              "unwritten atoms after %d attempts — refusing to return a "
+                              "partial surface\n", k0, n0, t, R76_I32_TASK_ATTEMPTS);
+                  rc = ROCKET_E_DEVICE; goto done;
+              }
+              r76_i32_stats.tasks++;
             }
             /* A poisoned job leaves the surface exactly as it found it, and a fresh BO
              * arrives zeroed — so "still all zero" is the signal, and redoing the job

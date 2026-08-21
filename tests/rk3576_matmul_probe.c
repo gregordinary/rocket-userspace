@@ -42,6 +42,7 @@
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
 #include "rocket_hw_profile.h"
+#include "requant_model.h"
 
 #define C2       16
 #define SENTINEL 0xAA
@@ -71,25 +72,6 @@ static void sleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
-static void requant_params(float conv_scale, unsigned *scale, unsigned *shift_reg)
-{
-    union { float f; uint32_t u; } cv;
-    uint32_t bits;
-    cv.f = conv_scale;
-    bits = cv.u;
-    *shift_reg = 127u + 31u - 32u - (bits >> 23) + 16u - 1u;
-    *scale = ((bits >> 9) & 0x7FFFu) + 1u;
-    if (*scale < (1u << 14)) *scale |= (1u << 14);
-}
-
-static int requant_apply(int64_t acc, unsigned scale, unsigned shift_reg)
-{
-    int64_t half = shift_reg ? ((int64_t)1 << (shift_reg - 1)) : 0;
-    int64_t v = (acc * (int64_t)scale + half) >> shift_reg;
-    if (v >  127) v =  127;
-    if (v < -128) v = -128;
-    return (int)v;
-}
 
 /* ============================================================================
  * SECTION — the mapping

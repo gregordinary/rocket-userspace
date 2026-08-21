@@ -2206,27 +2206,51 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
   ops[i++] = NPUOP(OP_REG_DPU, 0xE, DPU_S_POINTER);
   ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE, DPU_RDMA_S_POINTER);
 
-  value = ((cna_desc->proc_precision & 0x7) <<7) | ((cna_desc->in_precision & 0x7)<<4) |
-    (cna_desc->conv_mode & 0xf);
-  ops[i++] = NPUOP(OP_REG_CNA, value, CNA_CONV_CON1);
-  /* 10-bit CNA field. Normal path is m+1 (<=257), well within range; a diagnostic
-   * ROCKET_*_GRAINS override >1023 would be truncated by the &0x3FF below and
-   * mis-compute. Fail the emission unconditionally (NOT an assert: the Release build
-   * compiles asserts out via -DNDEBUG, so the guard would vanish in the shipping lib). */
-  if (cna_desc->feature_grains > 0x3FF) {
-    ROCKET_LOGE("npu_regcmd: feature_grains %u exceeds 10-bit CNA field (max 1023)\n",
-            cna_desc->feature_grains);
-    return -1;
+  /* ROCKET_CNA_DECONV / _X / _Y: an UNVALIDATED hardware mode, wired for a probe only.
+   *
+   * The CNA register map carries a transposed-convolution mode this library has never
+   * driven: CONV_CON1 bit 16 DECONV, and CONV_CON3 [13:11]/[10:8] DECONV_Y_STRIDE /
+   * DECONV_X_STRIDE. Nothing about it is decoded — not what the stride fields encode,
+   * not what layout it wants the kernel in, not what output geometry it produces — and
+   * the shipping transposed conv lowers onto a stride-1 forward conv instead, paying
+   * s^2 zero-MACs. The knobs exist so the part can be asked, without an API for a mode
+   * whose semantics are unknown. They are deliberately absent from npu_cna_desc.
+   *
+   * ROCKET_CNA_DECONV sets bit 16; _X and _Y write the two 3-bit stride fields RAW.
+   *
+   * NVDLA has no deconvolution mode at any revision, so this is Rockchip's own addition
+   * and its ancestor's documentation says nothing about it. */
+  {
+    const char *dc = getenv("ROCKET_CNA_DECONV");
+    const char *dx = getenv("ROCKET_CNA_DECONV_X");
+    const char *dy = getenv("ROCKET_CNA_DECONV_Y");
+    unsigned ds = (dc && *dc) ? (unsigned)strtoul(dc, NULL, 0) : 0;
+    unsigned fx = (dx && *dx) ? (unsigned)strtoul(dx, NULL, 0) : 0;
+    unsigned fy = (dy && *dy) ? (unsigned)strtoul(dy, NULL, 0) : 0;
+    value = ((cna_desc->proc_precision & 0x7) <<7) | ((cna_desc->in_precision & 0x7)<<4) |
+      (cna_desc->conv_mode & 0xf);
+    if (ds) value |= (1u << 16);
+    ops[i++] = NPUOP(OP_REG_CNA, value, CNA_CONV_CON1);
+    /* 10-bit CNA field. Normal path is m+1 (<=257), well within range; a diagnostic
+     * ROCKET_*_GRAINS override >1023 would be truncated by the &0x3FF below and
+     * mis-compute. Fail the emission unconditionally (NOT an assert: the Release build
+     * compiles asserts out via -DNDEBUG, so the guard would vanish in the shipping lib). */
+    if (cna_desc->feature_grains > 0x3FF) {
+      ROCKET_LOGE("npu_regcmd: feature_grains %u exceeds 10-bit CNA field (max 1023)\n",
+              cna_desc->feature_grains);
+      return -1;
+    }
+    value = ((cna_desc->kernel_groups & 0xFF) << 16) | ((cna_desc->feature_grains & 0x3FF) << 4);
+    ops[i++] = NPUOP(OP_REG_CNA, value, CNA_CONV_CON2);
+    /* CONV_CON3: stride [5:0] PLUS the ATROUS dilation fields (the conv delta vs the
+     * matmul emitter, which only sets stride). x-dilation [20:16], y-dilation
+     * [25:21], stored as rate-1 (0 == no dilation == byte-identical to matmul). */
+    value = ((cna_desc->atrous_y_dilation & 0x1F) << 21) |
+            ((cna_desc->atrous_x_dilation & 0x1F) << 16) |
+            ((cna_desc->conv_y_stride & 0x7) << 3) | (cna_desc->conv_x_stride & 0x7);
+    value |= ((fy & 0x7) << 11) | ((fx & 0x7) << 8);
+    ops[i++] = NPUOP(OP_REG_CNA, value, CNA_CONV_CON3);
   }
-  value = ((cna_desc->kernel_groups & 0xFF) << 16) | ((cna_desc->feature_grains & 0x3FF) << 4);
-  ops[i++] = NPUOP(OP_REG_CNA, value, CNA_CONV_CON2);
-  /* CONV_CON3: stride [5:0] PLUS the ATROUS dilation fields (the conv delta vs the
-   * matmul emitter, which only sets stride). x-dilation [20:16], y-dilation
-   * [25:21], stored as rate-1 (0 == no dilation == byte-identical to matmul). */
-  value = ((cna_desc->atrous_y_dilation & 0x1F) << 21) |
-          ((cna_desc->atrous_x_dilation & 0x1F) << 16) |
-          ((cna_desc->conv_y_stride & 0x7) << 3) | (cna_desc->conv_x_stride & 0x7);
-  ops[i++] = NPUOP(OP_REG_CNA, value, CNA_CONV_CON3);
   value = ((cna_desc->datain_width) & 0x7FF) << 16 | (cna_desc->datain_height & 0x7FF);
   ops[i++] = NPUOP(OP_REG_CNA, value, CNA_DATA_SIZE0);
   value = ((cna_desc->datain_channel-1) & 0xFFFF) << 16 | (cna_desc->datain_channel & 0xFFFF);

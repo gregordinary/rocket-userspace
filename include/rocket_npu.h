@@ -152,6 +152,33 @@ int  rocket_submit_matmul(int fd,
                           const uint32_t *out_handles, uint32_t n_out,
                           uint32_t timeout_ms);
 
+/* rocket_submit_matmul with a ROCKET_JOB_* bitmask (see below). */
+int  rocket_submit_matmul_flags(int fd,
+                                const rocket_bo *regcmd_bo, uint32_t regcmd_count,
+                                const uint32_t *in_handles,  uint32_t n_in,
+                                const uint32_t *out_handles, uint32_t n_out,
+                                uint32_t job_flags);
+
+/* Per-job submit flags, matching the kernel's DRM_ROCKET_JOB_* bits.
+ *
+ * ROCKET_JOB_BATCHED: this job's tasks are laid out contiguously and
+ *   self-chained (rocket_chain.c), so the driver runs them from ONE HW kick
+ *   with a single completion instead of one submit and one completion each.
+ *   Requires rocket_batched_submit_supported() -- a kernel that ignores the
+ *   flag runs the chained layout down the per-task path, which stalls.
+ *
+ * ROCKET_JOB_NO_DPU_DONE: every task in this job has a DPU output element
+ *   wider than one byte, so on the RK3576 it raises no DPU completion at all
+ *   and the driver's wait past PC_DONE is a blind settle rather than a
+ *   deadline on a completion that is coming. The driver cannot tell the two
+ *   classes apart; the caller can, because it emitted the program. ADVISORY:
+ *   a completion that does arrive retires the job immediately whatever this
+ *   says, so a wrong hint costs time and not correctness. Ignored by a kernel
+ *   older than interface version 1.2.
+ */
+#define ROCKET_JOB_BATCHED      (1u << 0)
+#define ROCKET_JOB_NO_DPU_DONE  (1u << 1)
+
 /* One task = one register-command program. regcmd is the 32-bit NPU IOVA of that
  * program (e.g. a slot inside a shared regcmd BO), regcmd_count its word count. */
 typedef struct { uint32_t regcmd; uint32_t regcmd_count; } rocket_task_desc;
@@ -174,17 +201,29 @@ int  rocket_submit_tasks(int fd,
  * bytes and reuses it across submits, so no drm_rocket_task[] is calloc/free'd
  * per submit. Identical semantics/return to rocket_submit_tasks otherwise.
  *
- * `batched`: set the per-job DRM_ROCKET_JOB_BATCHED flag — run the job's tasks
+ * `job_flags`: ROCKET_JOB_* bitmask. Bit 0 is the batched flag — run the job's tasks
  * as one chained HW kick instead of one submit/IRQ per task. ONLY valid when the
  * caller has laid the tasks' regcmds out contiguously and self-chained (the
  * rocket_chain.c helpers under ROCKET_BATCH_SUBMIT); a 0 here is the stock gapped
  * per-task path. Per-job, so a chained job and a gapped job can share one fd. */
+/* As rocket_submit_tasks, but sets the per-job batched flag: the job's tasks run
+ * as ONE chained HW kick with a single completion instead of one submit and one
+ * completion each. The caller must have laid the regcmds out contiguously and
+ * self-chained (rocket_chain.c) and must have checked
+ * rocket_batched_submit_supported() — an older kernel ignores the flag and runs
+ * the chained layout down the per-task path, which stalls. */
+int  rocket_submit_tasks_flags(int fd,
+                               const rocket_task_desc *tasks, uint32_t n_tasks,
+                               const uint32_t *in_handles,  uint32_t n_in,
+                               const uint32_t *out_handles, uint32_t n_out,
+                               uint32_t job_flags);
+
 size_t rocket_submit_scratch_size(uint32_t max_tasks);
 int    rocket_submit_tasks_pre(int fd, void *scratch,
                                const rocket_task_desc *tasks, uint32_t n_tasks,
                                const uint32_t *in_handles,  uint32_t n_in,
                                const uint32_t *out_handles, uint32_t n_out,
-                               int batched);
+                               uint32_t job_flags);
 
 /* One job = tasks that run sequentially on ONE core (uapi: same job -> same core,
  * for SRAM residency). To use all 3 NPU cores, submit MULTIPLE jobs in a single
