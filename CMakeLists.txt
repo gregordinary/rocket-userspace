@@ -266,6 +266,10 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_matmul_probe    # RK3576 board: the matmul-as-1x1-conv envelope (M axis, cost, precision)
             rk3576_matmul_gate     # RK3576 board GATE: the int8 matmul library entry vs a CPU model
             rk3576_refusal_gate    # RK3576 board GATE: ops with no encoder refuse, not write nothing
+            rk3576_submit_floor    # RK3576 board: the per-submit dispatch floor (us/submit) probe
+            rk3576_fc_vendor       # RK3576 board: submit a vendor capture VERBATIM — does it write?
+            rk3576_cost_table      # RK3576 board: what the library entries cost, against a CPU reference
+            rk3576_poison_probe    # RK3576 board: which programs poison the NEXT submit, and what carries it
             membench               # DRAM bandwidth + NPU readback de-tile microbench
             fabench)               # flash-attention QK/AV submit-chaining A/B (ROCKET_FA_CHAIN 0 vs 1)
         add_executable(${t} tests/${t}.c)
@@ -282,10 +286,12 @@ if(ROCKETNPU_BUILD_TESTS)
 
     # the RK3576 regcmd gate compiles the decoded vendor register programs in
     # (tests/data/rk3576-vendor-capture/rk3576_vendor_golden.h)
-    if(TARGET regcmd_rk3576_gate)
-        target_include_directories(regcmd_rk3576_gate PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rk3576-vendor-capture)
-    endif()
+    foreach(t regcmd_rk3576_gate rk3576_fc_vendor)
+        if(TARGET ${t})
+            target_include_directories(${t} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rk3576-vendor-capture)
+        endif()
+    endforeach()
 
     # the int8 depthwise ground-truth gates load the vendored Teflon capture fixtures
     # (tests/data/teflon-dw-capture); bake the absolute path at build time so the gate

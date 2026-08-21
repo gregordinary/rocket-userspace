@@ -285,6 +285,24 @@ static size_t r76_shift_offset(unsigned oc) { return r76_shift_offset_p(oc, 0); 
 #define R76_RDMA_BRDMA_DW      0x00000510u
 #define R76_RDMA_FMODE_DIRECT  0x40000010u
 #define R76_RDMA_FMODE_DW      0x40000012u
+/* Two DPU_RDMA words the vendor's FLOAT programs carry a different constant in, on the
+ * direct and the first-conv path alike and at every geometry. Both are reproduced and
+ * both are bit-exact on hardware.
+ *
+ * The THIRD one is not, and it is the case that shows register fidelity is not the
+ * goal — computing is. BRDMA_CFG (0x501C) reads 0x100 in every vendor float program
+ * against the integer path's 0x710, and emitting the vendor's value makes the DPU
+ * write NOTHING AT ALL: the surface comes back untouched, with no fault and nothing in
+ * dmesg. It is the BS operand reader, and it does not stand alone — paired with the BS
+ * ALU config the same programs carry (0x4044 = 2, where the integer path uses 1) the
+ * writer runs again, but the arithmetic is then wrong on about a tenth of the surface
+ * (1866/2048, worst relative error 0.016). So the vendor's float epilogue is a
+ * different BS ARRANGEMENT, not a different constant, and this library's A/B/C
+ * coefficient group is packed for the integer one — which is bit-exact at 0x710 with
+ * either ALU mode. Keep 0x710 until the whole arrangement is decoded together.
+ * [HW sweep, H96 MAX M9; leave-one-out over the six float-path registers] */
+#define R76_RDMA_ERDMA_FLOAT   0x00000001u
+#define R76_RDMA_FMODE_FLOAT   0x40010050u
 
 /* ============================================================================
  * SECTION — precision
@@ -496,11 +514,36 @@ static inline uint32_t r76_cna_format(int windowed)
  * per pixel column, kw columns" — but a first conv at another kernel width is
  * UNVALIDATED and should be checked against a CPU model.
  *
- * WHAT IS NOT TRANSCRIBED: the weight cube's own byte layout. The weights live in a
- * separate BO that the captures do not carry, so all these programs pin is its SIZE
- * and stride — oc * kh * round16(4*kw) bytes, one 16-byte row per kernel row per
- * output channel. A host packer for it is a hardware bring-up item, so this emitter
- * produces the register program and says so rather than shipping a guessed cube.
+ * THE WEIGHT CUBE. The found programs pin only its SIZE and stride —
+ * oc * kh * round16(4*kw) bytes, one 16-byte row per kernel row per output channel —
+ * because the weights live in a separate BO no capture carries. The FLOAT cube's own
+ * layout is decoded, from manufactured captures whose weights are unique per position
+ * (tests/data/rk3576-vendor-capture/argb/mkargb.py):
+ *
+ *     slot(oc, c, kh, kw) = (oc/16) * (KH*KW*64)
+ *                         + kh * (KW*64)
+ *                         + kw * 64
+ *                         + (oc%16) * 4
+ *                         + c
+ *
+ * a weight in a SIXTEEN-BIT slot, four lanes per (output channel, tap) with lane c
+ * carrying image channel c and any lane past ic left don't-care, output channels
+ * INTERLEAVED in groups of sixteen inside one tap, and the tap axis kh-outer. The 64
+ * is 16 output channels x 4 lanes. Note that `4*kw` is NOT rounded up to 16 here, so
+ * this layout's element count is not the byte size the register program declares.
+ * Reproduced at ic 3 and 4, k 1/3/5 and oc 16/32. [source-confirmed, RKNN-Toolkit2
+ * rk3576 float build]
+ *
+ * WHAT IS STILL NOT TRANSCRIBED: the INT8 cube. It is not this one — the depthwise
+ * path already showed that this part's int8 and float cubes are different objects —
+ * and a quantized ARGB capture does take the ARGB path (0x100C reads 0x2000a006,
+ * exactly the found value) but its weights do not survive as a findable value set.
+ * So the int8 first conv stays refused rather than shipping a guessed cube.
+ *
+ * ONE CORRECTION from these captures: the low field of 0x100C is not precision-
+ * independent. The found int8 ARGB programs carry 0x2000a006 and the float ones
+ * 0x2020a122, so it is 6 at int8 and 2 at fp16 — bit 2 clears on the float path while
+ * GROUP_LINE_OFF and ARGB_IN stay where they are.
  * ==========================================================================*/
 
 /* The CVT expands every pixel to this many int8 lanes, whatever the image carries. */
@@ -517,7 +560,12 @@ static inline uint32_t r76_cna_format(int windowed)
  * where Mesa's 1-channel 0x8 does, one per extra image channel. */
 #define R76_CNA_CON1_GROUP_LINE_OFF (1u << 29)
 #define R76_CNA_CON1_ARGB_IN_SHIFT  12
-#define R76_ARGB_CONV_MODE          6u    /* beside direct (0) and depthwise (1) */
+/* The mode nibble, beside direct (0) and depthwise (1). It is not precision-
+ * independent: bit 2 is set on the int8 first conv and clear on the float one, which
+ * reads as the fold — the int8 path folds the kernel width into the channel axis and
+ * the float path does not. Both values are transcribed, neither is swept. */
+#define R76_ARGB_CONV_MODE          6u
+#define R76_ARGB_CONV_MODE_FLOAT    2u
 
 /* Bit 21 of the same word, set in every vendor FLOAT program and in no integer one.
  * It is not optional and it is not implied by the two precision fields: with the
@@ -526,34 +574,60 @@ static inline uint32_t r76_cna_format(int windowed)
  * [source-confirmed, RKNN-Toolkit2 rk3576 float build; HW sweep, H96 MAX M9] */
 #define R76_CNA_CON1_FLOAT_EN       (1u << 21)
 
-/* The channel count PROGRAMMED at 0x1028: the kernel's width folded into the channel
- * axis, 4 lanes per pixel column. 12 at kw=3, which is what every capture carries. */
-static inline unsigned r76_argb_ic_prog(unsigned kw)
+/* The channel count PROGRAMMED at 0x1028.
+ *
+ * The two precisions do NOT agree here, and the difference is the whole shape of the
+ * datapath. At INT8 the kernel's width is folded into the channel axis — 4 lanes per
+ * pixel column, kw columns, so 12 at kw=3, which is what every int8 capture carries
+ * against a feature DMA of 3. At FP16 there is no fold: the programmed count is the
+ * image's own channel count and the taps stay on the kernel axis, which is also what
+ * the decoded float weight cube says (it carries explicit kh and kw axes with four
+ * lanes inside a tap, where a folded cube would carry the columns inside the lanes).
+ * Separated by manufactured captures at kw 1/3/5/7, all of which program ic.
+ * [source-confirmed, RKNN-Toolkit2 rk3576 float build] */
+static inline unsigned r76_argb_ic_prog(unsigned kw, unsigned ic_img, int is_float)
 {
-    return R76_ARGB_LANES * kw;
+    return is_float ? ic_img : R76_ARGB_LANES * kw;
 }
 
-/* Weight elements per output channel (0x1020): one 16-byte row per kernel row. */
-static inline unsigned r76_argb_weight_elems(unsigned kh, unsigned kw)
+/* Weight ELEMENTS per output channel. At int8 the fold pads each kernel row out to a
+ * 16-byte row; at fp16 it is a dense 4 lanes per tap, which is why the float cube's
+ * `4*kw` is not rounded up to 16. */
+/* The int8 kernel ROW: 4 lanes per tap column padded up to a 16-byte row. It is the
+ * stride of the int8 weight cube's output-channel axis as well as the emitter's own
+ * declared row, which is why it has a name. Separated from a constant 16 by k=5 and
+ * k=7, where it is 32. [HW sweep, H96 MAX M9] */
+static inline unsigned r76_argb_weight_row(unsigned kw)
 {
-    return kh * ((r76_argb_ic_prog(kw) + 15u) & ~15u);
+    return (R76_ARGB_LANES * kw + 15u) & ~15u;
 }
 
-/* CBUF granules per feature row. The row is the image row expanded to 4 lanes per
- * pixel — iw*4 bytes, iw/16 granules — plus ONE. The extra granule is the fold's
- * lookahead: the last output column of the row reads kw pixels, which reach past the
- * granule its own pixel sits in. Both captured widths carry exactly +1. */
-static inline unsigned r76_argb_entries(unsigned iw)
+static inline unsigned r76_argb_weight_elems(unsigned kh, unsigned kw, int is_float)
 {
-    return iw * R76_ARGB_LANES / 64u + 1u;
+    return is_float ? R76_ARGB_LANES * kh * kw
+                    : kh * r76_argb_weight_row(kw);
+}
+
+/* CBUF granules per feature row: the image row expanded to 4 lanes per pixel, in
+ * 64-byte granules.
+ *
+ * The +1 is the INT8 fold's lookahead — the last output column of the row reads kw
+ * pixels, which reach past the granule its own pixel sits in — so it goes with the
+ * fold and the float path has none. Measured at three widths on the float path
+ * (iw 16/32/64 give 2/4/8 with no k term at k 1/3/5/7), and both captured int8
+ * widths carry exactly +1. */
+static inline unsigned r76_argb_entries(unsigned iw, unsigned elem, int is_float)
+{
+    return iw * R76_ARGB_LANES * elem / 64u + (is_float ? 0u : 1u);
 }
 
 /* DDR row stride of the PACKED image, in 16-byte units. Not the normal path's
  * iw*4: that counts one NC1HWC2 channel-group row (iw*16 bytes) in 4-byte words,
- * and there is only one surface here. */
-static inline unsigned r76_argb_line_stride(unsigned iw, unsigned ic_img)
+ * and there is only one surface here. The element size enters because a float
+ * packed image is 3 or 4 interleaved fp16 per pixel, not bytes. */
+static inline unsigned r76_argb_line_stride(unsigned iw, unsigned ic_img, unsigned elem)
 {
-    return iw * ic_img / 16u;
+    return iw * ic_img * elem / 16u;
 }
 
 /* CNA_CVT_CON0 (0x1048), which packs exactly as the RK3588's: four 6-bit truncate
@@ -828,9 +902,11 @@ int rocket_rk3576_cbuf_f_prec(unsigned iw, unsigned ic, unsigned ih, unsigned oc
                               unsigned *f_out)
 {
     if (!iw || !ic || !ih || !kh || !kw) return -1;
-    if (ic <= R76_ARGB_LANES)            /* the packed-image first conv: uint8 only */
-        return r76_plan_cbuf(r76_argb_entries(iw), ih, oc,
-                             oc * r76_argb_weight_elems(kh, kw), 0, f_out);
+    if (ic <= R76_ARGB_LANES)            /* the packed-image first conv */
+        return r76_plan_cbuf(r76_argb_entries(iw, r76_elem_bytes(prec),
+                                              r76_is_float(prec)), ih, oc,
+                             oc * r76_argb_weight_elems(kh, kw, r76_is_float(prec))
+                                * r76_elem_bytes(prec), 0, f_out);
     return r76_plan_cbuf(r76_data_entries_p(iw, ic, r76_elem_bytes(prec)), ih, oc,
                          r76_weight_resident_bytes(ic, oc, kh, kw, dw), dw, f_out);
 }
@@ -852,8 +928,9 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
     if (!iw || !ic || !kh || !kw) return 0;
 
     if (ic <= R76_ARGB_LANES) {
-        entries = r76_argb_entries(iw);
-        wbytes  = oc * r76_argb_weight_elems(kh, kw);
+        entries = r76_argb_entries(iw, r76_elem_bytes(prec), r76_is_float(prec));
+        wbytes  = oc * r76_argb_weight_elems(kh, kw, r76_is_float(prec))
+                     * r76_elem_bytes(prec);
         dw      = 0;
     } else {
         entries = r76_data_entries_p(iw, ic, r76_elem_bytes(prec));
@@ -926,14 +1003,16 @@ static void r76_row_window(unsigned oy0, unsigned oh, unsigned stride, unsigned 
  * the allowance permits). Returns the task count, or 0 if a single output row
  * already overflows. `out` may be NULL to count without recording. */
 static unsigned r76_lay_rows(const conv_params_t *p, unsigned ih_full, unsigned oh_full,
-                             unsigned cap, unsigned want,
+                             unsigned cap, unsigned want, unsigned prec,
                              rocket_rk3576_row_task *out, unsigned max_tasks)
 {
     unsigned n = 0, oy0;
     unsigned prev_end = 0, resident = 0, retained = 0, entries;
+    unsigned elem = r76_elem_bytes(prec);
 
-    entries = p->ic <= R76_ARGB_LANES ? r76_argb_entries(p->iw)
-                                      : r76_data_entries(p->iw, p->ic);
+    entries = p->ic <= R76_ARGB_LANES
+                  ? r76_argb_entries(p->iw, elem, r76_is_float(prec))
+                  : r76_data_entries_p(p->iw, p->ic, elem);
 
     for (oy0 = 0; oy0 < oh_full; ) {
         unsigned iy0, ih, ptop, oh_task;
@@ -976,7 +1055,7 @@ static unsigned r76_lay_rows(const conv_params_t *p, unsigned ih_full, unsigned 
              * datapath reads the image as it comes out of a camera or a decoder,
              * not as an NC1HWC2 cube. The output is a cube either way. */
             out[n].feature_off = (uint32_t)iy0 * p->iw *
-                                 (p->ic <= R76_ARGB_LANES ? p->ic : R76_C2_BYTES);
+                                 (p->ic <= R76_ARGB_LANES ? p->ic * elem : R76_C2_BYTES);
             out[n].output_off  = (uint32_t)oy0 * p->ow * R76_C2_BYTES;
             /* What a reuse-aware caller needs: how many of this window's leading rows
              * the previous task already fetched, and how full the CBUF is when this
@@ -993,9 +1072,9 @@ static unsigned r76_lay_rows(const conv_params_t *p, unsigned ih_full, unsigned 
     return n;
 }
 
-int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
-                            rocket_rk3576_row_task *out, unsigned max_tasks,
-                            unsigned *count)
+int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
+                                 rocket_rk3576_row_task *out, unsigned max_tasks,
+                                 unsigned *count)
 {
     unsigned ih_full, oh_full, cap, entries, n, t;
     const char *forced;
@@ -1005,11 +1084,12 @@ int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
 
     ih_full = p->ih_full ? p->ih_full : p->ih;
     oh_full = p->oh_full ? p->oh_full : p->oh;
-    entries = p->ic <= R76_ARGB_LANES ? r76_argb_entries(p->iw)
-                                      : r76_data_entries(p->iw, p->ic);
+    entries = p->ic <= R76_ARGB_LANES
+                  ? r76_argb_entries(p->iw, r76_elem_bytes(prec), r76_is_float(prec))
+                  : r76_data_entries_p(p->iw, p->ic, r76_elem_bytes(prec));
     if (!entries) return -1;
 
-    cap = rocket_rk3576_max_task_rows(p->iw, p->ic, p->oc, p->kh, p->kw, dw);
+    cap = rocket_rk3576_max_task_rows_prec(p->iw, p->ic, p->oc, p->kh, p->kw, dw, prec);
     /* 0x1028 packs entries*rows in a 16-bit half, which can bite before the CBUF
      * does on a narrow, very deep plane. */
     if (cap > 0xFFFFu / entries) cap = 0xFFFFu / entries;
@@ -1031,7 +1111,7 @@ int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
      * 109 + 2 + 1 rather than two windows of 56 — and every extra task is a whole
      * submit, which on this part is a whole NPU power cycle. Taking the greedy count
      * as the target keeps the even pass from ever needing more tasks than greedy. */
-    n = r76_lay_rows(p, ih_full, oh_full, cap, 0, NULL, 0);
+    n = r76_lay_rows(p, ih_full, oh_full, cap, 0, prec, NULL, 0);
     if (!n) {
         ROCKET_LOGE("rk3576 rows: one output row already needs more than %u input "
                     "rows of allowance — split ic instead\n", cap);
@@ -1044,8 +1124,9 @@ int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
     }
     {
         unsigned even = (oh_full + n - 1u) / n;
-        unsigned m = r76_lay_rows(p, ih_full, oh_full, cap, even, out, max_tasks);
-        if (!m || m > n) m = r76_lay_rows(p, ih_full, oh_full, cap, 0, out, max_tasks);
+        unsigned m = r76_lay_rows(p, ih_full, oh_full, cap, even, prec, out, max_tasks);
+        if (!m || m > n)
+            m = r76_lay_rows(p, ih_full, oh_full, cap, 0, prec, out, max_tasks);
         if (!m) return -1;
         n = m;
     }
@@ -1053,12 +1134,20 @@ int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
     /* Every window has to satisfy the allowance planner too — same check the
      * emitter makes per task, made here so a plan is refused before any submit. */
     for (t = 0; t < n; t++)
-        if (rocket_rk3576_cbuf_f(p->iw, p->ic, out[t].ih, p->oc,
-                                 p->kh, p->kw, dw, NULL) < 0)
+        if (rocket_rk3576_cbuf_f_prec(p->iw, p->ic, out[t].ih, p->oc,
+                                      p->kh, p->kw, dw, prec, NULL) < 0)
             return -1;
 
     *count = n;
     return 0;
+}
+
+/* The int8 plan, which is what every caller before the float paths wanted. */
+int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
+                            rocket_rk3576_row_task *out, unsigned max_tasks,
+                            unsigned *count)
+{
+    return rocket_rk3576_plan_rows_prec(p, dw, precision_int8, out, max_tasks, count);
 }
 
 /* ============================================================================
@@ -1103,17 +1192,25 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * width folded into 4 lanes per pixel column), a CBUF row that is the image row
      * expanded to those lanes, and a weight kernel padded to a 16-byte row per kernel
      * row. Everything downstream of the CNA is the direct path's. */
-    unsigned ic_prog = argb ? r76_argb_ic_prog(kw) : ic;
+    unsigned ic_prog = argb ? r76_argb_ic_prog(kw, ic, is_float) : ic;
     /* The depthwise CBUF entry count is taken against the FEATURE granule, which
      * rounds the channel count past 16 in the one residue the hardware will not fetch
      * a partial block of. The weight cube rounds to 16 instead. */
-    unsigned entries = argb ? r76_argb_entries(iw)
+    unsigned entries = argb ? r76_argb_entries(iw, elem, is_float)
                             : (dw ? r76_data_entries_p(iw, r76_dw_cf(ic), elem)
                                   : r76_data_entries_p(iw, ic, elem));
-    unsigned welems  = argb ? r76_argb_weight_elems(kh, kw)
-                            : (dw ? r76_dw_cw(oc) : ic) * kh * kw;
-    unsigned wbpk = argb ? welems * 2u : r76_wbpk(ic, oc, kh, kw, dw);
-    unsigned line_stride = argb ? r76_argb_line_stride(iw, ic) : cna->line_stride;
+    /* Weight ELEMENTS per output channel, and the two registers built from them.
+     * 0x1020 carries the count scaled by the element size — the BYTES one output
+     * channel occupies — and 0x1030's high half carries twice the raw count. The two
+     * coincide at fp16, which is why one register can look like the other; at int8
+     * they differ by the factor of two and at fp16 by nothing. Depthwise is its own
+     * pair: a depthwise weight occupies a 16-bit slot whatever the precision, so its
+     * element count is already the float one and must NOT be scaled again. */
+    unsigned welem_count = argb ? r76_argb_weight_elems(kh, kw, is_float)
+                                : (dw ? r76_dw_cw(oc) : ic) * kh * kw;
+    unsigned welems = dw ? welem_count : welem_count * elem;
+    unsigned wbpk = argb ? welem_count * 2u : r76_wbpk(ic, oc, kh, kw, dw);
+    unsigned line_stride = argb ? r76_argb_line_stride(iw, ic, elem) : cna->line_stride;
     /* The rows this task actually FETCHES, and where in the CBUF they land. Without
      * reuse these reduce to the whole window at base 0. */
     unsigned fetch_rows = ih - (reuse->retained_rows < ih ? reuse->retained_rows : 0u);
@@ -1171,7 +1268,8 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
                      ((uint32_t)(cna->in_precision   & 0x7) << 4) |
                      (argb ? (R76_CNA_CON1_GROUP_LINE_OFF |
                               ((8u | ((ic - 1u) & 0x7u)) << R76_CNA_CON1_ARGB_IN_SHIFT) |
-                              R76_ARGB_CONV_MODE)
+                              (is_float ? R76_ARGB_CONV_MODE_FLOAT
+                                        : R76_ARGB_CONV_MODE))
                            : (dw ? 1u : 0u)), R76_CNA_CONV_MODE);
     ops[i++] = NPUOP(OP_REG_CNA, 0xFFFu, R76_CNA_CONV_CON2);
     ops[i++] = NPUOP(OP_REG_CNA,
@@ -1219,7 +1317,13 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
                      ((cbuf_f & R76_CBUF_F_MASK) << R76_CBUF_F_SHIFT) |
                      (cbuf_fetch_base & 0xFFFFu),
                      R76_CNA_CBUF_CON0);
-    ops[i++] = NPUOP(OP_REG_CNA, (iw << 16) | entries, R76_CNA_IW_ENTRIES);
+    /* The low half is the entry count on the direct path and on the int8 first conv.
+     * On the FLOAT first conv it is iw instead, measured at three widths — which is
+     * also `entries * 8` and `iw*LANES*elem/8`, three readings that coincide at every
+     * value the path can take, so the number is settled and the mechanism is not. */
+    ops[i++] = NPUOP(OP_REG_CNA,
+                     (iw << 16) | ((argb && is_float) ? iw : entries),
+                     R76_CNA_IW_ENTRIES);
     /* Same field packing as RK3588 CNA_CVT_CON0, at a different offset: four 6-bit
      * truncate fields above the four mode bits. Every non-ARGB capture bypasses the
      * converter and leaves all four truncates at zero; the ARGB one runs it, which is
@@ -1306,7 +1410,8 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * iw-1 twice with no exception. The ARGB path's own two halves are granule
      * counts. */
     ops[i++] = NPUOP(OP_REG_CNA,
-                     argb ? (((entries - 1u) << 16) | (entries - 2u))
+                     argb ? (is_float ? (((entries - 1u) << 16) | (entries - 1u))
+                                      : (((entries - 1u) << 16) | (entries - 2u)))
                           : (((iw - 1u) << 16) | (iw - 1u)),
                      R76_CNA_DATAIN_FULL);
 
@@ -1315,9 +1420,13 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * bits [10:8]; the rest of the word is transcribed and is zero there at int8.
      * The ARGB path sets one more bit (7) below that field, transcribed as its own
      * mode constant — everything past the CNA is otherwise the direct path's. */
+    /* Bit 0 is an INT8 marker, not part of the mode: every float capture clears it on
+     * both the direct and the first-conv path, where every integer one sets it.
+     * [source-confirmed, RKNN-Toolkit2 rk3576 float build] */
     ops[i++] = NPUOP(OP_REG_CORE,
-                     (argb ? R76_CORE_MISC_ARGB
-                           : (dw ? R76_CORE_MISC_DW : R76_CORE_MISC_DIRECT)) |
+                     ((argb ? R76_CORE_MISC_ARGB
+                            : (dw ? R76_CORE_MISC_DW : R76_CORE_MISC_DIRECT))
+                      & (is_float ? ~1u : ~0u)) |
                      ((uint32_t)(core->proc_precision & 0x7) << 8),
                      R76_CORE_MISC_CFG);
     ops[i++] = NPUOP(OP_REG_CORE, ((oh - 1u) << 16) | (ow - 1u), R76_CORE_DATAOUT_SIZE0);
@@ -1330,9 +1439,13 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     /* Zero in every capture, which is all-int8 under the RK3588's DPU_DATA_FORMAT
      * packing — so the int8 program is byte-unchanged and the three fields are
      * placed where that packing puts them. */
+    /* The middle field is the DPU's INPUT width, and the vendor leaves it at zero on
+     * the float path — only the output width and the processing precision move there.
+     * Ours used to carry fp16 in all three; that computes, so the field is inert at
+     * these shapes, but the capture is what this emitter reproduces. */
     ops[i++] = NPUOP(OP_REG_DPU,
                      ((uint32_t)(dpu->out_precision  & 0x7) << 29) |
-                     ((uint32_t)(dpu->in_precision   & 0x7) << 26) |
+                     (is_float ? 0u : ((uint32_t)(dpu->in_precision & 0x7) << 26)) |
                       (uint32_t)(dpu->proc_precision & 0x7), R76_DPU_DATA_FORMAT);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OFFSET_PEND);
     ops[i++] = NPUOP(OP_REG_DPU, dpu->dst_base_addr, R76_DPU_DST_BASE_ADDR);
@@ -1444,6 +1557,7 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, oh - 1u, R76_RDMA_CUBE_HEIGHT);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, oc - 1u, R76_RDMA_CUBE_CHANNEL);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SRC_BASE_ADDR);
+    /* The integer value on every path, deliberately — see R76_RDMA_ERDMA_FLOAT. */
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, dw ? R76_RDMA_BRDMA_DW : R76_RDMA_BRDMA_DIRECT,
                      R76_RDMA_BRDMA_CFG);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, dpu->bias_base_addr, R76_RDMA_BS_BASE_ADDR);
@@ -1463,10 +1577,13 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_NRDMA_CFG);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BN_BASE_ADDR);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5030);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x41u, R76_RDMA_ERDMA_CFG);
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA, is_float ? R76_RDMA_ERDMA_FLOAT : 0x41u,
+                     R76_RDMA_ERDMA_CFG);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_BASE_ADDR);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_SURF);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, dw ? R76_RDMA_FMODE_DW : R76_RDMA_FMODE_DIRECT,
+    ops[i++] = NPUOP(OP_REG_DPU_RDMA,
+                     is_float ? R76_RDMA_FMODE_FLOAT
+                              : (dw ? R76_RDMA_FMODE_DW : R76_RDMA_FMODE_DIRECT),
                      R76_RDMA_FEATURE_MODE);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SRC_DMA_CFG);
     ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SURF_NOTCH);
@@ -1598,9 +1715,10 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
                     "over)\n");
         return -1;
     }
-    if (argb && prec != precision_int8) {
-        ROCKET_LOGE("rk3576 conv: the first-conv ARGB datapath is int8/uint8 only — "
-                    "its converter output IS the int8 feature\n");
+    if (argb && prec != precision_int8 && prec != precision_float16) {
+        ROCKET_LOGE("rk3576 conv: the first-conv ARGB datapath has an int8 and an fp16 "
+                    "form and nothing else — precision %u has no transcribed mode "
+                    "word\n", prec);
         return -1;
     }
     if (argb && (IW % 16u)) {
@@ -1626,7 +1744,8 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
     /* 0x1028 packs entries*ih in its high half. Against the SCALED entry count, which
      * is what the task programs — a 2-byte element reaches the field twice as fast. */
     {
-        unsigned ent = argb ? r76_argb_entries(IW)
+        unsigned ent = argb ? r76_argb_entries(IW, r76_elem_bytes(prec),
+                                              r76_is_float(prec))
                             : r76_data_entries_p(IW, IC, r76_elem_bytes(prec));
         if (ent * IH > 0xFFFFu) {
             ROCKET_LOGE("rk3576 conv: CBUF entries*rows (%u) exceeds the 16-bit field — "
@@ -1719,12 +1838,25 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
         cna.cvt_scale1  = (uint16_t)(IC > 1u ? R76_ARGB_CVT_SCALE : 1u);
         cna.cvt_scale2  = (uint16_t)(IC > 2u ? R76_ARGB_CVT_SCALE : 1u);
         cna.cvt_scale3  = (uint16_t)(IC > 3u ? R76_ARGB_CVT_SCALE : 1u);
-        cna.data_offset = (uint16_t)(int16_t)
-                          -(int16_t)(((int)p->input_zero_point + 0x80) & 0xFF);
-        {
-            unsigned zp = (unsigned)(((int)p->input_zero_point + 0x80) & 0xFF), c;
-            cna.pad_con1 = 0;
-            for (c = 0; c < IC; c++) cna.pad_con1 |= zp << (8 * c);
+        /* The centring is the INT8 path's alone, and on the float path the converter
+         * is BYPASSED outright — a float packed image arrives as fp16 already in the
+         * value domain the MAC wants. So the offsets read zero, the border pads with a
+         * float zero, and CVT_CON0's mode bits are the direct path's minus cvt_type.
+         * (The per-channel truncates and Q14 scales stay in the word: the vendor emits
+         * them under bypass, where they are inert.) */
+        if (r76_is_float(prec)) {
+            cna.data_sign   = 1;
+            cna.cvt_bypass  = 1;
+            cna.data_offset = 0;
+            cna.pad_con1    = 0;
+        } else {
+            cna.data_offset = (uint16_t)(int16_t)
+                              -(int16_t)(((int)p->input_zero_point + 0x80) & 0xFF);
+            {
+                unsigned zp = (unsigned)(((int)p->input_zero_point + 0x80) & 0xFF), c;
+                cna.pad_con1 = 0;
+                for (c = 0; c < IC; c++) cna.pad_con1 |= zp << (8 * c);
+            }
         }
     }
     cna.pad_left    = p->pad_left;
@@ -1845,6 +1977,176 @@ int rocket_rk3576_weight_conv_fp16(unsigned oc_total, unsigned ic_total,
     if (kh >= kh_total || kw >= kw_total) return -1;
     return (int)((((((oc1 * nic1 + ic1) * kh_total) + kh) * kw_total + kw)
                   * R76_FP16_W_OC_GROUP + oc2) * R76_FP16_W_IC_GROUP + ic2);
+}
+
+/* ============================================================================
+ * SECTION — the FIRST CONV's float weight cube
+ *
+ * Neither of the two above. The packed-image datapath contracts four lanes per pixel
+ * whatever the image carries, so its cube has a LANE axis of four rather than an
+ * input-channel axis, and the taps stay on their own axes — there is no 4*kw fold in
+ * the cube, and no round-up of the lane group to sixteen.
+ *
+ * Decoded from manufactured captures whose weights carry a unique value per position
+ * (tests/data/rk3576-vendor-capture/argb/mkargb.py), at ic 3 and 4, k 1/3/5/7 and
+ * oc 16/32/48/64:
+ *
+ *   - a weight occupies a SIXTEEN-BIT slot;
+ *   - four lanes per (output channel, tap), lane c carrying image channel c, and any
+ *     lane past ic left don't-care;
+ *   - output channels INTERLEAVED in groups of sixteen inside one tap — sixteen
+ *     channels x four lanes is the 64 that separates one tap from the next;
+ *   - the tap axis kh-outer, and one oc group's whole tap plane before the next.
+ *
+ * [source-confirmed, RKNN-Toolkit2 rk3576 float build]
+ * ==========================================================================*/
+
+/* 16-bit SLOT index of the weight for (output channel, image channel, tap), or -1 if
+ * the position is out of range. Write a 16-bit element there. */
+int rocket_rk3576_weight_argb_fp16(unsigned oc_total, unsigned ic_total,
+                                   unsigned kh_total, unsigned kw_total,
+                                   unsigned oc, unsigned ic, unsigned kh, unsigned kw)
+{
+    const unsigned G = R76_FP16_W_OC_GROUP;      /* 16 output channels per tap block */
+    const unsigned tap = G * R76_ARGB_LANES;     /* 64 slots */
+    if (oc >= oc_total || ic >= ic_total || ic >= R76_ARGB_LANES ||
+        kh >= kh_total || kw >= kw_total)
+        return -1;
+    return (int)((oc / G) * (kh_total * kw_total * tap)
+                 + kh * (kw_total * tap)
+                 + kw * tap
+                 + (oc % G) * R76_ARGB_LANES
+                 + ic);
+}
+
+/* Bytes to allocate for that cube. Sized by the output-channel GROUPS, so an oc that
+ * is not a multiple of sixteen still gets a whole trailing group — which is also what
+ * the emitter's weight-byte register describes only when oc IS a multiple of sixteen,
+ * and why a partial group is warned about rather than packed around. */
+size_t rocket_rk3576_weight_argb_fp16_bytes(unsigned oc, unsigned kh, unsigned kw)
+{
+    unsigned groups = (oc + R76_FP16_W_OC_GROUP - 1u) / R76_FP16_W_OC_GROUP;
+    return (size_t)groups * kh * kw * R76_FP16_W_OC_GROUP * R76_ARGB_LANES * 2u;
+}
+
+/* Pack row-major OIHW fp16 weights into it. `src` is oc*ic*kh*kw 16-bit elements with
+ * ic the IMAGE's channel count (1..4); the lanes past it are zeroed rather than left
+ * undefined, since nothing in the captures says the part ignores them. */
+int rocket_rk3576_argb_fp16_pack_weights(void *dst, size_t dst_bytes,
+                                         const void *src, unsigned oc, unsigned ic,
+                                         unsigned kh, unsigned kw)
+{
+    const uint16_t *w = (const uint16_t *)src;
+    uint16_t *out = (uint16_t *)dst;
+    unsigned o, c, y, x;
+
+    if (!dst || !src || !oc || !ic || ic > R76_ARGB_LANES || !kh || !kw) return -1;
+    if (dst_bytes < rocket_rk3576_weight_argb_fp16_bytes(oc, kh, kw)) return -1;
+    memset(dst, 0, dst_bytes);
+    for (o = 0; o < oc; o++)
+        for (c = 0; c < ic; c++)
+            for (y = 0; y < kh; y++)
+                for (x = 0; x < kw; x++) {
+                    int s = rocket_rk3576_weight_argb_fp16(oc, ic, kh, kw, o, c, y, x);
+                    if (s < 0) return -1;
+                    out[s] = w[((o * ic + c) * kh + y) * kw + x];
+                }
+    return 0;
+}
+
+/* ============================================================================
+ * SECTION — the first conv's INT8 weight cube
+ *
+ * Not the float one, and the difference is the whole reason a quantized stem did not
+ * run: the float cube puts a weight in a 16-bit slot, groups output channels by
+ * sixteen and carries the tap axis OUTSIDE that group; this one is single bytes,
+ * groups output channels by THIRTY-TWO, and carries the tap ROW outside the group
+ * with the tap COLUMN folded into the same 16-byte row as the lanes. Read off the
+ * part with an impulse image and a one-byte cube (tests/rk3576_conv_gate.c fcmap),
+ * which names the output channel, both taps and the lane of every live byte at once:
+ *
+ *   byte(oc, c, kh, kw) = (oc/32) * (KH * R * 32)
+ *                       + kh * (32 * R)
+ *                       + (oc%32) * R
+ *                       + kw * 4
+ *                       + c
+ *
+ *      R = round16(4 * KW)   the padded 16-byte kernel row the emitter declares
+ *
+ * Four lanes per (output channel, tap column) with lane c carrying image channel c
+ * and the lanes past `ic` don't-care; 4*KW of each R-byte row live and the rest
+ * padding the DMA still fetches. A bijection over every live byte at oc 32 and 64,
+ * k 3/5/7 and ic 3 and 4 — 1152, 2304, 3200, 6272 and 864 live bytes, each landing on
+ * exactly one output position of one channel, with none left over and none doubled.
+ * The oc group of 32 is observable only above one group: at OC=32 a flat `oc*R` fits
+ * equally, and OC=64 is what separates them. [HW sweep, H96 MAX M9]
+ *
+ * TWO GEOMETRY BOUNDS COME WITH IT, and neither is visible in any capture because
+ * every captured first conv is a 3x3 stride-2 SAME convolution:
+ *
+ *   - THE LEFT PAD MUST BE NON-ZERO. With CNA_PAD_CON0's pad_left field at zero the
+ *     DPU writes nothing at all — not a wrong surface, an untouched one — at every
+ *     plane, stride, kernel and channel count tried. The field alone decides it:
+ *     forcing 0x0100 into a zero-pad program makes the same program write, and
+ *     forcing 0x0000 into a working one stops it. The pad_top field does neither.
+ *   - THE OUTPUT WIDTH MUST BE iw/stride. A narrower one still writes a full surface,
+ *     and it is SHEARED: the tap a byte lands on drifts one output column per output
+ *     row, exactly as a row-stride mismatch does. Both bounds are what "SAME padding"
+ *     means, which is why the vendor's own stems satisfy them and nothing else does.
+ *
+ * The output-channel count follows the direct path's rule — a multiple of 32, with a
+ * partial group writing nothing (measured at oc=16) — but NOT the float first conv's
+ * 32-channel per-program cap: one int8 program delivers 64 output channels.
+ * [HW sweep, H96 MAX M9] */
+int rocket_rk3576_weight_argb_int8(unsigned oc_total, unsigned ic_total,
+                                   unsigned kh_total, unsigned kw_total,
+                                   unsigned oc, unsigned ic, unsigned kh, unsigned kw)
+{
+    const unsigned G = 32u;                                  /* output-channel group */
+    unsigned R = r76_argb_weight_row(kw_total);              /* padded kernel row     */
+    if (oc >= oc_total || ic >= ic_total || ic >= R76_ARGB_LANES ||
+        kh >= kh_total || kw >= kw_total)
+        return -1;
+    return (int)((oc / G) * (kh_total * R * G)
+                 + kh * (G * R)
+                 + (oc % G) * R
+                 + kw * R76_ARGB_LANES
+                 + ic);
+}
+
+/* Bytes to allocate. Sized by the output-channel GROUPS, so an oc that is not a
+ * multiple of 32 still gets a whole trailing group — which is also the only oc the
+ * part computes at, so the rounding is a safety net rather than a packing choice. */
+size_t rocket_rk3576_weight_argb_int8_bytes(unsigned oc, unsigned kh, unsigned kw)
+{
+    unsigned groups = (oc + 31u) / 32u;
+    return (size_t)groups * 32u * kh * r76_argb_weight_row(kw);
+}
+
+/* Pack row-major OIHW int8 weights into it. `src` is oc*ic*kh*kw bytes with ic the
+ * IMAGE's channel count (1..4); the lanes past it and the kernel-row padding are
+ * zeroed rather than left undefined — the DMA fetches the whole row, and a stale byte
+ * in a lane the image does not carry is a weight on a channel that does not exist. */
+int rocket_rk3576_argb_int8_pack_weights(void *dst, size_t dst_bytes,
+                                         const void *src, unsigned oc, unsigned ic,
+                                         unsigned kh, unsigned kw)
+{
+    const int8_t *w = (const int8_t *)src;
+    int8_t *out = (int8_t *)dst;
+    unsigned o, c, y, x;
+
+    if (!dst || !src || !oc || !ic || ic > R76_ARGB_LANES || !kh || !kw) return -1;
+    if (dst_bytes < rocket_rk3576_weight_argb_int8_bytes(oc, kh, kw)) return -1;
+    memset(dst, 0, dst_bytes);
+    for (o = 0; o < oc; o++)
+        for (c = 0; c < ic; c++)
+            for (y = 0; y < kh; y++)
+                for (x = 0; x < kw; x++) {
+                    int s = rocket_rk3576_weight_argb_int8(oc, ic, kh, kw, o, c, y, x);
+                    if (s < 0) return -1;
+                    out[s] = w[((o * ic + c) * kh + y) * kw + x];
+                }
+    return 0;
 }
 
 /* ============================================================================
@@ -2230,7 +2532,7 @@ int gen_conv2d_int8_rk3576_reuse(conv_params_t *p, int dw,
      * count that does not cover them is not a smaller base — it is a wrapped one,
      * and the CNA would then read rows from the far end of the CBUF. */
     if (index && t->retained) {
-        unsigned entries = p->ic <= R76_ARGB_LANES ? r76_argb_entries(p->iw)
+        unsigned entries = p->ic <= R76_ARGB_LANES ? r76_argb_entries(p->iw, 1u, 0)
                                                    : r76_data_entries(p->iw, p->ic);
         if ((unsigned)t->retained * entries > t->cbuf_resident) {
             ROCKET_LOGE("rk3576 reuse: task %u retains %u rows (%u granules) against a "
@@ -2262,6 +2564,13 @@ int gen_conv2d_int8_rk3576_reuse(conv_params_t *p, int dw,
 int gen_conv2d_fp16_rk3576(conv_params_t *p)
 {
     if (!p) return -1;
+    /* The packed-image first conv is a different CNA program, not this one at a small
+     * channel count: it contracts four lanes per pixel in one task, so the 16-channel
+     * contraction bound below does not apply to it. gen_conv2d_rk3576_fill() selects
+     * it from the same ic <= 4 test the int8 entry uses. */
+    if (p->ic <= 4u)
+        return gen_conv2d_rk3576_fill(p, 0, precision_float16, precision_float16,
+                                      precision_float16, &R76_NO_REUSE);
     if (p->ic != ROCKET_RK3576_FP16_IC_SLICE) {
         ROCKET_LOGE("rk3576 fp16 conv: one task contracts exactly %u input channels "
                     "and ic=%u was asked for. The DPU's output element stride is 16/ic "

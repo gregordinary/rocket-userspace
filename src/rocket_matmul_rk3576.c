@@ -255,14 +255,23 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
     if (!ops || !plan || !stage) { rc = ROCKET_E_NOMEM; goto done; }
 
     /* The FEATURE cube is packed once and shared by every N tile: the tiling is on the
-     * output-channel axis, which the feature side does not see. */
+     * output-channel axis, which the feature side does not see.
+     *
+     * BLOCKED, NOT PER ELEMENT. feature_data() at C2=16 puts channel k of pixel m at
+     * (k/16)*ih*iw*16 + 16*m + (k%16), so sixteen consecutive channels are sixteen
+     * consecutive bytes at BOTH ends — a copy rather than a scatter. K is a multiple of
+     * 32 on this path, so every run is a whole sixteen. The per-element form is what
+     * the index function above spells out and is the reference for this one. */
     {
-        int m, k;
-        for (m = 0; m < M; m++)
-            for (k = 0; k < K; k++)
-                stage[feature_data(K, (int)ih, (int)iw, C2,
-                                   k + 1, (int)(m / (int)iw) + 1, (int)(m % (int)iw) + 1)] =
-                    A[(size_t)m * K + k];
+        size_t plane = (size_t)ih * iw * C2;
+        unsigned k1, ngrp = (unsigned)K / C2;
+        int m;
+        for (m = 0; m < M; m++) {
+            const int8_t *src = A + (size_t)m * K;
+            int8_t *dst = stage + (size_t)C2 * (unsigned)m;
+            for (k1 = 0; k1 < ngrp; k1++)
+                memcpy(dst + (size_t)k1 * plane, src + (size_t)k1 * C2, C2);
+        }
     }
     if (rocket_bo_alloc(fd, in_bytes, &b.in) < 0) { rc = ROCKET_E_NOMEM; goto done; }
     rocket_bo_prep(fd, &b.in, 1, 0);
@@ -283,7 +292,7 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
         size_t obytes = (size_t)((nreg + C2 - 1) / C2) * surf_elems * C2;
         conv_params_t p = {0};
         uint32_t in_h[4], out_h[1];
-        unsigned ntask = 1, t, n, k;
+        unsigned ntask = 1, t, n;
 
         if (b.w.ptr)     rocket_bo_free(fd, &b.w);
         if (b.coeff.ptr) rocket_bo_free(fd, &b.coeff);
@@ -300,11 +309,23 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
          * group count follows the tile rather than the whole N. */
         rocket_bo_prep(fd, &b.w, 1, 0);
         memset(b.w.ptr, 0, w_bytes);
-        for (n = 0; n < tile_n; n++)
-            for (k = 0; k < (unsigned)K; k++)
-                ((int8_t *)b.w.ptr)[weight_conv_int8((int)tile_n, K, 1, 1,
-                                                     (int)n + 1, (int)k + 1, 1, 1)] =
-                    B[(size_t)(n0 + n) * K + k];
+        /* BLOCKED, NOT PER ELEMENT — and this is the one that mattered. At kh=kw=1
+         * weight_conv_int8() reduces to (n/32)*nK1*1024 + (k/32)*1024 + (n%32)*32 +
+         * (k%32), so thirty-two consecutive k are thirty-two consecutive bytes at both
+         * ends. A K*N element-at-a-time scatter through the index function is a million
+         * calls at K=N=1024, which was most of that shape's wall clock; the memset above
+         * still covers the output-channel tail of a partial group. */
+        {
+            unsigned nK1 = ((unsigned)K + 31u) / 32u, k1;
+            int8_t *w = (int8_t *)b.w.ptr;
+            for (n = 0; n < tile_n; n++) {
+                const int8_t *src = B + (size_t)(n0 + n) * K;
+                int8_t *dst = w + (size_t)(n / 32u) * nK1 * 1024u
+                                + (size_t)(n % 32u) * 32u;
+                for (k1 = 0; k1 < nK1; k1++)
+                    memcpy(dst + (size_t)k1 * 1024u, src + (size_t)k1 * 32u, 32);
+            }
+        }
         rocket_bo_fini(fd, &b.w);
 
         /* The COEFFICIENT buffer is NOT a flat int32 bias array on this part, and a
@@ -417,15 +438,20 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
 
         /* De-scatter this tile's channels straight into the caller's row-major C. */
         rocket_bo_prep(fd, &b.out, 0, 2000000000ull);
+        /* BLOCKED, NOT PER ELEMENT, the same way round: y*iw + x IS m, so the source
+         * index is (n/16)*surf_elems*16 + 16*m + (n%16) and sixteen consecutive output
+         * channels are sixteen consecutive bytes at both ends. */
         {
             const int8_t *o = (const int8_t *)b.out.ptr;
+            size_t surf = (size_t)surf_elems * C2;
             int m;
             for (m = 0; m < M; m++) {
-                unsigned y = (unsigned)m / iw, x = (unsigned)m % iw;
-                for (n = 0; n < tile_n; n++)
-                    C[(size_t)m * N + n0 + n] =
-                        o[(size_t)(n / C2) * surf_elems * C2 +
-                          (size_t)C2 * (y * iw + x) + (n % C2)];
+                const int8_t *src = o + (size_t)C2 * (unsigned)m;
+                int8_t *dst = C + (size_t)m * N + n0;
+                for (n = 0; n < tile_n; n += C2) {
+                    unsigned run = tile_n - n < C2 ? tile_n - n : (unsigned)C2;
+                    memcpy(dst + n, src + (size_t)(n / C2) * surf, run);
+                }
             }
         }
         rocket_bo_fini(fd, &b.out);
@@ -483,30 +509,121 @@ done:
  * turned off entirely (`power/control` = `on`) no amount of idle clears it at all. See
  * the submit loop for the measurement.
  *
- * So the default is read from the driver rather than fixed: twice the autosuspend delay
- * plus 20 ms covers it at every delay swept (5, 10, 20 and 50 ms), and a system that
- * lowers the delay gets a proportionally cheaper path for free. ROCKET_RK3576_MM_GAP_MS
- * overrides it outright. */
+ * So the default is read from the driver rather than fixed. The law is TWICE the
+ * autosuspend delay: over a 5 x 7 sweep of delay against gap, the gap at which a chain
+ * of wide-output submits first reaches 20 of 20 is ~100 ms at a 50 ms delay, ~40 at 20,
+ * ~20 at 10, ~10 at 5 and ~5 at 1. The small constant beside it is margin, and it is what
+ * dominates once the delay is low. ROCKET_RK3576_MM_GAP_MS overrides the result outright.
+ *
+ * LOWERING THE DRIVER'S DELAY IS THE LEVER, and it is a system policy rather than
+ * anything this library can set: mainline picks 50 ms as ~3 frames at 60 Hz, for an NPU
+ * feeding a display pipeline, and `power/autosuspend_delay_ms` is writable. At 1 ms every
+ * gate still passes bit-exactly, the per-submit dispatch floor is unchanged (1079 -> 1104
+ * us, which a back-to-back chain never lets the timer touch), and the fp16 first conv's
+ * gate group falls from 122-513 ms a shape to 1.3-122: 224x224 k3 s2 goes 257 -> 20 ms.
+ * [HW sweep, H96 MAX M9] */
+static const char *const R76_PM_DELAY_PATHS[] = {
+    "/sys/bus/platform/drivers/rocket/27700000.npu/power/autosuspend_delay_ms",
+    "/sys/bus/platform/drivers/rocket/27f00000.npu/power/autosuspend_delay_ms",
+};
+
+/* The device whose delay was read, so the kick below writes the same one back. */
+static const char *r76_pm_delay_path;
+
 static int r76_autosuspend_ms(void)
 {
-    static const char *const PATHS[] = {
-        "/sys/bus/platform/drivers/rocket/27700000.npu/power/autosuspend_delay_ms",
-        "/sys/bus/platform/drivers/rocket/27f00000.npu/power/autosuspend_delay_ms",
-    };
     unsigned i;
-    for (i = 0; i < sizeof PATHS / sizeof PATHS[0]; i++) {
-        FILE *fp = fopen(PATHS[i], "r");
+    for (i = 0; i < sizeof R76_PM_DELAY_PATHS / sizeof R76_PM_DELAY_PATHS[0]; i++) {
+        FILE *fp = fopen(R76_PM_DELAY_PATHS[i], "r");
         long v;
         if (!fp) continue;
-        if (fscanf(fp, "%ld", &v) == 1 && v >= 0 && v < 10000) { fclose(fp); return (int)v; }
+        if (fscanf(fp, "%ld", &v) == 1 && v >= 0 && v < 10000) {
+            fclose(fp);
+            r76_pm_delay_path = R76_PM_DELAY_PATHS[i];
+            return (int)v;
+        }
         fclose(fp);
     }
     return -1;
 }
 
+/* ============================================================================
+ * SECTION — the PM kick: pay the power cycle instead of waiting for it
+ *
+ * The guard below is an idle only because the driver's autosuspend timer is what
+ * cycles the power domain, and that timer is sized for a media pipeline rather than
+ * for this hazard. Lowering the delay system-wide fixes the wide-output paths and
+ * charges everything else: a resume costs about 230 us, and any workload whose
+ * inter-job gap falls between the new delay and the old one pays it on every job,
+ * a 60 Hz frame interval included. [HW sweep, H96 MAX M9]
+ *
+ * So drive the transition instead of waiting for it. Write a zero delay, wait for
+ * `runtime_status` to actually read `suspended`, and put the caller's delay back. The
+ * guard then costs one real power cycle rather than a worst-case idle, the steady-state
+ * policy every other consumer of this NPU sees is unchanged, and the wait is a poll on
+ * the thing being waited for rather than a timer.
+ *
+ * It needs WRITE access to that sysfs file, which a process without privilege does not
+ * have — so it is attempted, checked, and falls back to the plain idle. A udev rule
+ * granting a group write on `power/autosuspend_delay_ms` is what makes it available
+ * unprivileged. ROCKET_RK3576_PM_KICK=0 turns it off.
+ *
+ * THE WINDOW IS THE ONE COST. Between writing zero and writing the caller's value back
+ * there are a few milliseconds in which a kill would leave the system's delay at zero.
+ * That is a degraded power policy rather than a broken one, and it is self-healing:
+ * a delay of zero is not a value any system sets deliberately, so it is read as an
+ * interrupted kick and restored to mainline's 50 rather than preserved.
+ * ==========================================================================*/
+/* What mainline's rocket_core.c sets, and what an interrupted kick is healed to. */
+#define R76_PM_DELAY_DEFAULT_MS 50
+static int r76_pm_write_delay(int ms)
+{
+    FILE *fp;
+    int ok;
+    if (!r76_pm_delay_path) return 0;
+    fp = fopen(r76_pm_delay_path, "w");
+    if (!fp) return 0;
+    ok = fprintf(fp, "%d\n", ms) > 0;
+    if (fclose(fp) != 0) ok = 0;
+    return ok;
+}
+
+/* 1 once the device reports `suspended`, 0 if it has not within `budget_ms`. */
+static int r76_pm_wait_suspended(int budget_ms)
+{
+    char path[256];
+    const char *tail = "runtime_status";
+    size_t base;
+    int waited = 0;
+
+    if (!r76_pm_delay_path) return 0;
+    base = strlen(r76_pm_delay_path) - strlen("autosuspend_delay_ms");
+    if (base + strlen(tail) >= sizeof path) return 0;
+    memcpy(path, r76_pm_delay_path, base);
+    strcpy(path + base, tail);
+
+    for (;;) {
+        FILE *fp = fopen(path, "r");
+        char st[32] = {0};
+        int got = 0;
+        if (fp) {
+            got = fscanf(fp, "%31s", st) == 1;
+            fclose(fp);
+        }
+        if (got && !strcmp(st, "suspended")) return 1;
+        if (waited >= budget_ms) return 0;
+        {
+            struct timespec ts = { 0, 500000L };   /* 0.5 ms */
+            nanosleep(&ts, NULL);
+        }
+        waited++;   /* a poll is ~0.5 ms, so this bounds at ~2x budget_ms in wall time */
+    }
+}
+
 void rocket_rk3576_power_idle(void)
 {
     static int cached = -2;
+    static int kick = -2;          /* -2 unprobed, -1 unavailable, else the delay to restore */
     const char *g = getenv("ROCKET_RK3576_MM_GAP_MS");
     int gms;
     struct timespec ts;
@@ -516,8 +633,8 @@ void rocket_rk3576_power_idle(void)
     } else {
         if (cached == -2) {
             int d = r76_autosuspend_ms();
-            cached = d >= 0 ? 2 * d + 20 : 150;
-            if (cached < 20) cached = 20;
+            cached = d >= 0 ? 2 * d + 5 : 150;
+            if (cached < 5) cached = 5;
             if (cached > 300) cached = 300;
             ROCKET_LOGI("rk3576 matmul i32: the 32-bit writer's hazard is cleared by the "
                         "NPU power domain cycling, so the inter-submit idle is sized from "
@@ -525,6 +642,35 @@ void rocket_rk3576_power_idle(void)
         }
         gms = cached;
     }
+
+    /* Drive the power cycle rather than waiting for the autosuspend timer, when the
+     * sysfs delay is writable. Probed once: a process without privilege falls back to
+     * the idle below and pays what it always paid. */
+    if (kick == -2) {
+        int d = r76_autosuspend_ms();
+        kick = -1;
+        if (d >= 0 && getenv("ROCKET_RK3576_PM_KICK") &&
+            strcmp(getenv("ROCKET_RK3576_PM_KICK"), "0") == 0) {
+            /* explicitly off */
+        } else if (d >= 0 && r76_pm_write_delay(d ? d : R76_PM_DELAY_DEFAULT_MS)) {
+            /* A zero here is an earlier kick that was killed mid-window, not a policy —
+             * heal it rather than adopting it as the value to restore. */
+            kick = d ? d : R76_PM_DELAY_DEFAULT_MS;
+            ROCKET_LOGI("rk3576: the power-domain cycle the wide-output guard waits for is "
+                        "driven directly (autosuspend delay %d ms is writable), so the "
+                        "guard costs one cycle rather than the timer's worst case\n", kick);
+        }
+    }
+    if (kick >= 0) {
+        if (r76_pm_write_delay(0)) {
+            int done = r76_pm_wait_suspended(gms);
+            r76_pm_write_delay(kick);
+            if (done) return;
+            /* It did not suspend inside the budget — fall through to the plain idle
+             * rather than returning with the hazard possibly uncleared. */
+        }
+    }
+
     if (gms <= 0) return;
     ts.tv_sec = gms / 1000;
     ts.tv_nsec = (long)(gms % 1000) * 1000000L;

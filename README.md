@@ -48,6 +48,15 @@ The complete function reference — every entry point, per dtype and op — is i
 - Privilege to open the accel node — run as a user in the node's group, or with `sudo -E` (the `-E`
   preserves the `ROCKET_*` env knobs that plain `sudo` strips).
 
+**On the RK3576, install `udev/99-rocket-npu-pm.rules`.** A job on that part whose output element is
+wider than one byte — any fp16 convolution, either int32 matmul writer — leaves the next submit
+completing normally and writing nothing, and what clears it is the runtime-PM autosuspend cycling the
+NPU power domain. The library drives that cycle rather than waiting out the driver's 50 ms timer,
+which needs write access to one sysfs file; the rule hands it to the same group that already owns
+`/dev/accel/accel0`, so it grants nothing to anyone who could not already submit NPU work. Without it
+the library falls back to waiting and an fp16 224x224 stem costs 226 ms instead of 13.8. The RK3588
+has no such hazard and needs no rule.
+
 **Clock.** The NPU boots at 200 MHz and the library is correct there, but every performance figure
 below is at 600 MHz: apply the `patches/rocket` clock patch and load the module with
 `rocket_npu_clk_hz=600000000`. The patches only raise the clock (~1.43×) and trim dispatch latency.

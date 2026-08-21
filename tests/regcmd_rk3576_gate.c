@@ -87,6 +87,21 @@ static const uint16_t ALLOC_FIELDS[] = { 0x1040, 0x103C, 0x1018, 0x1038 };
  * one will want it. */
 static const uint16_t OPEN_FIELDS[] = { 0xFFFF };
 
+/* Where the vendor's FLOAT program and this emitter differ ON PURPOSE, because the
+ * vendor's value does not compute with the buffers this library packs.
+ *
+ * DPU_RDMA BRDMA_CFG (0x501C) is the BS operand reader. Every vendor float program
+ * carries 0x100 where the integer ones carry 0x710, and emitting 0x100 makes the DPU
+ * write nothing at all — no fault, no dmesg, an untouched surface. Paired with the BS
+ * ALU config those same programs carry (0x4044 = 2) the writer runs again and the
+ * arithmetic is wrong on about a tenth of the surface. The vendor's float epilogue is
+ * a different BS arrangement, and this library's A/B/C coefficient group is packed for
+ * the integer one, which is bit-exact under either ALU mode.
+ *
+ * Reported rather than excluded: this is a divergence with a measured reason, and it
+ * should stay visible until the arrangement is decoded as a whole. */
+static const uint16_t FLOAT_BS_FIELDS[] = { 0x501C };
+
 static int in_set(uint16_t reg, const uint16_t *set, size_t n)
 {
     for (size_t i = 0; i < n; i++) if (set[i] == reg) return 1;
@@ -105,14 +120,14 @@ static const char *blk(uint16_t t)
     }
 }
 
-struct gate_result { int fail, open, alloc, refetch, checked, excluded; };
+struct gate_result { int fail, open, alloc, refetch, checked, excluded, fbs; };
 
 /* Drive the emitter with a captured task's own geometry and diff the two programs. */
 static int run_case(const struct rk3576_golden_case *c, struct gate_result *tot,
                     int verbose)
 {
     uint64_t ops[256] = {0};
-    int fail = 0, open_hits = 0, alloc_hits = 0, refetch_hits = 0;
+    int fail = 0, open_hits = 0, alloc_hits = 0, refetch_hits = 0, fbs_hits = 0;
     int checked = 0, excluded = 0, rc;
     size_t n_golden = c->n_ops;
     /* Not the first task of its plane: the vendor keeps the overlap rows resident. */
@@ -165,7 +180,11 @@ static int run_case(const struct rk3576_golden_case *c, struct gate_result *tot,
         snprintf(fbuf, sizeof fbuf, "%u", c->cbuf_f);
         setenv("ROCKET_RK3576_CBUF_F", fbuf, 1);
     }
-    rc = c->dw ? gen_conv2d_dw_int8_rk3576(&p) : gen_conv2d_int8_rk3576(&p);
+    /* The capture's own precision, read off CNA_CONV_CON1 bit 21 rather than assumed.
+     * The float captures are manufactured (do_quantization=False on a float ONNX), and
+     * they are what turns the transcribed float fields into a gated program. */
+    rc = gen_conv2d_rk3576_prec(&p, (int)c->dw,
+                                c->is_float ? precision_float16 : precision_int8);
     unsetenv("ROCKET_RK3576_CBUF_F");
     if (rc != 0) {
         printf("  FAIL %s: generator returned %d\n", c->name, rc);
@@ -237,6 +256,13 @@ static int run_case(const struct rk3576_golden_case *c, struct gate_result *tot,
             alloc_hits++;
             continue;
         }
+        if (c->is_float && IN(gr, FLOAT_BS_FIELDS)) {
+            if (verbose)
+                printf("  float-bs[%3zu] %s 0x%04x  golden 0x%08x  emitted 0x%08x\n",
+                       i, blk(gt), gr, gv, ev);
+            fbs_hits++;
+            continue;
+        }
         if (IN(gr, OPEN_FIELDS)) {
             printf("  open [%3zu] %s 0x%04x  golden 0x%08x  emitted 0x%08x\n",
                    i, blk(gt), gr, gv, ev);
@@ -264,7 +290,7 @@ static int run_case(const struct rk3576_golden_case *c, struct gate_result *tot,
                "%d refetch, %d open, %d FAILED\n\n",
                checked, excluded, alloc_hits, refetch_hits, open_hits, fail);
     tot->fail += fail; tot->open += open_hits; tot->alloc += alloc_hits;
-    tot->refetch += refetch_hits;
+    tot->refetch += refetch_hits; tot->fbs += fbs_hits;
     tot->checked += checked; tot->excluded += excluded;
     return fail;
 }
@@ -307,21 +333,27 @@ int main(int argc, char **argv)
            "(%u conv-with-epilogue carried for reference)\n",
            n_direct, n_dw, n_argb, n_epi);
     printf("   %d registers matched, %d excluded (address/requant/model),\n"
-           "   %d allocator-choice, %d vendor CBUF row-reuse, %d open, %d FAILED\n\n",
-           tot.checked, tot.excluded, tot.alloc, tot.refetch, tot.open, tot.fail);
+           "   %d allocator-choice, %d vendor CBUF row-reuse, %d float BS arrangement,\n"
+           "   %d open, %d FAILED\n\n",
+           tot.checked, tot.excluded, tot.alloc, tot.refetch, tot.fbs,
+           tot.open, tot.fail);
 
-    /* The ARGB first-conv datapath's guards. The captures are all 3-channel int8 at
-     * a width that is a multiple of 16, so the emitter has to say so rather than
-     * emit a program outside what any of them pins. */
+    /* The ARGB first-conv datapath's guards. The captures pin an int8 and an fp16
+     * form at 1, 3 and 4 image channels and a width that is a multiple of 16, so the
+     * emitter has to say so rather than emit a program outside what any of them pins.
+     * bf16 is the case that would be a guess: it shares fp16's width class in the CNA
+     * word, and no capture separates the two on this path. */
     {
         int argb_fail = 0;
         struct { const char *what; unsigned ic, iw; int dw; unsigned prec; int want_ok; } g[] = {
             { "RGB 64x64 accepted",            3, 64, 0, precision_int8,    1 },
             { "RGBA accepted",                 4, 64, 0, precision_int8,    1 },
             { "grayscale accepted",            1, 64, 0, precision_int8,    1 },
+            { "fp16 RGB accepted",             3, 64, 0, precision_float16, 1 },
+            { "fp16 RGBA accepted",            4, 64, 0, precision_float16, 1 },
             { "iw not a multiple of 16",       3, 60, 0, precision_int8,    0 },
             { "no depthwise form",             3, 64, 1, precision_int8,    0 },
-            { "int8 only",                     3, 64, 0, precision_float16, 0 },
+            { "int8 and fp16 only",            3, 64, 0, precision_bfloat16, 0 },
         };
         printf("== ARGB first-conv guards ==\n");
         for (size_t i = 0; i < sizeof(g)/sizeof(g[0]); i++) {

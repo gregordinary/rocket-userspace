@@ -85,6 +85,11 @@ def decode(run):
         'wbpk': wo >> 16,
         'surface_add': g(0x1001, 0x40b8),
         'argb_pre': 1 if (cm >> 12) & 0xf else 0,
+        # CNA_CONV_CON1 bit 21 is the float enable: set in every vendor float program
+        # and in no integer one. The two precision fields beside it (proc at bits[9:7],
+        # in at bits[6:4]) both read 2 = fp16 in the float captures and 0 at int8, so
+        # the flag is what the gate needs to pick the emitter's precision.
+        'is_float': (cm >> 21) & 1,
     }
     d['oh_full'] = dsurf // d['ow'] if d['ow'] else 0
     # 0x118C is NOT the full plane height. Both its halves carry iw-1, which is
@@ -124,7 +129,8 @@ EPILOGUE_SOURCES = ("iso_bias", "iso_scale", "iso_sum")
 
 
 def name_for(d, seen):
-    base = "%s_c%u_%u_k%u_s%u_%ux%u_o%ux%u" % (
+    base = "%s%s_c%u_%u_k%u_s%u_%ux%u_o%ux%u" % (
+        "f16" if d['is_float'] else "",
         "dw" if d['dw'] else ("argb" if d['argb'] else
                               ("epi" if d.get('epilogue') else "conv")),
         d['ic'], d['oc'], d['kh'], d['sy'], d['iw'], d['ih_task'], d['ow'], d['oh_task'])
@@ -167,8 +173,9 @@ def main():
     L.append(" * rk3576_vendor_golden.h - GENERATED, do not edit by hand.")
     L.append(" *")
     L.append(" * RK3576 vendor register programs, decoded from RKNN-Toolkit2 .rknn captures")
-    L.append(" * (the gahingwoo vendor-capture set, plus the manufactured depthwise ones in")
-    L.append(" * dw/, rebuilt by dw/mkdw.py). Each table is one")
+    L.append(" * (the gahingwoo vendor-capture set, plus the manufactured ones here: dw/ for")
+    L.append(" * depthwise, float/ for the fp16 direct path, argb/ for the fp16 first conv,")
+    L.append(" * rebuilt by their own mk*.py). Each table is one")
     L.append(" * task's complete CNA+CORE+DPU+DPU_RDMA register program, in stream order, as")
     L.append(" * (target, reg, value) triples. These are the acceptance oracle for the RK3576")
     L.append(" * regcmd emitter: what the vendor toolkit programs for a known conv geometry.")
@@ -197,7 +204,7 @@ def main():
     L.append("    const char *source;")
     L.append("    const struct rk3576_golden_op *ops;")
     L.append("    unsigned n_ops;")
-    L.append("    unsigned dw, argb, epilogue;")
+    L.append("    unsigned dw, argb, epilogue, is_float;")
     L.append("    unsigned ic, oc, iw, ih_task, ih_full, ow, oh_task, oh_full;")
     L.append("    unsigned kh, kw, sy, sx, pad_top, pad_left, pad_bottom, pad_right;")
     L.append("    unsigned cbuf_f, cbuf_low;      /* the vendor allocator's own choice */")
@@ -206,8 +213,9 @@ def main():
     L.append("")
 
     for d in cases:
-        L.append("/* %s: %s%s ic=%u oc=%u k=%ux%u s=%u in %ux%u of %u rows -> out %ux%u of %u"
-                 % (d['name'], "depthwise " if d['dw'] else "", "ARGB " if d['argb'] else "",
+        L.append("/* %s: %s%s%s ic=%u oc=%u k=%ux%u s=%u in %ux%u of %u rows -> out %ux%u of %u"
+                 % (d['name'], "fp16 " if d['is_float'] else "",
+                    "depthwise " if d['dw'] else "", "ARGB " if d['argb'] else "",
                     d['ic'], d['oc'], d['kh'], d['kw'], d['sy'],
                     d['iw'], d['ih_task'], d['ih_full'], d['ow'], d['oh_task'], d['oh_full']))
         L.append(" * source: %s, %d entries */" % (d['source'], len(d['ops'])))
@@ -220,8 +228,9 @@ def main():
     L.append("static const struct rk3576_golden_case rk3576_golden_cases[] = {")
     for d in cases:
         L.append("    { \"%s\", \"%s\", rk3576_golden_%s, %d," % (d['name'], d['source'], d['name'], len(d['ops'])))
-        L.append("      %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u }," % (
-            d['dw'], d['argb'], d['epilogue'], d['ic'], d['oc'], d['iw'], d['ih_task'], d['ih_full'],
+        L.append("      %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u }," % (
+            d['dw'], d['argb'], d['epilogue'], d['is_float'],
+            d['ic'], d['oc'], d['iw'], d['ih_task'], d['ih_full'],
             d['ow'], d['oh_task'], d['oh_full'], d['kh'], d['kw'], d['sy'], d['sx'],
             d['pad_top'], d['pad_left'], d['pad_bottom'], d['pad_right'],
             d['cbuf_f'], d['cbuf_low'], d['weight_bytes'], d['weight_elems'], d['wbpk'],

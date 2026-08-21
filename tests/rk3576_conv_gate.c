@@ -49,6 +49,7 @@
  *                                  (default: envelope window; "all" runs every group)
  *   rk3576_conv_gate -l            list the table without running it
  *   rk3576_conv_gate dwmap         read the depthwise weight-cube layout off the part
+ *   rk3576_conv_gate fcmap         read the int8 FIRST-CONV weight-cube layout off it
  *   rk3576_conv_gate dwbias        which coefficient slot each channel read
  *   rk3576_conv_gate dwcoeff       the inverse: which output byte each slot reaches
  *   rk3576_conv_gate dwout         dump the raw output cube, undescattered
@@ -64,6 +65,7 @@
  *   ROCKET_G_CREG=<n>          override the channel count PROGRAMMED for a dw shape
  *   ROCKET_G_VERBOSE=1         per-task window lines and the first mismatches
  *   ROCKET_G_DWMAP_C / _K / _IW / _SPAN   dwmap geometry and how much cube to sweep
+ *   ROCKET_G_FCMAP_OC / _IC / _K / _KW / _IW / _SPAN   fcmap geometry and sweep extent
  *   ROCKET_G_DWOUT_OUTSCALE=<n>  dwout: divide the requant so a saturated lane names
  *                                its magnitude instead of reading as the clip
  *   ROCKET_G_DWOUT_BASE / _STEP  dwout: the bias ramp that names the channels
@@ -686,6 +688,334 @@ done:
 }
 
 /* ============================================================================
+ * SECTION — fcmap: read the INT8 FIRST-CONV weight-cube layout off the part
+ *
+ * The packed-image datapath's int8 weight cube is the one operand no capture pins and
+ * no other cube predicts. The float ARGB cube is decoded (16-bit slots, four lanes per
+ * output channel and tap, output channels interleaved by sixteen) and the depthwise
+ * path already showed this part's float and int8 cubes are different objects — the
+ * depthwise int8 one went from 16-bit slots and groups of 32 to one-byte slots, groups
+ * of 64 and a permuted lane order. So the int8 first conv's cube is read off the part
+ * the same way the depthwise one was.
+ *
+ * The probe is dw_map's, with the fold accounted for. Drive an IMPULSE image — one
+ * pixel at (y0,x0) — and a weight cube that is entirely zero except for ONE byte. The
+ * surface that comes back names four things at once:
+ *
+ *     out channel  = the output channel that byte belongs to
+ *     out y        = y0 - kh      (stride 1, no pad)
+ *     out x        = x0 - kw      the kernel COLUMN, which the int8 path folds into
+ *                                 the channel axis but which still shifts the output
+ *                                 pixel: output column x gathers image columns
+ *                                 x..x+kw-1, so a lane belonging to column kw is hit
+ *                                 at x = x0 - kw
+ *     value        = the image channel (LANE), because the impulse carries a distinct
+ *                    power of two per channel and the weight byte is 1
+ *
+ * That is a bijection read in one pass, and it separates the two axes the fold makes
+ * ambiguous. A probe that held the image uniform across its channels would report the
+ * tap and never the lane, which is the failure mode that has already cost this project
+ * two wrong answers on this part.
+ *
+ * The preflight matters as much as the sweep: a dead program and a cube of the wrong
+ * size look identical byte by byte, so an all-ones cube runs first and the sweep is
+ * only believed if that wrote something.
+ * ==========================================================================*/
+static int fc_map(int fd)
+{
+    unsigned oc   = (unsigned)env_int("ROCKET_G_FCMAP_OC", 32);
+    unsigned ic   = (unsigned)env_int("ROCKET_G_FCMAP_IC", 4);
+    unsigned k    = (unsigned)env_int("ROCKET_G_FCMAP_K", 3);
+    unsigned kw   = (unsigned)env_int("ROCKET_G_FCMAP_KW", (int)k);
+    unsigned iw   = (unsigned)env_int("ROCKET_G_FCMAP_IW", 16);
+    unsigned st   = (unsigned)env_int("ROCKET_G_FCMAP_S", 1);
+    unsigned span = (unsigned)env_int("ROCKET_G_FCMAP_SPAN", 0);   /* 0 = the whole cube */
+    /* The CONTROL. The fp16 first conv computes on this part, so running it through
+     * this same harness — same BOs, same coefficient buffer, same impulse, same
+     * "did anything get written" test — is what separates "the int8 program does not
+     * compute" from "the probe is wrong". */
+    int fp16 = env_int("ROCKET_G_FCMAP_FP16", 0);
+    /* THE GAP IS LOAD-BEARING, and leaving it out reads as a dead program. A submit
+     * that follows another too closely comes back with the surface never written —
+     * the same hazard the conv library sizes an idle for, cleared by the runtime-PM
+     * autosuspend cycling the NPU power domain rather than by elapsed time as such.
+     * Without it every run after the first in a process, and every process after the
+     * first in a shell loop, reports nothing written whatever the program says. */
+    int gap = env_int("ROCKET_G_FCMAP_GAP_MS", 200);
+    unsigned rep = (unsigned)env_int("ROCKET_G_FCMAP_REPEAT", 1);
+    /* The CNA converter's OFFSET, which is the only way a packed uint8 image reaches
+     * the MAC as a signed value — the ARGB feature DMA is unsigned and the offset
+     * registers are the subtraction. EVERY vendor ARGB capture is zero point 0, so
+     * those registers are transcribed and never exercised; this drives them. The
+     * impulse is written at raw = (1<<c) + (zp + 0x80), so the value the MAC should
+     * see is 1<<c whatever the zero point, and a lane that comes back carrying
+     * something else names an offset the part did not apply. */
+    int inzp = env_int("ROCKET_G_FCMAP_INZP", 0x80);
+    unsigned esz = fp16 ? 2u : 1u;
+    /* Leading pad, on both axes, as the vendor's own first-conv captures carry it
+     * (pad_top = pad_left = 1 at k=3 stride 2). It is a geometry axis in its own
+     * right here: the captured program computes and a zero-pad one at the same
+     * kernel does not. */
+    unsigned pad = (unsigned)env_int("ROCKET_G_FCMAP_PAD", 0);
+    unsigned kh = k;
+    unsigned ih = iw;
+    unsigned ow = (iw + pad - kw) / st + 1, oh = (ih + pad - kh) / st + 1;
+    /* At stride s the impulse at (y0,x0) is seen by output (y,x) through tap
+     * (y0 - s*y, x0 - s*x), so a tap is reachable only where that difference is a
+     * multiple of s away from an in-range output. Placing the impulse at (kh-1, kw-1)
+     * with s = 1 reaches every tap; at s = 2 it reaches the taps of one parity, and the
+     * SHIFT knob moves the impulse to reach the other. */
+    unsigned shift = (unsigned)env_int("ROCKET_G_FCMAP_SHIFT", 0);
+    unsigned y0 = kh - 1 + shift, x0 = kw - 1 + shift;
+    (void)0;
+    size_t in_bytes = (size_t)ih * iw * ic * esz;
+    unsigned c2out  = fp16 ? 8u : (unsigned)C2;
+    unsigned surf_elems = rocket_rk3576_out_surf_elems(ow, oh, 0);
+    size_t obytes   = fp16 ? rocket_rk3576_fp16_out_bytes(oc, oh, ow)
+                           : (size_t)((oc + C2 - 1) / C2) * surf_elems * C2;
+    size_t coeff    = rocket_rk3576_coeff_bytes(oc);
+    /* The size the emitter itself programs: one 16-byte row per kernel row per output
+     * channel at int8, and a dense four lanes per tap at fp16. Allocate twice that, so
+     * a layout reaching past the declared extent shows up as a live offset rather than
+     * as a fault. */
+    unsigned welems  = kh * ((4u * kw + 15u) & ~15u);
+    size_t w_declared = fp16 ? rocket_rk3576_weight_argb_fp16_bytes(oc, kh, kw)
+                             : (size_t)oc * welems;
+    size_t w_bytes    = w_declared * 2;
+    rocket_bo in_bo = {0}, w_bo = {0}, b_bo = {0}, o_bo = {0}, r_bo = {0};
+    uint64_t ops[RK3576_CONV_TASK_OPS] = {0};
+    uint32_t in_h[4], out_h[1];
+    conv_params_t p = {0};
+    int32_t *bias = NULL;
+    unsigned off, live = 0;
+    int rc = 1;
+
+    if (!span || span > w_bytes) span = (unsigned)w_bytes;
+    bias = calloc(oc, sizeof *bias);
+    if (!bias) return 1;
+
+    if (rocket_bo_alloc(fd, in_bytes, &in_bo) < 0) goto done;
+    if (rocket_bo_alloc(fd, w_bytes,  &w_bo)  < 0) goto done;
+    if (rocket_bo_alloc(fd, coeff,    &b_bo)  < 0) goto done;
+    /* Twice the surface. The register-override sweeps drive output-width fields across
+     * precisions, and a program writing a wider element than this run sized for must
+     * land inside the BO rather than past it. */
+    if (rocket_bo_alloc(fd, obytes * 2, &o_bo) < 0) goto done;
+    if (rocket_bo_alloc(fd, sizeof ops, &r_bo) < 0) goto done;
+
+    /* The impulse: one pixel, a distinct power of two per image channel. With the
+     * input zero point at 0x80 the converter's offset is zero, so the raw byte IS the
+     * value the MAC sees. */
+    rocket_bo_prep(fd, &in_bo, 1, 0);
+    memset(in_bo.ptr, 0, in_bytes);
+    {
+        unsigned c, bias8 = (unsigned)((inzp + 0x80) & 0xFF);
+        for (c = 0; c < ic; c++) {
+            size_t at = ((size_t)y0 * iw + x0) * ic + c;
+            if (fp16) ((_Float16 *)in_bo.ptr)[at] = (_Float16)(1u << c);
+            else      ((uint8_t  *)in_bo.ptr)[at] = (uint8_t)((1u << c) + bias8);
+        }
+        /* The whole image sits at the zero point, so every tap but the impulse's
+         * contributes nothing once the converter has subtracted it. */
+        if (!fp16 && bias8) memset(in_bo.ptr, (int)bias8, in_bytes);
+        if (!fp16 && bias8)
+            for (c = 0; c < ic; c++)
+                ((uint8_t *)in_bo.ptr)[((size_t)y0 * iw + x0) * ic + c] =
+                    (uint8_t)((1u << c) + bias8);
+    }
+    rocket_bo_fini(fd, &in_bo);
+
+    rocket_bo_prep(fd, &b_bo, 1, 0);
+    rocket_rk3576_pack_coeff_prec(b_bo.ptr, coeff, bias, oc,
+                                  fp16 ? precision_float16 : precision_int8);
+    rocket_bo_fini(fd, &b_bo);
+
+    p.ic = (uint16_t)ic; p.ih = (uint16_t)ih; p.iw = (uint16_t)iw;
+    p.oc = (uint16_t)oc; p.oh = (uint16_t)oh; p.ow = (uint16_t)ow;
+    p.kh = (uint16_t)kh; p.kw = (uint16_t)kw;
+    p.stride_y = (uint8_t)st; p.stride_x = (uint8_t)st;
+    p.pad_top = (uint8_t)pad; p.pad_left = (uint8_t)pad;
+    p.int8_out = fp16 ? 0 : 1;
+    /* out == acc, so the surface value is weight x lane value directly. */
+    p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
+    p.input_zero_point = (uint8_t)(fp16 ? 0 : inzp);
+    p.output_zero_point = (uint8_t)(fp16 ? 0 : 0x80);
+    p.weight_zero_point = (uint8_t)(fp16 ? 0 : 0x80);
+    p.tasks       = ops;
+    p.input_dma   = in_bo.dma_address;
+    p.weights_dma = w_bo.dma_address;
+    p.bias_dma    = b_bo.dma_address;
+    p.output_dma  = o_bo.dma_address;
+    p.ih_full = (uint16_t)ih; p.oh_full = (uint16_t)oh;
+
+    in_h[0] = in_bo.handle; in_h[1] = w_bo.handle;
+    in_h[2] = b_bo.handle;  in_h[3] = r_bo.handle;
+    out_h[0] = o_bo.handle;
+
+    if ((fp16 ? gen_conv2d_fp16_rk3576(&p) : gen_conv2d_int8_rk3576(&p)) != 0) {
+        printf("fcmap: generator failed\n"); goto done;
+    }
+    /* The int8 first-conv program beside the fp16 one at the SAME geometry. The fp16
+     * program computes and the int8 one does not, so the difference between them is
+     * the search space, and it is a handful of registers rather than a sweep. */
+    if (env_int("ROCKET_G_FCMAP_DUMP", 0) && !fp16) {
+        conv_params_t q = p;
+        uint64_t *fops = calloc(RK3576_CONV_TASK_OPS, sizeof *fops);
+        unsigned n8 = p.task_count, nf = 0, a, b_i;
+        if (fops) {
+            q.tasks = fops; q.int8_out = 0;
+            q.input_zero_point = 0; q.output_zero_point = 0; q.weight_zero_point = 0;
+            if (gen_conv2d_fp16_rk3576(&q) == 0) nf = q.task_count;
+        }
+        printf("fcmap: program dump — int8 %u ops, fp16 %u ops\n", n8, nf);
+        for (a = 0; a < n8; a++) {
+            unsigned blk = (unsigned)(ops[a] >> 48), reg = (unsigned)(ops[a] & 0xFFFF);
+            uint32_t v8 = (uint32_t)(ops[a] >> 16), vf = 0;
+            int found = 0;
+            for (b_i = 0; b_i < nf; b_i++)
+                if ((unsigned)(fops[b_i] >> 48) == blk &&
+                    (unsigned)(fops[b_i] & 0xFFFF) == reg) {
+                    vf = (uint32_t)(fops[b_i] >> 16); found = 1; break;
+                }
+            if (!found)
+                printf("  blk %04x reg %04x  int8 %08x   fp16 --------  (absent)\n",
+                       blk, reg, v8);
+            else
+                printf("  blk %04x reg %04x  int8 %08x   fp16 %08x%s\n", blk, reg, v8,
+                       vf, v8 == vf ? "" : "   <-- DIFFERS");
+        }
+        free(fops);
+        /* Re-emit, since the fp16 pass above clobbered nothing but the copy. */
+    }
+    rocket_bo_prep(fd, &r_bo, 1, 0);
+    memcpy(r_bo.ptr, ops, p.task_count * sizeof(uint64_t));
+    rocket_bo_fini(fd, &r_bo);
+
+    printf("fcmap: oc=%u ic=%u k=%ux%u s=%u pad=%u plane %ux%u -> %ux%u, impulse at (%u,%u), "
+           "cube %zu bytes declared / %zu allocated\n",
+           oc, ic, kh, kw, st, pad, iw, ih, ow, oh, y0, x0, w_declared, w_bytes);
+
+    /* Preflight: an all-ones cube. If the program writes nothing here, every dead
+     * offset below means nothing at all. */
+    {
+        const int8_t *o;
+        unsigned i, hits = 0;
+        rocket_bo_prep(fd, &w_bo, 1, 0);
+        if (fp16) {   /* fp16 1.0; a byte fill would be a denormal that underflows */
+            size_t j;
+            for (j = 0; j < w_bytes / 2; j++) ((uint16_t *)w_bo.ptr)[j] = 0x3C00;
+        } else {
+            memset(w_bo.ptr, 1, w_bytes);
+        }
+        rocket_bo_fini(fd, &w_bo);
+        rocket_bo_prep(fd, &o_bo, 1, 0);
+        memset(o_bo.ptr, SENTINEL, obytes * 2);
+        rocket_bo_fini(fd, &o_bo);
+        sleep_ms(gap);
+        if (rocket_submit_matmul(fd, &r_bo, p.task_count, in_h, 4, out_h, 1, 2000) != 0) {
+            printf("fcmap: preflight submit failed\n"); goto done;
+        }
+        if (rocket_bo_prep(fd, &o_bo, 0, 2000000000ull) < 0) {
+            printf("fcmap: preflight PREP_BO timed out\n"); goto done;
+        }
+        o = (const int8_t *)o_bo.ptr;
+        for (i = 0; i < obytes * 2; i++) if ((uint8_t)o[i] != SENTINEL) hits++;
+        rocket_bo_fini(fd, &o_bo);
+        printf("fcmap: preflight (all-ones cube) touched %u of %zu output bytes%s\n",
+               hits, obytes * 2, hits ? "" : "  — THE PROGRAM WROTE NOTHING");
+
+        /* How often does an identical program, resubmitted at this gap, come back
+         * with the surface never written? That rate is what the conv library's
+         * retry-and-power-idle guard pays for, and it is the thing to measure before
+         * sweeping thousands of submits at five seconds apiece. */
+        if (rep > 1) {
+            unsigned r, wrote = hits ? 1u : 0u;
+            for (r = 1; r < rep; r++) {
+                rocket_bo_prep(fd, &o_bo, 1, 0);
+                memset(o_bo.ptr, SENTINEL, obytes * 2);
+                rocket_bo_fini(fd, &o_bo);
+                sleep_ms(gap);
+                if (rocket_submit_matmul(fd, &r_bo, p.task_count, in_h, 4, out_h, 1,
+                                         2000) != 0) break;
+                if (rocket_bo_prep(fd, &o_bo, 0, 2000000000ull) < 0) break;
+                o = (const int8_t *)o_bo.ptr;
+                for (i = 0; i < obytes * 2; i++)
+                    if ((uint8_t)o[i] != SENTINEL) { wrote++; break; }
+                rocket_bo_fini(fd, &o_bo);
+            }
+            printf("fcmap: %u of %u submits wrote at a %d ms gap\n", wrote, rep, gap);
+            rc = 0; goto done;
+        }
+        if (!hits) goto done;
+    }
+
+    for (off = 0; off < span; off++) {
+        unsigned c, y, x, hits = 0, hc = 0, hy = 0, hx = 0;
+        int hv = 0;
+        const int8_t *o;
+
+        rocket_bo_prep(fd, &w_bo, 1, 0);
+        memset(w_bo.ptr, 0, w_bytes);
+        ((uint8_t *)w_bo.ptr)[off] = 1;
+        rocket_bo_fini(fd, &w_bo);
+
+        rocket_bo_prep(fd, &o_bo, 1, 0);
+        memset(o_bo.ptr, SENTINEL, obytes * 2);
+        rocket_bo_fini(fd, &o_bo);
+
+        sleep_ms(gap);
+        if (rocket_submit_matmul(fd, &r_bo, p.task_count, in_h, 4, out_h, 1, 2000) != 0) {
+            printf("fcmap: submit failed at off %u\n", off); goto done;
+        }
+        if (rocket_bo_prep(fd, &o_bo, 0, 2000000000ull) < 0) {
+            printf("fcmap: PREP_BO timed out at off %u\n", off); goto done;
+        }
+        o = (const int8_t *)o_bo.ptr;
+        for (c = 0; c < oc; c++)
+            for (y = 0; y < oh; y++)
+                for (x = 0; x < ow; x++) {
+                    size_t at = fp16 ? ((size_t)(ow * oh) * c2out * (c / c2out) +
+                                        (size_t)c2out * (y * ow + x) + (c % c2out))
+                                     : out_index(surf_elems, ow, c, y, x);
+                    int v = fp16 ? (int)((const _Float16 *)o)[at] : o[at];
+                    int sent = fp16 ? ((const uint16_t *)o)[at] ==
+                                      ((SENTINEL << 8) | SENTINEL)
+                                    : (uint8_t)v == SENTINEL;
+                    if (v && !sent) {
+                        if (!hits) { hc = c; hy = y; hx = x; hv = v; }
+                        hits++;
+                    }
+                }
+        rocket_bo_fini(fd, &o_bo);
+
+        if (!hits) {
+            printf("  off %4u -> dead\n", off);
+        } else {
+            /* The value is the sum of the lanes this byte contracted; a power of two
+             * names exactly one, anything else names a set. */
+            int lane = -1;
+            if (hv > 0 && (hv & (hv - 1)) == 0) { lane = 0; while ((1 << lane) != hv) lane++; }
+            live++;
+            printf("  off %4u -> oc=%-3u kh=%-2d kw=%-2d lane=%-3s v=%-4d%s\n", off, hc,
+                   (int)y0 - (int)(st * hy) + (int)pad, (int)x0 - (int)(st * hx) + (int)pad,
+                   lane < 0 ? "MIX" : (const char *[]){"0","1","2","3"}[lane & 3], hv,
+                   hits > 1 ? "  (MULTIPLE positions)" : "");
+        }
+    }
+    printf("fcmap: %u of %u cube bytes live (declared extent %zu)\n",
+           live, span, w_declared);
+    rc = 0;
+done:
+    if (r_bo.ptr)  rocket_bo_free(fd, &r_bo);
+    if (o_bo.ptr)  rocket_bo_free(fd, &o_bo);
+    if (b_bo.ptr)  rocket_bo_free(fd, &b_bo);
+    if (w_bo.ptr)  rocket_bo_free(fd, &w_bo);
+    if (in_bo.ptr) rocket_bo_free(fd, &in_bo);
+    free(bias);
+    return rc;
+}
+
+/* ============================================================================
  * SECTION — dwbias: read the depthwise COEFFICIENT indexing off the hardware
  *
  * Depthwise drives exactly EIGHT live output channels at C=32 and none at all above
@@ -1287,6 +1617,11 @@ int main(int argc, char **argv)
 
     if (argc > 1 && !strcmp(argv[1], "dwmap")) {
         int r = dw_map(fd);
+        rocket_close(fd);
+        return r;
+    }
+    if (argc > 1 && !strcmp(argv[1], "fcmap")) {
+        int r = fc_map(fd);
         rocket_close(fd);
         return r;
     }

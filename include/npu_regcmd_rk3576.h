@@ -261,6 +261,74 @@ int rocket_rk3576_weight_conv_fp16(unsigned oc_total, unsigned ic_total,
 unsigned rocket_rk3576_pad_ic(unsigned ic);
 unsigned rocket_rk3576_pad_oc(unsigned oc);
 
+/* ---- The first conv's FLOAT weight cube -------------------------------------
+ *
+ * The packed-image datapath contracts FOUR LANES per pixel whatever the image
+ * carries, so this cube has a lane axis of four rather than an input-channel axis,
+ * and its taps stay on their own axes — no 4*kw fold and no round-up to sixteen.
+ * Decoded from manufactured float captures at ic 3/4, k 1/3/5/7, oc 16/32/48/64:
+ *
+ *   slot(oc, c, kh, kw) = (oc/16) * (KH*KW*64)
+ *                       + kh * (KW*64) + kw * 64
+ *                       + (oc%16) * 4 + c
+ *
+ * 16-bit slots, four lanes per (output channel, tap) with lane c carrying image
+ * channel c, output channels interleaved in groups of sixteen inside one tap, tap
+ * axis kh-outer. Size the buffer with _bytes(), which rounds oc up to a whole group.
+ *
+ * This is the FLOAT cube; the int8 one below is a different object.
+ * [source-confirmed, RKNN-Toolkit2 rk3576 float build] */
+int rocket_rk3576_weight_argb_fp16(unsigned oc_total, unsigned ic_total,
+                                   unsigned kh_total, unsigned kw_total,
+                                   unsigned oc, unsigned ic, unsigned kh, unsigned kw);
+size_t rocket_rk3576_weight_argb_fp16_bytes(unsigned oc, unsigned kh, unsigned kw);
+int rocket_rk3576_argb_fp16_pack_weights(void *dst, size_t dst_bytes,
+                                         const void *src, unsigned oc, unsigned ic,
+                                         unsigned kh, unsigned kw);
+
+/* ---- The first conv's INT8 weight cube ---------------------------------------
+ *
+ * A weight is ONE BYTE here, output channels group by THIRTY-TWO, and the tap ROW
+ * sits outside that group while the tap COLUMN is folded into the same 16-byte row as
+ * the four lanes — none of which the float cube does. Read off the part with an
+ * impulse image and a one-byte cube (rk3576_conv_gate fcmap):
+ *
+ *   byte(oc, c, kh, kw) = (oc/32) * (KH * R * 32)
+ *                       + kh * (32 * R)
+ *                       + (oc%32) * R
+ *                       + kw * 4
+ *                       + c            R = round16(4*KW)
+ *
+ * Lane c carries image channel c and the lanes past `ic` are don't-care; 4*KW of each
+ * R-byte row is live. A bijection over every live byte at oc 32 and 64, k 3/5/7 and
+ * ic 3 and 4. The 32-channel group is observable only above one group — at oc=32 a
+ * flat oc*R fits equally. [HW sweep, H96 MAX M9]
+ *
+ * TWO GEOMETRY BOUNDS COME WITH THE PATH, and no capture shows either because every
+ * captured first conv is a 3x3 stride-2 SAME convolution:
+ *
+ *   THE LEFT PAD MUST BE NON-ZERO. At pad_left = 0 the DPU writes nothing at all —
+ *   an untouched surface, not a wrong one — at every plane, stride, kernel and
+ *   channel count. CNA_PAD_CON0's pad_left field decides it alone: forcing 0x0100
+ *   into a zero-pad program makes that program write, and forcing 0 into a working
+ *   one stops it, while the pad_top field does neither.
+ *
+ *   THE OUTPUT WIDTH MUST BE iw/stride. Anything else writes a full surface that is
+ *   SHEARED — the tap a weight lands on drifts one output column per output row, the
+ *   signature of a row-stride mismatch — and it shears for a narrow ow and a wide one
+ *   alike. Together the two are what SAME padding means.
+ *
+ * The output-channel count follows the direct path's multiple-of-32 rule (oc=16
+ * writes nothing) but NOT the float first conv's 32-channel per-program cap: one int8
+ * program delivers 64 output channels. [HW sweep, H96 MAX M9] */
+int rocket_rk3576_weight_argb_int8(unsigned oc_total, unsigned ic_total,
+                                   unsigned kh_total, unsigned kw_total,
+                                   unsigned oc, unsigned ic, unsigned kh, unsigned kw);
+size_t rocket_rk3576_weight_argb_int8_bytes(unsigned oc, unsigned kh, unsigned kw);
+int rocket_rk3576_argb_int8_pack_weights(void *dst, size_t dst_bytes,
+                                         const void *src, unsigned oc, unsigned ic,
+                                         unsigned kh, unsigned kw);
+
 /* ---- The depthwise weight cube ----------------------------------------------
  *
  * Not the RK3588's, and not the direct path's. Decoded from vendor captures carrying
@@ -557,6 +625,15 @@ typedef struct {
 int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
                             rocket_rk3576_row_task *out, unsigned max_tasks,
                             unsigned *count);
+
+/* The same plan at another precision, which changes three things and nothing else: the
+ * CBUF entry count per row, the row cap the allowance affords, and — on the packed-image
+ * first conv — the feature offsets, since a float packed image is `ic` interleaved
+ * halfwords per pixel where an int8 one is bytes. rocket_rk3576_plan_rows() is this at
+ * precision_int8. */
+int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
+                                 rocket_rk3576_row_task *out, unsigned max_tasks,
+                                 unsigned *count);
 
 /* ---- Emitting a windowed task that REUSES the previous task's overlap rows ----
  *

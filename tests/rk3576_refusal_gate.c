@@ -44,9 +44,11 @@
 #include "rocket_reduce.h"
 
 static int fails;
+static int checks;
 
 static void expect_refused(const char *what, int rc)
 {
+    checks++;
     if (rc == 0) {
         printf("  FAIL   %-28s returned 0 — it emitted the RK3588 encoding and the job "
                "wrote nothing\n", what);
@@ -59,6 +61,7 @@ static void expect_refused(const char *what, int rc)
 /* The inverse assertion, for an entry that now reaches this part's own encoder. */
 static void expect_ran(const char *what, int rc)
 {
+    checks++;
     if (rc != 0) {
         printf("  FAIL   %-28s refused (%d) — this part has an encoder for it and the "
                "entry is supposed to dispatch there\n", what, rc);
@@ -119,6 +122,44 @@ int main(void)
                                          1.0f, 1.0f, 64.0f, 0, 0, 0, qout));
     }
 
+    /* The FIRST CONV. A packed image runs the CNA's own sub-encoding and BOTH
+     * precisions of it compute, so what is asserted here is the shape of the int8
+     * envelope rather than a blanket refusal — the bounds it adds are silent when
+     * violated (a zero left pad writes an untouched surface; a wrong output width
+     * writes a sheared one), which makes each refusal load-bearing in both directions.
+     *
+     * `rocket_conv2d_int8()` stays refused: it is the int32-output entry, and this
+     * part's first conv writes int8 through the DPU's requant. */
+    {
+        rocket_conv2d_desc d = {0};
+        static _Float16 fin[3 * 32 * 32], fW[16 * 3 * 9], fout[16 * 32 * 32];
+        static int8_t  qin[3 * 32 * 32], qW[32 * 3 * 9], qout[32 * 32 * 32];
+        static int32_t qout32[16 * 32 * 32];
+        d.ic = 3; d.ih = 32; d.iw = 32; d.oc = 16;
+        d.kh = 3; d.kw = 3; d.stride_y = 1; d.stride_x = 1;
+        d.pad_top = 1; d.pad_left = 1; d.dil_y = 1; d.dil_x = 1;
+        expect_ran("rocket_conv2d_fp16 first conv",
+                   rocket_conv2d_fp16(fd, &d, fin, fW, fout));
+        expect_refused("rocket_conv2d_int8 first conv (int32 out)",
+                       rocket_conv2d_int8(fd, &d, qin, qW, qout32));
+        /* oc=16 is a partial 32-channel group and writes nothing. */
+        expect_refused("rocket_conv2d_int8_rk3576 first conv, oc 16",
+                       rocket_conv2d_int8_rk3576(fd, &d, qin, qW, NULL,
+                                                 1.0f, 1.0f, 64.0f, 0, 0, 0, qout));
+        d.oc = 32;
+        expect_ran("rocket_conv2d_int8_rk3576 first conv",
+                   rocket_conv2d_int8_rk3576(fd, &d, qin, qW, NULL,
+                                             1.0f, 1.0f, 64.0f, 0, 0, 0, qout));
+        d.pad_top = 0; d.pad_left = 0;
+        expect_refused("rocket_conv2d_int8_rk3576 first conv, pad_left 0",
+                       rocket_conv2d_int8_rk3576(fd, &d, qin, qW, NULL,
+                                                 1.0f, 1.0f, 64.0f, 0, 0, 0, qout));
+        d.pad_top = 1; d.pad_left = 1; d.ic = 1;
+        expect_refused("rocket_conv2d_int8_rk3576 first conv, one image channel",
+                       rocket_conv2d_int8_rk3576(fd, &d, qin, qW, NULL,
+                                                 1.0f, 1.0f, 64.0f, 0, 0, 0, qout));
+    }
+
     /* Pooling, on the PPU. */
     {
         rocket_pool_desc d = {0};
@@ -146,7 +187,8 @@ int main(void)
                        rocket_reduce_feature_fp16(fd, M, H, in, out, 0));
     }
 
-    printf("== %d entries behaved as required, %d did not ==\n", 9 - fails, fails);
+    printf("== %d entries behaved as required, %d did not ==\n",
+           checks - fails, fails);
     rocket_close(fd);
     return fails ? 1 : 0;
 }

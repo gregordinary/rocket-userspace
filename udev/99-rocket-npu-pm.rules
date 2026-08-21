@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# 99-rocket-npu-pm.rules — let an unprivileged NPU process drive the RK3576 power cycle.
+#
+# WHY THIS EXISTS. On the RK3576 a job whose DPU output element is wider than one byte
+# (any fp16 convolution, either int32 matmul writer) leaves the NEXT submit completing
+# normally and writing nothing. What clears it is the runtime-PM autosuspend cycling the
+# NPU power domain, not elapsed time — so the library has to wait for that cycle before
+# the next submit, and mainline sizes the autosuspend delay at 50 ms for a display
+# pipeline. Waiting out that timer costs ~105 ms per call.
+#
+# Instead the library DRIVES the transition: write a zero delay, wait for the device to
+# report `suspended`, put the original delay back. That costs one real power cycle
+# (224x224 k3 s2 at fp16: 13.75 ms against 226) and leaves the steady-state policy every
+# other consumer of the NPU sees unchanged.
+#
+# It needs write access to `power/autosuspend_delay_ms`, which is root-only by default.
+# This rule hands that one file to the `render` group — the same group that already owns
+# `/dev/accel/accel0`, so it grants nothing to anyone who could not already submit NPU
+# work. Without it the library falls back to the plain idle and simply pays the timer.
+#
+# Install:
+#   sudo install -m 0644 udev/99-rocket-npu-pm.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=platform
+#
+# Verify (as an unprivileged user in `render`):
+#   test -w /sys/bus/platform/devices/27700000.npu/power/autosuspend_delay_ms && echo ok
+#
+# Turn the behaviour off at runtime regardless: ROCKET_RK3576_PM_KICK=0.
+#
+# LOWERING THE DELAY OUTRIGHT IS THE OTHER OPTION AND IT IS NOT FREE. A resume costs
+# about 230 us, and a lower delay makes every job whose inter-job gap falls between the
+# new delay and the old one pay it — at a 16.7 ms gap, one 60 Hz frame, a submit goes
+# from 1124 us to 1372. Prefer this rule; reach for a lower delay only on a box whose NPU
+# work is the only thing that matters.
+
+ACTION=="add|change", SUBSYSTEM=="platform", DRIVERS=="rocket", \
+  RUN+="/bin/sh -c 'chgrp render $sys$devpath/power/autosuspend_delay_ms 2>/dev/null; chmod g+w $sys$devpath/power/autosuspend_delay_ms 2>/dev/null'"
