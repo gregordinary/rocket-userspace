@@ -16,8 +16,9 @@
  * would not say so.
  *
  * The `refuse` column is a result, not an omission: K is the contraction and is not
- * tiled here, so a K past what one task holds must come back ROCKET_E_SHAPE rather
- * than compute something quietly wrong.
+ * tiled here, so a K past what one task holds must come back an error from BOTH the
+ * planner and the entry rather than compute something quietly wrong — or, as the K
+ * rows are really there for, rather than take a route that wedges the part.
  *
  * Run with `sudo -E` on the RK3576. Exits 2 (skip) on any other part.
  */
@@ -36,7 +37,7 @@
 typedef struct {
     const char *name;
     int M, K, N;
-    int refuse;      /* 1 = the planner MUST refuse; running it is the bug */
+    int refuse;      /* 1 = planner AND entry MUST refuse; running it is the bug */
 } mm_shape;
 
 static const mm_shape SHAPES[] = {
@@ -69,10 +70,13 @@ static const mm_shape SHAPES[] = {
     {"m100",          100,   288,   96, 0},
     {"m33-n160",       33,   160,  160, 0},
     {"k1120",          40,  1120,  224, 0},
-    /* past one task's contraction: K is split through the int32 writer and the requant
-     * moves to the host. These used to be refusals. */
-    {"k8192",          32,  8192,  128, 0},
-    {"k16384",         16, 16384,   64, 0},
+    /* Past one task's contraction (K >= 6176) the entry REFUSES. Both of these compute
+     * when the route is opted into — they ran green here for several sessions — but the
+     * same route wedges the NPU across processes at prefill scale, and where between the
+     * two the boundary lies is not known. The route's own coverage is in I32_SHAPES
+     * below, which calls the int32 entry directly. */
+    {"k8192",          32,  8192,  128, 1},
+    {"k16384",         16, 16384,   64, 1},
     /* the refusals that remain: neither is a K bound */
     {"k-unaligned",    32,   100,   32, 1},   /* K%32 */
     {"n-unaligned",    32,   128,   48, 1},   /* N%32 */
@@ -171,14 +175,32 @@ static int run_shape(int fd, const mm_shape *s, int verbose)
 
     jobs = rocket_matmul_plan_int8_rk3576(M, K, N, &Mt, &Kt, &Nt);
     if (s->refuse) {
-        printf("  %-6s %-14s %5dx%-5dx%-5d %s\n",
-               jobs < 0 ? "PASS" : "RAN", s->name, M, K, N,
-               jobs < 0 ? "refused, as the table says" : "PLANNED — it should not have");
-        return jobs < 0 ? 0 : 1;
+        /* Drive the ENTRY as well as the planner. The two agree by contract now, and the
+         * K rows are here because the entry declining is the property that keeps the
+         * device alive — a plan that refuses beside an entry that submits anyway is
+         * exactly the state this row exists to catch. Operands are zeroed: nothing may
+         * reach the part, so their contents cannot matter. */
+        /* WHICH refusal, not merely that there was one. The two classes are told apart
+         * by the shape itself — a misaligned axis is ROCKET_E_SHAPE, and a K with no
+         * single-task plan is ROCKET_E_UNSUPPORTED — and they were briefly collapsed
+         * onto one code, which reported a K>=6176 contraction bound for a K of 100. */
+        int want = (K % 32 || N % 32) ? ROCKET_E_SHAPE : ROCKET_E_UNSUPPORTED;
+        A = calloc((size_t)M * K, 1);
+        B = calloc((size_t)N * K, 1);
+        C = calloc((size_t)M * N, 1);
+        if (!A || !B || !C) { rc = 1; goto done; }
+        rc = rocket_matmul_int8_rk3576(fd, M, K, N, A, B, NULL, 1.0f / 64.0f, C);
+        printf("  %-6s %-14s %5dx%-5dx%-5d %s (plan %s, entry %d, wanted %d)\n",
+               (jobs < 0 && rc == want) ? "PASS" : "RAN", s->name, M, K, N,
+               (jobs < 0 && rc == want) ? "refused, as the table says"
+                                        : "NOT the refusal the table says",
+               jobs < 0 ? "refused" : "planned", rc, want);
+        rc = (jobs < 0 && rc == want) ? 0 : 1;
+        goto done;
     }
-    /* The single-task planner refuses a K past one contraction and the entry runs it
-     * anyway, through the int32 writer. Which side of that boundary a shape lands on
-     * decides which requant the model has to apply. */
+    /* Both refuse a K past one contraction now, so nothing below reaches the K split.
+     * `deep` is kept for the opted-in route (ROCKET_RK3576_MM_KSPLIT=1), where the
+     * requant moves to the host and the model has to follow it. */
     if (jobs < 0) deep = 1;
 
     A    = calloc((size_t)M * K, 1);

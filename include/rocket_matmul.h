@@ -162,19 +162,108 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
  *   - N is TILED, and the tile is what buys throughput: a submit costs ~1.4 ms
  *     whatever it carries, so MACs per submit is the only lever and N is the only
  *     free axis. ROCKET_RK3576_MM_NT overrides the default tile.
- *   - K IS tiled, past what one task contracts, through the int32-output entry below,
- *     and the requant is then applied on the host. Inside one task's contraction the
- *     requant is the DPU's own. The boundary is not visible in the result but it is in
- *     the cost — see the int32 entry.
+ *   - K IS NOT tiled here, and the entry REFUSES a K it cannot contract in one task.
+ *     The boundary is K >= 6176, for every (M, N) enumerated: the planner shrinks the
+ *     output-channel tile by halves to 32 channels before it gives up, so what decides
+ *     it is the CBUF pool against a one-group weight cube, a condition on K alone. Past
+ *     it the return is ROCKET_E_UNSUPPORTED and nothing is submitted. The K-split route
+ *     that used to run those shapes — the int32 entry below — wedges the NPU across
+ *     processes until the board is rebooted, so a caller that needs a larger K runs it
+ *     on the host. ROCKET_RK3576_MM_KSPLIT=1 takes the route anyway, for measurement.
+ *   - BELOW that boundary K is free, but it is not FLAT: the output tile collapses from
+ *     1024 channels to 32 in one step at K > 4992, which multiplies the submit count by
+ *     32 at M=512 N=2048 with nothing refusing and nothing computing wrong. A caller
+ *     picking a K for speed should stay at or below 4608.
+ *
+ * WHAT ONE PER-TENSOR OUTPUT SCALE COSTS AN LLM. `scale` is the OUTPUT's alone: A and B
+ * arrive quantized, so every input-side choice is the caller's. Simulated exactly on two
+ * real models' own prefill activations at M=512, every offloadable projection replaced,
+ * wikitext-2 perplexity against an fp16 floor of 1.000x:
+ *
+ *     per-tensor A and B          SmolLM2-1.7B 2.26x      Qwen2.5-1.5B 1.11x
+ *     per-row A, per-channel B    SmolLM2-1.7B 86x        Qwen2.5-1.5B 1.03x
+ *
+ * TWO THINGS FOLLOW FOR A CALLER. The cost is model-dependent by more than an order of
+ * magnitude, so measure a candidate model end to end — a per-GEMM norm does not predict
+ * it, and prefers the arm that is 86x worse. And per-axis INPUT scales are a coin flip
+ * here rather than an improvement: free at this interface, better on every per-GEMM
+ * number, and on one model of two catastrophic. Mechanism open — the error-concentration
+ * story does not separate the models, and SmolLM2's damage is calibration rather than
+ * ranking (top-1 60.7% against the per-tensor arm's 62.0%, perplexity 25 -> 964).
+ *
+ * WHAT RECOVERS IT, on both models, and neither half alone: an orthonormal Hadamard
+ * rotation along K before quantization (host-side, no library change, 1.31x / 1.02x on
+ * its own) plus a per-output-channel output requant (a library change — this DPU's
+ * epilogue is `(acc + A[oc]) * C[oc]` then one `(v*MUL)>>SHIFT`, and the per-axis
+ * convolution path programs that C ramp today; 1.54x / 1.06x on its own). Together they
+ * measure 1.004x and 1.002x at 97% top-1 — with an EXACT per-column scale, so that is
+ * the ceiling of the route rather than what the integer ramp would deliver.
+ * [host arithmetic over two real models, 2026-08-10]
  *
  * rocket_matmul_plan_int8_rk3576 previews the tiling (pure, no HW) and returns the
- * NPU job count, or <0 on a shape this part cannot run. It reports the SINGLE-TASK
- * plan, so a K past one contraction returns ROCKET_E_SHAPE there while
- * rocket_matmul_int8_rk3576 still runs it. [HW sweep, H96 MAX M9] */
+ * NPU job count, or <0 on a shape this part cannot run — which now agrees with what
+ * the entry does, since both refuse the same K. [HW sweep, H96 MAX M9] */
 int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *Nt);
 int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
                               const int8_t *A, const int8_t *B,
                               const int32_t *bias, float scale, int8_t *C);
+
+/* ---- the same matmul with a PER-OUTPUT-COLUMN output scale -------------------
+ *
+ *     C[m][n] = sat8( round_half_to_even( (sum_k A[m][k]*B[n][k] + bias[n])
+ *                                         * scale_n[n] ) )
+ *
+ * Every shape rule, refusal and hazard of rocket_matmul_int8_rk3576() applies unchanged
+ * — this is that entry with the output scale given per column instead of per tensor.
+ * `scale_n` has N entries and every one must be positive.
+ *
+ * WHY IT EXISTS. One per-tensor output scale is what blocks an LLM from using the
+ * per-tensor entry: simulated on two real models' own prefill activations, it costs
+ * 2.26x perplexity on SmolLM2-1.7B and 1.11x on Qwen2.5-1.5B, and a per-column output
+ * requant recovers those to 1.54x / 1.06x on its own and to 1.004x / 1.002x composed
+ * with a host-side Hadamard rotation along K. [host arithmetic, two models, 2026-08-10]
+ *
+ * HOW IT IS EXPRESSED, and where its accuracy therefore stops. The DPU has ONE (MUL,
+ * SHIFT) per task, so the per-column part rides on the coefficient group's int16 C
+ * term: the epilogue is `(acc + bias[n]) * C[n]` in saturating int32 and then the shared
+ * `(v*MUL)>>SHIFT`. Column n's gain is C[n] * MUL/2^SHIFT, so its resolution is
+ * 0.5/C[n] — and C is capped not by its int16 field but by that column's worst-case
+ * accumulator, because `(acc + bias)*C` must not overflow int32. At a GEMM's contraction
+ * depth that cap binds hard: the bound is 128*sum_k|B[n][k]|, so a K of a few thousand
+ * leaves C in the low hundreds whatever the field allows. `worst_rel_err` (may be NULL)
+ * reports the largest relative gain error the ramp actually delivered over all columns,
+ * which is the only number that separates this from an exact per-column scale — READ IT
+ * rather than assuming the 1.004x above, which was simulated with exact scales and is
+ * the route's ceiling, not this entry's.
+ *
+ * The ramp is planned PER N TILE, since the (MUL, SHIFT) is per task. A tile whose
+ * columns share a scale loses nothing; a wide spread inside one tile is where the
+ * resolution goes — forcing eight tiles took an 8x-spread K=1024 cell from 1.53% to
+ * 0.265%. That measurement is the SORTED case and this entry does NOT sort: the columns
+ * are tiled in the caller's order, so a caller whose scales are interleaved gets the
+ * whole spread in every tile. Handing the columns over already grouped by scale, and
+ * un-permuting the result, is the caller's lever until the entry takes a permutation.
+ *
+ * WHERE `scale_n` COMES FROM, AND WHAT IT COSTS. This entry cannot compute it: the scale
+ * a column wants is set by that column's accumulator, which is what the call produces.
+ * The 1.004x / 1.002x above, and every other perplexity figure on this route, used an
+ * ORACLE scale taken from the accumulator being quantized, so they are the route's best
+ * case and not a caller's. What a caller can actually supply has been measured on the
+ * same windows: a scale FROZEN from a calibration pass over disjoint text costs
+ * Qwen2.5-1.5B **1.047x fp32 at 87.3% top-1** against the oracle's 1.0025x at 96.6% —
+ * an excess eighteen times the oracle arm's, and the largest single term in the route.
+ * The pure analytic bound `128*sum_k|B[n][k]|` — the same term that caps C below — is
+ * NOT a usable substitute: it overshoots a real column's accumulator by ~60x, spending
+ * six bits of the int8 output on headroom nothing reaches. **So a caller must calibrate,
+ * and must budget for what calibration costs it.** [host arithmetic, 2026-08-11]
+ *
+ * Measured: 0 wrong of 698368 elements against a host model of this ramp, over six
+ * shapes at two column-scale spreads, including a forced eight-tile run.
+ * [HW gate, H96 MAX M9, tests/rk3576_mm_requant, 2026-08-10] */
+int rocket_matmul_int8_rk3576_perc(int fd, int M, int K, int N,
+                                   const int8_t *A, const int8_t *B,
+                                   const int32_t *bias, const float *scale_n,
+                                   int8_t *C, double *worst_rel_err);
 
 /* ---- the RK3576's int32-output matmul, and the K split ------------------
  *
@@ -188,7 +277,18 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
  * every thirty-two. This entry gets around that by programming four times the output
  * channels and scattering the real ones into the delivered slots — correct, and a
  * quarter of the int8 path's MACs per submit. Use it for the K a single task cannot
- * contract, not as the default matmul. [HW sweep, H96 MAX M9] */
+ * contract, not as the default matmul. [HW sweep, H96 MAX M9]
+ *
+ * WHAT IT CAN DO TO THE BOARD. At M=512 K=8192 N=2048 — 256 submits, a 4.5 MiB weight
+ * cube, the narrow writer — this entry's write guard spent its eight power cycles, the
+ * call returned -4, and the part raised the driver's DMA-error WARN_ON. The NPU then
+ * computed nothing in ANY process: shapes that had run clean minutes earlier came back
+ * -4, and a module reload left core 0 failing to probe at -22. Only a reboot cleared
+ * it. Small cells in the class do compute (M=32 K=8192 N=128 and M=16 K=16384 N=64 run
+ * green in the gate list; M=64 K=8192 N=32 scored exact three times), and where the
+ * boundary between them lies is NOT known — one shape reached the wedge and each
+ * occurrence costs a reboot. rocket_matmul_int8_rk3576() therefore no longer falls onto
+ * this entry at all. [HW, H96 MAX M9, one shape, 2026-08-07] */
 int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                                   const int8_t *A, const int8_t *B,
                                   const int32_t *bias, int32_t *C);

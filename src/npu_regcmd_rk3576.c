@@ -986,6 +986,81 @@ static inline unsigned r76_weight_slice_cap(unsigned oc)
     return ~0u;                      /* one group: the pool check governs */
 }
 
+/* THE TABLE ABOVE IS THE SPACE AT F=0, AND THE FEATURE ALLOWANCE IS THE OTHER HALF OF THE
+ * SAME POOL — so a slice the table calls safe is silently wrong once a rung is programmed.
+ *
+ * The emitter programs 4096+F granules for the feature side WHATEVER the plane's actual
+ * height is, so every granule of F is a granule the weight path does not get. The table
+ * was measured at F=0, where that leaves 3072 granules; at F it leaves 3072-F, and the
+ * usable part falls granule for granule with it. Charging that is one subtraction, and
+ * without it the failure is this file's usual signature: a full, correctly sized surface
+ * whose LEADING output-channel groups are bit-exact and whose trailing ones are wrong, at
+ * every row, with nothing to fault on.
+ *
+ * Measured on two shapes, four F values and two group counts, one task per cell, the plane
+ * held well inside the F=0 budget so a rung the part ignored would be harmless:
+ *
+ *   shape                    groups  slice     F      usable   part
+ *   112x112 k7 ic64 oc64     2       98 KiB    0      156 KiB  exact
+ *                                              1024    92 KiB  WRONG, chans 32-63 (1 of 2)
+ *                                              2048    28 KiB  no PC_DONE at all
+ *   112x112 k7 ic32 oc128    4       49 KiB    0      144 KiB  exact
+ *                                              1024    80 KiB  exact
+ *                                              2048    16 KiB  WRONG, chans 32-127 (3 of 4)
+ *
+ * Both wrong cells are shapes the SHIPPED pool check accepts (6688 and 6928 granules
+ * against 7168), and the first is what `rowmap`'s `k7ic64-g2` cell had been reporting as a
+ * dead F=1024 rung. It is not one: forcing F=1024 there is 3/3 wrong at all 30 plane
+ * heights from 7 to 36 — including heights needing 784 of 4096 granules, where a rung the
+ * part declined could not matter — while the same forced rung beside a 16-granule slice is
+ * exact at 42 of 42 cells over 1, 2 and 3 groups. The governing quantity is the SLICE
+ * against what F leaves, not the rung.
+ *
+ * Past the pool the failure stops being quiet: at F=2048 beside the 98 KiB slice the job
+ * raises no PC_DONE and the surface guard spends eight power cycles before the entry gives
+ * up with -4. So the pool check is a real cliff and this bound sits inside it.
+ *
+ * THE SLOPE IS MEASURED 1:1, at three group counts and two allowances. Reading the
+ * boundary directly — `slicemap`, a 4x2 plane, k=1 so the slice moves in 1 KiB steps,
+ * F forced so it is the only thing that changes — the last exact slice is:
+ *
+ *   groups   F=1024      F=2048      the weight path holds     usable = hold - reserve
+ *   2         96 KiB      32 KiB      2048 / 1024 granules      reserve 512 granules
+ *   3         85 KiB      21 KiB                                reserve 688
+ *   4         80 KiB      16 KiB                                reserve 768
+ *
+ * `hold` is `3072-F` granules and the reserve is CONSTANT in F at every group count, so
+ * the subtraction below is right to the granule. The intercepts that implies at F=0 are
+ * 160 / 149 / 144 KiB, against this table's 156 / 148 / 144, so the shipped numbers
+ * OVER-charge by 4 / 1 / 0 KiB — they refuse a few KiB early and never accept a slice the
+ * part computes wrong, which is the safe direction and is why they stand. They are not
+ * raised to the implied values because F=0 is the one point this sweep cannot reach
+ * directly: r76_conv_oc_tile() splits the output channels above 156 KiB, so a two-group
+ * conv past that never runs as two groups.
+ *
+ * A SLICE THAT IS AN EXACT MULTIPLE OF 512 GRANULES (32 KiB) COMPUTES ANYWAY, far above
+ * the cap — 96 KiB and 128 KiB are exact at F=1024 at all three group counts, and 64 and
+ * 32 KiB at F=2048, while every neighbouring KiB is wrong. A multiple of 16 KiB that is
+ * not one of 32 does not escape (112 KiB is wrong). So the bound has an alignment term
+ * this rule does not model, and modelling it would only ACCEPT more; it is left out
+ * deliberately. Over-charging refuses early and costs a shorter row window;
+ * under-charging computes a plausible wrong surface.
+ *
+ * The escape is a property of the slice's BYTE COUNT and not of the cube or the plane
+ * that produce it: at oc=128 and F=1024 the same map — cap 80 KiB, one group lost at 81,
+ * two at 86, 96 exact, three to 127, 128 exact — comes back at k=2 (where the same 96 KiB
+ * is ic 768 rather than 3072, 0 of 20 against 20 of 20 at every reachable neighbour) and
+ * on a 4x19 plane that consumes 3040-4864 granules of the forced allowance against 4x2's
+ * 160-256. So there is no shape of conv for which charging the alignment would be safe.
+ * [HW sweep, H96 MAX M9, `rk3576_conv_lib_gate slicemap` with ROCKET_LG_SLICE_K] */
+static inline unsigned r76_weight_slice_cap_at(unsigned oc, unsigned f)
+{
+    unsigned cap = r76_weight_slice_cap(oc);
+    unsigned lost = f * R76_GRANULE_BYTES;
+    if (cap == ~0u) return ~0u;      /* one group: the pool check governs, and it sees F */
+    return cap > lost ? cap - lost : 0u;
+}
+
 /* The allowance planner proper, driven by the two quantities that actually govern it:
  * the granules ONE ROW of the task's feature plane costs, and the weight footprint
  * that has to be resident beside it. Both differ on the ARGB path — its row is the
@@ -1032,10 +1107,13 @@ static int r76_plan_cbuf(unsigned entries, unsigned ih, unsigned oc, unsigned wb
                     R76_CBUF_MAX_GRANULES / entries);
         return -1;
     }
-    if (!dw && wbytes > r76_weight_slice_cap(oc)) {
+    if (!dw && wbytes > r76_weight_slice_cap_at(oc, f)) {
         ROCKET_LOGE("rk3576 cbuf: a resident weight slice of %u KiB drives only the "
-                    "leading output-channel groups at oc=%u (cap %u KiB) — split ic\n",
-                    wbytes / 1024u, oc, r76_weight_slice_cap(oc) / 1024u);
+                    "leading output-channel groups at oc=%u beside a feature allowance of "
+                    "4096+%u granules (cap %u KiB, %u KiB at F=0) — shorten the row window "
+                    "or split ic\n",
+                    wbytes / 1024u, oc, f, r76_weight_slice_cap_at(oc, f) / 1024u,
+                    r76_weight_slice_cap(oc) / 1024u);
         return -1;
     }
     /* Two bounds the slice cap above does not cover, because no conv shape reaches
@@ -1142,6 +1220,8 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
         return 0;                     /* the weight slice does not fit even at F=0 */
     if (!dw && wbytes > r76_weight_slice_cap(oc))
         return 0;                     /* it fits, but only the leading groups compute */
+    /* The slice cap is what the rung loop below has to honour as well, not just the pool:
+     * a rung is a claim on the same granules. Held here so the refusal is the F=0 one. */
     if (!dw && (oc > R76_MAX_OC ||
                 (uint64_t)((oc + 31u) / 32u) * wbytes > R76_MAX_WEIGHT_CUBE))
         return 0;                     /* the output-channel-axis bounds; see r76_plan_cbuf */
@@ -1165,12 +1245,19 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
         if (R76_CBUF_BASE_GRANULES + cube <= R76_CBUF_POOL_GRANULES) wgran = cube;
     }
 
-    /* The highest rung the weight cube still leaves room for, inside the data cap. */
+    /* The highest rung the weight cube still leaves room for, inside the data cap — and
+     * inside the SLICE cap, which shrinks granule for granule with the rung (see
+     * r76_weight_slice_cap_at). Without that term this returned 45 rows for
+     * 112x112 k7 ic 64 oc 64, which is F=1024's window and the whole failing band: every
+     * task the row planner cut was a full surface with its trailing output-channel group
+     * wrong. Skipping the rung rather than breaking, because the cap is not monotone in
+     * the same way the pool is. */
     for (r = 0; r < r76_cbuf_f_nrungs; r++) {
         unsigned cand = r76_cbuf_f_rungs[r];
         if (R76_CBUF_BASE_GRANULES + cand > R76_CBUF_MAX_GRANULES) break;
         if (R76_CBUF_BASE_GRANULES + cand + wgran > R76_CBUF_POOL_GRANULES) break;
         if (!r76_rung_live(cand, wres, dw)) continue;
+        if (!dw && wbytes > r76_weight_slice_cap_at(oc, cand)) continue;
         f = cand;
     }
 

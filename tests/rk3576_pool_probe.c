@@ -68,7 +68,12 @@
  *            axis that differs between this probe's ~1% and the graph's ~30%. The
  *            library's check is turned off inside it, so the raw rate comes back.
  *
- * Usage:  rk3576_pool_probe [sweep|gate|lib|split|bound|rect|pad|avg|rate]  (default: sweep)
+ *   `onset`  what sets the lag's SLIP POINT — the source cube's address, its line
+ *            stride or its group stride — scored on the onset channel group, which is a
+ *            point mass and so breaks at fifty occurrences where a rate needs hundreds.
+ *
+ * Usage:  rk3576_pool_probe [sweep|gate|lib|split|bound|rect|pad|avg|rate|onset]
+ *         (default: sweep)
  * Env:    ROCKET_POOLB_LEAD / ROCKET_POOLB_TRAIL   the pads `bound` uses (1 and 0)
  *         ROCKET_POOLP_OTHER                       `pad`'s non-swept extent (4)
  *         ROCKET_POOLA_N                           `avg`'s iterations a cell (30)
@@ -258,7 +263,13 @@ static int run_pool(int fd, const pool_case *pc, unsigned dst_reg, int check,
     in_h[0] = bo_in.handle; in_h[1] = bo_r.handle;
     out_h[0] = bo_o.handle;
 
-    if (rocket_submit_matmul(fd, &bo_r, p.task_count, in_h, 2, out_h, 1, 2000) != 0) {
+    /* A pool raises the PPU's completion and no DPU bit at all, so a submit that names no
+     * class waits out the driver's fallback -- the grace on the shipped module and the
+     * backstop on one where that wait is untimed. Gated: the ioctl rejects a flag word it
+     * does not recognise. */
+    if (rocket_submit_matmul_flags(fd, &bo_r, p.task_count, in_h, 2, out_h, 1,
+                                   rocket_ppu_done_supported()
+                                       ? ROCKET_JOB_PPU_DONE : 0u) != 0) {
         printf("    submit failed\n"); goto done;
     }
     if (rocket_bo_prep(fd, &bo_o, 0, 2000000000ull) < 0) {
@@ -1225,11 +1236,34 @@ static int rate_map(int fd)
         fflush(stdout);
         for (g = 0; g < ngap; g++) {
             unsigned wrong_iters = 0;
+            /* THE ONSET IS AN OUTPUT, NOT A SWEEP. The lag is a contiguous suffix of
+             * channel groups ending at the last one, so the first wrong element's group
+             * IS the group the divisor state slipped in. It is near-constant per shape
+             * over the occurrences on record, but every one of those was drawn at one
+             * value of the conditions — so a probe that moves a condition has to report
+             * this, or it can only ever see the rate. */
+            long on_lo = -1, on_hi = -1, on_sum = 0, on_n = 0, short_end = 0;
             for (it = 0; it < iters; it++) {
                 memset(out, 0x5A, out_n);
                 if (rocket_pool_int8_rk3576(fd, &d, 0, in, out) != ROCKET_OK) continue;
                 if (memcmp(out, mdl, out_n) != 0) {
+                    long grp, endgrp;
+                    size_t j;
                     wrong_iters++;
+                    for (k = 0; k < out_n && out[k] == mdl[k]; k++) { }
+                    grp = (long)(k / ((size_t)oh * ow) / 16u);
+                    if (on_lo < 0 || grp < on_lo) on_lo = grp;
+                    if (grp > on_hi) on_hi = grp;
+                    on_sum += grp; on_n++;
+                    /* The END is what the SHIPPED tail-only check rests on: it scores the
+                     * last channel group alone, which is complete only while every
+                     * occurrence reaches that group. That premise was established over
+                     * occurrences drawn at one memory-system load, so count the ones that
+                     * stop short here — this is the column that would price the class the
+                     * tail check misses. */
+                    for (j = out_n; j > 0 && out[j - 1] == mdl[j - 1]; j--) { }
+                    endgrp = (long)((j - 1) / ((size_t)oh * ow) / 16u);
+                    if (endgrp != (long)((d.c + 15) / 16) - 1) short_end++;
                     /* WHICH FUNCTION, not how many elements: a cell that is wrong for
                      * some other reason must not be counted as this hazard. */
                     if (wrong_iters == 1) {
@@ -1242,6 +1276,10 @@ static int rate_map(int fd)
                 sleep_ms(gaps[g]);
             }
             printf("  %3u/%-3u", wrong_iters, iters);
+            if (on_n)
+                printf(" on g%ld-%ld mean %.1f of %u, %ld short of the last group",
+                       on_lo, on_hi, (double)on_sum / (double)on_n,
+                       (unsigned)((d.c + 15) / 16), short_end);
             fflush(stdout);
         }
         printf("\n");
@@ -1250,6 +1288,327 @@ static int rate_map(int fd)
     printf("\n  A rate that falls with the gap says the hazard is a function of TIME "
            "between\n  submits and not of the pooling program.\n");
     return 0;
+}
+
+/* ===========================================================================
+ * `onset` — WHAT SETS THE SLIP POINT: the source's ADDRESS, or its DELIVERY.
+ *
+ * The lag's ONSET channel group is the instrument here, not the rate. At `288x35x35` it
+ * is a point mass on group 2 when the memory system is quiet and it spreads under a CPU
+ * memory load, so it breaks visibly at ~50 occurrences where the rate needs several
+ * hundred calls. Two NPU-side dials move through it, both on the SOURCE cube, because a
+ * CPU-side load cannot reach the feature stream at all:
+ *
+ *   base    the cube's byte offset inside a bigger BO. The library requires a whole
+ *           channel-group offset, so the reachable set is `G * surf_elems * 16` — which
+ *           at this geometry is 19600 bytes a step and sweeps five distinct 4 KiB page
+ *           phases over G = 1,2,3,5,8. An ADDRESS or page-boundary mechanism moves the
+ *           onset here; a program-sequence one does not.
+ *   pitch   the source's DDR line stride above the plane's own width. The PPU carries
+ *           the consumed extent and the line stride in separate registers, so the
+ *           arithmetic is untouched and the feature DMA issues one short burst a ROW
+ *           instead of one long one a channel group. This is the delivery-rate dial.
+ *   stride  the source's channel-GROUP stride above the plane, which adds one jump a
+ *           group where `pitch` adds one a row. It is `pitch`'s control for the stride
+ *           term, not a separate hypothesis.
+ *
+ * EVERY CELL RUNS THE SAME CODE PATH, cube-in with a caller-owned BO the host scatters
+ * per iteration — the control cell differs from the arms only in the three numbers. If
+ * the control does not reproduce the point mass, the instrument does not exist on this
+ * path and no arm below means anything; that is a result about the host scatter, and it
+ * is why the control is a cell and not an assumption.
+ *
+ * The arms are INTERLEAVED over passes: this hazard's rate wanders, and a block of one
+ * arm prices the stretch it ran in. Every wrong element is also scored against the
+ * previous window's divisor, because a wrong SCATTER computes a full plausible surface
+ * too and must not be counted as this hazard.
+ *
+ * Env: ROCKET_POOLO_N (iterations a cell a pass, 20), ROCKET_POOLO_PASSES (3),
+ *      ROCKET_POOLO_C (288), ROCKET_POOLO_PLANE (35), ROCKET_POOLO_ONLY (name substring),
+ *      ROCKET_POOLO_PAD (bytes of untouched pad BO taken before the handles),
+ *      ROCKET_POOLO_PAD_N (take the pad as k separate BOs instead of one),
+ *      ROCKET_POOLO_PAD_FREE (release the pad before any run),
+ *      ROCKET_POOLO_QUIET (set these cells up but never submit against them; a leading `!`
+ *                          inverts the match).
+ * ==========================================================================*/
+/* HOW THE CALL IS MADE is a cell, not the harness. The recorded 92.6% at this geometry
+ * was measured through the TRANSIENT row-major entry, which allocates its BOs and
+ * generates its program per call; a graph holds a handle and reads a producer's cube. The
+ * first run of this mode found the cube path QUIET at the same geometry, and "cube-in" and
+ * "prepacked" were varied together to get there — two changes, one cell. These three
+ * separate them, and the dials below only mean something in whichever is loud. */
+enum { ONM_TRANSIENT = 0, ONM_RM_PREPACK, ONM_CUBE };
+static const char *ONM_NAME[3] = { "transient row-major", "prepacked row-major",
+                                   "prepacked cube-in" };
+
+typedef struct {
+    const char *name;
+    int         mode;
+    unsigned    off_groups;   /* base offset, in channel groups                     */
+    unsigned    surf_extra;   /* elements added to the group stride beyond the plane */
+    unsigned    pitch_w;      /* source line stride in elements; 0 = the plane's own */
+} onset_cell;
+
+typedef struct {
+    rocket_pool_int8_rk3576_handle *h;
+    rocket_bo   bo;
+    size_t      off, surf, bo_bytes;
+    unsigned    pitch, live, quiet;
+    /* accumulated over every pass */
+    unsigned    calls, wrong;
+    long        on_lo, on_hi, on_sum, on_mode, short_end;
+    long        expl_prev, expl_wrong;
+    unsigned    pass_wrong[8], pass_calls[8];
+} onset_run;
+
+static int onset_map(int fd)
+{
+    static const onset_cell CELLS[] = {
+        { "rm-transient", ONM_TRANSIENT,  0, 0,    0   },
+        { "rm-prepack",   ONM_RM_PREPACK, 0, 0,    0   },
+        { "cube-ctrl",    ONM_CUBE,       0, 0,    0   },
+        { "base-g1",      ONM_CUBE,       1, 0,    0   },
+        { "base-g2",      ONM_CUBE,       2, 0,    0   },
+        { "base-g3",      ONM_CUBE,       3, 0,    0   },
+        { "base-g5",      ONM_CUBE,       5, 0,    0   },
+        { "base-g8",      ONM_CUBE,       8, 0,    0   },
+        { "stride+7",     ONM_CUBE,       0, 7,    0   },
+        { "stride+55",    ONM_CUBE,       0, 55,   0   },
+        { "stride+823",   ONM_CUBE,       0, 823,  0   },  /* 2048 elements a group */
+        { "pitch36",      ONM_CUBE,       0, 0,    36  },
+        { "pitch48",      ONM_CUBE,       0, 0,    48  },
+        { "pitch64",      ONM_CUBE,       0, 0,    64  },
+        { "pitch128",     ONM_CUBE,       0, 0,    128 },
+    };
+    enum { NCELL = sizeof CELLS / sizeof *CELLS };
+    const char *en = getenv("ROCKET_POOLO_N");
+    const char *ep = getenv("ROCKET_POOLO_PASSES");
+    const char *ec = getenv("ROCKET_POOLO_C");
+    const char *el = getenv("ROCKET_POOLO_PLANE");
+    const char *eo = getenv("ROCKET_POOLO_ONLY");
+    const char *es = getenv("ROCKET_POOLO_SKIP");
+    const char *eq = getenv("ROCKET_POOLO_QUIET");
+    /* THE CELL OR ITS POSITION. Whichever cell runs LAST in a pass and whichever runs
+     * first are different cells; reversing the order is the one arm that separates a
+     * property of the cell from a property of where it sits in the process. */
+    const int rev = getenv("ROCKET_POOLO_REV") != NULL;
+    const unsigned iters  = en ? (unsigned)atoi(en) : 20u;
+    unsigned passes = ep ? (unsigned)atoi(ep) : 3u;
+    const unsigned C      = ec ? (unsigned)atoi(ec) : 288u;
+    const unsigned P      = el ? (unsigned)atoi(el) : 35u;
+    rocket_pool_desc d;
+    onset_run run[NCELL];
+    int8_t *in, *out, *mdl, *prv;
+    size_t in_n, out_n, k;
+    unsigned ow, oh, groups, ci, ordi, it, pass, ngrp;
+    int rc = 0;
+
+    if (passes > 8) passes = 8;
+    memset(&d, 0, sizeof d);
+    d.c = (int)C; d.ih = d.iw = (int)P;
+    d.kh = d.kw = 3; d.stride_y = d.stride_x = 1;
+    d.pad_top = d.pad_left = d.pad_bottom = d.pad_right = 1;
+    d.method = POOL_METHOD_AVG;
+    d.avg_exclude_pad = 1;
+    if (C % 16u) { printf("onset: c must be a multiple of 16 for a cube-in join\n"); return 1; }
+    groups = C / 16u;
+    ngrp = (C + 15u) / 16u;
+    oh = (unsigned)rocket_pool_oh(&d); ow = (unsigned)rocket_pool_ow(&d);
+    in_n = (size_t)C * P * P;
+    out_n = (size_t)C * oh * ow;
+
+    /* Not cached inside the library, so setting it here reaches every call below. */
+    setenv("ROCKET_RK3576_POOL_LAGCHECK", "0", 1);
+    printf("onset: c%u %ux%u padded 3x3 s1 average, %u groups, %u iterations a cell a\n"
+           "       pass, %u passes INTERLEAVED. The library's divisor check is OFF so the\n"
+           "       raw occurrences come back. Every cell is cube-in from a caller BO the\n"
+           "       host scatters per iteration; `ctrl` differs only in the three numbers.\n\n",
+           C, P, P, groups, iters, passes);
+
+    in = malloc(in_n); out = malloc(out_n); mdl = malloc(out_n); prv = malloc(out_n);
+    if (!in || !out || !mdl || !prv) { printf("   out of memory\n"); return 1; }
+    for (k = 0; k < in_n; k++)
+        in[k] = (int8_t)(((k * 37u + (k >> 6) * 101u) % 40u) - 128u);
+    avg_model(&d, in, mdl, AVGM_LIB);
+    avg_model(&d, in, prv, AVGM_PREV);
+
+    /* THE ALLOCATION LAYOUT AS AN AXIS. Which cell of a composition is loud does not
+     * follow the geometry, the call's position or the source's offset, so what is left is
+     * where the allocator puts the buffers — which changes with every BO the process took
+     * before them. This pads the sequence with one BO that is never touched and never
+     * submitted against, so nothing about any program moves except the addresses that
+     * follow it. A rate that moves with this is an address property. */
+    /* The pad's dial is its PAGE COUNT, since the allocator rounds to 4096, and the two
+     * controls separate what a page of it spends. `_PAD_N` takes the same total as k
+     * separate BOs: a rule in the ADDRESS shift cannot tell one k-page BO from k one-page
+     * ones, a rule in a per-BO resource can. `_PAD_FREE` releases them before the runs:
+     * if the map survives that, the pad left something behind that an address did not. */
+    {
+        const char *epad = getenv("ROCKET_POOLO_PAD");
+        const char *epn  = getenv("ROCKET_POOLO_PAD_N");
+        const int   pfree = getenv("ROCKET_POOLO_PAD_FREE") != NULL;
+        size_t pad = epad && *epad ? (size_t)strtoull(epad, NULL, 0) : 0u;
+        unsigned pn = epn && *epn ? (unsigned)atoi(epn) : 1u, pi, ok = 0;
+        static rocket_bo padbo[64];
+        if (pn > 64) pn = 64;
+        if (pad) {
+            for (pi = 0; pi < pn; pi++) {
+                if (rocket_bo_alloc(fd, pad, &padbo[pi]) < 0)
+                    printf("   pad BO %u of %zu refused\n", pi, pad);
+                else
+                    ok++;
+            }
+            printf("   %u untouched pad BO(s) of %zu bytes (%zu pages each) allocated "
+                   "first%s\n", ok, pad, (pad + 4095u) / 4096u,
+                   pfree ? ", then FREED before any run" : "");
+            if (pfree)
+                for (pi = 0; pi < ok; pi++)
+                    rocket_bo_free(fd, &padbo[pi]);
+        }
+    }
+
+    memset(run, 0, sizeof run);
+    for (ci = 0; ci < NCELL; ci++) {
+        rocket_rk3576_cube src;
+        unsigned pitch = CELLS[ci].pitch_w ? CELLS[ci].pitch_w : P;
+        run[ci].on_lo = -1; run[ci].on_hi = -1; run[ci].on_mode = -1;
+        if (eo && *eo && !strstr(CELLS[ci].name, eo)) continue;
+        if (es && *es && strstr(CELLS[ci].name, es)) continue;
+        run[ci].pitch = pitch;
+        run[ci].surf  = (size_t)pitch * P + CELLS[ci].surf_extra;
+        run[ci].off   = (size_t)CELLS[ci].off_groups * run[ci].surf * 16u;
+        run[ci].bo_bytes = run[ci].off + (size_t)groups * run[ci].surf * 16u;
+        run[ci].live  = 1;
+        /* A CELL THAT IS SET UP AND NEVER SUBMITTED AGAINST separates "a companion's buffers
+         * exist" from "a companion's programs ran between my calls". `_ONLY` and `_SKIP`
+         * cannot: they drop the allocation and the execution together. A leading `!` inverts
+         * the match, so `_QUIET='!pitch128'` leaves the whole composition allocated, packed
+         * and joined and runs one cell. An untouched pad BO is not this control — it carries
+         * no handle and no internal buffers. */
+        if (eq && *eq) {
+            const char *pat = *eq == '!' ? eq + 1 : eq;
+            const int   hit = strstr(CELLS[ci].name, pat) != NULL;
+            run[ci].quiet = (*eq == '!') ? !hit : hit;
+        }
+        /* The transient cell holds nothing: its entry allocates and frees per call, which
+         * is the whole point of having it beside the other two. */
+        if (CELLS[ci].mode == ONM_TRANSIENT) continue;
+        run[ci].h = rocket_pool_int8_pack_rk3576(fd, &d, 0);
+        if (!run[ci].h) {
+            printf("   %s: pack refused\n", CELLS[ci].name);
+            run[ci].live = 0; rc = 1; continue;
+        }
+        if (CELLS[ci].mode == ONM_RM_PREPACK) continue;
+        if (rocket_bo_alloc(fd, run[ci].bo_bytes, &run[ci].bo) < 0) {
+            printf("   %s: BO alloc of %zu refused\n", CELLS[ci].name, run[ci].bo_bytes);
+            run[ci].live = 0; rc = 1; continue;
+        }
+        memset(&src, 0, sizeof src);
+        src.fd = fd; src.c = C; src.h = P; src.w = P;
+        src.groups = groups; src.surf_elems = run[ci].surf;
+        src.bo = run[ci].bo; src.off = run[ci].off;
+        src.pitch_w = CELLS[ci].pitch_w;
+        if (rocket_pool_int8_cube_in_rk3576(run[ci].h, &src) != ROCKET_OK) {
+            printf("   %s: cube-in REFUSED (off %zu, surf %zu, pitch %u) — a bound of "
+                   "OURS, not the part's\n",
+                   CELLS[ci].name, run[ci].off, run[ci].surf, pitch);
+            rocket_bo_free(fd, &run[ci].bo);
+            rocket_pool_int8_free_rk3576(fd, run[ci].h);
+            run[ci].h = NULL; run[ci].live = 0;
+            continue;
+        }
+    }
+
+    for (pass = 0; pass < passes; pass++) {
+        printf("  pass %u:", pass);
+        fflush(stdout);
+        for (ordi = 0; ordi < NCELL; ordi++) {
+            onset_run *r;
+            ci = rev ? (unsigned)(NCELL - 1) - ordi : ordi;
+            r = &run[ci];
+            unsigned pw = r->pitch, y, x, c;
+            if (!r->live || r->quiet) continue;
+            for (it = 0; it < iters; it++) {
+                int prc;
+                /* THE HOST SCATTER IS PART OF THE ARM in all three modes — the library
+                 * does it in the two row-major ones and this cell does it here — so the
+                 * part always reads a surface the CPU wrote microseconds earlier, which
+                 * is one of the contexts the lag is loud in. */
+                if (CELLS[ci].mode == ONM_CUBE) {
+                    rocket_bo_prep(fd, &r->bo, 1, 0);
+                    memset((char *)r->bo.ptr, 0x5A, r->bo_bytes);
+                    for (c = 0; c < C; c++)
+                        for (y = 0; y < P; y++)
+                            for (x = 0; x < P; x++)
+                                ((int8_t *)r->bo.ptr)[r->off + ((size_t)(c / 16u) * r->surf
+                                    + (size_t)y * pw + x) * 16u + (c % 16u)]
+                                    = in[((size_t)c * P + y) * P + x];
+                    rocket_bo_fini(fd, &r->bo);
+                }
+                memset(out, 0x5A, out_n);
+                r->calls++; r->pass_calls[pass]++;
+                prc = CELLS[ci].mode == ONM_TRANSIENT
+                        ? rocket_pool_int8_rk3576(fd, &d, 0, in, out)
+                        : rocket_pool_int8_prepacked_rk3576(fd, r->h,
+                              CELLS[ci].mode == ONM_RM_PREPACK ? in : NULL, out);
+                if (prc != ROCKET_OK) continue;
+                if (memcmp(out, mdl, out_n) == 0) continue;
+                r->wrong++; r->pass_wrong[pass]++;
+                for (k = 0; k < out_n && out[k] == mdl[k]; k++) { }
+                {
+                    long grp = (long)(k / ((size_t)oh * ow) / 16u);
+                    size_t j;
+                    if (r->on_lo < 0 || grp < r->on_lo) r->on_lo = grp;
+                    if (grp > r->on_hi) r->on_hi = grp;
+                    r->on_sum += grp;
+                    if (grp == 2) r->on_mode = r->on_mode < 0 ? 1 : r->on_mode + 1;
+                    for (j = out_n; j > 0 && out[j - 1] == mdl[j - 1]; j--) { }
+                    if ((long)((j - 1) / ((size_t)oh * ow) / 16u) != (long)ngrp - 1)
+                        r->short_end++;
+                    /* WHICH FUNCTION, not how many elements. A wrong scatter also
+                     * computes a full plausible surface; only the previous window's
+                     * divisor is this hazard. */
+                    for (k = 0; k < out_n; k++)
+                        if (out[k] != mdl[k]) {
+                            r->expl_wrong++;
+                            if (out[k] == prv[k]) r->expl_prev++;
+                        }
+                }
+            }
+            printf(" %s %u/%u", CELLS[ci].name, r->pass_wrong[pass], r->pass_calls[pass]);
+            fflush(stdout);
+        }
+        printf("\n");
+    }
+
+    printf("\n  %-12s %-20s %5s %5s %5s  %-9s %-15s %s\n", "cell", "how the call is made",
+           "off", "surf", "pitch", "rate", "onset g (mean)",
+           "at g2 / short / prev-explained");
+    for (ci = 0; ci < NCELL; ci++) {
+        onset_run *r = &run[ci];
+        if (!r->live) continue;
+        printf("  %-12s %-20s %5zu %5zu %5u  %3u/%-5u ", CELLS[ci].name,
+               ONM_NAME[CELLS[ci].mode], (size_t)CELLS[ci].off_groups, r->surf,
+               r->pitch, r->wrong, r->calls);
+        if (r->quiet)
+            printf("%-15s SET UP, NEVER RUN\n", "-");
+        else if (r->wrong)
+            printf("g%ld-%-3ld (%4.2f)   %ld / %ld / %ld of %ld\n",
+                   r->on_lo, r->on_hi, (double)r->on_sum / (double)r->wrong,
+                   r->on_mode < 0 ? 0 : r->on_mode, r->short_end,
+                   r->expl_prev, r->expl_wrong);
+        else
+            printf("%-15s no occurrence\n", "-");
+    }
+    for (ci = 0; ci < NCELL; ci++) {
+        if (CELLS[ci].mode == ONM_CUBE && run[ci].h) rocket_bo_free(fd, &run[ci].bo);
+        if (run[ci].h) rocket_pool_int8_free_rk3576(fd, run[ci].h);
+    }
+    free(in); free(out); free(mdl); free(prv);
+    printf("\n  `off` is in channel GROUPS. An onset that moves with `off` is an address\n"
+           "  mechanism; one that moves with `pitch` and not with `surf` is a delivery\n"
+           "  one; one that moves with neither is a position in the program's sequence.\n");
+    return rc;
 }
 
 /* ===========================================================================
@@ -1523,7 +1882,10 @@ static int dst_arm(int fd, int diw, int dih, int dc, const char *name,
 
     in_h[0] = bo_in.handle; in_h[1] = bo_r.handle;
     out_h[0] = bo_o.handle;
-    if (rocket_submit_matmul(fd, &bo_r, p.task_count, in_h, 2, out_h, 1, 2000) != 0) {
+    /* Also a pool -- see the note in run_pool. */
+    if (rocket_submit_matmul_flags(fd, &bo_r, p.task_count, in_h, 2, out_h, 1,
+                                   rocket_ppu_done_supported()
+                                       ? ROCKET_JOB_PPU_DONE : 0u) != 0) {
         printf("   submit failed\n"); return -1;
     }
     if (rocket_bo_prep(fd, &bo_o, 0, 2000000000ull) < 0) {
@@ -1812,6 +2174,8 @@ int main(int argc, char **argv)
         rc = avg_hazard(fd);
     } else if (!strcmp(mode, "rate")) {
         rc = rate_map(fd);
+    } else if (!strcmp(mode, "onset")) {
+        rc = onset_map(fd);
     } else if (!strcmp(mode, "dst")) {
         rc = dst_map(fd);
     } else if (!strcmp(mode, "gate")) {

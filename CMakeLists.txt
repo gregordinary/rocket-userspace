@@ -296,6 +296,9 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_matmul_gate     # RK3576 board GATE: the int8 matmul library entry vs a CPU model
             rk3576_refusal_gate    # RK3576 board GATE: ops with no encoder refuse, not write nothing
             rk3576_submit_floor    # RK3576 board: the per-submit dispatch floor (us/submit) probe
+            rk3576_mm_corr         # RK3576 board: does an arbitrary matmul shape lose surface, and how often?
+            rk3576_mm_requant      # RK3576 board GATE: the matmul entry's requant vs the host models of it
+            rk3576_w8a8_route      # RK3576 board GATE: the W8A8 two-pass calibration route, composed on the part
             rk3576_prep_floor      # RK3576 board: what a PREP_BO/FINI_BO bracket costs, floor vs bytes
             rk3576_fc_vendor       # RK3576 board: submit a vendor capture VERBATIM — does it write?
             rk3576_cost_table      # RK3576 board: what the library entries cost, against a CPU reference
@@ -354,7 +357,7 @@ if(ROCKETNPU_BUILD_TESTS)
     # own wide-output poison guard (rocket_rk3576_power_idle) around their submits, both
     # being DPU-only programs and so victims of it
     foreach(t prototype_shared_scratch_rocket crossop_chain_rocket rk3576_cbuf_base
-              rk3576_lut_probe rk3576_add_probe)
+              rk3576_lut_probe rk3576_add_probe rk3576_mm_requant rk3576_w8a8_route)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()

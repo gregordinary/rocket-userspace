@@ -574,6 +574,11 @@ static void concat_link(rocket_graph_plan *g)
         int ok = 1;
 
         if (L->kind != ROCKET_GRAPH_CONCAT || nojoin_forced(j)) continue;
+        /* A PLACED CONCATENATION OWNS NO ROW-MAJOR TENSOR, so a caller that has an
+         * outside reader for this one has said so. Refusing the placement costs the
+         * host copy the placement was removing; taking it would leave that reader a
+         * surface nothing ever writes. */
+        if (L->row_major_out) { g->catn_escaped++; continue; }
         ns = rocket_graph_srcs(L, s);
         if (!ns) continue;
         /* THE OFFSETS ARE THE PRODUCERS' CHANNEL COUNTS IN OPERAND ORDER — the same
@@ -688,6 +693,10 @@ static void concat_link(rocket_graph_plan *g)
         RG_LOG(g, "   concatenation layers: %d of them are placement — their operands are "
                "slices of one buffer their consumers read as a cube, so no copy, no "
                "transpose and no program\n", g->catn_wired);
+    if (g->catn_escaped)
+        RG_LOG(g, "   concatenation layers: %d of them the caller declared row-major — "
+               "something outside the description reads the tensor, so the placement "
+               "would leave it with nothing writing it\n", g->catn_escaped);
 }
 /*
  * A PRODUCER THAT CANNOT DECLARE ITS OWN TAIL CAN BE GIVEN ONE.

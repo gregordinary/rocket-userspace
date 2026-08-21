@@ -192,14 +192,28 @@ static int pool_init(int fd, struct pool_prog *pr, unsigned plane, unsigned c,
     return 0;
 }
 
-/* Stage one program in its own BO and submit it as a single unchained task. */
+/* Stage one program in its own BO and submit it as a single unchained task.
+ *
+ * The completion class is the CALLER'S to name, because it is a property of the program
+ * and this helper runs both kinds: a pool raises the PPU's bit and no DPU bit at all,
+ * a convolution the reverse. Passing a blanket flag here would be wrong on three of the
+ * five call sites. */
 static int run_alone(int fd, rocket_bo *rc, const uint64_t *ops, uint32_t count,
-                     const uint32_t *in_h, uint32_t n_in, uint32_t out_h)
+                     const uint32_t *in_h, uint32_t n_in, uint32_t out_h,
+                     uint32_t job_flags)
 {
     rocket_bo_prep(fd, rc, 1, 0);
     memcpy(rc->ptr, ops, (size_t)count * sizeof(uint64_t));
     rocket_bo_fini(fd, rc);
-    return rocket_submit_matmul(fd, rc, count, in_h, n_in, &out_h, 1, 2000) == 0 ? 0 : -1;
+    return rocket_submit_matmul_flags(fd, rc, count, in_h, n_in, &out_h, 1,
+                                      job_flags) == 0 ? 0 : -1;
+}
+
+/* PPU_DONE where the kernel honours it, 0 otherwise: the submit ioctl REJECTS a flag
+ * word it does not recognise, so an ungated bit fails the submit on an older kernel. */
+static uint32_t pool_flags(void)
+{
+    return rocket_ppu_done_supported() ? ROCKET_JOB_PPU_DONE : 0u;
 }
 
 static int all_sentinel(const void *p, size_t n)
@@ -282,7 +296,7 @@ static int run_case(int fd, unsigned plane, unsigned c, int iters,
         t_sep = now_us();
         in_h[0] = A.handle; in_h[1] = p1.w.handle; in_h[2] = p1.b.handle;
         in_h[3] = p1.r.handle;
-        if (run_alone(fd, &p1.r, p1.ops, p1.p.task_count, in_h, 4, X.handle) != 0) {
+        if (run_alone(fd, &p1.r, p1.ops, p1.p.task_count, in_h, 4, X.handle, 0u) != 0) {
             could_not = 1; break;
         }
         if (rocket_bo_prep(fd, &X, 0, 2000000000ull) < 0) { could_not = 1; break; }
@@ -290,7 +304,8 @@ static int run_case(int fd, unsigned plane, unsigned c, int iters,
         rocket_bo_fini(fd, &X);
 
         in_h[0] = X.handle; in_h[1] = p2.r.handle;
-        if (run_alone(fd, &p2.r, p2.ops, p2.p.task_count, in_h, 2, Y.handle) != 0) {
+        if (run_alone(fd, &p2.r, p2.ops, p2.p.task_count, in_h, 2, Y.handle,
+                      pool_flags()) != 0) {
             could_not = 1; break;
         }
         if (rocket_bo_prep(fd, &Y, 0, 2000000000ull) < 0) { could_not = 1; break; }
@@ -299,7 +314,7 @@ static int run_case(int fd, unsigned plane, unsigned c, int iters,
 
         in_h[0] = Y.handle; in_h[1] = p3.w.handle; in_h[2] = p3.b.handle;
         in_h[3] = p3.r.handle;
-        if (run_alone(fd, &p3.r, p3.ops, p3.p.task_count, in_h, 4, Z.handle) != 0) {
+        if (run_alone(fd, &p3.r, p3.ops, p3.p.task_count, in_h, 4, Z.handle, 0u) != 0) {
             could_not = 1; break;
         }
         if (rocket_bo_prep(fd, &Z, 0, 2000000000ull) < 0) { could_not = 1; break; }
@@ -321,7 +336,8 @@ static int run_case(int fd, unsigned plane, unsigned c, int iters,
         bo_fill(fd, &X, x_bytes, SENTINEL);
         bo_fill(fd, &Y, y_bytes, SENTINEL);
         in_h[0] = X.handle; in_h[1] = p2.r.handle;
-        if (run_alone(fd, &p2.r, p2.ops, p2.p.task_count, in_h, 2, Y.handle) != 0) {
+        if (run_alone(fd, &p2.r, p2.ops, p2.p.task_count, in_h, 2, Y.handle,
+                      pool_flags()) != 0) {
             could_not = 1; break;
         }
         if (rocket_bo_prep(fd, &Y, 0, 2000000000ull) < 0) { could_not = 1; break; }
@@ -332,7 +348,7 @@ static int run_case(int fd, unsigned plane, unsigned c, int iters,
         bo_fill(fd, &Z, z_bytes, SENTINEL);
         in_h[0] = Y.handle; in_h[1] = p3.w.handle; in_h[2] = p3.b.handle;
         in_h[3] = p3.r.handle;
-        if (run_alone(fd, &p3.r, p3.ops, p3.p.task_count, in_h, 4, Z.handle) != 0) {
+        if (run_alone(fd, &p3.r, p3.ops, p3.p.task_count, in_h, 4, Z.handle, 0u) != 0) {
             could_not = 1; break;
         }
         if (rocket_bo_prep(fd, &Z, 0, 2000000000ull) < 0) { could_not = 1; break; }

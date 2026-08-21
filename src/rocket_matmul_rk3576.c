@@ -131,6 +131,15 @@ static unsigned r76_mm_nt(void)
     return (unsigned)rocket_hw_current()->max_tile;
 }
 
+/* Whether this entry may fall onto the int32 K-split route. Off by default, and the
+ * reason is in the refusal's own message. Read per call, so a probe can bracket one
+ * shape with it. */
+static int r76_mm_ksplit_opt_in(void)
+{
+    const char *e = getenv("ROCKET_RK3576_MM_KSPLIT");
+    return e && *e && *e != '0';
+}
+
 /* ============================================================================
  * SECTION — the plan
  * ==========================================================================*/
@@ -179,14 +188,13 @@ int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *N
     r76_mm_plane((unsigned)M, (unsigned)K, &iw, &ih);
     nt = r76_mm_fit_nt(iw, (unsigned)K, (unsigned)N, &rows);
     if (!nt) {
-        /* Not an error: this entry reports the SINGLE-TASK plan, and a K past one
-         * task's contraction has one — it is split through the int32 writer instead.
-         * rocket_matmul_int8_rk3576() takes that route when this returns E_SHAPE, so
-         * saying so at error level would shout on a supported path. */
+        /* Not an error here: this entry reports the SINGLE-TASK plan and there is none.
+         * rocket_matmul_int8_rk3576() declines the shape when this returns E_SHAPE — the
+         * K-split route it used to fall onto wedges the device — so the caller's own
+         * refusal, not this line, is where the message that matters is. */
         ROCKET_LOGI("rk3576 matmul: K=%d does not fit one task even at a 32-channel "
-                    "output tile, so there is no single-task plan to report. "
-                    "rocket_matmul_int8_rk3576() still runs it, splitting K through "
-                    "the int32 writer and requantizing on the host\n", K);
+                    "output tile (the boundary is K>=6176), so there is no single-task "
+                    "plan to report and rocket_matmul_int8_rk3576() will decline it\n", K);
         return ROCKET_E_SHAPE;
     }
 
@@ -213,15 +221,26 @@ static void r76_mm_free(int fd, struct r76_mm_bos *b)
     memset(b, 0, sizeof *b);
 }
 
-int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
-                              const int8_t *A, const int8_t *B,
-                              const int32_t *bias, float scale, int8_t *C)
+/* The shipped body, with `scale_n` optional.
+ *
+ * NULL is the per-tensor entry: one output scale, programmed straight into the OUT_CVT
+ * pair. Non-NULL is the per-output-channel entry: `scale_n[n]` is column n's own output
+ * scale, carried by the coefficient group's C ramp over a shared (MUL, SHIFT). The two
+ * differ in exactly two places — the coefficient packing and what `out_scale` is — which
+ * is why they are one function rather than two: everything else about a tile, from the
+ * weight cube to the write guard to the row plan, is the same program. */
+static int r76_mm_int8(int fd, int M, int K, int N,
+                       const int8_t *A, const int8_t *B,
+                       const int32_t *bias, float scale, const float *scale_n,
+                       int8_t *C, double *worst_rel_err)
 {
     const struct rocket_hw_profile *hw = rocket_hw_current();
     struct r76_mm_bos b = {0};
     uint64_t *ops = NULL;
     int8_t *stage = NULL;
     int32_t *tile_bias = NULL;
+    int16_t *cmul = NULL;
+    int64_t *sum_abs_w = NULL;
     rocket_rk3576_row_task *plan = NULL;
     unsigned iw, ih, nt, n0, surf_elems, max_tasks;
     size_t in_bytes;
@@ -229,33 +248,81 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
     int rc = ROCKET_E_SHAPE;
 
     if (fd < 0 || !A || !B || !C) return ROCKET_E_SHAPE;
+    if (worst_rel_err) *worst_rel_err = 0.0;
     if (strcmp(hw->name, "rk3576") != 0) {
         ROCKET_LOGE("rocket_matmul_int8_rk3576: this is the RK3576 encoding and the "
                     "active profile is %s\n", hw->name);
         return ROCKET_E_UNSUPPORTED;
     }
-    if (scale <= 0.0f) {
+    if (!scale_n && scale <= 0.0f) {
         ROCKET_LOGE("rk3576 matmul: scale must be positive (the DPU's OUT_CVT gates "
                     "the whole BS stage off at zero and writes an empty surface)\n");
+        return ROCKET_E_SHAPE;
+    }
+    /* Checked here rather than per tile: a non-positive column scale is the caller's
+     * error and the plan below would report it as a shape refusal instead. */
+    if (scale_n) {
+        int n;
+        for (n = 0; n < N; n++) {
+            if (!(scale_n[n] > 0.0f)) {
+                ROCKET_LOGE("rk3576 matmul: scale_n[%d] is %g — every per-column output "
+                            "scale must be positive (a zero C term gates the BS stage "
+                            "off for its whole eight-channel group and the DPU writes a "
+                            "full but empty surface)\n", n, (double)scale_n[n]);
+                return ROCKET_E_SHAPE;
+            }
+        }
+    }
+    /* Ahead of the plan call, because the plan refuses malformed shapes and K-split ones
+     * with the same code: without this, an unaligned K reports the K>=6176 bound below
+     * and sends the caller looking for a contraction limit it is nowhere near. */
+    if (M <= 0 || K <= 0 || N <= 0 || (K % 32) || (N % 32)) {
+        ROCKET_LOGE("rk3576 matmul: M=%d K=%d N=%d — K and N must be multiples of 32 "
+                    "(the int8 weight cube groups each channel axis by 32)\n", M, K, N);
         return ROCKET_E_SHAPE;
     }
     {
         int ntile = 0;
         if (rocket_matmul_plan_int8_rk3576(M, K, N, NULL, NULL, &ntile) < 0) {
-            /* A K past one task's contraction is not an unsupported shape any more: run
-             * it through the int32 writer, which splits K, and requant on the host. The
-             * requant is then the host's float rounding rather than the DPU's OUT_CVT
-             * approximation of it — a different arithmetic on this side of the boundary,
-             * and the more accurate one. */
+            /* A K with no single-task plan can only be run by splitting it through the
+             * int32 writer and requantizing on the host. That route TAKES THE DEVICE DOWN
+             * at prefill scale: at M=512 K=8192 N=2048 the write guard spends its eight
+             * power cycles, the entry returns -4, the part raises the driver's DMA-error
+             * WARN_ON, and the NPU then computes nothing in ANY process until the board is
+             * rebooted — a module reload leaves core 0 failing to probe at -22. So this
+             * entry declines instead of routing, and a caller falls back to its own CPU
+             * path with the device intact. [HW, H96 MAX M9, one shape, 2026-08-07]
+             *
+             * The boundary is where the single-task planner gives up, which is K >= 6176
+             * for every (M, N) enumerated — a condition on K alone, because the planner
+             * shrinks the output tile to 32 channels before it refuses and what is left
+             * is the CBUF pool against a one-group weight cube.
+             *
+             * Small cells in this class do compute — M=32 K=8192 N=128 and M=16 K=16384
+             * N=64 have run green in the gate list every session, and M=64 K=8192 N=32
+             * scored exact three times — so this is a bound on the SHAPES MEASURED, not a
+             * decoded mechanism, and it is set where it is because the cost of declining
+             * a shape that would have worked is a CPU fallback and the cost of accepting
+             * one that does not is a reboot. ROCKET_RK3576_MM_KSPLIT=1 restores the route
+             * for measurement; rocket_matmul_int8_rk3576_i32() still reaches it directly
+             * and carries the same warning. */
             int32_t *acc;
             int m, rc32;
+            if (!r76_mm_ksplit_opt_in()) {
+                ROCKET_LOGE("rk3576 matmul: K=%d has no single-task plan (the boundary is "
+                            "K>=6176), and the int32 K-split route that would run it has "
+                            "been seen to wedge the NPU across processes until a reboot. "
+                            "Declining — run this K on the host, or set "
+                            "ROCKET_RK3576_MM_KSPLIT=1 to take the route anyway\n", K);
+                return ROCKET_E_UNSUPPORTED;
+            }
             if (M <= 0 || N <= 0) return ROCKET_E_SHAPE;
             acc = calloc((size_t)M * N, sizeof *acc);
             if (!acc) return ROCKET_E_NOMEM;
             rc32 = rocket_matmul_int8_rk3576_i32(fd, M, K, N, A, B, bias, acc);
             if (rc32 == ROCKET_OK) {
                 for (m = 0; m < M * N; m++) {
-                    float v = (float)acc[m] * scale;
+                    float v = (float)acc[m] * (scale_n ? scale_n[m % N] : scale);
                     long r = (long)(v < 0.0f ? v - 0.5f : v + 0.5f);
                     C[m] = (int8_t)(r < -128 ? -128 : (r > 127 ? 127 : r));
                 }
@@ -275,6 +342,24 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
     plan  = calloc(max_tasks, sizeof *plan);
     stage = calloc(in_bytes, 1);
     if (!ops || !plan || !stage) { rc = ROCKET_E_NOMEM; goto done; }
+
+    /* THE C RAMP IS CAPPED BY THE ACCUMULATOR, so the plan needs each column's own
+     * sum of |weight| — the actual one. The int8 envelope (128*K*127) is one to two
+     * orders of magnitude looser than a real weight row and the difference IS the
+     * available precision, which is why this O(N*K) pass is worth its cost. It is one
+     * pass over the same bytes the weight cube copies. */
+    if (scale_n) {
+        int n;
+        sum_abs_w = calloc((size_t)N, sizeof *sum_abs_w);
+        if (!sum_abs_w) { rc = ROCKET_E_NOMEM; goto done; }
+        for (n = 0; n < N; n++) {
+            const int8_t *w = B + (size_t)n * K;
+            int64_t s = 0;
+            int k;
+            for (k = 0; k < K; k++) s += w[k] < 0 ? -(int64_t)w[k] : (int64_t)w[k];
+            sum_abs_w[n] = s;
+        }
+    }
 
     /* The FEATURE cube is packed once and shared by every N tile: the tiling is on the
      * output-channel axis, which the feature side does not see.
@@ -315,6 +400,7 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
         conv_params_t p = {0};
         uint32_t in_h[4], out_h[1];
         unsigned ntask = 1, t, n;
+        float base_scale;
 
         if (b.w.ptr)     rocket_bo_free(fd, &b.w);
         if (b.coeff.ptr) rocket_bo_free(fd, &b.coeff);
@@ -359,8 +445,32 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
         if (!tile_bias) { rc = ROCKET_E_NOMEM; goto done; }
         if (bias)
             for (n = 0; n < tile_n; n++) tile_bias[n] = bias[n0 + n];
+        /* THE PER-COLUMN RAMP IS PLANNED PER TILE, because the (MUL, SHIFT) it rides on
+         * is per TASK and every N tile is its own program. A tile whose columns share a
+         * scale gets a flat ramp and loses nothing; a tile spanning a wide spread pays
+         * its resolution there and nowhere else, which is why a wide-spread N is better
+         * off in several tiles than in one. The planner is the convolution path's — one
+         * copy, because the two bounds it balances are the part's and not the op's. */
+        base_scale = scale;
+        if (scale_n) {
+            double err = 0.0;
+            free(cmul);
+            cmul = calloc(nreg, sizeof *cmul);
+            if (!cmul) { rc = ROCKET_E_NOMEM; goto done; }
+            if (rocket_rk3576_plan_perchannel("rk3576 matmul", n0, tile_n, nreg,
+                                              tile_bias, sum_abs_w, 1.0f, scale_n,
+                                              1.0f, NULL, cmul, &base_scale,
+                                              &err) != 0) {
+                rc = ROCKET_E_SHAPE; goto done;
+            }
+            if (worst_rel_err && err > *worst_rel_err) *worst_rel_err = err;
+        }
         rocket_bo_prep(fd, &b.coeff, 1, 0);
-        rocket_rk3576_pack_coeff(b.coeff.ptr, coeff_bytes, tile_bias, nreg);
+        if (cmul)
+            rocket_rk3576_pack_coeff_perc(b.coeff.ptr, coeff_bytes, tile_bias, nreg,
+                                          NULL, cmul, 1);
+        else
+            rocket_rk3576_pack_coeff(b.coeff.ptr, coeff_bytes, tile_bias, nreg);
         rocket_bo_fini(fd, &b.coeff);
 
         p.ic = (uint16_t)K;    p.ih = (uint16_t)ih; p.iw = (uint16_t)iw;
@@ -370,10 +480,11 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
         p.ih_full = (uint16_t)ih; p.oh_full = (uint16_t)ih;
         p.int8_out = 1;
         /* The requant the caller asked for. conv_scale = in*w/out is what the emitter
-         * derives OUT_CVT from, so a unit in/w and out = 1/scale puts the caller's
-         * factor there directly. Per-tensor: the DPU's OUT_CVT has no per-channel
-         * multiplier on this path. */
-        p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f / scale;
+         * derives OUT_CVT from, so a unit in/w and out = 1/base puts the factor there
+         * directly. The OUT_CVT itself has no per-channel multiplier: on the per-column
+         * entry `base` is the shared gain the ramp rides on and the per-column part is
+         * in the coefficient group's C, not here. */
+        p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f / base_scale;
         p.input_zero_point = 0x80;   /* symmetric int8: every zero-point term cancels */
         p.output_zero_point = 0x80;
         p.weight_zero_point = 0x80;
@@ -494,8 +605,25 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
 
 done:
     free(ops); free(plan); free(stage); free(tile_bias);
+    free(cmul); free(sum_abs_w);
     r76_mm_free(fd, &b);
     return rc;
+}
+
+int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
+                              const int8_t *A, const int8_t *B,
+                              const int32_t *bias, float scale, int8_t *C)
+{
+    return r76_mm_int8(fd, M, K, N, A, B, bias, scale, NULL, C, NULL);
+}
+
+int rocket_matmul_int8_rk3576_perc(int fd, int M, int K, int N,
+                                   const int8_t *A, const int8_t *B,
+                                   const int32_t *bias, const float *scale_n,
+                                   int8_t *C, double *worst_rel_err)
+{
+    if (!scale_n) return ROCKET_E_SHAPE;
+    return r76_mm_int8(fd, M, K, N, A, B, bias, 0.0f, scale_n, C, worst_rel_err);
 }
 
 /* ============================================================================

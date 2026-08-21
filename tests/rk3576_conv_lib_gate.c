@@ -33,10 +33,35 @@
  *   rk3576_conv_lib_gate -l            list without running
  *   rk3576_conv_lib_gate rowbound|rowlaw|rowmap    the row-allowance probes; these
  *                                      MEASURE and print a map, they do not assert
+ *   rk3576_conv_lib_gate slicemap      where the trailing output-channel group is lost
+ *                                      as the resident weight SLICE grows, at a forced
+ *                                      feature allowance; also a map, not an assertion
  *
  * Env: ROCKET_LG_FILTER=<substr>   run only shapes whose name contains this
  *      ROCKET_LG_VERBOSE=1         per-shape detail and the first mismatches
  *      ROCKET_LG_MAP_LO/_HI        narrow rowmap's height walk
+ *      ROCKET_LG_MAP_REPS=N        run each height N times and report the RATE, which is
+ *                                  what an intermittent wall needs (default: one run,
+ *                                  with a wrong result confirmed twice)
+ *      ROCKET_LG_MAP_ONLY=1        skip rowmap's forced-rung section
+ *      ROCKET_LG_MAP_SEQ=1         with REPS, print one line PER REP: the dropped-to-zero
+ *                                  and wrong-valued counts and the span of each, in order.
+ *                                  The aggregate reports the widest span over the reps, so
+ *                                  it cannot see two reps failing in different FORMS, nor
+ *                                  where in the sequence a form occurs.
+ *      ROCKET_LG_MAP_F=N           force one CBUF F across the whole map walk, so the
+ *                                  programmed allowance is constant between cells; on
+ *                                  slicemap it selects ONE of the two forced arms
+ *      ROCKET_LG_SLICE_LO/_HI      slicemap's slice walk, in KiB (default 80..116)
+ *      ROCKET_LG_SLICE_OC          slicemap's output channels, i.e. its group count
+ *      ROCKET_LG_SLICE_IW/_IH      slicemap's plane (default 4x2, where nothing drains)
+ *      ROCKET_LG_SLICE_K           slicemap's kernel (default 1). The slice is
+ *                                  32*ic*k*k and ic must be a multiple of 32, so the
+ *                                  reachable slices are the multiples of k*k KiB —
+ *                                  which is what decides whether a given k can put a
+ *                                  slice on a 32 KiB boundary at all
+ *      ROCKET_LG_SLICE_PASTPOOL=1  run slicemap's cells past the pool too, where the
+ *                                  failure stops being quiet (no completion at all)
  *
  * Exit: 0 all pass, 1 a shape failed, 2 no NPU or the wrong chip (skip).
  */
@@ -266,11 +291,17 @@ struct lg_stat {
     int    chans;      /* output channels exact over their whole plane */
     double ms;
     /* What a wrong element LOOKS like, which is what separates the two hazards this
-     * path carries. An atom the DPU never emitted reads as the calloc'd zero, so a
-     * failure whose wrong elements are all zero-where-a-value-was-wanted is a DROP;
-     * one with wrong non-zero values is arithmetic. Both counted, plus the span, so
-     * an intermittent names itself rather than being re-run blind. */
-    int    wrong_zero, wrong_val;
+     * path carries. THREE classes, not two, because the library stamps every output
+     * surface with 0xA5 before the submit (`rocket_rk3576_sentinel_on`, on by default):
+     *   - still the SENTINEL (-91 as int8)  -> the part never wrote that element.
+     *   - zero where a value was wanted     -> written, and written as nothing.
+     *   - any other wrong value             -> written, with wrong data.
+     * Reading a stamped surface as though it were the calloc'd zero collapses the first
+     * class into the third and makes a dropped write indistinguishable from a wrong one;
+     * `wrong_zero` alone therefore says nothing about whether the part reached an element.
+     * All three counted, plus the span, so an intermittent names itself rather than being
+     * re-run blind. */
+    int    wrong_zero, wrong_val, wrong_stamp;
     int    span_c0, span_c1, span_y0, span_y1, span_x0, span_x1;
 };
 
@@ -298,9 +329,13 @@ static void lg_note_failure(const char *group, const char *name,
 }
 
 /* Record one wrong element: which kind, and how far the damage spreads. */
-static void lg_wrong(struct lg_stat *st, int got_is_zero, unsigned c, unsigned y, unsigned x)
+static void lg_wrong(struct lg_stat *st, int got_is_zero, int got_is_stamp,
+                     unsigned c, unsigned y, unsigned x)
 {
     if (got_is_zero) st->wrong_zero++; else st->wrong_val++;
+    /* The library's own stamp byte, read back through the output surface. Counted
+     * independently of the two above so the existing columns keep their meaning. */
+    if (got_is_stamp) st->wrong_stamp++;
     if (st->wrong_zero + st->wrong_val == 1) {
         st->span_c0 = st->span_c1 = (int)c;
         st->span_y0 = st->span_y1 = (int)y;
@@ -319,8 +354,9 @@ static void lg_wrong(struct lg_stat *st, int got_is_zero, unsigned c, unsigned y
 static void lg_print_signature(const struct lg_stat *st)
 {
     if (!st->wrong_zero && !st->wrong_val) return;
-    printf("         %d dropped to zero, %d wrong-valued; c %d..%d y %d..%d x %d..%d\n",
-           st->wrong_zero, st->wrong_val, st->span_c0, st->span_c1,
+    printf("         %d dropped to zero, %d wrong-valued (%d still the stamp); "
+           "c %d..%d y %d..%d x %d..%d\n",
+           st->wrong_zero, st->wrong_val, st->wrong_stamp, st->span_c0, st->span_c1,
            st->span_y0, st->span_y1, st->span_x0, st->span_x1);
 }
 
@@ -478,7 +514,7 @@ static int run_one_pad(int fd, const char *name, unsigned ic, unsigned oc, unsig
                 if (diff > st->maxdiff) st->maxdiff = diff;
                 if (got == want) st->exact++;
                 else {
-                    lg_wrong(st, got == 0, c, y, x);
+                    lg_wrong(st, got == 0, got == (int)(int8_t)0xA5, c, y, x);
                     if (verbose && shown < 8) {
                         printf("    mism c=%u y=%u x=%u: want %d got %d (acc %lld)\n",
                                c, y, x, want, got, (long long)acc);
@@ -637,7 +673,7 @@ static int run_fc(int fd, const fc_shape_t *s, struct lg_stat *st)
                     int dq = (int)(dv < 0 ? -dv : dv);
                     chan_exact = 0;
                     if (dq > st->maxdiff) st->maxdiff = dq;
-                    lg_wrong(st, (float)got == 0.0f, c, y, x);
+                    lg_wrong(st, (float)got == 0.0f, 0, c, y, x);
                     if (verbose && shown < 8) {
                         printf("    mism c=%u y=%u x=%u: want %g got %g\n",
                                c, y, x, (double)(float)want, (double)(float)got);
@@ -988,6 +1024,36 @@ static const struct rowmap_case ROWMAP[] = {
      * reaches them. */
     { "dir-160-ic32-k1-oc64", 32,  64, 160, 1, 0 },
     { "dir-160-ic32-k1-oc96", 32,  96, 160, 1, 0 },
+    /* ---- THE DIRECT PATH'S ROW ALLOWANCE, at the output-channel group counts where the
+     * shipped planner is over. A bisection (`rowlaw`) put the ceiling at 79 / 57-61 /
+     * 44-45 / 38-39 / 32-34 input rows at 2-6 groups — falling with the group count, far
+     * below any rung boundary, with only the last few output rows wrong and a 1-4 row
+     * swing between runs. A bisection over a band or an intermittent reports whichever
+     * edge it walks into, so these are read as a MAP, and `ROCKET_LG_MAP_REPS` makes each
+     * height a RATE rather than one sample.
+     *
+     * `iw 112 ic 32 k7` is `rowlaw`'s own geometry — 56 granules a feature row, a
+     * 784-granule weight slice per output-channel group — so the only axis that moves
+     * across the six is `oc`. g1 and g2 are the controls: the shipped planner agrees with
+     * the part at g1 and the conv gate's own k7 shapes sit at 1 and 2 groups. */
+    { "k7g1-112",  32,  32, 112, 7, 0 },
+    { "k7g2-112",  32,  64, 112, 7, 0 },
+    { "k7g3-112",  32,  96, 112, 7, 0 },
+    { "k7g4-112",  32, 128, 112, 7, 0 },
+    { "k7g5-112",  32, 160, 112, 7, 0 },
+    { "k7g6-112",  32, 192, 112, 7, 0 },
+    /* The axes the six above hold constant, so the onset can be FITTED rather than
+     * described. The SLICE at a fixed group count and width, through the kernel (k5 is
+     * 400 granules, k3 is 144, against k7's 784) and through `ic` — the two must move the
+     * onset the same way or the governing quantity is not the slice. And the WIDTH at a
+     * fixed cube, where a per-ROW term would show up as an onset that moves with the row
+     * count rather than with the granule total. Each is narrow enough to map around a
+     * predicted onset in about a minute with ROCKET_LG_MAP_LO/_HI. */
+    { "k5g4-112",   32, 128, 112, 5, 0 },
+    { "k3g4-112",   32, 128, 112, 3, 0 },
+    { "k7g4-56",    32, 128,  56, 7, 0 },
+    { "k7g4-224",   32, 128, 224, 7, 0 },
+    { "k7ic64-g2",  64,  64, 112, 7, 0 },
 };
 #define N_ROWMAP ((int)(sizeof ROWMAP / sizeof *ROWMAP))
 
@@ -1025,6 +1091,7 @@ static int rowmap(int fd)
            "        shipped planner's own choice lands. `need` is ih*entries granules;\n"
            "        a rung that delivers covers a window up to 4096+F.\n");
 
+    if (env_int("ROCKET_LG_MAP_ONLY", 0)) goto map_only;
     printf("\n-- rungs: ONE window, each rung FORCED under it --\n");
     for (i = 0; i < N_ROWMAP; i++) {
         const struct rowmap_case *s = &ROWMAP[i];
@@ -1066,6 +1133,7 @@ static int rowmap(int fd)
 
     /* The band as a caller meets it: the planner choosing, the height walking. Linear,
      * because the whole point is that the failing region has an upper edge. */
+map_only:
     printf("\n-- map: the shipped planner choosing F, plane height walking --\n");
     for (i = 0; i < N_ROWMAP; i++) {
         const struct rowmap_case *s = &ROWMAP[i];
@@ -1083,20 +1151,215 @@ static int rowmap(int fd)
             hi = (unsigned)env_int("ROCKET_LG_MAP_HI", 0);
         printf("  %-16s %s entries %u/row, reachable heights %u..%u\n",
                s->name, s->dw ? "dw    " : "direct", entries, lo, hi);
+        int reps = env_int("ROCKET_LG_MAP_REPS", 0);
+        /* The planner's own F moves BETWEEN cells — a cube that fits at F=0 lets it charge
+         * the whole cube and take a lower rung — so a walk that lets it choose is two
+         * experiments at once and the honoured window cannot be fitted against the cube.
+         * Forcing one rung across every cell holds the programmed allowance fixed and
+         * leaves the cube as the only thing that moves. */
+        int f_env = env_int("ROCKET_LG_MAP_F", -1);
+        unsigned f_force = f_env < 0 ? ~0u : (unsigned)f_env;
+
         for (ih = lo; ih <= hi; ih++) {
             unsigned f = 0;
             int planned = rocket_rk3576_cbuf_f(s->iw, s->ic, ih, s->oc, s->k, s->k,
                                                s->dw, &f);
-            int rc = rowmap_try(fd, s, ih, ~0u, &st);
-            if (rc == 1) rc = rowmap_try(fd, s, ih, ~0u, &st);
-            printf("      ih %-4u need %-5u  planner F=%-5u  %s\n", ih, ih * entries,
-                   planned < 0 ? 0u : f,
-                   rc == 0 ? "exact"
-                   : rc == 3 ? "refused" : rc == 2 ? "skip" : "WRONG");
+            if (f_env >= 0) f = (unsigned)f_env;
+            if (reps < 2) {
+                int rc = rowmap_try(fd, s, ih, f_force, &st);
+                if (rc == 1) rc = rowmap_try(fd, s, ih, f_force, &st);
+                printf("      ih %-4u need %-5u  planner F=%-5u  %s\n", ih, ih * entries,
+                       planned < 0 ? 0u : f,
+                       rc == 0 ? "exact"
+                       : rc == 3 ? "refused" : rc == 2 ? "skip" : "WRONG");
+                continue;
+            }
+            /* A RATE, because a wall that swings between runs is not read by a
+             * confirm-twice: that turns a hazard which fires half the time into one that
+             * prints "exact" three cells in four. Each height is run `reps` times and the
+             * count of wrong runs is the cell; the spans are the WIDEST any wrong run
+             * reached, since which rows and which channels go wrong is what separates a
+             * row-tail wall from a channel-group one. */
+            {
+                int r2, n_wrong = 0, refused = 0, worst = 0;
+                int y0 = 0, y1 = 0, c0 = 0, c1 = 0;
+                /* The aggregate below reports the WIDEST span over the reps, which is what
+                 * a wall's extent needs — but it cannot see whether two reps failed
+                 * DIFFERENTLY, and this path has two failure forms (a row tail of the
+                 * trailing group, and a surface wrong across every row and channel). The
+                 * per-rep line separates them and carries the two things that discriminate
+                 * a cut drain from a write landing in the wrong job's window: the
+                 * zero/wrong-valued split, and the rep's POSITION. Off by default so no
+                 * gate expectation moves. */
+                int seq = env_int("ROCKET_LG_MAP_SEQ", 0);
+
+                for (r2 = 0; r2 < reps; r2++) {
+                    int rc = rowmap_try(fd, s, ih, f_force, &st);
+                    if (seq && rc == 1)
+                        printf("      seq ih %-4u rep %-3d %6d zero %6d val %6d stamp  "
+                               "y %d-%d c %d-%d x %d-%d\n",
+                               ih, r2, st.wrong_zero, st.wrong_val, st.wrong_stamp,
+                               st.span_y0, st.span_y1, st.span_c0, st.span_c1,
+                               st.span_x0, st.span_x1);
+                    else if (seq)
+                        printf("      seq ih %-4u rep %-3d %s\n", ih, r2,
+                               rc == 0 ? "exact" : rc == 3 ? "refused" : "skip");
+                    if (rc != 1) { if (rc != 0) refused++; continue; }
+                    if (!n_wrong) {
+                        y0 = st.span_y0; y1 = st.span_y1;
+                        c0 = st.span_c0; c1 = st.span_c1;
+                    } else {
+                        if (st.span_y0 < y0) y0 = st.span_y0;
+                        if (st.span_y1 > y1) y1 = st.span_y1;
+                        if (st.span_c0 < c0) c0 = st.span_c0;
+                        if (st.span_c1 > c1) c1 = st.span_c1;
+                    }
+                    if (st.wrong_zero + st.wrong_val > worst)
+                        worst = st.wrong_zero + st.wrong_val;
+                    n_wrong++;
+                }
+                printf("      ih %-4u out %-4u need %-5u  %sF=%-5u  %d/%d wrong",
+                       ih, ih - s->k + 1u, ih * entries,
+                       f_env >= 0 ? "forced " : "planner ", planned < 0 ? 0u : f,
+                       n_wrong, reps);
+                if (n_wrong)
+                    printf("   rows %d-%d of %u, chans %d-%d, worst %d elements",
+                           y0, y1, ih - s->k + 1u, c0, c1, worst);
+                if (refused) printf("   (%d refused or skipped)", refused);
+                printf("\n");
+            }
         }
     }
     printf("== rowmap MEASURES; the assertion is in the conv and net gates ==\n");
 #undef ROWMAP_SKIP
+    return 0;
+}
+
+/* ---- the SLICE boundary as a function of the feature allowance ---------------------
+ *
+ * r76_weight_slice_cap() is the space at F=0 and r76_weight_slice_cap_at() subtracts F
+ * from it granule for granule. That subtraction is 1:1 by MECHANISM — one pool, and a
+ * granule is spent once — but the two cells that established the pool reading BRACKET it
+ * rather than pin it: 98 KiB wrong at two groups and 49 KiB exact at four. A slope
+ * steeper than 1:1 leaves the shipped rule accepting shapes the part computes wrong,
+ * which is this file's usual quiet failure.
+ *
+ * So read the boundary directly, at one group count, with F the only thing that moves.
+ * The plane is 4x2 — far inside every budget, nothing drains, and it is the geometry the
+ * F=0 table itself was measured on — and `k=1` makes the slice `32*ic`, so an `ic` step
+ * of 32 is a 1 KiB step. `ROCKET_RK3576_CBUF_F` forces the allowance and bypasses both
+ * fit checks, which is what makes a boundary readable at all: the shipped plan would
+ * refuse every cell past its own cap.
+ *
+ * Stay under the POOL as well as under the cap. At F the weight path has
+ * 7168-4096-F granules, so the quiet graded loss only exists below that; past it the job
+ * raises no completion and the surface guard spends its power cycles. At F=1024 that
+ * ceiling is 128 KiB, so the default sweep stops at 116.
+ */
+static int slicemap(int fd)
+{
+    unsigned lo_kib = (unsigned)env_int("ROCKET_LG_SLICE_LO", 80);
+    unsigned hi_kib = (unsigned)env_int("ROCKET_LG_SLICE_HI", 116);
+    unsigned oc     = (unsigned)env_int("ROCKET_LG_SLICE_OC", 64);
+    unsigned iw     = (unsigned)env_int("ROCKET_LG_SLICE_IW", 4);
+    unsigned ih     = (unsigned)env_int("ROCKET_LG_SLICE_IH", 2);
+    unsigned kk     = (unsigned)env_int("ROCKET_LG_SLICE_K", 1);
+    int reps        = env_int("ROCKET_LG_MAP_REPS", 3);
+    int f_env       = env_int("ROCKET_LG_MAP_F", -1);
+    /* ROCKET_LG_MAP_F selects ONE forced allowance rather than filtering the default
+     * pair — a value the pair does not contain would otherwise skip every arm and print
+     * an empty section, which reads as "no cells" and not as "you asked for nothing". */
+    unsigned fs_one[1], kib;
+    const unsigned *FS;
+    int n_fs, fi;
+    static const unsigned FS_DEFAULT[] = { 0u, 1024u };
+    int past_pool = env_int("ROCKET_LG_SLICE_PASTPOOL", 0);
+
+    if (f_env >= 0) { fs_one[0] = (unsigned)f_env; FS = fs_one; n_fs = 1; }
+    else            { FS = FS_DEFAULT; n_fs = (int)(sizeof FS_DEFAULT / sizeof *FS_DEFAULT); }
+
+    if (reps < 1) reps = 1;
+    if (kk < 1) kk = 1;
+    /* The slice is 32*ic*k*k bytes and the direct path demands ic be a multiple of 32
+     * (rocket_rk3576_pad_ic), so the reachable slices are exactly the multiples of
+     * k*k KiB — 1 KiB apart at k=1, 4 at k=2, 9 at k=3, 16 at k=4. That lattice is
+     * what decides which k can drive a question about a slice SIZE: a 32 KiB-multiple
+     * slice needs lcm(k*k, 32) = 32, so k=1, 2 and 4 reach one and k=3 and k=5 cannot
+     * reach one below 288 and 800 KiB. A cell off the lattice is printed rather than
+     * silently skipped, because an absent row reads as a cell that ran and passed. */
+    printf("slicemap: where the trailing output-channel group is lost, as a function of\n"
+           "          the resident weight SLICE, at a FORCED feature allowance. Plane\n"
+           "          %ux%u, k=%u, oc=%u (%u group(s)); slice = 32*ic*k*k, so %u KiB\n"
+           "          per step and only multiples of %u KiB are reachable.\n",
+           iw, ih, kk, oc, (oc + 31u) / 32u, kk * kk, kk * kk);
+    if (iw < kk || ih < kk) {
+        printf("      the %ux%u plane is smaller than k=%u at VALID padding: every cell\n"
+               "      would skip. Raise ROCKET_LG_SLICE_IW/_IH.\n", iw, ih, kk);
+        return 0;
+    }
+
+    for (fi = 0; fi < n_fs; fi++) {
+        unsigned f = FS[fi];
+        unsigned pool_kib;
+
+        pool_kib = (7168u - 4096u - f) / 16u;   /* granules left to the weight path */
+        printf("\n-- forced F=%u: budget %u granules, the weight path has %u (%u KiB) --\n",
+               f, 4096u + f, 7168u - 4096u - f, pool_kib);
+        for (kib = lo_kib; kib <= hi_kib; kib++) {
+            unsigned ic;
+            struct lg_stat st;
+            int r, n_wrong = 0, refused = 0, worst = 0, nocomp = 0;
+            int c0 = 0, c1 = 0;
+            unsigned nout = oc * (iw - kk + 1u) * (ih - kk + 1u);   /* VALID, stride 1 */
+            char nm[48];
+
+            if (kib % (kk * kk)) {
+                printf("      slice %-4u KiB  --      off the k=%u lattice, no legal ic\n",
+                       kib, kk);
+                continue;
+            }
+            ic = kib / (kk * kk) * 32u;
+            if (kib > pool_kib && !past_pool) {
+                printf("      slice %-4u KiB  ic %-5u  past the pool, not run "
+                       "(ROCKET_LG_SLICE_PASTPOOL=1 runs it)\n", kib, ic);
+                continue;
+            }
+            snprintf(nm, sizeof nm, "slice-%uKiB-oc%u-F%u-k%u", kib, oc, f, kk);
+            for (r = 0; r < reps; r++) {
+                int rc;
+                char buf[32];
+
+                snprintf(buf, sizeof buf, "%u", f);
+                setenv("ROCKET_RK3576_CBUF_F", buf, 1);
+                rc = run_one(fd, nm, ic, oc, iw, ih, kk, 1, 0 /*VALID*/, 0,
+                             0, 0, 0, 0, &st);
+                unsetenv("ROCKET_RK3576_CBUF_F");
+                if (rc != 1) { if (rc != 0) refused++; continue; }
+                /* The entry failing outright comes back as `wrong` with nothing scored,
+                 * which otherwise prints as "N/N wrong, worst 0" and reads as a wrong
+                 * SURFACE. It is the opposite kind of cell — past the pool the program
+                 * does not execute at all — so it gets its own column. */
+                if (!st.total) { nocomp++; continue; }
+                if (!n_wrong) { c0 = st.span_c0; c1 = st.span_c1; }
+                else {
+                    if (st.span_c0 < c0) c0 = st.span_c0;
+                    if (st.span_c1 > c1) c1 = st.span_c1;
+                }
+                if (st.wrong_zero + st.wrong_val > worst)
+                    worst = st.wrong_zero + st.wrong_val;
+                n_wrong++;
+            }
+            printf("      slice %-4u KiB  ic %-5u  %d/%d wrong", kib, ic, n_wrong, reps);
+            if (n_wrong)
+                printf("   chans %d-%d of %u, worst %d of %u elements",
+                       c0, c1, oc, worst, nout);
+            if (nocomp) printf("   (%d did not COMPLETE — the entry failed, no surface "
+                               "to score)", nocomp);
+            if (refused) printf("   (%d refused or skipped)", refused);
+            printf("\n");
+        }
+    }
+    printf("== slicemap MEASURES; the assertion is claimplan's `one pool` cells ==\n");
     return 0;
 }
 
@@ -1159,6 +1422,66 @@ static int claimplan(void)
     }
     printf("== claimplan: %d shapes, %d accept-a-refusal, %d over-refusal ==\n",
            n, fail, over);
+
+    /* ---- the feature allowance and the weight slice are one pool, asserted PURELY.
+     *
+     * `4096+F` granules are programmed for the feature side whatever the plane's height
+     * is, so a rung is a claim on the same granules the resident slice needs, and the
+     * measured slice cap is the space at F=0. Both shapes below were wrong ON THE PART at
+     * the rung the planner used to take, in the trailing output-channel groups and at every
+     * row — 1 of 2 groups at 98 KiB beside F=1024, 3 of 4 at 49 KiB beside F=2048 — and the
+     * CBUF pool check accepts both (6688 and 6928 granules against 7168), so it is not what
+     * covers them. `k7ic64-g2` is the one that had been recorded as a dead F=1024 rung.
+     *
+     * These are the WINDOW's side of it. A rung whose F-aware cap no longer covers the
+     * slice must be skipped rather than taken, or the row planner hands out exactly the
+     * failing band: 45 input rows for the first shape is F=1024's window and every height
+     * from 37 to 45 was wrong. Pure arithmetic, so this asserts off-device too, which is
+     * the whole point — nothing in the corpus reaches either geometry.
+     * [HW sweep, H96 MAX M9, `rowmap` with ROCKET_LG_MAP_F] */
+    {
+        static const struct { const char *name; unsigned iw, ic, oc, k, rows, f_at; }
+        POOLSHARE[] = {
+            /* 98 KiB slice, 2 groups: F=1024's cap is 92 KiB, so F=0 and 36 rows. */
+            { "k7 ic64 oc64  112", 112,  64,  64, 7, 36, 0u },
+            /* 49 KiB slice, 4 groups: F=1024's cap is 80 KiB and F=2048's is 16, so
+             * F=1024 and 91 rows — where charging the pool alone would take 2048. */
+            { "k7 ic32 oc128 112", 112,  32, 128, 7, 91, 1024u },
+        };
+        size_t j;
+        printf("== the feature allowance and the weight slice are one pool ==\n");
+        for (j = 0; j < sizeof POOLSHARE / sizeof POOLSHARE[0]; j++) {
+            unsigned got = rocket_rk3576_max_task_rows(POOLSHARE[j].iw, POOLSHARE[j].ic,
+                                                       POOLSHARE[j].oc, POOLSHARE[j].k,
+                                                       POOLSHARE[j].k, 0);
+            unsigned f = ~0u;
+            int rc = rocket_rk3576_cbuf_f(POOLSHARE[j].iw, POOLSHARE[j].ic,
+                                          POOLSHARE[j].rows, POOLSHARE[j].oc,
+                                          POOLSHARE[j].k, POOLSHARE[j].k, 0, &f);
+            int bad = got != POOLSHARE[j].rows || rc != 0 || f != POOLSHARE[j].f_at;
+            printf("  %-6s %-18s window %u row(s) (want %u), F=%d at that window "
+                   "(want %u)\n", bad ? "FAIL" : "ok", POOLSHARE[j].name, got,
+                   POOLSHARE[j].rows, rc == 0 ? (int)f : -1, POOLSHARE[j].f_at);
+            if (bad) {
+                lg_note_failure("poolshare", POOLSHARE[j].name, NULL,
+                                "the rung and the weight slice are not charged together");
+                fail++;
+            }
+        }
+        /* And the height one past that window must REFUSE rather than compute, which is
+         * the difference between a shorter window and a silently wrong surface. */
+        {
+            unsigned f = ~0u;
+            int rc = rocket_rk3576_cbuf_f(112, 64, 37, 64, 7, 7, 0, &f);
+            printf("  %-6s %-18s one row past the window refuses (rc=%d)\n",
+                   rc == 0 ? "FAIL" : "ok", "k7 ic64 oc64  112", rc);
+            if (rc == 0) {
+                lg_note_failure("poolshare", "k7 ic64 oc64 112 ih37", NULL,
+                                "the plan accepts a rung the slice does not leave room for");
+                fail++;
+            }
+        }
+    }
     return fail ? 1 : 0;
 }
 
@@ -1176,11 +1499,13 @@ int main(int argc, char **argv)
     int ngroups = 0;
 
     int want_rowbound = 0, want_rowlaw = 0, want_rowmap = 0, want_claimplan = 0;
+    int want_slicemap = 0;
     for (a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-l")) list = 1;
         else if (!strcmp(argv[a], "rowbound")) want_rowbound = 1;
         else if (!strcmp(argv[a], "rowlaw")) want_rowlaw = 1;
         else if (!strcmp(argv[a], "rowmap")) want_rowmap = 1;
+        else if (!strcmp(argv[a], "slicemap")) want_slicemap = 1;
         else if (!strcmp(argv[a], "claimplan")) want_claimplan = 1;
         else if (!strcmp(argv[a], "all")) ngroups = 0;
         else if (ngroups < 16) groups[ngroups++] = argv[a];
@@ -1217,10 +1542,11 @@ int main(int argc, char **argv)
         }
     }
 
-    if (want_rowbound || want_rowlaw || want_rowmap) {
+    if (want_rowbound || want_rowlaw || want_rowmap || want_slicemap) {
         int rc = want_rowbound ? rowbound(fd) : 0;
         if (want_rowlaw) rc |= rowlaw(fd);
         if (want_rowmap) rc |= rowmap(fd);
+        if (want_slicemap) rc |= slicemap(fd);
         rocket_close(fd);
         return rc;
     }

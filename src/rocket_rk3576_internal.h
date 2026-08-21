@@ -49,6 +49,36 @@ int rocket_rk3576_sentinel_on(void);
 
 #define ROCKET_RK3576_SENTINEL_BYTE 0xA5u
 
+/* The per-output-channel requant plan, shared by the convolution and the matmul.
+ *
+ * The DPU's epilogue is `(acc + A[oc]) * C[oc]` in saturating int32 followed by ONE
+ * `(v*MUL)>>SHIFT` per task, so a per-channel scale is an integer C ramp riding on a
+ * single (MUL, SHIFT). This picks both: the largest base gain every channel can reach
+ * without its C exceeding the int16 field or its `(acc + A)*C` product overflowing
+ * int32, then the ramp against the base the emitter will ACTUALLY program — the
+ * quantized one, read back through the same derivation, not the one that was asked for.
+ *
+ * `w_scale[oc]` is per channel and `in_scale`/`out_scale` are per tensor; the target
+ * gain is `in_scale*w_scale[oc]/out_scale`. A caller whose per-channel factor is
+ * already the whole gain passes it as `w_scale` with the other two at 1.
+ *
+ * `sum_abs_w[oc]` is that channel's sum of |weight| over its whole filter, which is
+ * what bounds the accumulator: taken from the ACTUAL weights, because the int8 envelope
+ * is one to two orders of magnitude looser and the difference is most of the available
+ * precision. `perm` may be NULL for the identity order. `C` is written for `ocreg`
+ * channels — the padded tail gets 1, never 0, because a zero C gates the whole
+ * eight-channel group's BS stage off and the DPU writes an empty surface with no fault.
+ *
+ * Returns the worst-case relative gain error over the tile's channels in
+ * `*max_rel_err`, which is the resolution the integer ramp actually delivered and the
+ * only thing that separates it from an exact per-column scale. */
+int rocket_rk3576_plan_perchannel(const char *entry, unsigned oc0, unsigned tile_oc,
+                                  unsigned ocreg, const int32_t *A,
+                                  const int64_t *sum_abs_w, float in_scale,
+                                  const float *w_scale, float out_scale,
+                                  const unsigned *perm,
+                                  int16_t *C, float *base_scale, double *max_rel_err);
+
 /* Where in the CBUF a task stages, as a granule offset added to the window base and
  * the fetch base together — a bring-up knob, zero for every shipped path.
  *

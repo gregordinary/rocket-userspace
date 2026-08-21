@@ -154,7 +154,13 @@ static int pool_run(int fd, const struct geom *g, unsigned ow, unsigned oh,
 
     in_h[0] = in->handle; in_h[1] = bo_r.handle;
     out_h[0] = out->handle;
-    if (rocket_submit_matmul(fd, &bo_r, p.task_count, in_h, 2, out_h, 1, 2000) != 0) {
+    /* Every program this probe submits is a pool, so its completion is the PPU's own bit
+     * and never the DPU's. Naming the class is what keeps the job off the driver's
+     * fallback wait; gate it, because the submit ioctl rejects an unrecognised flag word
+     * rather than ignoring it. */
+    if (rocket_submit_matmul_flags(fd, &bo_r, p.task_count, in_h, 2, out_h, 1,
+                                   rocket_ppu_done_supported()
+                                       ? ROCKET_JOB_PPU_DONE : 0u) != 0) {
         printf("      submit failed\n"); goto done;
     }
     if (rocket_bo_prep(fd, out, 0, 2000000000ull) < 0) {

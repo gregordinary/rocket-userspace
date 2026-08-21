@@ -95,6 +95,14 @@ typedef struct {
      * scatters what it is handed and has no way to know a prepared copy was meant. */
     unsigned host_input;
 
+    /* Set where this layer's output must stay a ROW-MAJOR tensor because something
+     * outside the description reads it — in a frontend, a partition output. Every other
+     * kind says that by leaving its handle NULL below, which costs one join and never a
+     * wrong answer; a CONCATENATION has no handle to leave, and placing one leaves its
+     * consumers reading a cube and nothing writing the tensor the outside reader wants.
+     * Without this the caller's only recourse is to refuse the whole graph. */
+    unsigned row_major_out;
+
     /* The resident handles, already packed. Exactly one of them is set, by kind; a NULL
      * here is how a layer says it cannot be linked or chained at all. */
     rocket_conv2d_int8_weights_rk3576 *conv;
@@ -154,6 +162,10 @@ typedef struct rocket_graph_plan {
     int nojoin[ROCKET_GRAPH_NJ_N];
     size_t nojoin_bytes[ROCKET_GRAPH_NJ_N];
     int cat_adds, catn_wired, tails_given, multi_srcs;
+    /* Concatenations the caller declared row-major, so the placement above was not
+     * taken. Counted rather than silent: it is the difference between a graph that
+     * pays a host copy and one whose shape the planner could not have wired. */
+    int catn_escaped;
     int kick_runs, kick_layers;
     int kb_count[ROCKET_GRAPH_KB_N];
     unsigned char *kb_of;      /* per layer: the bucket + 1, or 0 for "in a run"          */

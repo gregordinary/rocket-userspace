@@ -70,6 +70,15 @@ g conv_lib_gate              -- rk3576_conv_lib_gate
 g conv_sym                   -- rk3576_conv_sym all
 g refusal_gate               -- rk3576_refusal_gate
 g matmul_gate                -- rk3576_matmul_gate
+# The matmul entry's REQUANT against a host model of it, per-tensor and per-column. The
+# only gate anywhere that scores what the DPU's output convertor computes on the matmul
+# path; every int8 accuracy claim about that entry rests on the two agreeing.
+g mm_requant                 -- rk3576_mm_requant
+# The W8A8 route COMPOSED: the frontend's two-pass calibration, its frozen scale and the
+# de-quantize, driven end to end on the part. Every other number on that route is host
+# arithmetic over a simulator, and this is the only row where the part supplies the
+# accumulator the calibration reads.
+g w8a8_route                 -- rk3576_w8a8_route
 g perchannel_gate            -- rk3576_perchannel_gate
 g coeff_c                    -- rk3576_coeff_c all
 
@@ -141,7 +150,10 @@ echo "pass=$pass skip=$skip fail=$fail   ($(($(date +%s) - t0)) s)"
 [ -n "$failed_names" ] && echo "FAILED:$failed_names"
 echo "taint: $(cat /proc/sys/kernel/tainted)"
 echo "dmesg WARNING: $(sudo dmesg | grep -c WARNING)"
-# The backstop is a job that raised no PC_DONE at all, which is what a poisoned submit
-# looks like from the driver. Expected non-zero, and only from the two poison rows.
-echo "backstop hits (cumulative dmesg): $(sudo dmesg | grep -c 'raised no PC_DONE')"
+# The backstop is a job that never reported itself finished, which is what a poisoned
+# submit looks like from the driver. Expected non-zero, and only from the two poison rows.
+# Matched on "retiring it" rather than on the reason: the driver's wording for it has
+# changed once already, and a grep that misses the message reports zero hits rather than
+# no column, which reads as a clean run.
+echo "backstop hits (cumulative dmesg): $(sudo dmesg | grep -c 'retiring it')"
 exit $([ "$fail" -gt 0 ] && echo 1 || echo 0)

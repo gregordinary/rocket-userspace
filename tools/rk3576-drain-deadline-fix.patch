@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gregordinary <33880035+gregordinary@users.noreply.github.com>
+Date: Wed, 5 Aug 2026 00:00:00 +0000
+Subject: [PATCH] accel/rocket: wait for the writing block, not for a deadline
+
+0022 anchored a job's completion wait on the hardware's own account of the
+kick, so how long a batched STREAM may be stopped being a property of the
+driver's timing.  What it left is the other half: how long ONE program may
+be.
+
+Past the kick, the driver waits for the writing block's own completion
+bounded by dpu_grace_us, a fitted 500 us.  That bound is on the last
+program of the kick, and PC_DONE does not mean that program is finished
+computing -- it means the program counter retired it.  On a job of one
+task, where TASK_NUMBER = 1 and both PC_TASK_STATUS counters read zero
+always, PC_DONE alone is the kick-over signal and it is raised while the
+CNA/CORE/DPU pipeline still has the whole convolution to run.  So the
+grace is asked to cover an entire program's execution, and every value is
+too small for some program.
+
+What that looks like from userspace is a hardware capacity bound, and it
+wore one convincingly enough to be recorded as one.  A single 112x112 k7
+ic32 convolution is bit-exact up to a plane height that FALLS as the
+output-channel count rises -- 78 rows at two output-channel groups, 44 at
+four, 32 at six -- with a full, correctly sized surface whose last rows of
+the last output-channel group carry plausible wrong values.  No
+"feature + weights <= pool" form states it: one group computes at a total
+of 6888 CBUF granules where two groups fail at 5992.  What every one of
+those walls has in common is WORK -- 766 to 830 MMACs, at a footprint that
+falls 2.4x across them -- and work is a time.  Raising dpu_grace_us to 750
+makes all of them bit-exact at unchanged shape, program and CBUF budget,
+and restoring 500 brings them back [HW sweep, H96 MAX M9].
+
+Two further measurements say the governing quantity is the program's
+execution and not the bytes it writes.  At the same plane and a 3x3 kernel
+-- 5.4x fewer MACs per output element, and a LARGER surface -- the same
+convolution is bit-exact at every reachable height to 109, where the
+output is 1.47 MB against the 516 KB the k7 wall sits at.  And at 64 input
+channels, where the MACs per output element double and the surface halves,
+the wall comes BACK.
+
+So the deadline is the wrong shape for this wait, and there is no right
+value for it.  The block raises its own completion; wait for that.  The
+backstop 0022 added already bounds a job that never reports itself
+finished, and it moves out of the kick-unfinished branch to cover this
+wait too -- a job whose writing block never completes now retires there,
+loudly, instead of silently handing back a truncated surface.
+
+dpu_grace_us stays, as an optional CAP, and defaults to 0 -- wait for the
+block.  Setting it non-zero restores the old bounded wait, which is what
+makes the two comparable on one kernel.  Note that 0 used to mean "retire
+on the tick after PC_DONE" and now means "wait"; nothing set it to 0.
+
+The cost of this is paid by a job that raises no completion and does not
+say so.  DRM_ROCKET_JOB_NO_DPU_DONE and DRM_ROCKET_JOB_PPU_DONE are
+advisory, and a job in the wrong class used to lose 500 us; it now waits
+out the backstop instead.  That trade is deliberate in kind -- the old
+failure was silent and produced a wrong surface, the new one is slow, is
+logged with the core and the task count, and produces a right one -- but
+it is not free, and how much it costs was measured rather than assumed.
+
+Raising dpu_grace_us to 5000 on the old behaviour shows which submits ride
+it to completion, because those are the ones whose wall scales with it.
+Over a 58-gate list [HW sweep, H96 MAX M9] the whole run moves +1.0% and
+every graph is inside noise -- MobileNetV1 623 ms either way, Inception V3
+65917 -> 65351 ms -- so nothing on the library's own paths rides it: those
+name their class (a matmul and a convolution as the wide-output class, a
+pool as the PPU class).  Two probe rows do: 153 -> 535 ms and 214 -> 404
+ms, which is ~85 and ~42 grace-bound submits, and both are raw test
+submits that pass no class flag at all.
+
+So the population that pays is jobs with no flag naming their writer, and
+the fix for that is to name it, not to keep a deadline for everyone.
+Measured with this patch applied, those two rows are 153 -> 10303 ms and
+214 -> 4767 ms, which is the 125 ms backstop times the submit counts the
+grace sweep predicted, to within 10%.  They stay rc=0: the surfaces are
+right and the wait is long.  Every other row of the 58 is unmoved.
+
+Measured with this patch applied, as an out-of-tree build of the same
+source against the board's own headers [HW sweep, H96 MAX M9]:
+
+  - the 112x112 k7 ic32 convolution at four output-channel groups is
+    bit-exact at every height from 40 to 56, 51 runs, 0 wrong;
+  - setting dpu_grace_us = 500 on this same kernel brings the failure
+    back -- 13 of those same 17 heights are wrong, 30 runs of 51, with
+    the wrong elements a suffix of the rows of the last output-channel
+    group as before -- so the two behaviours are one A/B on one binary;
+  - the unmodified series, rebuilt the same way, is 58 of 58 gates rc=0
+    at taint 4096 in 205 s against the shipped module's 202 s, which is
+    what says the rebuild is faithful before anything is read off it.
+
+Signed-off-by: gregordinary <33880035+gregordinary@users.noreply.github.com>
+---
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -40,10 +40,25 @@
+ MODULE_PARM_DESC(poll_interval_us,
+ 		 "RK3576 PC_DONE completion poll period, in microseconds (default 50)");
+ 
+-static unsigned int rocket_dpu_grace_us = 500;
++/*
++ * An optional CAP on the wait for the writing block's completion, for a job
++ * that has one.  Zero -- the default -- waits for the block.
++ *
++ * It was a deadline of 500 us, and a deadline is the wrong shape for this
++ * wait.  How long a program's write DMA takes to drain is a property of the
++ * program: a single-task convolution whose drain outruns the cap has its fence
++ * signalled while the core is still writing, and the caller reads a full,
++ * correctly sized surface whose last rows of the last output-channel group are
++ * wrong.  Every value is too small for some program, so no value is right.
++ *
++ * The block says when it is done, so wait for it; ROCKET_POLL_BACKSTOP_US
++ * still bounds a job whose completion never arrives at all.  Set this non-zero
++ * to restore the old bounded wait.
++ */
++static unsigned int rocket_dpu_grace_us;
+ module_param_named(dpu_grace_us, rocket_dpu_grace_us, uint, 0644);
+ MODULE_PARM_DESC(dpu_grace_us,
+-		 "RK3576: how long to wait past PC_DONE for the DPU's own completion, in microseconds (default 500)");
++		 "RK3576: cap on the wait for the writing block's completion, in microseconds, or 0 to wait for it (default 0)");
+ 
+ /*
+  * The same deadline for a job userspace has told us raises no DPU completion
+@@ -650,10 +665,12 @@
+ 	 * convolution or a matmul, the PPU for a pooling program, which enables
+ 	 * no DPU stage at all.
+ 	 *
+-	 * That wait is bounded by the grace, so a task raising no completion at
+-	 * all cannot stall behind one -- and because it now starts when the kick
+-	 * is over rather than at the first poll, the grace is once again the
+-	 * drain it was measured as.
++	 * How long that drain takes is a property of the program, so nothing
++	 * here puts a deadline on it: a job that names a writing block waits for
++	 * that block.  Only a job flagged as raising no completion at all takes
++	 * a timed wait, and that one is a blind SETTLE rather than a deadline.
++	 * The backstop below bounds both, so a job whose completion never
++	 * arrives still retires.
+ 	 */
+ 	raw = rocket_pc_readl(core, INTERRUPT_RAW_STATUS);
+ 	if (rocket_poll_kick_over(core, raw)) {
+@@ -661,13 +678,23 @@
+ 			goto complete;
+ 		if (!core->poll_kick_over_at)
+ 			core->poll_kick_over_at = ktime_get();
+-		else if (ktime_us_delta(ktime_get(), core->poll_kick_over_at) >=
++		else if (core->poll_grace_us &&
++			 ktime_us_delta(ktime_get(), core->poll_kick_over_at) >=
+ 			 (s64)core->poll_grace_us)
+ 			goto complete;
+-	} else if (ktime_us_delta(ktime_get(), core->poll_started_at) >=
+-		   (s64)ROCKET_POLL_BACKSTOP_US) {
++	}
++
++	/*
++	 * The backstop is from the KICK and covers every way a job can fail to
++	 * report itself finished -- no PC_DONE, a task counter that never
++	 * clears, or a writing block that never raises its completion.  It has
++	 * to be tested on the same tick as the wait above rather than only when
++	 * the kick is unfinished, because that wait is no longer timed.
++	 */
++	if (ktime_us_delta(ktime_get(), core->poll_started_at) >=
++	    (s64)ROCKET_POLL_BACKSTOP_US) {
+ 		dev_err(core->dev,
+-			"job of %u task(s) raised no PC_DONE in %u us; retiring it\n",
++			"job of %u task(s) did not report completion in %u us; retiring it\n",
+ 			core->poll_tasks, (unsigned int)ROCKET_POLL_BACKSTOP_US);
+ 		goto complete;
+ 	}
+--- a/drivers/accel/rocket/rocket_core.h
++++ b/drivers/accel/rocket/rocket_core.h
+@@ -95,9 +95,16 @@
+ 	/* How many tasks this job's single kick covers. */
+ 	unsigned int poll_tasks;
+ 	/*
+-	 * How long past PC_DONE to keep waiting for that completion, in
+-	 * microseconds.  Latched per submit from the job's class (see
+-	 * DRM_ROCKET_JOB_NO_DPU_DONE) so the poll timer needs no job pointer.
++	 * How long past the kick to stop waiting for that completion anyway, in
++	 * microseconds, or ZERO to wait for it.  Latched per submit from the
++	 * job's class (see DRM_ROCKET_JOB_NO_DPU_DONE) so the poll timer needs
++	 * no job pointer.
++	 *
++	 * A job that names a writing block gets zero: the block raises its own
++	 * completion and how long it takes to drain is a property of the
++	 * program, not of the driver.  A job flagged as raising none gets the
++	 * blind settle, which is a settle time and not a deadline.  Either way
++	 * the backstop still bounds the wait.
+ 	 */
+ 	unsigned int poll_grace_us;
+ 	/*
+--- a/drivers/accel/rocket/rocket_drv.c
++++ b/drivers/accel/rocket/rocket_drv.c
+@@ -179,6 +179,13 @@
+  *         object.  A caller that touches a few bytes of a large surface pays for
+  *         those bytes; the whole-object forms are unchanged and a range_count of
+  *         zero is exactly them.
++ * - 1.6 - a job that names a writing block waits for that block's completion
++ *         instead of for a deadline, so how long ONE program's write DMA may
++ *         take to drain stops being a property of the driver's timing.  No new
++ *         uAPI: the bump exists because on an older kernel a single program
++ *         whose drain outruns dpu_grace_us retires with its last output rows
++ *         unwritten -- silently, and looking exactly like a capacity bound --
++ *         and a caller that sizes its programs has no other way to tell.
+  *
+  * Userspace MUST NOT self-chain a job's regcmd layout unless the driver reports
+  * >= 1.1: an older kernel does not know the flag, would run that chained layout
+@@ -186,7 +193,7 @@
+  */
+ static const struct drm_driver rocket_drm_driver = {
+ 	.major			= 1,
+-	.minor			= 5,
++	.minor			= 6,
+ 	.driver_features	= DRIVER_COMPUTE_ACCEL | DRIVER_GEM,
+ 	.open			= rocket_open,
+ 	.postclose		= rocket_postclose,
+-- 
+2.43.0
+

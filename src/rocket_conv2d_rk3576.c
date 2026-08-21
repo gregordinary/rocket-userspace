@@ -756,8 +756,13 @@ static void r76_fold_coeff(int32_t *A, const int32_t *bias, unsigned oc0,
  * ic*kh*kw*127*127 and the difference is most of the available precision.
  *
  * Returns the worst-case relative gain error over the channels in `*max_rel_err`.
+ *
+ * NOT static: the matmul entry programs the same ramp on the same epilogue, and the two
+ * bounds above are the part's, not the convolution's. One copy — a forked copy of a rule
+ * like this computes a full, plausible, wrongly-scaled surface. Declared in
+ * rocket_rk3576_internal.h.
  */
-static int r76_plan_perchannel(const char *entry, unsigned oc0, unsigned tile_oc,
+int rocket_rk3576_plan_perchannel(const char *entry, unsigned oc0, unsigned tile_oc,
                                unsigned ocreg, const int32_t *A,
                                const int64_t *sum_abs_w, float in_scale,
                                const float *w_scale, float out_scale,
@@ -1967,7 +1972,7 @@ static int r76_wtile_pack(const char *entry, r76_w *h, unsigned t, const int8_t 
      * carries is per task and each output-channel tile is its own task. */
     if (h->w_scale_oc) {
         double err = 0.0;
-        if (r76_plan_perchannel(entry, oc0, tile_oc, ocreg, A, h->sum_abs_w,
+        if (rocket_rk3576_plan_perchannel(entry, oc0, tile_oc, ocreg, A, h->sum_abs_w,
                                 h->in_scale, h->w_scale_oc, h->out_scale, h->perm,
                                 Cmul, &s->base_scale, &err) != 0) {
             rc = ROCKET_E_SHAPE; goto out;
