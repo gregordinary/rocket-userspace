@@ -98,6 +98,7 @@
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
 #include "rocket_hw_profile.h"
+#include "rocket_rk3576_internal.h"   /* rocket_rk3576_power_idle() — the poison guard */
 
 #define C2       16u
 #define SENTINEL 0xA5
@@ -265,19 +266,42 @@ static void fill_ramp(int8_t *v, size_t n, int seed)
     }
 }
 
+/* THIS PROGRAM IS A VICTIM OF THE WIDE-OUTPUT POISONING, so an asserting case redoes a
+ * submit that wrote nothing behind a power cycle rather than reporting it.
+ *
+ * A DPU-only program (this one and the LUT pair) behind an int32-output writer completes
+ * normally and leaves its surface untouched, and nothing but the power domain collapsing
+ * clears it — a sacrificial submit does not, which is why an unguarded run loses EVERY
+ * case rather than only its first: the whole run sits inside one active window. Measured
+ * here as 2 of 6 runs behind `rk3576_pool_probe avg` (the mode that submits an int32
+ * matmul) against 0 of 6 behind an idle and 0 of 6 behind `pool_probe gate`.
+ * [HW sweep, H96 MAX M9, 2026-08-04]
+ *
+ * The redo count is the report: a case that needed one met the hazard, and a case that
+ * never writes over the budget is a fact about the encoding. */
+enum { EW_POISON_ATTEMPTS = 8 };
+static int g_redos;
+
 /* One case: run it, compare every element against add_ref, report. */
 static int check_case(int fd, const char *name, ew_params_rk3576_t *p,
                       const int8_t *a, const int8_t *b)
 {
     size_t n = (size_t)p->c * p->h * p->w;
     int8_t *out = malloc(n);
-    int wrote = 0, bad = 0, maxd = 0, shown = 0;
+    int wrote = 0, bad = 0, maxd = 0, shown = 0, att;
     size_t i;
 
     if (!out) return -1;
-    if (run_ew(fd, p, a, b, out, &wrote) != 0) { free(out); return -1; }
+    for (att = 0; att < EW_POISON_ATTEMPTS; att++) {
+        if (run_ew(fd, p, a, b, out, &wrote) != 0) { free(out); return -1; }
+        if (wrote) break;
+        if (att + 1 < EW_POISON_ATTEMPTS) {
+            g_redos++;
+            rocket_rk3576_power_idle();
+        }
+    }
     if (!wrote) {
-        printf("  %-28s NOTHING WRITTEN\n", name);
+        printf("  %-28s NOTHING WRITTEN over %d attempts\n", name, EW_POISON_ATTEMPTS);
         free(out);
         return 1;
     }
@@ -1296,7 +1320,7 @@ static int mode_gate(int fd)
         free(a); free(b);
     }
 
-    printf("== %d shape(s), %d failed ==\n", ran, fails);
+    printf("== %d shape(s), %d failed, %d redo(s) ==\n", ran, fails, g_redos);
     return fails ? 1 : 0;
 }
 

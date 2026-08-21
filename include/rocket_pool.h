@@ -47,6 +47,17 @@ typedef struct {
     int stride_y, stride_x;
     int pad_top, pad_left, pad_bottom, pad_right;
     int method;          /* POOL_METHOD_MAX / POOL_METHOD_AVG */
+    /* WHICH DIVISOR AN AVERAGE USES, and it is a property of the OP rather than of the
+     * part: TFLite's AVERAGE_POOL_2D divides a border window by the number of taps that
+     * fell inside the plane, ONNX's AveragePool carries the choice as an attribute, and
+     * the PPU has a mode bit for each. 0 divides by kh*kw whatever the padding excluded
+     * (count-include-pad = TRUE) and is what every caller before this asked for; 1 drops
+     * the pad taps from the divisor as well as the sum.
+     *
+     * LAST FIELD DELIBERATELY. A positional initializer that predates it leaves it 0,
+     * which is the old behaviour, and at pad 0 the two are the same function anyway.
+     * RK3576 int8 only — every other pool entry refuses a 1 rather than ignoring it. */
+    int avg_exclude_pad;
 } rocket_pool_desc;
 
 static inline int rocket_pool_oh(const rocket_pool_desc *d)
@@ -111,6 +122,34 @@ void rocket_pool_ref_int8(const rocket_pool_desc *d, const int8_t *in, int8_t *o
  * [HW sweep, H96 MAX M9] */
 int rocket_pool_int8_rk3576_plan(const rocket_pool_desc *d);
 int rocket_pool_int8_rk3576_exact(const rocket_pool_desc *d);
+
+/* Output columns one pooling task may produce on this part. Past it the PPU writes a
+ * full, correctly sized surface that is WRONG FROM COLUMN 0 at every height.
+ *
+ * THE ALLOWANCE IS A FUNCTION OF THE KERNEL HEIGHT AND THE VERTICAL STRIDE — it halves
+ * per output ROW in flight over a given input row, from 128 — so it takes the whole
+ * descriptor rather than a (kw, stride_x) pair, which is what it used to take and which a
+ * square-kernel table could not distinguish.
+ *
+ * A WIDER PLANE IS SPLIT BY COLUMNS rather than refused: the entry runs one task per
+ * slice, each reading a column window of the caller's tensor and writing a column window
+ * of the output, so neither end costs a copy. The PPU's DESTINATION has a channel-group
+ * stride (`0x607C`, honoured at any value) and no line stride — its rows are always the
+ * programmed output width apart — so each slice writes its OWN surface and the slices are
+ * separate submits. That is what a split costs: `ceil(ow / max_ow) - 1` extra submits,
+ * plus a de-scatter that walks rows instead of whole planes.
+ *
+ * `rocket_pool_int8_rk3576_ow_slices()` is that count, pure and without a device, so a
+ * caller can price the shape before packing it. A split handle refuses a cube on its
+ * OUTPUT side and refuses to be a chain node — each slice owns a surface, so there is no
+ * single one for a consumer to read — but its INPUT side takes one: what a slice reads is
+ * a column window, which is the ordinary pitched cube. [HW sweep, H96 MAX M9] */
+unsigned rocket_pool_int8_rk3576_max_ow(const rocket_pool_desc *d);
+unsigned rocket_pool_int8_rk3576_ow_slices(const rocket_pool_desc *d);
+
+/* The most column slices one handle will carry. A shape needing more is refused rather
+ * than run as dozens of submits. */
+#define ROCKET_RK3576_POOL_MAX_SLICES 8
 int rocket_pool_int8_rk3576(int fd, const rocket_pool_desc *d, int in_zp,
                             const int8_t *in, int8_t *out);
 void rocket_pool_ref_int8_rk3576(const rocket_pool_desc *d, int in_zp,
@@ -149,7 +188,16 @@ void rocket_pool_ref_int8_rk3576(const rocket_pool_desc *d, int in_zp,
  * row-major input. Refuses a foreign fd, a mismatched plane or channel count, a buffer
  * too short for the channel groups the PPU walks, and a channel count that is not a
  * multiple of 16 (below that the handle's own cube carries padding channels a producer
- * does not write). */
+ * does not write).
+ *
+ * A COLUMN-SPLIT PLANE TAKES A CUBE IN TOO. A plane wider than one pooling task's
+ * output-width allowance is packed as several handles, each owning a column window at
+ * both ends — and a window of a producer's surface is the ordinary pitched cube, since the
+ * PPU carries the DDR line stride separately from what the windows consume and honours a
+ * base part way into a row [HW sweep, H96 MAX M9]. So the split costs the INPUT side
+ * nothing. Its OUTPUT stays refused: the destination surface stride is derived from the
+ * plane with no register to move it, so the slices cannot write one plane between them,
+ * and such a handle is neither a cube producer nor a chain node. */
 typedef struct rocket_pool_int8_rk3576_handle rocket_pool_int8_rk3576_handle;
 struct rocket_rk3576_cube;
 
@@ -188,14 +236,60 @@ int rocket_pool_int8_cube_of_rk3576(const rocket_pool_int8_rk3576_handle *h,
  * producer's as one concatenated operand. Implies cube-out. `dst` NULL restores the handle's
  * own surface. The buffer is BORROWED and must outlive the calls that write it.
  *
- * REFUSES A SLICE WHOSE CHANNEL-GROUP STRIDE IS NOT round4(ow*oh). The pooling program's
- * destination stride is derived from the output plane and is not a field a caller can move,
- * so a buffer at any other stride would be written at the wrong offsets; a plane whose
- * element count is already a multiple of four needs nothing. Also refuses a foreign fd, a
- * plane that is not this handle's, a slice too short for the channel groups the PPU writes,
- * and an offset that is not a whole group. */
+ * THE SLICE'S CHANNEL-GROUP STRIDE IS PROGRAMMED, so a pool writes beside convolutions
+ * whose surface stride is the plane exactly. `0x607C` carries it and the part honours any
+ * value at or above the plane — including strides that are neither a multiple of four atoms
+ * nor of a 64-byte line, and odd ones [HW sweep, H96 MAX M9, tests/rk3576_pool_probe.c dst].
+ * BELOW the plane the channel groups overlap, and that is the one stride refused. There is
+ * no destination LINE stride to go with it, so a slice may be a plane inside a deeper buffer
+ * and never a plane inside wider rows. Also refuses a foreign fd, a plane that is not this
+ * handle's, a slice too short for the channel groups the PPU writes, and an offset that is
+ * not a whole group. */
 int rocket_pool_int8_cube_out_at_rk3576(rocket_pool_int8_rk3576_handle *h,
                                         const struct rocket_rk3576_cube *dst);
+
+/* THE DIVISOR LAG, for a caller that owns the submit.
+ *
+ * A padded average pool on this part intermittently divides an output window by the tap
+ * count of the PREVIOUS window in raster order. The sum is right and the surface is fully
+ * written, so a write check cannot see it; the per-call entry above checks the positions
+ * where it can show and redoes its own submit. A CROSS-LAYER KICK owns the submit instead,
+ * so it runs the same check from its verify bracket:
+ *
+ *   if (!rocket_pool_int8_rk3576_lag_check(fd, h, surf)) redo the kick;   // no power cycle
+ *
+ * `surf` is this handle's output surface, already synced for the CPU by the caller's own
+ * bracket. The input side is a producer's cube and is bracketed inside. Returns 1 when the
+ * surface is right OR the hazard cannot show on this handle, so a caller may call it
+ * unconditionally; `_lag_observable()` says in advance whether it will do anything, and
+ * `_lag_src_handle()` names the BO it reads — a caller holding that surface must not
+ * overwrite it (with a sentinel, say) before the check runs.
+ *
+ * ROCKET_RK3576_POOL_LAGCHECK=0 turns all of it off. */
+int rocket_pool_int8_rk3576_lag_check(int fd, rocket_pool_int8_rk3576_handle *h,
+                                      const void *surf);
+int rocket_pool_int8_rk3576_lag_observable(const rocket_pool_int8_rk3576_handle *h);
+/* Whether this handle's GEOMETRY has any position where the lag could show, whatever the
+ * check is set to. Separate from _lag_observable() on purpose: turning the check off is an
+ * RE arm, and anything that decides PLACEMENT off this must not move when it is thrown, or
+ * the arm prices two things at once. */
+int rocket_pool_int8_rk3576_lag_can_show(const rocket_pool_int8_rk3576_handle *h);
+uint32_t rocket_pool_int8_rk3576_lag_src_handle(const rocket_pool_int8_rk3576_handle *h);
+/* And how many bytes that bracket walks, for a caller pricing the check. 0 when there is
+ * no check on this handle. */
+size_t rocket_pool_int8_rk3576_lag_src_bytes(const rocket_pool_int8_rk3576_handle *h);
+/* How often this handle's divisor has lagged, and over how many checks. The rate is what
+ * every cost about the hazard is a function of, and it is a property of the LAYER rather
+ * than of the geometry — so a caller with a graph prints it per layer. A parent handle
+ * sums its column slices. */
+void rocket_pool_int8_rk3576_lag_counts(const rocket_pool_int8_rk3576_handle *h,
+                                        unsigned *fires, unsigned *calls);
+unsigned long rocket_pool_int8_rk3576_lag_discr(const rocket_pool_int8_rk3576_handle *h);
+/* How many redos to give it — NOT the poisoning's budget, which is small because each of
+ * those costs a power cycle. A lag redo costs a submit, and the lag is COMMON where it can
+ * show: roughly a third of Inception V3's padded average pool calls. Default 32,
+ * ROCKET_RK3576_POOL_LAG_ATTEMPTS. */
+unsigned rocket_pool_int8_rk3576_lag_attempts(void);
 
 void rocket_pool_int8_free_rk3576(int fd, rocket_pool_int8_rk3576_handle *h);
 

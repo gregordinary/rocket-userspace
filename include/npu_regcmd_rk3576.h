@@ -806,6 +806,35 @@ typedef struct {
      * copy. The field is honoured verbatim, so it is also the way to find out whether
      * the PPU takes a stride that is not a multiple of four. */
     uint32_t src_surf_elems;
+    /* Elements per input ROW — the DDR line stride `0x7024` carries, which is a
+     * different quantity from the plane. `iw` is what the WINDOWS consume against;
+     * this is how far apart the rows holding it sit. 0 takes `iw`, so every program
+     * that does not set it is byte-identical.
+     *
+     * A producer whose surface is WIDER than its tensor sets it: the packed-image
+     * first conv materialises its pad columns and writes a 128-wide surface for a
+     * 112-wide output, and a consumer told the pitch reads that surface in place
+     * rather than making the producer de-scatter and re-scatter it. Only the PPU can
+     * do this — the CNA's feature DMA carries the width and the line stride as one
+     * quantity in two units, so a convolution consumer has no such register. */
+    uint32_t src_line_elems;
+    /* Elements per OUTPUT channel group — the destination surface stride `0x607C`
+     * carries. 0 takes round4(ow*oh), which is what the vendor's own pooling programs
+     * carry, so every program that does not set it is byte-identical.
+     *
+     * A caller writing into a buffer somebody else owns sets it: a shared concatenation
+     * buffer's group stride is the plane EXACTLY, because a direct convolution's output
+     * surface stride is `ow*oh` and the other operands are convolutions. The part
+     * honours it at any value at or above the plane — including values that are neither
+     * a multiple of four atoms nor of a 64-byte line, and odd ones: at a 5x3 plane
+     * 240 bytes and 272 bytes both land every atom, while 224 (one atom UNDER the plane)
+     * loses one, which is the control that says the register is live.
+     * [HW sweep, H96 MAX M9, tests/rk3576_pool_probe.c dst]
+     *
+     * There is no destination LINE stride to go with it — `0x6084` is inert and the rows
+     * are always the programmed output width — so a slice may be a plane inside a deeper
+     * buffer but never a plane inside wider rows. */
+    uint32_t dst_surf_elems;
     uint64_t *tasks;             /* at least RK3576_POOL_TASK_OPS words            */
     uint32_t task_count;         /* words written                                  */
 } pool_params_rk3576_t;

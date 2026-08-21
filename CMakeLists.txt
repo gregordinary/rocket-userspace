@@ -47,6 +47,7 @@ set(ROCKETNPU_SOURCES
     src/rocket_chain.c        # contiguous self-chaining regcmd layout (batched submit, shared)
     src/rocket_matmul.c       # tiled single-fd matmul (CBUF-fit, CPU K-accum)
     src/rocket_matmul_rk3576.c # the RK3576 int8 matmul (1x1 conv, its own cubes + envelope)
+    src/rocket_rk3576_cube_pack.c # the CHW <-> NC1HWC2 transpose (16x16 NEON block), shared
     src/rocket_conv2d_rk3576.c # the RK3576 CONV_2D entries (int8 direct/depthwise, fp16)
     src/rocket_conv.c         # general fp16 CONV_2D (KxK/stride/pad/dilation)
     src/rocket_conv_transpose.c # ConvTranspose2d (deconv) lowered onto the forward conv
@@ -97,6 +98,23 @@ target_include_directories(rocketnpu
            $<INSTALL_INTERFACE:include/rocketnpu>)
 target_link_libraries(rocketnpu PUBLIC Threads::Threads m PRIVATE ${DRM_LIBRARIES})
 
+# --- the RK3576 graph planner: a component, NOT part of the library ---------------
+#
+# No graph-execution object lives in librocketnpu — a frontend owns scheduling and its own
+# tensor model, and the one thing it cannot own (which streams the part will run) is the
+# run FINDER, which is pure and is in the library already. What is between those two is the
+# placement and linking rules: generic to the part, not the part, and expensive to get
+# right — twelve refusal classes, every one closed so far a host-buffer rule rather than
+# the hardware's. So they are a separate target the frontends and the gate both link,
+# because a second copy of them would fork silently.
+add_library(rocketgraph STATIC graph/rocket_graph_rk3576.c)
+add_library(rocketnpu::rocketgraph ALIAS rocketgraph)
+target_include_directories(rocketgraph
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/graph>
+           $<INSTALL_INTERFACE:include/rocketnpu>)
+target_link_libraries(rocketgraph PUBLIC rocketnpu)
+target_compile_options(rocketgraph PRIVATE -O2 -Wall -Wextra ${DRM_CFLAGS_OTHER})
+
 if(BUILD_SHARED_LIBS)
     add_library(rocketnpu_shared SHARED $<TARGET_OBJECTS:rocketnpu_obj>)
     set_target_properties(rocketnpu_shared PROPERTIES
@@ -139,6 +157,11 @@ set(ROCKETNPU_PUBLIC_HEADERS
 
 include(GNUInstallDirs)
 install(TARGETS rocketnpu EXPORT rocketnpu-targets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+# The planner ships with the package: a frontend that links the INSTALLED rocketnpu (the
+# tflite-rocket delegate does) has to reach it, and a second copy of its rules would fork
+# silently. Its header goes in the same include directory as the library's.
+install(TARGETS rocketgraph EXPORT rocketnpu-targets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES graph/rocket_graph_rk3576.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rocketnpu)
 if(BUILD_SHARED_LIBS)
     install(TARGETS rocketnpu_shared EXPORT rocketnpu-targets LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
@@ -253,6 +276,7 @@ if(ROCKETNPU_BUILD_TESTS)
             moe_gw_bench           # resident group-wise int8 at the MoE expert shape (hand-run, not a gate)
             uapi_selftest_rocket   # rocket uAPI conformance gate (BO/deadline/IOVA contracts)
             uapi_submit_errpath_rocket # rocket uAPI GATE: a rejected submit returns an errno, it does not oops
+            uapi_bo_ranges_rocket  # rocket uAPI GATE: the ranged cache-maintenance ioctls accept and refuse correctly
             uapi_bo_lifetime_rocket # rocket uAPI GATE: a BO referenced by an in-flight job survives its file's close
             prep_signal_robust_rocket # PREP_BO wait: EINTR-retry + UINT64_MAX-deadline saturation gate
             submit_overhead_rocket # per-job dispatch floor (us/submit) A/B probe for IOMMU keep-attach
@@ -272,8 +296,10 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_matmul_gate     # RK3576 board GATE: the int8 matmul library entry vs a CPU model
             rk3576_refusal_gate    # RK3576 board GATE: ops with no encoder refuse, not write nothing
             rk3576_submit_floor    # RK3576 board: the per-submit dispatch floor (us/submit) probe
+            rk3576_prep_floor      # RK3576 board: what a PREP_BO/FINI_BO bracket costs, floor vs bytes
             rk3576_fc_vendor       # RK3576 board: submit a vendor capture VERBATIM — does it write?
             rk3576_cost_table      # RK3576 board: what the library entries cost, against a CPU reference
+            rk3576_stem_cost       # RK3576 board: is a conv's execution its MACs or its feature DMA?
             rk3576_poison_probe    # RK3576 board: which programs poison the NEXT submit, and what carries it
             rk3576_argb_ic1        # RK3576 board: why the int8 first conv writes nothing at one image channel
             rk3576_fp16_split_cost # RK3576 board: where the fp16 ic split spends its wall
@@ -291,13 +317,22 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_lut_probe       # RK3576 board: the DPU LUT's input map, off our own table-load program
             rk3576_act_gate        # RK3576 board: the int8 LUT activation entry, against a model of the chip
             rk3576_argb_pad        # RK3576 board: is a TFLite stem reachable on the int8 first conv
+            rk3576_argb_extent     # RK3576 board: does the packed-image first conv honour an asymmetric extent?
+            rk3576_argb_padcon     # RK3576 board: what value does a PAD TAP feed the MAC on the packed path?
+            rk3576_argb_padmap     # RK3576 board: WHERE does a pad tap's value come from (position, not word)?
+            rk3576_argb_border_cost # RK3576 host: what the two routes past the packed stem's column bound cost
+            rk3576_argb_extend     # RK3576 board: can the packed stem's pad columns be MATERIALISED?
             rk3576_net_gate        # RK3576 board GATE: a whole quantized classifier, layer by layer
             rk3576_chain_raw       # RK3576 board: does a chained stream honour RAW between its programs?
             rk3576_chain_pool      # RK3576 board: may a POOL program sit inside a chained convolution stream?
+            rk3576_chain_argb      # RK3576 board: may a PACKED-IMAGE first conv head a chained stream?
             rk3576_chain_len       # RK3576 board: how long a chained stream may be, and what the bound follows
             rk3576_offset_cube     # RK3576 board: is a cube base a plain address (a channel-group offset)?
             rk3576_pad_channels    # RK3576 board: what a producer leaves past its live output channels
             rk3576_surf_stride     # RK3576 board: will the CNA read a cube whose groups sit further apart than the plane?
+            rk3576_row_pitch       # RK3576 board: will the PPU read a plane whose ROWS sit further apart than its windows consume?
+            rk3576_conv_pitch      # RK3576 board: and will the CNA? a readout of what 0x1090 does
+            rk3576_conv_sym        # RK3576 board: the symmetry audit on the CNA — non-square strides, and a rung fitted at kh == kw
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
             uapi_regcmd_fault_rocket # probe, NOT a gate: a client-requested NPU DMA fault (faults the NPU on purpose)
             hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure
@@ -307,9 +342,18 @@ if(ROCKETNPU_BUILD_TESTS)
         target_link_libraries(${t} PRIVATE rocketnpu)
         target_compile_options(${t} PRIVATE -Wall -Wextra)
     endforeach()
+    # the network gate is the graph planner's first caller: it owns the tensors and the
+    # weights, graph/ owns which of them stay in cube layout and which runs are one kick
+    if(TARGET rk3576_net_gate)
+        target_link_libraries(rk3576_net_gate PRIVATE rocketgraph)
+    endif()
+
     # the shared-scratch prototype + the cross-op chain probe drive the internal
-    # tiled-matmul primitives directly
-    foreach(t prototype_shared_scratch_rocket crossop_chain_rocket rk3576_cbuf_base)
+    # tiled-matmul primitives directly; the LUT and elementwise probes run the library's
+    # own wide-output poison guard (rocket_rk3576_power_idle) around their submits, both
+    # being DPU-only programs and so victims of it
+    foreach(t prototype_shared_scratch_rocket crossop_chain_rocket rk3576_cbuf_base
+              rk3576_lut_probe rk3576_add_probe)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
@@ -386,6 +430,11 @@ if(ROCKETNPU_BUILD_TESTS)
     # is the probe that settled it rather than a check on anything.
     add_test(NAME rk3576_pool_probe COMMAND rk3576_pool_probe gate)
     set_tests_properties(rk3576_pool_probe PROPERTIES SKIP_RETURN_CODE 2)
+    # A pool writing a SLICE of a shared concatenation buffer, whose channel-group stride is
+    # the plane where the pool's own surface is round4(ow*oh). Asserts the arithmetic, that
+    # nothing outside the slice moved, and that a stride below the plane is still refused.
+    add_test(NAME rk3576_pool_place COMMAND rk3576_pool_probe place)
+    set_tests_properties(rk3576_pool_place PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME rk3576_add_probe COMMAND rk3576_add_probe gate)
     set_tests_properties(rk3576_add_probe PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME rk3576_residual_add COMMAND rk3576_residual_add gate)
@@ -405,6 +454,10 @@ if(ROCKETNPU_BUILD_TESTS)
     # depthwise producer's surface is.
     add_test(NAME rk3576_surf_stride COMMAND rk3576_surf_stride)
     set_tests_properties(rk3576_surf_stride PROPERTIES SKIP_RETURN_CODE 2)
+    # And a feature plane whose ROWS sit further apart than the plane is wide — the same
+    # question one register down, asked of the CNA rather than of the PPU.
+    add_test(NAME rk3576_conv_pitch COMMAND rk3576_conv_pitch)
+    set_tests_properties(rk3576_conv_pitch PROPERTIES SKIP_RETURN_CODE 2)
     # A whole quantized classifier, layer by layer against TFLite's own intermediates.
     # It skips without the model blob, which is not committed — build it once with
     # tests/data/rk3576-net/fetch.sh + mknet.py. ROCKET_SRC_DIR is how it finds the blob
@@ -554,6 +607,8 @@ if(ROCKETNPU_BUILD_TESTS)
     # gate reports which site did it instead of dying with it, and stops at the first.
     add_test(NAME uapi_submit_errpath_rocket COMMAND uapi_submit_errpath_rocket)
     set_tests_properties(uapi_submit_errpath_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME uapi_bo_ranges_rocket COMMAND uapi_bo_ranges_rocket)
+    set_tests_properties(uapi_bo_ranges_rocket PROPERTIES SKIP_RETURN_CODE 2)
     # The per-context IOVA allocator is freed in rocket_postclose(), but a BO's IOVA
     # node is removed in its GEM free path — which the drm_sched free worker can run
     # after that close. Submitting and closing without waiting races the two on

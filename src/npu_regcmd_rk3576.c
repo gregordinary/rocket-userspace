@@ -770,34 +770,52 @@ static uint32_t r76_zero_value(uint16_t reg, const uint32_t *zval)
 /* The F values measured to deliver exactly 4096+F granules, ascending. Not a formula,
  * because combinations of these bits do not deliver their sum (see above).
  *
- * AND TWO OF THEM DELIVER ONLY AT kh == 1. The rung table was characterised on a k=1
- * plane, and 256 and 512 do not survive a kernel with vertical extent: at kh > 1 each
- * delivers exactly 4096 granules — the F=0 budget — so a task the planner put on one of
- * them overruns its allowance and writes a full surface with a wrong tail.
+ * AND TWO OF THEM DELIVER ONLY WHERE THE RESIDENT WEIGHT SLICE IS SMALL. 256 and 512
+ * deliver exactly 4096 granules — the F=0 budget — the moment the slice passes 1 KiB, so
+ * a task the planner put on one of them overruns its allowance and writes a full,
+ * correctly sized surface with a WRONG TAIL: every output row past 4096/entries.
  *
- * Measured at ONE granule total, 4352, across five plane widths so the width is
- * controlled out: at k=1 every width (16, 32, 64, 128, 272) is bit-exact, at k=3 every
- * one of them is wrong, and k=5 is wrong. The F=0 controls one row below are exact at
- * k=3, so the kernel does not itself need rows the model omits — it is the rung. And the
- * delivered budget backs out to the row from the exact-element counts: at k=3 the last
- * correct output row is always the one fed by input row 4096/entries, at widths 16, 64,
- * 128 and 272 and at k=5, which is what makes "delivers 4096" a measurement rather than
- * a reading. 1024 and 2048 deliver at kh > 1 — the vendor's own windowed depthwise
- * capture is a k=3 program at F=1024 — so this is the two low rungs and not the field.
+ * THE GOVERNING QUANTITY IS THE SLICE, not the kernel, and a square-kernel sweep cannot
+ * say which. The first characterisation of this held ic at 32 and moved the kernel — k=1
+ * exact at five plane widths, k=3 and k=5 wrong at every one — which reads as "the rung
+ * needs kh == 1" and is what shipped. Crossing the axes says otherwise: at ONE granule
+ * total (4352, the F=256 rung exactly) and ONE kernel (k1x1), the same (row size, row
+ * count) is bit-exact at ic 32 and wrong at ic 64 and 128 — 68 rows of 64 granules, wrong
+ * from output row 64 in both. So `ic` at a fixed kernel and the kernel at a fixed `ic`
+ * move the same thing, `32*ic*kh*kw`, and it is the same quantity r76_weight_slice_cap()
+ * is already stated over. Live at 16 granules (ic 32, k=1); dead at 32 (ic 64), 64
+ * (ic 128), 144 (ic 32, k=3) and 400 (ic 32, k=5).
  *
- * So they are offered only to a kh == 1 task, which is where a matmul lives and where
- * they were measured good. The cost elsewhere is the next rung up, which is the same
- * CBUF and no extra submits, or — when the weight slice leaves no room for 1024 — a
- * shorter row window, which is one more task and not a wrong answer.
- * ROCKET_RK3576_CBUF_RUNGS is a comma-separated override, for re-measuring this rather
- * than for shipping. [HW sweep, H96 MAX M9, tests/rk3576_conv_lib_gate.c rung256] */
+ * The delivered budget backs out to the row from the exact-element counts: the last
+ * correct output row is always the one fed by input row 4096/entries. 1024 and 2048
+ * deliver at every slice tried — the vendor's own windowed depthwise capture is a k=3
+ * program at F=1024, and an ic=128 plane is bit-exact at F=1024 where it is wrong at 256
+ * and 512 — so this is the two low rungs and not the field.
+ *
+ * Stated as a BOUND at the measured-live point rather than as the law, in TWO ways. The
+ * threshold between 16 and 32 granules is bracketed, not pinned. And whether the quantity
+ * is one group's SLICE or the WHOLE CUBE is not separated — every cell that reached a rung
+ * had oc 32, one output-channel group, where the two are the same number — so the rule is
+ * taken over the whole cube, which is the smaller envelope and is exactly the geometry the
+ * measurement covers. Being UNDER costs the next rung up (the same CBUF, no extra submits)
+ * or a shorter row window (one more task); being OVER computes a silently wrong surface.
+ * Nothing in the corpus is affected either way: a rung is reachable only where the plane is
+ * 4097-4608 granules AND the weights are under 1 KiB, and the matmul's own row planner is
+ * past that at every K it runs. ROCKET_RK3576_CBUF_RUNGS is a comma-separated override,
+ * for re-measuring this rather than for shipping.
+ * [HW sweep, H96 MAX M9, tests/rk3576_conv_sym.c rung] */
 static unsigned r76_cbuf_f_rungs[] = { 0u, 256u, 512u, 1024u, 2048u };
 static unsigned r76_cbuf_f_nrungs = 5u;
 
-/* Whether this rung may be programmed for a task with this kernel height. */
-static int r76_rung_live(unsigned f, unsigned kh)
+/* The resident weight footprint at which the two low rungs were measured to deliver. */
+#define R76_RUNG_WEIGHT_MAX_GRANULES 16u
+
+/* Whether this rung may be programmed beside a resident weight cube of this many granules.
+ * Zero is "not weighed" rather than "none", so the rung is refused there too. */
+static int r76_rung_live(unsigned f, unsigned wgran)
 {
-    return kh == 1u || (f != 256u && f != 512u);
+    if (f != 256u && f != 512u) return 1;
+    return wgran && wgran <= R76_RUNG_WEIGHT_MAX_GRANULES;
 }
 
 static void r76_cbuf_rungs_from_env(void)
@@ -924,10 +942,13 @@ static void r76_cbuf_rungs_init(void)
 }
 
 static int r76_plan_cbuf(unsigned entries, unsigned ih, unsigned oc, unsigned wbytes,
-                         int dw, unsigned kh, unsigned *f_out)
+                         int dw, unsigned *f_out)
 {
     unsigned need = entries * ih;
     unsigned wgran = r76_granules(wbytes);
+    /* The RESIDENT footprint, which is what the rung liveness is stated over: a direct
+     * conv holds one slice per output-channel group, a depthwise one holds its group. */
+    unsigned wres = dw ? wgran : ((oc + 31u) / 32u) * wgran;
     unsigned f;
     size_t r;
 
@@ -937,7 +958,7 @@ static int r76_plan_cbuf(unsigned entries, unsigned ih, unsigned oc, unsigned wb
     /* The lowest rung whose budget covers the plane. */
     f = r76_cbuf_f_rungs[r76_cbuf_f_nrungs - 1u];
     for (r = 0; r < r76_cbuf_f_nrungs; r++) {
-        if (!r76_rung_live(r76_cbuf_f_rungs[r], kh)) continue;
+        if (!r76_rung_live(r76_cbuf_f_rungs[r], wres)) continue;
         if (R76_CBUF_BASE_GRANULES + r76_cbuf_f_rungs[r] >= need) {
             f = r76_cbuf_f_rungs[r];
             break;
@@ -1022,9 +1043,9 @@ int rocket_rk3576_cbuf_f_prec(unsigned iw, unsigned ic, unsigned ih, unsigned oc
         return r76_plan_cbuf(r76_argb_entries(iw, r76_elem_bytes(prec),
                                               r76_is_float(prec)), ih, oc,
                              oc * r76_argb_weight_elems(kh, kw, r76_is_float(prec))
-                                * r76_elem_bytes(prec), 0, kh, f_out);
+                                * r76_elem_bytes(prec), 0, f_out);
     return r76_plan_cbuf(r76_data_entries_p(iw, ic, r76_elem_bytes(prec)), ih, oc,
-                         r76_weight_resident_bytes(ic, oc, kh, kw, dw), dw, kh, f_out);
+                         r76_weight_resident_bytes(ic, oc, kh, kw, dw), dw, f_out);
 }
 
 int rocket_rk3576_cbuf_f(unsigned iw, unsigned ic, unsigned ih, unsigned oc,
@@ -1038,7 +1059,7 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
                                           unsigned kh, unsigned kw, int dw,
                                           unsigned prec)
 {
-    unsigned entries, wbytes, wgran, f = 0;
+    unsigned entries, wbytes, wgran, wres, f = 0;
     size_t r;
 
     if (!iw || !ic || !kh || !kw) return 0;
@@ -1054,6 +1075,10 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
         wbytes  = r76_weight_resident_bytes(ic, oc, kh, kw, dw);
     }
     wgran = r76_granules(wbytes);
+    /* The RESIDENT footprint the rung liveness is stated over — every group's slice for a
+     * direct conv. Taken before the charge below, which grows `wgran` to the same thing
+     * only when it still leaves a rung and so cannot stand in for it. */
+    wres = dw ? wgran : ((oc + 31u) / 32u) * wgran;
     if (!entries || R76_CBUF_BASE_GRANULES + wgran > R76_CBUF_POOL_GRANULES)
         return 0;                     /* the weight slice does not fit even at F=0 */
     if (!dw && wbytes > r76_weight_slice_cap(oc))
@@ -1086,7 +1111,7 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
         unsigned cand = r76_cbuf_f_rungs[r];
         if (R76_CBUF_BASE_GRANULES + cand > R76_CBUF_MAX_GRANULES) break;
         if (R76_CBUF_BASE_GRANULES + cand + wgran > R76_CBUF_POOL_GRANULES) break;
-        if (!r76_rung_live(cand, kh)) continue;
+        if (!r76_rung_live(cand, wres)) continue;
         f = cand;
     }
 
@@ -1221,12 +1246,35 @@ int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
 
     ih_full = p->ih_full ? p->ih_full : p->ih;
     oh_full = p->oh_full ? p->oh_full : p->oh;
+    /* The row window is charged at the DDR row ADVANCE, so a pitched feature buffer
+     * plans shorter windows — the one cost of a pitch, and the same one the widened
+     * lowering pays. */
     entries = p->ic <= R76_ARGB_LANES
                   ? r76_argb_entries(p->iw, r76_elem_bytes(prec), r76_is_float(prec))
-                  : r76_data_entries_p(p->iw, p->ic, r76_elem_bytes(prec));
+                  : r76_data_entries_p(p->in_pitch_w ? p->in_pitch_w : p->iw,
+                                       p->ic, r76_elem_bytes(prec));
     if (!entries) return -1;
 
-    cap = rocket_rk3576_max_task_rows_prec(p->iw, p->ic, p->oc, p->kh, p->kw, dw, prec);
+    cap = rocket_rk3576_max_task_rows_prec(p->in_pitch_w ? p->in_pitch_w : p->iw,
+                                           p->ic, p->oc, p->kh, p->kw, dw, prec);
+    /* A PITCHED TASK IS CHARGED ITS DMA ROW BUDGET, NOT ITS ROWS. The budget is
+     * `ceil(rows * entries_pitch / entries_plane)` rows and the CBUF is charged that
+     * many at the PITCH's own entry count, so the window a pitched task may take is the
+     * unpitched allowance scaled DOWN by that ratio, and by measurement it is scaled
+     * down by the ratio TWICE. A 112-wide plane inside 128-wide rows has an allowance of
+     * 48 rows: 40, 41, 42 and 47 all compute wrong and 16, 32 and 36 are bit-exact, so
+     * the once-scaled 42 is over and the twice-scaled 36 is under. **It is a BOUND, not
+     * the law** — the residue between 36 and 40 is unpinned and the extra margin has the
+     * size of the retained rows a chained window carries, which is a charge this
+     * arithmetic does not model. Safe in one direction only, like the unpitched
+     * allowance it scales: too small is a submit, too large is a silently wrong surface.
+     * [HW sweep, H96 MAX M9, tests/rk3576_conv_pitch.c] */
+    if (p->in_pitch_w && p->in_pitch_w != p->iw) {
+        unsigned ep = r76_data_entries_p(p->iw, p->ic, r76_elem_bytes(prec));
+        if (ep && entries)
+            cap = (unsigned)(((uint64_t)cap * ep * ep) / ((uint64_t)entries * entries));
+        if (!cap) cap = 1u;
+    }
     /* 0x1028 packs entries*rows in a 16-bit half, which can bite before the CBUF
      * does on a narrow, very deep plane. */
     if (cap > 0xFFFFu / entries) cap = 0xFFFFu / entries;
@@ -1235,6 +1283,19 @@ int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
         unsigned f = (unsigned)strtoul(forced, NULL, 0);
         if (f && f < cap) cap = f;
         ROCKET_LOGI("rk3576 rows: per-task row cap forced to %u\n", cap);
+    }
+    /* THE PROBE KNOB, and it is the only one here that can RAISE the cap. The shipped
+     * allowance is a BOUND rather than the part's law — it charges the whole weight
+     * cube, which is under the measurement — so pinning the law means asking the part
+     * about windows the planner would never choose. Every window is still validated by
+     * the emitter's own per-task allowance check below, so this reaches only into the
+     * region that check permits, and a window past THAT is refused rather than emitted.
+     * Never set in shipping code. [tests/rk3576_conv_lib_gate.c rowlaw] */
+    forced = getenv("ROCKET_RK3576_ROW_CAP_PROBE");
+    if (forced && *forced) {
+        unsigned f = (unsigned)strtoul(forced, NULL, 0);
+        if (f) cap = f;
+        ROCKET_LOGI("rk3576 rows: per-task row cap set to %u by the RE probe knob\n", cap);
     }
     if (!cap) {
         ROCKET_LOGE("rk3576 rows: no row window fits — the weight slice alone "
@@ -1313,7 +1374,8 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
                                   int dw, int argb, unsigned ih_full, unsigned oh_full,
                                   unsigned pad_right, unsigned pad_bottom,
                                   unsigned cbuf_f, const struct r76_reuse *reuse,
-                                  const lut_rk3576_t *lut, unsigned in_surf_elems)
+                                  const lut_rk3576_t *lut, unsigned in_surf_elems,
+                                  unsigned in_pitch_w)
 {
     int i = 0;
     unsigned iw  = cna->datain_width,  ih  = cna->datain_height;
@@ -1337,6 +1399,18 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     unsigned entries = argb ? r76_argb_entries(iw, elem, is_float)
                             : (dw ? r76_data_entries_p(iw, r76_dw_cf(ic), elem)
                                   : r76_data_entries_p(iw, ic, elem));
+    /* THE FETCH LENGTH AND THE DDR ROW STRIDE ARE TWO REGISTERS, not one quantity in
+     * two units. `entries` above is the row's granule count and sizes the CBUF at
+     * 0x103C and 0x1028; the granule count at 0x1044's LOW half is what the feature
+     * DMA ADVANCES BY between rows. They are equal in every capture because every
+     * capture has a tight plane, which is why the pair reads as one number.
+     * [HW sweep, H96 MAX M9, tests/rk3576_conv_pitch.c map mode: a 16-wide plane in
+     * 20-wide rows reads at stride 16 with everything derived, at stride 20 with this
+     * one half moved, and 0x1090 — the register a source read named as the line
+     * stride — advances by its own value once every FOUR rows and cannot express a
+     * pitch at all.] */
+    unsigned entries_ddr = (!argb && !dw && in_pitch_w)
+                             ? r76_data_entries_p(in_pitch_w, ic, elem) : entries;
     /* Weight ELEMENTS per output channel, and the two registers built from them.
      * 0x1020 carries the count scaled by the element size — the BYTES one output
      * channel occupies — and 0x1030's high half carries twice the raw count. The two
@@ -1352,6 +1426,17 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     /* The rows this task actually FETCHES, and where in the CBUF they land. Without
      * reuse these reduce to the whole window at base 0. */
     unsigned fetch_rows = ih - (reuse->retained_rows < ih ? reuse->retained_rows : 0u);
+    /* THE FEATURE DMA'S BUDGET IS A ROW COUNT, AND IT IS SPENT AT THE ROW ADVANCE.
+     * The DMA stops after `fetch_rows * entries` granules of ADDRESS, not of data, so a
+     * pitched walk — which advances `entries_ddr` per row while still staging `entries`
+     * — runs out part way down the plane and every row past that reads whatever the
+     * DMA had left. The map departs at exactly the atom where that total is spent, at
+     * two geometries, and inflating this ONE field in proportion makes it affine to the
+     * last row. The window grid does not follow it: the output extent and both derived
+     * pads come from the real geometry, so a pitched task still synthesizes the
+     * trailing pad an inflated PLANE would have read real bytes for.
+     * [HW sweep, H96 MAX M9, tests/rk3576_conv_pitch.c] */
+    unsigned dma_rows;
     /* A constant granule offset added to both, which moves WHERE in the CBUF this
      * task stages without changing anything about what it computes — see the
      * CBUF-base RE knob below. Zero unless a bring-up sweep sets it. */
@@ -1360,13 +1445,43 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     unsigned cbuf_window_base = reuse->resident - entries * reuse->retained_rows
                                 + cbuf_bias;
     int windowed = (ih < ih_full);
-    uint32_t kword = (uint32_t)(((kh - 1u) & 0xFFu) << 8 | ((kw - 1u) & 0xFFu));
+    /* THE TWO KERNEL AXES IN ONE WORD, AND THE LOW HALF IS THE HEIGHT.
+     *
+     * `0x1024`'s high half carries the kernel: bits [31:24] are the WIDTH and [23:16] the
+     * HEIGHT. A SQUARE kernel cannot tell that map from its transpose, and every vendor
+     * capture this was transcribed from is square, as is every cell of every conv gate
+     * here and every kernel in the first four networks — so the transposed assignment
+     * computed a full, correctly sized, entirely plausible surface and nothing could see
+     * it. The same shape of trap as the PPU's pad nibbles, on the other block.
+     *
+     * Measured on Inception V3, which is the first graph here with a non-square kernel:
+     * its 34 layers at 1x7, 7x1, 1x3 and 3x1 over planes 17 and 8 are wrong in every
+     * element region with the halves the other way round and BIT-EXACT with this one,
+     * while all 61 square-kernel convolutions are unmoved.
+     * [HW sweep, H96 MAX M9, tests/rk3576_net_gate.c --net iv3]
+     *
+     * ROCKET_RK3576_KSWAP=1 puts the old assignment back; it is the control that made
+     * this a measurement rather than a guess, and it is kept for the same reason. */
+    const char *kswap_env = getenv("ROCKET_RK3576_KSWAP");
+    int kswap = kswap_env && *kswap_env && *kswap_env != '0';
+    uint32_t kword = kswap
+                       ? (uint32_t)(((kh - 1u) & 0xFFu) << 8 | ((kw - 1u) & 0xFFu))
+                       : (uint32_t)(((kw - 1u) & 0xFFu) << 8 | ((kh - 1u) & 0xFFu));
     /* Address placement — the default is the transcribed one; see the RE knobs. */
     uint16_t faddr_reg = r76_env_reg("ROCKET_RK3576_FADDR_REG", R76_CNA_FEATURE_ADDR);
     uint16_t waddr_reg = r76_env_reg("ROCKET_RK3576_WADDR_REG", R76_CNA_DCOMP_ADDR0);
     int shotgun = getenv("ROCKET_RK3576_ADDR_SHOTGUN") != NULL;
     uint32_t zval[sizeof r76_zero_regs / sizeof r76_zero_regs[0]];
     size_t zi;
+
+    dma_rows = entries_ddr > entries
+                 ? (fetch_rows * entries_ddr + entries - 1u) / entries : fetch_rows;
+    if (dma_rows > 0xFFFFu) {
+        ROCKET_LOGE("rk3576 conv: a pitched feature row needs a DMA budget of %u rows, "
+                    "past the 16-bit field — the task needs a smaller row window\n",
+                    dma_rows);
+        return -1;
+    }
 
     for (zi = 0; zi < sizeof zval / sizeof zval[0]; zi++) {
         uint32_t v = 0;
@@ -1469,7 +1584,7 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * also `entries * 8` and `iw*LANES*elem/8`, three readings that coincide at every
      * value the path can take, so the number is settled and the mechanism is not. */
     ops[i++] = NPUOP(OP_REG_CNA,
-                     (iw << 16) | ((argb && is_float) ? iw : entries),
+                     (iw << 16) | ((argb && is_float) ? iw : entries_ddr),
                      R76_CNA_IW_ENTRIES);
     /* Same field packing as RK3588 CNA_CVT_CON0, at a different offset: four 6-bit
      * truncate fields above the four mode bits. Every non-ARGB capture bypasses the
@@ -1507,9 +1622,10 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     /* The feature DMA's own view of the fetch. On the normal path it repeats the
      * cube's width and height; on the ARGB path the width becomes the PACKED row's
      * granule count, because the DMA is walking interleaved image bytes and not a
-     * channel-group plane. */
+     * channel-group plane. The row count is the BUDGET (see dma_rows above), which is
+     * the fetched rows themselves everywhere but a pitched feature buffer. */
     ops[i++] = NPUOP(OP_REG_CNA,
-                     ((argb ? line_stride - 1u : iw - 1u) << 16) | (fetch_rows - 1u),
+                     ((argb ? line_stride - 1u : iw - 1u) << 16) | (dma_rows - 1u),
                      R76_CNA_DMA_SIZE);
     /* The DMA's channel count is the IMAGE's on the ARGB path — 3 for RGB — while
      * 0x1028 above carries the folded count the MAC sees. The two disagreeing is the
@@ -1966,6 +2082,50 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
             return -1;
         }
     }
+    /* A row pitch describes a plane sitting inside WIDER rows and nothing else. The
+     * ARGB path's row stride is a granule count the emitter derives from the packed
+     * image, and its single surface makes every stride the task's own. */
+    if (p->in_pitch_w && p->in_pitch_w != IW) {
+        if (argb || dw) {
+            ROCKET_LOGE("rk3576 conv: only the DIRECT datapath takes a feature row "
+                        "pitch — the ARGB one derives its row stride from the packed "
+                        "image and the depthwise one has an unmeasured feature "
+                        "granule\n");
+            return -1;
+        }
+        /* BOTH widths are GRANULE counts and neither may round. The pitch is what the
+         * DMA advances by and the plane is what it stages, and the budget that ties
+         * them is `rows * plane_granules` — so a plane whose own row does not fill a
+         * whole granule already carries a rounding the budget arithmetic cannot undo,
+         * and every row past the first lands short. [HW sweep: iw=21 at ic=32 is 10.5
+         * granules and computes wrong at every pitch, where iw=28 at the same ic is
+         * bit-exact at four.] */
+        if ((p->in_pitch_w * IC * r76_elem_bytes(prec)) % 64u ||
+            (IW * IC * r76_elem_bytes(prec)) % 64u) {
+            ROCKET_LOGE("rk3576 conv: a feature row pitch needs BOTH the %u-wide pitch "
+                        "and the %u-wide plane to fill whole 64-byte DDR granules at "
+                        "ic=%u (%u and %u bytes)\n", p->in_pitch_w, IW, IC,
+                        p->in_pitch_w * IC * r76_elem_bytes(prec),
+                        IW * IC * r76_elem_bytes(prec));
+            return -1;
+        }
+        if (p->in_pitch_w < IW) {
+            ROCKET_LOGE("rk3576 conv: a feature row pitch of %u elements is narrower "
+                        "than the %u-wide plane it carries\n", p->in_pitch_w, IW);
+            return -1;
+        }
+        if (p->in_pitch_w > 0xFFFFu) {
+            ROCKET_LOGE("rk3576 conv: a feature row pitch of %u elements exceeds the "
+                        "register field\n", p->in_pitch_w);
+            return -1;
+        }
+        if (!p->in_surf_elems && p->in_pitch_w != IW) {
+            ROCKET_LOGE("rk3576 conv: a feature row pitch of %u needs the channel-group "
+                        "stride told too — the derived %ux%u plane does not describe a "
+                        "pitched buffer\n", p->in_pitch_w, IW, ih_full);
+            return -1;
+        }
+    }
     /* 0x1028 packs entries*ih in its high half. Against the SCALED entry count, which
      * is what the task programs — a 2-byte element reaches the field twice as fast. */
     {
@@ -2090,6 +2250,11 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
     cna.decompress_addr0  = p->weights_dma;
     cna.weight_burst_len  = 0xF;
     cna.data_burst_len    = 0xF;
+    /* NOT the DDR row jump, whatever its RK3588 name says: a readout of the fetch map
+     * has this register advancing the address by its own value once every FOUR rows
+     * while the rows in between step by the fetched width, so it cannot express a
+     * pitch and a pitched program leaves it derived. The row stride is 0x1044's low
+     * half. [HW sweep, H96 MAX M9, tests/rk3576_conv_pitch.c map mode] */
     cna.line_stride       = IW * 4u;
 
     /* The CORE keeps the OPERAND precision, not the datapath one — the two words
@@ -2157,7 +2322,14 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
             cbuf_f = (unsigned)strtoul(e, NULL, 0);
             ROCKET_LOGI("rk3576 cbuf: F forced to %u (%u granules of feature budget)\n",
                         cbuf_f, R76_CBUF_BASE_GRANULES + cbuf_f);
-        } else if (rocket_rk3576_cbuf_f_prec(IW, IC, IH, OC, KH, KW, dw, prec,
+        /* AGAINST THE PITCH, not the plane. The CBUF allowance is consumed at the
+         * DDR row ADVANCE and not at the fetch length: a task told a pitch and planned
+         * for the tight row runs out of granules part way down the plane, and every
+         * row past that reads whatever the DMA had left — measured departing at
+         * exactly `ent_iw * ih / ent_pitch` rows, at two geometries.
+         * [HW sweep, H96 MAX M9, tests/rk3576_conv_pitch.c map mode] */
+        } else if (rocket_rk3576_cbuf_f_prec(p->in_pitch_w ? p->in_pitch_w : IW,
+                                             IC, IH, OC, KH, KW, dw, prec,
                                              &cbuf_f) < 0) {
             return -1;
         }
@@ -2166,7 +2338,8 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
     {
         int rc = gen_conv2d_task_rk3576(p->tasks, &cna, &core, &dpu, dw, argb,
                                         ih_full, oh_full, pad_right, pad_bottom,
-                                        cbuf_f, reuse, p->lut, p->in_surf_elems);
+                                        cbuf_f, reuse, p->lut, p->in_surf_elems,
+                                        p->in_pitch_w);
         if (rc < 0) return rc;
         r76_apply_overrides(p->tasks, rc);
         r76_dump_program(p->tasks, rc);
@@ -3127,7 +3300,7 @@ static uint32_t r76_round4(uint32_t v) { return (v + 3u) & ~3u; }
 int gen_pool_rk3576(pool_params_rk3576_t *p)
 {
     uint64_t *ops = p ? p->tasks : NULL;
-    unsigned iw, ih, c, ow, oh, in_w, in_h, creg;
+    unsigned iw, ih, c, ow, oh, in_w, in_h, creg, pitch, dst_surf;
     unsigned mode, dst_reg;
     int i = 0;
 
@@ -3168,6 +3341,33 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
     in_h = in_h > p->pad_top  ? in_h - p->pad_top  : 1u;
     if (in_w > iw) in_w = iw;
     if (in_h > ih) in_h = ih;
+
+    /* THE ROW PITCH IS NOT THE PLANE, and clamping the consumed extent against the
+     * wrong one of the two is silent. `iw` above is the real plane, so a window that
+     * hangs off its right edge reads a SYNTHESISED pad; a pitch passed in `iw` instead
+     * would lift that clamp and the same window would read whatever the producer's
+     * surplus columns hold. Two of four geometries in `tests/rk3576_row_pitch.c` differ
+     * on exactly that and only that. */
+    pitch = p->src_line_elems ? p->src_line_elems : iw;
+    if (pitch < iw) {
+        ROCKET_LOGE("gen_pool_rk3576: a row pitch of %u is shorter than the %u-wide "
+                    "plane it holds\n", pitch, iw);
+        return -1;
+    }
+
+    /* THE DESTINATION SURFACE STRIDE IS A REGISTER, and it takes the plane exactly. The
+     * vendor's pooling programs all carry round4(ow*oh), which is what a cube this
+     * emitter allocates for itself uses; a caller writing a SLICE of somebody else's
+     * buffer passes that buffer's group stride instead, which for a shared concatenation
+     * is `ow*oh` — a convolution's own surface stride. Below the plane the groups
+     * overlap and atoms are lost. */
+    dst_surf = p->dst_surf_elems ? p->dst_surf_elems : r76_round4(ow * oh);
+    if (dst_surf < ow * oh) {
+        ROCKET_LOGE("gen_pool_rk3576: a destination surface stride of %u is shorter than "
+                    "the %ux%u plane it holds; the channel groups would overlap\n",
+                    dst_surf, ow, oh);
+        return -1;
+    }
 
     creg = ((c + 15u) / 16u) * 16u;
 
@@ -3239,8 +3439,8 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
                      R76_PPU_ZERO_605C);
     ops[i++] = NPUOP(OP_REG_PPU, dst_reg == R76_PPU_ZERO_6070 ? p->output_dma : 0u,
                      R76_PPU_ZERO_6070);
-    ops[i++] = NPUOP(OP_REG_PPU, r76_round4(ow * oh) * 16u, R76_PPU_DST_SURF0);
-    ops[i++] = NPUOP(OP_REG_PPU, r76_round4(ow * oh) * 16u, R76_PPU_DST_SURF1);
+    ops[i++] = NPUOP(OP_REG_PPU, dst_surf * 16u, R76_PPU_DST_SURF0);
+    ops[i++] = NPUOP(OP_REG_PPU, dst_surf * 16u, R76_PPU_DST_SURF1);
     ops[i++] = NPUOP(OP_REG_PPU, dst_reg == R76_PPU_ZERO_60DC ? p->output_dma : 0u,
                      R76_PPU_ZERO_60DC);
 
@@ -3249,9 +3449,10 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
     ops[i++] = NPUOP(OP_REG_PPU_RDMA, in_h - 1u, R76_PPUR_IN_HEIGHT);
     ops[i++] = NPUOP(OP_REG_PPU_RDMA, creg - 1u, R76_PPUR_IN_CHANNEL);
     ops[i++] = NPUOP(OP_REG_PPU_RDMA, p->input_dma, R76_PPUR_SRC_BASE);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, iw * 16u, R76_PPUR_SRC_LINE);
+    ops[i++] = NPUOP(OP_REG_PPU_RDMA, pitch * 16u, R76_PPUR_SRC_LINE);
     ops[i++] = NPUOP(OP_REG_PPU_RDMA,
-                     (p->src_surf_elems ? p->src_surf_elems : r76_round4(iw * ih)) * 16u,
+                     (p->src_surf_elems ? p->src_surf_elems
+                                        : r76_round4(pitch * ih)) * 16u,
                      R76_PPUR_SRC_SURF);
     ops[i++] = NPUOP(OP_REG_PPU_RDMA, 0x40, R76_PPUR_CONST_7030);
 

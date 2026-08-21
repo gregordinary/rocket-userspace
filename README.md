@@ -132,22 +132,31 @@ exactly at `C = 256`.
 A tensor can stay in CUBE LAYOUT between two layers, so neither host transpose runs at the join: a
 direct convolution's output surface is the next layer's feature cube byte for byte
 (`rocket_conv2d_int8_cube_of_rk3576()` / `_cube_in_` / `_cube_out_`), and a run of cube-linked layers
-goes out as ONE hardware kick (`rocket_conv2d_int8_chain_new_rk3576()`, with
-`_chain_plan_rk3576()` grouping already-linked handles into the longest legal runs).
+goes out as ONE hardware kick (`rocket_chain_new_rk3576()`, with `rocket_chain_plan_rk3576()`
+grouping already-linked nodes into the longest legal runs). A run's members are NODES rather than
+convolution handles, because three kinds may sit in one stream: a convolution, a POOL (its own
+register program, interior only), and a PLACEMENT layer — one the caller states emits no program and
+leaves no host work, such as a concatenation whose operands are already slices of one buffer. Without
+that third kind a layer with no program breaks every run it sits in.
 
 **A cube may be a SLICE of a larger buffer.** Its base is a plain address on both sides of a
 convolution, so a producer can be told to write its surface at a channel-group offset inside a
-caller's allocation (`rocket_rk3576_cube_alloc()`, `_cube_slice()`,
-`rocket_conv2d_int8_cube_out_at_rk3576()`). That is what makes a channel CONCATENATION free: two
+caller's allocation (`rocket_rk3576_cube_alloc()`, `_cube_slice()`, `_cube_declare_tail()`,
+`rocket_conv2d_int8_cube_out_at_rk3576()`). That is what makes a channel CONCATENATION free:
 producers writing their own slices of one buffer already ARE the concatenated tensor, so a residual
-add's operands need no host copy and the layer that feeds the skip does not have to leave a row-major
-tensor behind for it. A slice starts every sixteen channels, which is the width one atom interleaves.
+add's operands and an Inception module's four branches need no host copy, and the layer that feeds
+the skip does not have to leave a row-major tensor behind for it. A slice starts every sixteen
+channels, which is the width one atom interleaves; a slice is sized for what its producer WRITES
+(the round-32 register channel count) and a consumer's view for what its feature DMA WALKS, which is
+what `_cube_declare_tail()` states along with the constant the groups past the live channels hold.
 
-Two whole networks run end to end: **MobileNetV1-224** (29 compute layers) and **MobileNetV2-224**
-(64, with ten residual skips), each layer bit-exact against a CPU model of the part's own arithmetic
-and each returning TFLite's own top-1. MobileNetV2 runs in **12.8-13.0 ms and 16 submits** with
-resident weights, cube layout, the concatenation buffers and the cross-layer kick, against 112.9 ms
-and 64 submits with none of them — the same answer to the byte at every step.
+Four whole networks run end to end, each layer bit-exact against a CPU model of the part's own
+arithmetic and each returning TFLite's own top-1: **MobileNetV1-224** (29 compute layers, 4.9 ms),
+**MobileNetV2-224** (64, with ten residual skips, 6.7), **ResNet-18-224** (31, 9.2) and
+**Inception V1-224** (81, with nine four-operand concatenations and thirteen pooling layers, 10.8).
+**Each is ONE hardware kick in ONE submit**, against 112.9 / 144.9 / 159.7 ms and tens of submits
+with none of resident weights, cube layout, the placed slices and the cross-layer kick — the same
+answer to the byte at every step.
 
 The rest of the
 op library still emits the RK3588 encoding, and on this part the matmul entries **refuse** rather than

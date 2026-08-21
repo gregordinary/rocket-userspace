@@ -42,7 +42,12 @@
  * scaled), and above it.
  *
  * Modes:
- *   load    does the DPU-only table-load program execute at all
+ *   load    whether the DPU-only table-load program's dummy cube writes the scratch BO.
+ *           IT DOES NOT, and that is not evidence the program did not run: this reads 0
+ *           of the whole 4096 bytes in a state where `gate` is exact in all four spans,
+ *           so the table demonstrably loaded. Where the dummy cube writes is not decoded.
+ *           The mode is kept as the readout it is; it is not a control, and it is not in
+ *           the gate list, which is how it came to be read as one.
  *   tables  the same sweep under eight different tables — a readout that tracks the
  *           table is a loaded table, one that does not is not there
  *   one     one ramp run, one line; ROCKET_LUT_SKIP / _SET / _BN / _ADD drive it,
@@ -50,6 +55,21 @@
  *   map     the index as a function of the datapath value, per channel
  *   interp  does it interpolate between entries, or step
  *   gate    the whole map against a CPU model, at four different spans
+ *
+ * A WIDE-OUTPUT JOB IN FRONT OF THIS PROBE POISONS ITS FIRST SUBMIT, and that is the
+ * part rather than the probe: an int32-output predecessor leaves the pair writing
+ * NOTHING, like every other victim kind. Guarded here the way the library guards itself
+ * — a wholly untouched surface is redone after a power cycle, up to LUT_POISON_ATTEMPTS,
+ * with the redo count reported — so the gate is deterministic and the hazard is visible.
+ *
+ * READ THE `surface untouched` COLUMN BEFORE SCORING A SPAN. SENTINEL is 0xAA, which is
+ * -86 as an int8 and a perfectly plausible output value, so an unguarded poisoned span
+ * scores against the model as a wrong CONSTANT — a whole session was spent on that
+ * reading before the stamp was recognised. Only the first span of a run could ever show
+ * it: `mode_gate` sleeps 150 ms between spans, over the ~100 ms idle that clears the
+ * hazard. ROCKET_LUT_DOUBLELOAD=1 duplicates the table-load task, which a per-TASK
+ * reading of the hazard predicts would clear it; it does not (10 of 40 against 14 of 40
+ * interleaved), so the hazard is per submit and this knob is kept only as that arm.
  *
  * Usage:  rk3576_lut_probe [load|tables|one|map|interp|gate]   (default: gate)
  * Exit:   0, 1 on a failure, 2 no NPU (skip).
@@ -65,9 +85,13 @@
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
 #include "rocket_hw_profile.h"
+#include "rocket_rk3576_internal.h"
 
 #define C2        16u
 #define SENTINEL  0xAA
+/* The library's own budget for the wide-output poisoning: a confirmed power cycle
+ * clears it about 87% of the time, so the number of redos is the lever. */
+#define LUT_POISON_ATTEMPTS 8
 #define IC        32u
 #define OC        32u
 #define PLANE     16u          /* 16x16 = 256 pixels, one per int8 value */
@@ -232,6 +256,21 @@ typedef struct {
     uint64_t *lut_ops;     /* RK3576_LUT_TASK_OPS  */
     uint64_t *conv_ops;    /* RK3576_CONV_TASK_OPS */
     uint32_t lut_count, conv_count;
+    /* The table-load program's dummy cube writes into the scratch BO, which `run_pair`
+     * re-stamps before every submit — so the same positive control `load` mode uses is
+     * available on the PAIR, and it separates "the load did not execute" from "it ran
+     * and the table did not take effect". A constant surface says nothing on its own. */
+    unsigned scratch_moved;
+    /* Power cycles spent on a submit that wrote nothing. Non-zero means this span met
+     * the wide-output poisoning and was repaired, not that the encoding is marginal. */
+    unsigned redos;
+    /* HOW MUCH OF THE OUTPUT SURFACE IS STILL THE STAMP. A poisoned submit writes
+     * nothing, so the surface reads back as whatever `run_pair` memset into it — and
+     * `SENTINEL` is 0xAA, which is -86 as an int8 and is a perfectly plausible output
+     * value. Scored against a model, an untouched surface is therefore indistinguishable
+     * from a wrong CONSTANT one, and a whole session was spent on the second reading.
+     * So the probe reports it: untouched == out_bytes means the program never ran. */
+    size_t out_untouched;
 } harness;
 
 static void harness_free(harness *h)
@@ -308,8 +347,9 @@ static int run_pair(harness *h, const int16_t *lo, const int16_t *hi,
 {
     lut_load_params_rk3576_t lp = {0};
     conv_params_t p = {0};
-    rocket_task_desc task[2];
-    uint32_t in_h[4], out_h[1];
+    rocket_task_desc task[3];
+    uint32_t in_h[4], out_h[2];
+    unsigned ntask;
     int miss;
 
     lp.lo = lo; lp.hi = hi;
@@ -380,34 +420,91 @@ static int run_pair(harness *h, const int16_t *lo, const int16_t *hi,
            h->conv_count * sizeof(uint64_t));
     rocket_bo_fini(h->fd, &h->rc);
 
-    /* Bracketed, never a bare memset: dirty CPU lines race the DPU's write DMA. */
-    rocket_bo_prep(h->fd, &h->out, 1, 0);
-    memset(h->out.ptr, SENTINEL, h->out_bytes);
-    rocket_bo_fini(h->fd, &h->out);
-    rocket_bo_prep(h->fd, &h->scratch, 1, 0);
-    memset(h->scratch.ptr, SENTINEL, 4096);
-    rocket_bo_fini(h->fd, &h->scratch);
-
-    task[0].regcmd = h->rc.dma_address;
-    task[0].regcmd_count = h->lut_count;
-    task[1].regcmd = h->rc.dma_address + RK3576_LUT_TASK_OPS * sizeof(uint64_t);
-    task[1].regcmd_count = h->conv_count;
+    /* IS THE WIDE-OUTPUT POISONING PER SUBMIT OR PER TASK? A job of load/consumer writes
+     * nothing when a wide-output job ran before it. Duplicating the load makes a per-task
+     * reading differ from a per-submit one: per-task, the second copy lands and the table
+     * is there; per-submit, nothing changes. ROCKET_LUT_DOUBLELOAD=1. */
+    {
+        const char *dbl = getenv("ROCKET_LUT_DOUBLELOAD");
+        ntask = 0;
+        if (dbl && *dbl && atoi(dbl)) {
+            task[ntask].regcmd = h->rc.dma_address;
+            task[ntask].regcmd_count = h->lut_count;
+            ntask++;
+        }
+        task[ntask].regcmd = h->rc.dma_address;
+        task[ntask].regcmd_count = h->lut_count;
+        ntask++;
+        task[ntask].regcmd = h->rc.dma_address +
+                             RK3576_LUT_TASK_OPS * sizeof(uint64_t);
+        task[ntask].regcmd_count = h->conv_count;
+        ntask++;
+    }
 
     in_h[0] = h->in.handle; in_h[1] = h->w.handle;
     in_h[2] = h->coeff.handle; in_h[3] = h->rc.handle;
     out_h[0] = h->out.handle;
+    /* The scratch is named so the table-load program's dummy cube is a live positive
+     * control on the PAIR and not only on `load` mode's solo submit — unnamed, it read
+     * zero on passing and failing spans alike and discriminated nothing. */
+    out_h[1] = h->scratch.handle;
 
-    if (rocket_submit_tasks(h->fd, task, 2, in_h, 4, out_h, 1) != 0) {
-        printf("  submit failed\n");
-        return -1;
+    /* THE SAME WRITE GUARD THE LIBRARY RUNS, FOR THE SAME REASON. A wide-output job
+     * anywhere on the system — in another process, several submits back — poisons this
+     * one, and a poisoned submit writes NOTHING. Unguarded, that lands here as a surface
+     * still holding the stamp, which is scored against the model like any other data and
+     * reads as a wrong CONSTANT rather than as a program that never ran. So the whole
+     * surface still being at the sentinel is the retry condition, the domain is cycled
+     * between attempts (the only thing measured to clear the hazard, ~87% per cycle, so
+     * the budget is the library's eight), and the redo count is reported rather than
+     * hidden — the gate stays deterministic and the hazard stays observable.
+     *
+     * Only a WHOLLY untouched surface retries. A partial write is a different failure and
+     * must reach the model, or this loop would paper over an encoding defect. */
+    h->redos = 0;
+    for (;;) {
+        size_t b;
+
+        /* Bracketed, never a bare memset: dirty CPU lines race the DPU's write DMA. */
+        rocket_bo_prep(h->fd, &h->out, 1, 0);
+        memset(h->out.ptr, SENTINEL, h->out_bytes);
+        rocket_bo_fini(h->fd, &h->out);
+        rocket_bo_prep(h->fd, &h->scratch, 1, 0);
+        memset(h->scratch.ptr, SENTINEL, 4096);
+        rocket_bo_fini(h->fd, &h->scratch);
+
+        if (rocket_submit_tasks(h->fd, task, ntask, in_h, 4, out_h, 2) != 0) {
+            printf("  submit failed\n");
+            return -1;
+        }
+        if (rocket_bo_prep(h->fd, &h->out, 0, 2000000000ull) < 0) {
+            printf("  PREP_BO on the output timed out\n");
+            return -1;
+        }
+        memcpy(out, h->out.ptr, h->out_bytes);
+        h->out_untouched = 0;
+        for (b = 0; b < h->out_bytes; b++)
+            if (((const uint8_t *)h->out.ptr)[b] == SENTINEL) h->out_untouched++;
+        rocket_bo_fini(h->fd, &h->out);
+
+        h->scratch_moved = 0;
+        if (rocket_bo_prep(h->fd, &h->scratch, 0, 2000000000ull) >= 0) {
+            unsigned s;
+            for (s = 0; s < 4096; s++)
+                if (((const uint8_t *)h->scratch.ptr)[s] != SENTINEL) h->scratch_moved++;
+            rocket_bo_fini(h->fd, &h->scratch);
+        }
+
+        if (h->out_untouched < h->out_bytes) return 0;
+        if (h->redos >= LUT_POISON_ATTEMPTS - 1) {
+            printf("  the surface was never written over %d attempts — the submit is "
+                   "being poisoned and the power cycle is not clearing it\n",
+                   LUT_POISON_ATTEMPTS);
+            return 0;
+        }
+        h->redos++;
+        rocket_rk3576_power_idle();
     }
-    if (rocket_bo_prep(h->fd, &h->out, 0, 2000000000ull) < 0) {
-        printf("  PREP_BO on the output timed out\n");
-        return -1;
-    }
-    memcpy(out, h->out.ptr, h->out_bytes);
-    rocket_bo_fini(h->fd, &h->out);
-    return 0;
 }
 
 /* ------------------------------------------------------------------ load mode */
@@ -459,9 +556,12 @@ static int mode_load(harness *h)
     if (rocket_bo_prep(h->fd, &h->scratch, 0, 2000000000ull) < 0) {
         printf("      PREP_BO timed out\n"); goto done;
     }
-    for (i = 0; i < 64; i++)
+    /* THE WHOLE BO, not the first 64 bytes. Scanned at 64 this reported zero while the
+     * table demonstrably took effect in `gate` — a positive control that reads negative
+     * while the thing it controls for works says the SCAN is wrong, not the program. */
+    for (i = 0; i < 4096; i++)
         if (((const uint8_t *)h->scratch.ptr)[i] != SENTINEL) moved++;
-    printf("      the dummy cube wrote %u of its first 64 bytes\n", moved);
+    printf("      the dummy cube wrote %u of the scratch BO's 4096 bytes\n", moved);
     printf("      %s\n", moved ? "the DPU-only program RUNS"
                                : "nothing written — the program did not execute, or "
                                  "its dummy cube writes nowhere");
@@ -876,8 +976,11 @@ static int mode_gate(harness *h)
                 n++;
             }
         printf("  %-18s sel=%d LE_START=%-7d LO_END=%-6d  max |diff| %d, "
-               "%d of %d past one count  %s\n",
+               "%d of %d past one count  (load wrote %u/4096, surface untouched "
+               "%zu/%zu, %u redo%s)  %s\n",
                SPANS[t].name, g_sel, g_le_start, g_lo_end, worst, over1, n,
+               h->scratch_moved, h->out_untouched, h->out_bytes,
+               h->redos, h->redos == 1 ? "" : "s",
                over1 ? "FAIL" : "PASS");
         if (over1) fails++;
         sleep_ms(150);

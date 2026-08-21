@@ -192,6 +192,19 @@ typedef struct {
    * Read ONLY by the RK3576 generators; the RK3588 ones never look at it, so every
    * existing path is byte-identical. A stride SMALLER than the plane is refused. */
   uint32_t  in_surf_elems;
+  /* The FEATURE plane's DDR ROW PITCH, in elements. 0 (default) == iw, rows
+   * contiguous, which is what every cube this library packs itself carries. A
+   * non-zero value LARGER than iw says the iw-wide plane sits inside wider rows —
+   * a materialising packed-image stem writes surplus columns its caller's tensor
+   * never had — and goes to the CNA's DDR line stride (0x1090) in place of the
+   * derived quantity, leaving the fetched extent (0x1078's width half, 0x1080's
+   * two halves) and the CBUF row granule count at iw.
+   *
+   * A caller that sets this must also set in_surf_elems, since the channel-group
+   * jump is over the PITCHED rows and the derived plane no longer describes it.
+   * Read ONLY by the RK3576 non-ARGB generators; the RK3588 ones never look at it,
+   * so every existing path is byte-identical. */
+  uint32_t  in_pitch_w;
   uint32_t  task_count;   /* OUT: number of NPUOP words written      */
 } conv_params_t;
 

@@ -118,6 +118,33 @@ void rocket_bo_free(int fd, rocket_bo *bo);
 int  rocket_bo_prep(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns);
 int  rocket_bo_fini(int fd, rocket_bo *bo);
 
+/* A byte range within a BO, for the ranged forms below. */
+typedef struct { uint64_t offset, size; } rocket_bo_range;
+
+/* As rocket_bo_prep / rocket_bo_fini, but the cache maintenance covers only the
+ * named ranges instead of the whole object — the cost of a bracket is what it
+ * WALKS (about 10.6 GB/s per direction on an RK3576, against a 1.1 us per-ioctl
+ * floor), so a caller that touches a few bytes of a large surface otherwise pays
+ * for the surface.
+ *
+ * Ranges must be ASCENDING and non-overlapping and lie inside the BO; the kernel
+ * checks all three and refuses with -EINVAL. `n == 0` means the whole object, so
+ * these are supersets of the plain forms.
+ *
+ * A kernel that does not carry the ranged ioctls (interface < 1.5) falls back to
+ * the whole-BO form, which is always correct and never faster — so a caller may
+ * use these unconditionally, and rocket_bo_ranges_supported() only says whether
+ * the saving is available. FINI's ranges must cover everything the CPU dirtied:
+ * a range left out is not written back and the NPU then reads stale memory. */
+int  rocket_bo_prep_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
+                           unsigned n, uint64_t timeout_ns);
+int  rocket_bo_fini_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
+                           unsigned n);
+
+/* 1 if the running kernel carries DRM_ROCKET_PREP_BO_RANGES / _FINI_BO_RANGES
+ * (interface >= 1.5). Probed once and cached. */
+int  rocket_bo_ranges_supported(void);
+
 /* 1 if the running kernel honors DRM_ROCKET_JOB_BATCHED (per-job chained submit)
  * AND its master switch is on; 0 otherwise. Probed once and cached. Chaining is a
  * joint layout contract with the kernel, so a kernel that would ignore the flag

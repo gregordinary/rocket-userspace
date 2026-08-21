@@ -33,6 +33,11 @@ int rocket_pool_fp16_plan(const rocket_pool_desc *d)
     if (d->c < 1 || d->ih < 1 || d->iw < 1) return -2;
     if (d->kh < 1 || d->kw < 1 || d->stride_y < 1 || d->stride_x < 1) return -3;
     if (d->method != POOL_METHOD_MAX && d->method != POOL_METHOD_AVG) return -4;
+    /* count-include-pad = FALSE is claimed on the RK3576 int8 path alone
+     * (rocket_pool_int8_rk3576()). These entries always divide by kh*kw, so a 1 here is
+     * refused rather than silently dropped — the two are the same function only at pad 0
+     * and a caller that asked has a padded window in mind. */
+    if (d->avg_exclude_pad) return -10;
     int oh = rocket_pool_oh(d), ow = rocket_pool_ow(d);
     if (oh < 1 || ow < 1) return -5;
     /* CUBE_* dims are 13-bit (value-1); kernel/stride 4-bit (value-1); pad 3-bit. */

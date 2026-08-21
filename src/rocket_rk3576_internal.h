@@ -102,4 +102,34 @@ struct rocket_pool_int8_rk3576_handle;
 int rocket_rk3576_pool_link(struct rocket_pool_int8_rk3576_handle *h,
                             struct rocket_rk3576_pool_link *out, uint64_t *ops);
 
+/* THE CHW <-> NC1HWC2 TRANSPOSE, for one channel group of a cube.
+ *
+ * A cube interleaves sixteen channels into every sixteen-byte atom, so a row-major
+ * tensor and a cube are a transpose rather than a copy — and written an element at a
+ * time it is one useful byte per destination cache line. The implementation is a 16x16
+ * NEON block (rocket_rk3576_cube_pack.c) with the scalar loop as the pixel tail and the
+ * non-NEON build.
+ *
+ * `sp`/`dp` are up to sixteen channel PLANES, as pointers rather than a base and a
+ * stride, because a per-axis convolution sorts its output channels by scale so channel
+ * c of a group can land anywhere in the caller's tensor. `px` is the pixel count and
+ * `live` how many of the sixteen lanes the caller owns.
+ *
+ * On the PACK side the dead lanes of a partial group are still WRITTEN, because a whole
+ * atom is stored either way — so `pad` is what they carry, and it is NOT free: it has to
+ * be the value the consumer's datapath substitutes where those channels are read (the
+ * CNA's border constant on a convolution's cube). A caller with no such contract keeps
+ * the scalar loop for its partial group. */
+void rocket_rk3576_c2_pack(int8_t *cube, const int8_t *const *sp, unsigned live,
+                           size_t px, unsigned char pad);
+void rocket_rk3576_c2_unpack(int8_t *const *dp, unsigned live, const int8_t *cube,
+                             size_t px);
+
+/* CHW -> the packed-image first conv's INTERLEAVED image: img[p*ic + c] = sp[c][p]. A
+ * different transform from the cube transpose above — a 2/3/4-way interleave of whole
+ * planes, which NEON stores with one vst2/vst3/vst4 — and it is what the packed encoding
+ * spends against the MAC count it saves. `ic` is the PROGRAMMED channel count, so every
+ * lane is a real plane and there is no dead-lane contract to keep. */
+void rocket_rk3576_argb_pack(int8_t *img, const int8_t *const *sp, unsigned ic, size_t px);
+
 #endif /* ROCKET_RK3576_INTERNAL_H */

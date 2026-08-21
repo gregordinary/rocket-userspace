@@ -14,7 +14,14 @@
 # channel counts that are not multiples of 32, which is a different question about the
 # part rather than a bigger instance of the same one. ResNet-18 is a third: 3x3-heavy
 # where both MobileNets are 1x1-heavy, with a 7x7 stem, a max pool, and skips whose two
-# operands are the same width so the graph is all identity-shortcut blocks.
+# operands are the same width so the graph is all identity-shortcut blocks. Inception V1 is
+# a fourth, chosen for the axes it VARIES rather than for size: a concat/split topology
+# (nine four-operand joins), nine producers with four readers, a k=7 pooling kernel,
+# thirteen pooling layers, and 18+18 layers whose operand A is not the layer before. It
+# arrives quantized like the MobileNets do. Inception V3 at 299 is a fifth, and it is
+# the first with a NON-SQUARE kernel (1x7, 7x1, 1x3, 3x1), VALID padding, odd planes and
+# a requantization edge -- axes every earlier gate cell on this part holds constant, and
+# each one turned out to hide a shipped encoding that computed a plausible wrong surface.
 #
 # THE TWO MOBILENETS ARRIVE QUANTIZED; RESNET-18 DOES NOT. No per-tensor-quantized
 # ResNet-18 is published, so this pulls the float checkpoint and the calibration images
@@ -35,7 +42,8 @@ cd "$(dirname "$0")"
 
 BASE=https://raw.githubusercontent.com/google-coral/test_data/master
 
-for MODEL in mobilenet_v1_1.0_224_quant.tflite mobilenet_v2_1.0_224_quant.tflite; do
+for MODEL in mobilenet_v1_1.0_224_quant.tflite mobilenet_v2_1.0_224_quant.tflite \
+             inception_v1_224_quant.tflite inception_v3_299_quant.tflite; do
   [ -f "$MODEL" ] || curl -fsSL -o "$MODEL" "$BASE/$MODEL"
 done
 [ -f labels.txt ] || curl -fsSL -o labels.txt "$BASE/imagenet_labels.txt"
@@ -58,5 +66,6 @@ for IMG in bird.bmp cat.bmp dragonfly.bmp grace_hopper.bmp hot_dog.jpg owl.jpg \
 done
 
 ls -l mobilenet_v1_1.0_224_quant.tflite mobilenet_v2_1.0_224_quant.tflite \
+      inception_v1_224_quant.tflite inception_v3_299_quant.tflite \
       resnet18_a1_in1k.safetensors labels.txt grace_hopper.bmp
 ls calib | wc -l | sed 's/^/calibration images: /'

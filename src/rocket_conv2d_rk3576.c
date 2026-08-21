@@ -65,6 +65,7 @@
 #include "rocket_npu.h"
 #include "rocket_conv.h"
 #include "rocket_matmul.h"
+#include "rocket_pool.h"   /* a chain node may be a pool, and a padded average one is checked */
 #include "rocket_hw_profile.h"
 #include "rocket_log.h"
 #include "npu_matmul.h"
@@ -72,195 +73,14 @@
 #include "rocket_rk3576_internal.h"
 #include "rocket_chain.h"
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#include <arm_neon.h>
-#define R76_HAVE_NEON 1
-#endif
-
 #define C2     16u      /* int8 feature/output channel atom */
 #define C2F     8u      /* fp16 feature/output channel atom */
 
-/* ============================================================================
- * SECTION — the CHW <-> NC1HWC2 transpose
- *
- * A convolution on this part spends most of its host time HERE and not in the submit:
- * on a MobileNet graph the feature scatter and the output de-scatter are together about
- * seventy per cent of the library's wall, against the submit's thirty.
- *
- * The cube interleaves sixteen channels into every sixteen-byte atom, so a row-major
- * tensor and a cube are a TRANSPOSE rather than a copy. Written an element at a time
- * that is one useful byte per destination cache line, and the sixteen channels of a
- * group each walk the same lines again — four line touches per byte moved.
- *
- * A 16x16 BLOCK moves the same bytes in whole vectors: sixteen 16-byte loads, a 16x16
- * byte transpose (four levels of TRN1/TRN2, the standard recursive block transpose), and
- * four full cache lines stored. Each line is touched ONCE.
- *
- * CHANNEL-OUTER IS STILL THE READ ORDER, and the block does not change that. Sixteen
- * concurrent read streams is what made the scalar pixel-outer rewrite a measured
- * negative — but a block reads a whole VECTOR from each stream instead of one byte, so
- * the streams advance sixteen times more slowly for the same work and the line traffic
- * falls instead of rising.
- *
- * The scalar loop in each is the pixel tail AND the non-NEON build, and it is the loop
- * that was there before the block — so a shape whose pixel count is not a multiple of
- * sixteen runs both against each other on every gate, and most of them are.
- * ==========================================================================*/
-#ifdef R76_HAVE_NEON
-#define R76_U8(x)  vreinterpretq_u8_u64(x)
-#define R76_U64(x) vreinterpretq_u64_u8(x)
+/* The CHW <-> NC1HWC2 transpose is in rocket_rk3576_cube_pack.c — the pooling entry packs
+ * the same cube, so it is shared rather than a convolution's. */
+#define r76_c2_pack   rocket_rk3576_c2_pack
+#define r76_c2_unpack rocket_rk3576_c2_unpack
 
-/* Transpose eight 16-byte rows as two independent 8x8 byte blocks — the low halves and
- * the high halves. EIGHT LIVE VECTORS IS THE POINT: a 16x16 done as one array of sixteen
- * needs thirty-two registers with the scratch and the compiler puts the array on the
- * STACK, which measured 3x slower than this on the part. Two of these plus a swap of the
- * off-diagonal halves is the 16x16. */
-static inline void r76_trans8(uint8x16_t *r0, uint8x16_t *r1, uint8x16_t *r2,
-                              uint8x16_t *r3, uint8x16_t *r4, uint8x16_t *r5,
-                              uint8x16_t *r6, uint8x16_t *r7)
-{
-    uint8x16_t a0, a1, a2, a3, a4, a5, a6, a7;
-    uint8x16_t b0, b1, b2, b3, b4, b5, b6, b7;
-
-#define R76_T1(o1, o2, x, y) do { uint8x16_t _x = (x), _y = (y);                       \
-        o1 = vtrn1q_u8(_x, _y); o2 = vtrn2q_u8(_x, _y); } while (0)
-#define R76_T2(o1, o2, x, y) do { uint16x8_t _x = vreinterpretq_u16_u8(x),             \
-                                             _y = vreinterpretq_u16_u8(y);             \
-        o1 = vreinterpretq_u8_u16(vtrn1q_u16(_x, _y));                                 \
-        o2 = vreinterpretq_u8_u16(vtrn2q_u16(_x, _y)); } while (0)
-#define R76_T4(o1, o2, x, y) do { uint32x4_t _x = vreinterpretq_u32_u8(x),             \
-                                             _y = vreinterpretq_u32_u8(y);             \
-        o1 = vreinterpretq_u8_u32(vtrn1q_u32(_x, _y));                                 \
-        o2 = vreinterpretq_u8_u32(vtrn2q_u32(_x, _y)); } while (0)
-    R76_T1(a0, a1, *r0, *r1); R76_T1(a2, a3, *r2, *r3);
-    R76_T1(a4, a5, *r4, *r5); R76_T1(a6, a7, *r6, *r7);
-    R76_T2(b0, b2, a0, a2); R76_T2(b1, b3, a1, a3);
-    R76_T2(b4, b6, a4, a6); R76_T2(b5, b7, a5, a7);
-    R76_T4(*r0, *r4, b0, b4); R76_T4(*r1, *r5, b1, b5);
-    R76_T4(*r2, *r6, b2, b6); R76_T4(*r3, *r7, b3, b7);
-#undef R76_T1
-#undef R76_T2
-#undef R76_T4
-}
-#endif
-
-/*
- * ONE cube group, both directions. `sp`/`dp` are up to C2 channel planes — pointers
- * rather than a base and a stride, because a per-axis convolution sorts its output
- * channels by scale, so channel c of a group can land anywhere in the caller's tensor.
- *
- * `full` is a CONSTANT at every call site, so the compiler emits the common
- * sixteen-live-channel loop with no per-lane predicate and the partial one with it —
- * one source, two specializations, rather than two hand-written kernels that have to be
- * kept in agreement. The dead lanes of a partial group are still WRITTEN on the way in,
- * because a whole atom has to be stored either way — so they carry `pad`, which is the
- * cube's channel padding and is NOT zero: it has to be the same value the CNA substitutes
- * at a border tap, or the B term's sum stops being position-independent. See h->taps in
- * r76_w_prepare().
- */
-#ifdef R76_HAVE_NEON
-__attribute__((always_inline))
-static inline size_t r76_c2_pack_vec(int8_t *cube, const int8_t *const *sp,
-                                     unsigned live, size_t px, unsigned char pad,
-                                     const int full)
-{
-    const uint8x16_t padv = vdupq_n_u8(pad);
-    size_t p;
-#define R76_LD(i) ((full || (i) < live) ? vld1q_u8((const uint8_t *)sp[i] + p) : padv)
-    for (p = 0; p + C2 <= px; p += C2) {
-        uint8x16_t v0, v1, v2, v3, v4, v5, v6, v7;
-        uint8x16_t w0, w1, w2, w3, w4, w5, w6, w7;
-        uint8_t *d = (uint8_t *)cube + p * C2;
-        uint64x2_t z;
-        v0 = R76_LD(0); v1 = R76_LD(1); v2 = R76_LD(2); v3 = R76_LD(3);
-        v4 = R76_LD(4); v5 = R76_LD(5); v6 = R76_LD(6); v7 = R76_LD(7);
-        r76_trans8(&v0, &v1, &v2, &v3, &v4, &v5, &v6, &v7);
-        w0 = R76_LD(8);  w1 = R76_LD(9);  w2 = R76_LD(10); w3 = R76_LD(11);
-        w4 = R76_LD(12); w5 = R76_LD(13); w6 = R76_LD(14); w7 = R76_LD(15);
-        r76_trans8(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7);
-        /* Row i of the low block is output row i's first eight channels and row i of the
-         * high block its last eight; atom i is the two halves joined. */
-#define R76_EMIT(i, lo, hi)                                                            \
-        z = vcombine_u64(vget_low_u64(R76_U64(lo)), vget_low_u64(R76_U64(hi)));        \
-        vst1q_u8(d + (i) * C2, R76_U8(z));                                             \
-        z = vcombine_u64(vget_high_u64(R76_U64(lo)), vget_high_u64(R76_U64(hi)));      \
-        vst1q_u8(d + ((i) + 8) * C2, R76_U8(z))
-        R76_EMIT(0, v0, w0); R76_EMIT(1, v1, w1);
-        R76_EMIT(2, v2, w2); R76_EMIT(3, v3, w3);
-        R76_EMIT(4, v4, w4); R76_EMIT(5, v5, w5);
-        R76_EMIT(6, v6, w6); R76_EMIT(7, v7, w7);
-#undef R76_EMIT
-    }
-#undef R76_LD
-    return p;
-}
-
-__attribute__((always_inline))
-static inline size_t r76_c2_unpack_vec(int8_t *const *dp, unsigned live,
-                                       const int8_t *cube, size_t px, const int full)
-{
-    size_t p;
-    for (p = 0; p + C2 <= px; p += C2) {
-        const uint8_t *s = (const uint8_t *)cube + p * C2;
-        uint8x16_t v0, v1, v2, v3, v4, v5, v6, v7;
-        uint8x16_t w0, w1, w2, w3, w4, w5, w6, w7;
-        uint64x2_t z;
-#define R76_LOAD(i, a, b) do {                                                         \
-        uint8x16_t _l = vld1q_u8(s + (i) * C2), _h = vld1q_u8(s + ((i) + 8) * C2);     \
-        z = vcombine_u64(vget_low_u64(R76_U64(_l)), vget_low_u64(R76_U64(_h)));        \
-        a = R76_U8(z);                                                                 \
-        z = vcombine_u64(vget_high_u64(R76_U64(_l)), vget_high_u64(R76_U64(_h)));      \
-        b = R76_U8(z); } while (0)
-        R76_LOAD(0, v0, w0); R76_LOAD(1, v1, w1);
-        R76_LOAD(2, v2, w2); R76_LOAD(3, v3, w3);
-        R76_LOAD(4, v4, w4); R76_LOAD(5, v5, w5);
-        R76_LOAD(6, v6, w6); R76_LOAD(7, v7, w7);
-#undef R76_LOAD
-        r76_trans8(&v0, &v1, &v2, &v3, &v4, &v5, &v6, &v7);
-        r76_trans8(&w0, &w1, &w2, &w3, &w4, &w5, &w6, &w7);
-#define R76_ST(i, r) if (full || (i) < live) vst1q_u8((uint8_t *)dp[i] + p, r)
-        R76_ST(0, v0); R76_ST(1, v1); R76_ST(2, v2);  R76_ST(3, v3);
-        R76_ST(4, v4); R76_ST(5, v5); R76_ST(6, v6);  R76_ST(7, v7);
-        R76_ST(8, w0); R76_ST(9, w1); R76_ST(10, w2); R76_ST(11, w3);
-        R76_ST(12, w4); R76_ST(13, w5); R76_ST(14, w6); R76_ST(15, w7);
-#undef R76_ST
-    }
-    return p;
-}
-#endif  /* R76_HAVE_NEON */
-
-/* cube[p*C2 + c] = sp[c][p] for c < live, `pad` above it. The scalar tail leaves the dead
- * lanes alone rather than filling them, because those bytes were never live and still hold
- * the allocation's own fill — which is the same `pad`. */
-static void r76_c2_pack(int8_t *cube, const int8_t *const *sp, unsigned live, size_t px,
-                        unsigned char pad)
-{
-    size_t p = 0, q;
-    unsigned c;
-
-#ifdef R76_HAVE_NEON
-    p = (live == C2) ? r76_c2_pack_vec(cube, sp, C2, px, pad, 1)
-                     : r76_c2_pack_vec(cube, sp, live, px, pad, 0);
-#else
-    (void)pad;
-#endif
-    for (c = 0; c < live; c++)
-        for (q = p; q < px; q++) cube[q * C2 + c] = sp[c][q];
-}
-
-/* dp[c][p] = cube[p*C2 + c] for c < live. */
-static void r76_c2_unpack(int8_t *const *dp, unsigned live, const int8_t *cube, size_t px)
-{
-    size_t p = 0, q;
-    unsigned c;
-
-#ifdef R76_HAVE_NEON
-    p = (live == C2) ? r76_c2_unpack_vec(dp, C2, cube, px, 1)
-                     : r76_c2_unpack_vec(dp, live, cube, px, 0);
-#endif
-    for (c = 0; c < live; c++)
-        for (q = p; q < px; q++) dp[c][q] = cube[q * C2 + c];
-}
 
 int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
 int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
@@ -417,6 +237,55 @@ struct r76_task_extent {
     size_t   span;        /* this task's rows within a group            */
 };
 
+/* HOW MUCH OF A TASK'S EXTENT THE GUARD TOUCHES. ROCKET_RK3576_GUARD_NARROW.
+ *
+ * The check asks whether a task wrote ANYTHING, so it reads only until the first byte
+ * that differs from the sentinel — but the STAMP has to cover whatever the check may
+ * read, and on a task that wrote nothing the check reads the whole extent. So the guard's
+ * host work is a full memset of every surface per call, and its two cache-maintenance
+ * ioctls sync the whole BO either way.
+ *
+ * Narrowed, both ends touch one cache line per (task, channel group) instead. That is the
+ * FILL half of the guard — measured 0.113 us/KiB against the bracket's own 0.194
+ * (`tests/rk3576_prep_floor.c`) — and it is the half userspace can collect alone; the
+ * bracket's bytes need a ranged cache-maintenance ioctl, which the uAPI does not have.
+ *
+ * WHAT IT TRADES. A line per group per task still witnesses the hazard the guard exists
+ * for: the wide-output poisoning kills a whole submit, so every line of every extent
+ * still holds the sentinel. What it stops seeing is a PARTIAL write that happens to spare
+ * those lines — the same class of coverage `ROCKET_RK3576_GUARD_PER_KICK` trades away,
+ * and the same reason both are off by default. It also raises the false-alarm rate: a
+ * task whose first 64 bytes per group genuinely equal the sentinel byte reads as unwritten
+ * and costs a redo, where the wide check needs the whole extent to.
+ *
+ * Resolved once. The CHECK honours it everywhere, including the per-call path whose stamp
+ * is still the whole surface — a narrow check against a wide stamp is sound, since the
+ * lines it reads carry the sentinel whenever the extent does. */
+#define R76_GUARD_LINE 64u
+
+static int r76_guard_narrow(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("ROCKET_RK3576_GUARD_NARROW");
+        cached = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 0;
+    }
+    return cached;
+}
+
+/* An RE escape: a named environment flag that lets a probe ask past a decoded bound.
+ * Every caller of this states in its own comment what the admitted shape computes. */
+static int r76_env_on(const char *name)
+{
+    const char *e = getenv(name);
+    return e && *e && *e != '0';
+}
+
+static size_t r76_guard_limit(void)
+{
+    return r76_guard_narrow() ? (size_t)R76_GUARD_LINE : (size_t)-1;
+}
+
 /* A span still holding the stamp everywhere was never written.
  *
  * PER TASK, not per tile: one poisoned submit among several leaves its own rows stale
@@ -425,11 +294,12 @@ struct r76_task_extent {
 static int r76_task_wrote(const unsigned char *o, const struct r76_task_extent *e,
                           unsigned char stamp)
 {
+    size_t limit = r76_guard_limit();
     unsigned g;
     for (g = 0; g < e->groups; g++) {
         const unsigned char *p = o + e->base + (size_t)g * e->group_bytes + e->row_off;
-        size_t i;
-        for (i = 0; i < e->span; i++)
+        size_t i, n = e->span < limit ? e->span : limit;
+        for (i = 0; i < n; i++)
             if (p[i] != stamp) return 1;
     }
     return 0;
@@ -486,6 +356,10 @@ static int r76_int8_prof_on(void)
  * instrumentation costs one predictable branch on the hot path. */
 #define R76_PT(p) ((p).on ? r76_now_us() : 0.0)
 #define R76_ACC(p, field, t0) do { if ((p).on) (p).field += r76_now_us() - (t0); } while (0)
+/* A REDO's cost is the whole attempt it repeats, not one of the buckets inside it, so it is
+ * charged at every exit from an attempt rather than accumulated per phase. */
+#define R76_ACC_REDO(p, t0, isredo) \
+    do { if ((p).on && (isredo)) (p).redo_us += r76_now_us() - (t0); } while (0)
 
 /* How long to let a surface drain before calling it unwritten, in microseconds.
  * ROCKET_RK3576_DRAIN_US sets it; DEFAULT 0, because it is a MEASURED NEGATIVE — see
@@ -1086,6 +960,27 @@ struct rocket_conv2d_int8_weights_rk3576 {
     int      resident;      /* 1 = a caller packed these and holds them */
     rocket_conv2d_desc d;
     int      dw;
+    /* THE PACKED-IMAGE FIRST CONV, which is this handle's third encoding and not a mode of
+     * the direct one: a feature buffer of `ICP` interleaved bytes per pixel instead of an
+     * NC1HWC2 cube, a weight cube of its own, 64 output channels per program instead of the
+     * tile the CBUF affords, and four geometry bounds the direct path does not carry. What
+     * it SHARES is everything after the operands — the coefficient group, the row plan, the
+     * zero-point fold over the live taps, the NC1HWC2 surface, the write guard and the
+     * de-scatter — which is why it is a flag here rather than a second entry.
+     *
+     * Set from the descriptor exactly as the public entries route: four or fewer input
+     * channels that did not ask for `direct_datapath`, and never depthwise. */
+    int      argb;
+    unsigned ICP;           /* image channels as PROGRAMMED — 1 is emitted as 2 */
+    /* THE MATERIALISED PAD COLUMNS. The packed sub-encoding's pad columns feed the MAC a
+     * constant 0 whatever CNA_PAD_CON1 holds, so at a non-zero input zero point they are
+     * built into the IMAGE instead of synthesized: `ext_lead` columns of the input zero
+     * point before the caller's column 0, a register pad of one, and `ext_crop` programmed
+     * output columns discarded on the left. Zero on every other path, and the geometry
+     * below is then the caller's exactly. See r76_argb_extend_plan(). */
+    unsigned ext_lead, ext_crop;
+    unsigned src_iw;        /* the CALLER's row width; IW is what the program reads   */
+    unsigned dst_ow;        /* the CALLER's output width; ow is what the program writes */
     float    in_scale, w_scale, out_scale;
     int      in_zp, w_zp, out_zp;
     /* Geometry, so a call derives none of it. */
@@ -1211,6 +1106,181 @@ static void r76_w_free(r76_w *h)
     free(h);
 }
 
+/* Output channels one packed program drives. 32 and 64 are measured — every live weight
+ * byte of a 64-channel cube lands on exactly one output position of one channel — and above
+ * that the split is the tile loop's, exactly as on the float path. [HW sweep] */
+#define R76_ARGB_INT8_OC_MAX 64u
+
+/*
+ * THE PACKED-IMAGE FIRST CONV'S OWN BOUNDS. Four, and three of them are SILENT — a
+ * violation writes a full, correctly sized, entirely plausible surface — so each is refused
+ * here rather than computed wrong. Jointly they are the ONNX symmetric-SAME convention plus
+ * a zero input zero point; an asymmetric output EXTENT is not among them and is programmed.
+ *
+ * The emitter derives the trailing pad from the extent for both sub-encodings out of one
+ * shared r76_trail_pad(OW, stride, KW, pad_left, IW) into CNA_PAD_CON0's high bytes, and the
+ * packed converter honours those bytes exactly as the direct path does: bit-exact over
+ * kernels 5 and 7, strides 1 and 2, planes 64/128/224, trailing pads 2/3/4 and each axis
+ * asymmetric on its own, scored by pad region so a derived pad that was not read would have
+ * shown as an exact interior against a wrong trailing edge. What bounds the extent is the
+ * shared rule in r76_conv_check(): a trailing pad of kh or more is a whole window of pad.
+ * [HW sweep, H96 MAX M9, tests/rk3576_argb_extent.c]
+ */
+static int r76_argb_bounds(const char *entry, const rocket_conv2d_desc *d,
+                           unsigned ow, unsigned oh, int in_zp, int ext)
+{
+    unsigned IW = (unsigned)d->iw, IH = (unsigned)d->ih;
+    unsigned SX = (unsigned)d->stride_x, SY = (unsigned)d->stride_y;
+    unsigned OC = (unsigned)d->oc;
+
+    if (IW % 16u) {
+        ROCKET_LOGE("%s: the first conv needs iw a multiple of 16 (iw=%u); its DDR row "
+                    "stride and CBUF row are both counted in 16-byte granules\n", entry, IW);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    /* At pad_left 0 the DPU writes nothing at all — an untouched surface, not a wrong one —
+     * at every plane, stride and kernel. The fp16 form of the same conv has no such bound. */
+    if (d->pad_left == 0) {
+        ROCKET_LOGE("%s: the int8 first conv needs a NON-ZERO left pad (pad_left=0). At "
+                    "pad_left 0 the DPU writes nothing at all — an untouched surface, not "
+                    "a wrong one — at every plane, stride and kernel. The fp16 form of "
+                    "the same conv has no such bound: rocket_conv2d_fp16_rk3576()\n", entry);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    /* The OUTPUT width has its own granule and it is not implied by the input's: at ow 24
+     * and 56 — both from an iw that is a multiple of 16 — output row 0 is exact and every
+     * row after it is wrong, while 16, 32, 48, 64, 80 and 112 are exact. The direct path
+     * carries no such rule; this one comes with the channel fold. */
+    if (ow % 16u || oh == 0u) {
+        ROCKET_LOGE("%s: the int8 first conv needs ow a multiple of 16 (ow=%u from iw=%u "
+                    "stride %u). At any other output width the first output row is exact "
+                    "and every row after it is wrong\n", entry, ow, IW, SX);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    if (ow * SX != IW || oh * SY != IH) {
+        ROCKET_LOGE("%s: the int8 first conv needs the SAME-padding output extent — "
+                    "ow*stride_x == iw and oh*stride_y == ih (got %u*%u vs iw=%u, %u*%u "
+                    "vs ih=%u). Any other output width writes a full surface SHEARED by "
+                    "one column per row, with nothing to fault on\n",
+                    entry, ow, SX, IW, oh, SY, IH);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    /* A NON-ZERO INPUT ZERO POINT COMPUTES A WRONG BORDER HERE, and the bound is an AXIS.
+     * This sub-encoding's pad COLUMNS feed the MAC a constant 0 — at BOTH ends and at every
+     * row, whatever CNA_PAD_CON1 holds — while its pad ROWS and its corners honour the
+     * register at both ends, and the DIRECT path honours it on both axes at every position.
+     * At in_zp 0 a dead column feeds the right answer, which is why every gate that ever ran
+     * this path was exact. The map from the register is `(int8_t)byte` per image channel and
+     * is not the residual. Nor is any other register: walking the packed program one register
+     * at a time to the direct program's value, over all seventeen they differ on at one
+     * geometry, leaves the columns at 0 in every arm whose interior still computes — a
+     * one-at-a-time search, so it cannot see a condition of two.
+     * [HW sweep, H96 MAX M9, tests/rk3576_argb_padmap.c]
+     *
+     * REPAIR IS NOT THE ROUTE PAST IT. The error is data-independent — `-in_zp` times the
+     * sum of the weights over the taps in a pad column — but it lives in the ACCUMULATOR and
+     * this entry returns a requantized int8, so repairing an affected output means
+     * recomputing it: 9.8 ms of host work on a 224x224 k7 s2 oc=64 stem against a ~2 ms
+     * saving (tests/rk3576_argb_border_cost.c). MATERIALISING them is, and r76_argb_extend_
+     * plan() below does it for every geometry that admits one, so a non-zero zero point
+     * reaching this check is one where no extension fits (a zero left pad, or a kernel
+     * narrower than the leading pad plus the stride) — or one where an RE probe asked for
+     * the naive program outright. */
+    /* ROCKET_RK3576_ARGB_INZP=1 asks PAST this bound, and suppresses the extension with it.
+     * It is an RE escape, not a mode: the shape it admits computes wrong pad-column outputs
+     * and the probes that drive it score by region. What it exists for is that a refusal
+     * cannot be measured. */
+    if (in_zp != 0 && !ext && !r76_env_on("ROCKET_RK3576_ARGB_INZP")) {
+        ROCKET_LOGE("%s: the int8 first conv computes a wrong BORDER at a non-zero input "
+                    "zero point (in_zp=%d) — its pad COLUMNS feed the MAC a zero at both "
+                    "ends and at every row, whatever CNA_PAD_CON1 holds, while its pad rows "
+                    "honour the register [HW sweep, tests/rk3576_argb_padmap.c] — and no "
+                    "extension of this geometry materialises them (pad_left=%d, kw=%d, "
+                    "stride_x=%d: the extension needs a non-zero left pad and kw >= 1 + "
+                    "stride_x). rocket_conv2d_desc.direct_datapath is exact at any zero "
+                    "point\n", entry, in_zp, d->pad_left, d->kw, d->stride_x);
+        return ROCKET_E_UNSUPPORTED;
+    }
+    if (OC != rocket_rk3576_pad_oc(OC)) {
+        ROCKET_LOGE("%s: oc=%u is a partial 32-channel group and writes nothing; size the "
+                    "output and coefficient buffers for %u channels and pass that count "
+                    "(rocket_rk3576_pad_oc)\n", entry, OC, rocket_rk3576_pad_oc(OC));
+        return ROCKET_E_UNSUPPORTED;
+    }
+    return ROCKET_OK;
+}
+
+/*
+ * MATERIALISE THE PAD COLUMNS, so a non-zero input zero point is a geometry question rather
+ * than a refusal.
+ *
+ * The bound above is an AXIS: this sub-encoding's pad COLUMNS feed the MAC a constant 0 at
+ * both ends and at every row, while its pad ROWS and corners honour CNA_PAD_CON1. So do not
+ * let the hardware synthesize the columns at all. Extend the image by
+ *
+ *     L = pad_left - P + stride_x * D
+ *
+ * columns of the input zero point, give the program a register pad of `P`, and read the
+ * caller's output column `x` from the program's `x + D`. With P = 1 the ONLY output whose
+ * window reaches the one synthesized column is the program's column 0, and D = 1 discards
+ * exactly that one, at any stride.
+ *
+ * The encoding's own bounds — iw and ow multiples of 16, ow*stride == iw — then force the
+ * programmed extent wider than the caller's, so the image grows by a whole 16-output granule
+ * (`iw + 16*stride_x`) and the surplus output columns are cropped in the de-scatter. Both
+ * ends of the extension are the input zero point, so the caller's own trailing pad is
+ * materialised too and the program's derived trailing pad (kw - P - stride_x) falls on
+ * columns no wanted output reads.
+ *
+ * Bit-exact against the DIRECT lowering — which is exact at every zero point, border
+ * included — over kernels 3/5/7, both strides, model pads 1/2/3 and both signs of zero point
+ * [HW sweep, H96 MAX M9, tests/rk3576_argb_extend.c].
+ *
+ * What it costs is a wider image (one 16-output granule of columns), the MACs of the surplus
+ * output columns, and a de-scatter that walks rows instead of one contiguous plane. What it
+ * cannot do is leave a CUBE: the surface is `owx` wide where a consumer wants the caller's
+ * `ow`, and the row stride inside a plane is implied by `iw` with no register to move it —
+ * r76_cube_shape_ok() refuses it there.
+ *
+ * Returns ROCKET_OK with the programmed descriptor in `dx`, or a negative status, in which
+ * case the caller falls through to r76_argb_bounds()'s refusal.
+ */
+static int r76_argb_extend_plan(const rocket_conv2d_desc *d, rocket_conv2d_desc *dx,
+                                unsigned *lead, unsigned *crop, unsigned *dst_ow)
+{
+    const unsigned P = 1u, D = 1u;
+    unsigned SX = (unsigned)d->stride_x, PL = (unsigned)d->pad_left;
+    unsigned IW = (unsigned)d->iw, KW = (unsigned)d->kw;
+    int ow_model = rocket_conv2d_ow(d), oh_model = rocket_conv2d_oh(d);
+    unsigned L, iwx, owx, reach;
+
+    if (ow_model <= 0 || oh_model <= 0) return ROCKET_E_SHAPE;
+    /* A zero left pad is a different bound of this encoding's and not one an extension
+     * reaches: the DPU writes nothing at all there, at every plane, stride and kernel. */
+    if (PL < P) return ROCKET_E_UNSUPPORTED;
+    /* The programmed extent is the SAME-padding one, so the trailing pad it derives is
+     * kw - P - stride_x. A kernel that cannot cover a leading pad of one plus a stride is
+     * asking for a NEGATIVE trailing pad, which is not an extent this emitter expresses. */
+    if (KW < P + SX) return ROCKET_E_UNSUPPORTED;
+    L   = PL - P + SX * D;
+    iwx = IW + 16u * SX;
+    if (SX == 0u || iwx % SX) return ROCKET_E_SHAPE;
+    owx = iwx / SX;
+    /* One past the last image column any WANTED output reads. Past it lies the trailing pad
+     * the hardware synthesizes, and no output the caller keeps may reach there. */
+    reach = ((unsigned)ow_model - 1u + D) * SX + KW - P;
+    if (L + IW > iwx || (unsigned)ow_model + D > owx || reach > iwx)
+        return ROCKET_E_UNSUPPORTED;
+
+    *dx = *d;
+    dx->iw = (int)iwx;
+    dx->pad_left = (int)P;
+    dx->ow = (int)owx;
+    dx->oh = oh_model;
+    *lead = L; *crop = D; *dst_ow = (unsigned)ow_model;
+    return ROCKET_OK;
+}
+
 /*
  * Validate the shape and the quant contract, then derive the geometry.
  *
@@ -1226,12 +1296,49 @@ static int r76_w_prepare(const char *entry, int fd, const rocket_conv2d_desc *d,
 {
     r76_w *h;
     unsigned ow, oh;
+    /* Derived rather than passed, so this and the public entries cannot disagree about
+     * which encoding a descriptor asks for. */
+    int argb = d && !dw && d->ic <= 4 && !d->direct_datapath;
     int rc;
+    rocket_conv2d_desc dx;
+    unsigned ext_lead = 0u, ext_crop = 0u, src_iw = 0u, dst_ow = 0u;
 
     *out_h = NULL;
 
-    rc = r76_conv_check(entry, fd, d, dw, 0, &ow, &oh);
+    /* THE PAD COLUMNS ARE BUILT INTO THE IMAGE at a non-zero input zero point, so everything
+     * below sees the PROGRAMMED geometry and the caller keeps its own. ROCKET_RK3576_ARGB_INZP
+     * suppresses this as well as the refusal: what an RE probe of those columns needs is the
+     * naive program, not a correct one. A plan that does not fit falls through to
+     * r76_argb_bounds(), which refuses and says why. */
+    if (argb && in_zp != 0 && !r76_env_on("ROCKET_RK3576_ARGB_INZP") &&
+        r76_argb_extend_plan(d, &dx, &ext_lead, &ext_crop, &dst_ow) == ROCKET_OK) {
+        src_iw = (unsigned)d->iw;
+        d = &dx;
+    }
+
+    rc = r76_conv_check(entry, fd, d, dw, argb, &ow, &oh);
     if (rc != ROCKET_OK) return rc;
+    if (argb) {
+        rc = r76_argb_bounds(entry, d, ow, oh, in_zp, ext_lead != 0);
+        if (rc != ROCKET_OK) return rc;
+        /* Two levers the packed encoding has never been measured under, refused at the one
+         * choke point both entries pass through rather than at each of them. The per-axis
+         * planner reorders output channels and re-tiles them against the CBUF, neither of
+         * which this cube's 64-channel program expresses; the fused LUT's window is the EW
+         * stage of a direct program. `direct_datapath` reaches both at any channel count. */
+        if (w_scale_oc) {
+            ROCKET_LOGE("%s: a per-axis requant is not claimed on the packed-image first "
+                        "conv — its output-channel tiling and scale sort are the direct "
+                        "path's. Set rocket_conv2d_desc.direct_datapath\n", entry);
+            return ROCKET_E_UNSUPPORTED;
+        }
+        if (lut) {
+            ROCKET_LOGE("%s: a fused activation is not claimed on the packed-image first "
+                        "conv. Set rocket_conv2d_desc.direct_datapath, or run the layer "
+                        "plain and follow it with rocket_act_int8_rk3576()\n", entry);
+            return ROCKET_E_UNSUPPORTED;
+        }
+    }
     if (w_scale_oc && w_zp) {
         ROCKET_LOGE("%s: a per-axis weight quantization is symmetric by construction; "
                     "a non-zero weight zero point with per-channel scales is not a "
@@ -1289,8 +1396,25 @@ static int r76_w_prepare(const char *entry, int fd, const rocket_conv2d_desc *d,
      * (the weight cube rounds to 16, the CBUF allocation sometimes one 16-group further)
      * are the emitter's business, and rounding here would hide every count where the two
      * differ. */
-    h->icreg = dw ? h->IC : rocket_rk3576_pad_ic(h->IC);
-    h->icpad = (h->icreg + 31u) / 32u * 32u;
+    /* ONE IMAGE CHANNEL IS PROGRAMMED AS TWO. The int8 first conv writes nothing at ic=1 —
+     * an untouched surface, not a wrong one — and what gates it is the feature DMA's row
+     * width: the emitted `line_stride - 1` is correct from ic=2 up, and at ic=1 the program
+     * only writes when that field is raised to `line_stride`, at which point the DMA reads
+     * past the packed row and nothing is exact. So the ROW is widened rather than the
+     * register: a second interleaved channel of zero samples against zero weights. The
+     * arithmetic is untouched — the MAC term is zero because the weight is, `sum_w` is
+     * unchanged so A is, and B multiplies a sum of RAW samples that gains only zeros — so
+     * the tap count below stays the caller's. */
+    h->argb = argb;
+    h->ICP  = h->IC == 1u ? 2u : h->IC;
+    /* The caller's geometry where it differs from the program's, and the program's where it
+     * does not — so every path that is not the feature pack or the de-scatter reads one
+     * quantity and needs no flag. */
+    h->ext_lead = ext_lead; h->ext_crop = ext_crop;
+    h->src_iw = src_iw ? src_iw : h->IW;
+    h->dst_ow = dst_ow ? dst_ow : ow;
+    h->icreg = argb ? h->ICP : (dw ? h->IC : rocket_rk3576_pad_ic(h->IC));
+    h->icpad = argb ? h->ICP : (h->icreg + 31u) / 32u * 32u;
     h->surf_elems = rocket_rk3576_out_surf_elems(ow, oh, dw);
     /* THE TAP COUNT IS THE PROGRAMMED ONE, NOT THE CALLER'S, and it has to be — the CNA's
      * border substitution covers the whole programmed channel group, so at a pad tap the
@@ -1310,13 +1434,23 @@ static int r76_w_prepare(const char *entry, int fd, const rocket_conv2d_desc *d,
      * equal, and at w_zp == 0 the term is zero. What it fixes is a NON-ZERO weight zero
      * point at a padded channel count, which is every ic from 1 to 31 and not only the
      * narrow ones. [HW sweep, H96 MAX M9, tests/rk3576_conv_lib_gate.c nic] */
-    h->taps = dw ? h->KH * h->KW : h->icreg * h->KH * h->KW;
-    h->in_bytes = (size_t)((h->icpad + C2 - 1u) / C2) * h->IH * h->IW * C2;
+    /* The PACKED path's tap count is the LIVE one and its feature buffer is the image, not
+     * a cube: there is no padded channel group to substitute a border constant into, since
+     * the channels the datapath folds are the kernel's columns and not a MAC group. */
+    h->taps = argb ? h->IC * h->KH * h->KW
+                   : (dw ? h->KH * h->KW : h->icreg * h->KH * h->KW);
+    h->in_bytes = argb ? (size_t)h->IH * h->IW * h->ICP
+                       : (size_t)((h->icpad + C2 - 1u) / C2) * h->IH * h->IW * C2;
     h->max_tasks = oh + 2u;
 
-    h->oc_tile = dw ? h->OC
-                    : r76_conv_oc_tile(h->icreg, h->KH, h->KW,
-                                       rocket_rk3576_pad_oc(h->OC));
+    /* ONE PACKED PROGRAM DELIVERS 64 OUTPUT CHANNELS, not the tile the CBUF affords: 32 and
+     * 64 are measured — every live weight byte of a 64-channel cube lands on exactly one
+     * output position of one channel — and above that the split is this loop's, exactly as
+     * on the float path. */
+    h->oc_tile = argb ? (h->OC < R76_ARGB_INT8_OC_MAX ? h->OC : R76_ARGB_INT8_OC_MAX)
+                      : (dw ? h->OC
+                            : r76_conv_oc_tile(h->icreg, h->KH, h->KW,
+                                               rocket_rk3576_pad_oc(h->OC)));
     if (!h->oc_tile) { r76_w_free(h); return ROCKET_E_SHAPE; }
 
     /* Room for every row task's program at once when the job carries more than one, and
@@ -1490,9 +1624,10 @@ static int r76_wtile_pack(const char *entry, r76_w *h, unsigned t, const int8_t 
     struct r76_int8_wtile *s = &h->tile[t];
     unsigned ocreg = s->ocreg, tile_oc = s->tile_oc, oc0 = s->oc0;
     unsigned KH = h->KH, KW = h->KW, IC = h->IC, icreg = h->icreg;
-    size_t w_bytes = h->dw ? rocket_rk3576_weight_dw_bytes(ocreg, KH, KW)
-                           : (size_t)((ocreg + 31u) / 32u) * ((icreg + 31u) / 32u) *
-                             32u * 32u * KH * KW;
+    size_t w_bytes = h->argb ? rocket_rk3576_weight_argb_int8_bytes(tile_oc, KH, KW)
+                   : h->dw   ? rocket_rk3576_weight_dw_bytes(ocreg, KH, KW)
+                             : (size_t)((ocreg + 31u) / 32u) * ((icreg + 31u) / 32u) *
+                               32u * 32u * KH * KW;
     size_t coeff_bytes = h->dw ? rocket_rk3576_coeff_bytes_dw(ocreg)
                                : rocket_rk3576_coeff_bytes(ocreg);
     size_t obytes = (size_t)((ocreg + C2 - 1u) / C2) * h->surf_elems * C2;
@@ -1526,7 +1661,25 @@ static int r76_wtile_pack(const char *entry, r76_w *h, unsigned t, const int8_t 
     {
         int8_t *cube = (int8_t *)s->w.ptr;
         unsigned c, i, y, x;
-        if (h->dw) {
+        if (h->argb) {
+            /* THE PACKED CUBE IS A DIFFERENT OBJECT and its packer owns it: one byte per
+             * weight, output channels grouped by 32, the tap ROW outside that group and the
+             * tap COLUMN folded into the same round16(4*kw) row as the four lanes. It takes
+             * a dense [tile_oc][ICP][KH][KW] slice, so a widened ic=1 layer is materialised
+             * here and the padding lane's zero weights are what make it inert. */
+            int8_t *slice = calloc((size_t)tile_oc * h->ICP * KH * KW, 1);
+            if (!slice) { rocket_bo_fini(h->fd, &s->w); return ROCKET_E_NOMEM; }
+            for (c = 0; c < tile_oc; c++)
+                for (i = 0; i < IC; i++)
+                    memcpy(slice + ((size_t)c * h->ICP + i) * KH * KW,
+                           W + ((size_t)r76_oc_of(h->perm, oc0 + c) * IC + i) * KH * KW,
+                           (size_t)KH * KW);
+            rc = rocket_rk3576_argb_int8_pack_weights(cube, w_bytes, slice, tile_oc,
+                                                     h->ICP, KH, KW) < 0
+                 ? ROCKET_E_SHAPE : ROCKET_OK;
+            free(slice);
+            if (rc != ROCKET_OK) { rocket_bo_fini(h->fd, &s->w); return rc; }
+        } else if (h->dw) {
             /* This part's own depthwise cube: channels grouped by 64, tap-major inside a
              * group, two byte slots per weight — and at int8 the byte a channel owns
              * inside a tap block is 4*(c/2) + (c%2), with its SECOND two further on.
@@ -1642,6 +1795,42 @@ out:
     return rc;
 }
 
+/* One output-channel tile's channels out of the NC1HWC2 surface into the caller's row-major
+ * plane. `o` is the tile's surface, already made CPU-visible.
+ *
+ * THE CROP IS THIS LOOP, not a pass of its own. A materialised-column program writes `ow`
+ * columns where the caller asked for `dst_ow`, and the de-scatter is already reading the
+ * surface and writing the caller's buffer — so it reads each row from column `ext_crop` and
+ * stops at the caller's width, and the surplus costs the DDR read it never issues. Without
+ * an extension `ext_crop` is zero, the two widths are equal and this is the one contiguous
+ * unpack over the whole plane it always was.
+ */
+static void r76_descatter(const r76_w *h, const int8_t *o, int8_t *out,
+                          unsigned oc0, unsigned tile_oc)
+{
+    size_t px  = (size_t)h->oh * h->ow;          /* the surface's own plane  */
+    size_t dpx = (size_t)h->oh * h->dst_ow;      /* the caller's             */
+    unsigned c, k, y;
+
+    for (c = 0; c < tile_oc; c += C2) {
+        unsigned m = tile_oc - c < C2 ? tile_oc - c : C2;
+        const int8_t *src = o + (size_t)(c / C2) * h->surf_elems * C2;
+        int8_t *dp[C2];
+        for (k = 0; k < m; k++)
+            dp[k] = out + (size_t)r76_oc_of(h->perm, oc0 + c + k) * dpx;
+        if (!h->ext_crop) {
+            r76_c2_unpack(dp, m, src, px);
+            continue;
+        }
+        for (y = 0; y < h->oh; y++) {
+            int8_t *row[C2];
+            for (k = 0; k < m; k++) row[k] = dp[k] + (size_t)y * h->dst_ow;
+            r76_c2_unpack(row, m, src + ((size_t)y * h->ow + h->ext_crop) * C2,
+                          h->dst_ow);
+        }
+    }
+}
+
 /* Scatter the caller's row-major CHW tensor into this handle's feature cube.
  *
  * CUBE IN is the early return: the producer's surface already IS this cube, so there is no
@@ -1654,6 +1843,69 @@ out:
 static int r76_feature_pack(r76_w *h, const int8_t *in)
 {
     if (h->cube_in) return ROCKET_OK;
+    /* THE PACKED IMAGE, which is an interleave and not a transpose: `ICP` bytes per pixel in
+     * the order the CNA's four lanes read them. The sample goes in as PLAIN TWO'S COMPLEMENT
+     * — the converter's OFFSET registers are inert on this part, so the zero point is folded
+     * into the coefficient A term exactly as the direct path folds it — and a widened ic=1
+     * layer's second lane stays zero against zero weights. */
+    if (h->argb) {
+        size_t px = (size_t)h->IH * h->src_iw;   /* the CALLER's plane */
+        const int8_t *sp[4];
+        unsigned c;
+        if (!h->in.ptr) {
+            if (rocket_bo_alloc(h->fd, h->in_bytes, &h->in) < 0) return ROCKET_E_NOMEM;
+            /* Only on the allocation, and for two reasons. A WIDENED one-channel image's
+             * second lane is zero samples against zero weights. And an EXTENDED one's
+             * columns outside the caller's plane are the input zero point on every live
+             * lane — the pad the hardware would otherwise synthesize as a dead 0. Neither
+             * region is written again: the per-call pack covers the live window exactly. */
+            if (h->ICP != h->IC || h->ext_lead) {
+                rocket_bo_prep(h->fd, &h->in, 1, 0);
+                memset(h->in.ptr, 0, h->in_bytes);
+                if (h->ext_lead && h->in_zp) {
+                    int8_t *img = (int8_t *)h->in.ptr;
+                    size_t n = (size_t)h->IH * h->IW, q;
+                    for (q = 0; q < n; q++)
+                        for (c = 0; c < h->IC; c++)
+                            img[q * h->ICP + c] = (int8_t)h->in_zp;
+                }
+                rocket_bo_fini(h->fd, &h->in);
+            }
+        }
+        rocket_bo_prep(h->fd, &h->in, 1, 0);
+        if (h->ext_lead) {
+            /* The live window, row by row, into an image that is wider than it: the
+             * interleave is the same one, and what changes is where each row lands. */
+            unsigned y;
+            for (y = 0; y < h->IH; y++) {
+                int8_t *row = (int8_t *)h->in.ptr +
+                              ((size_t)y * h->IW + h->ext_lead) * h->ICP;
+                for (c = 0; c < h->ICP; c++)
+                    sp[c] = c < h->IC ? in + (size_t)c * px + (size_t)y * h->src_iw : NULL;
+                if (h->ICP == h->IC) {
+                    rocket_rk3576_argb_pack(row, sp, h->ICP, h->src_iw);
+                } else {
+                    size_t q;
+                    for (q = 0; q < h->src_iw; q++) row[q * h->ICP] = sp[0][q];
+                }
+            }
+            rocket_bo_fini(h->fd, &h->in);
+            return ROCKET_OK;
+        }
+        for (c = 0; c < h->ICP; c++)
+            sp[c] = c < h->IC ? in + (size_t)c * px : NULL;
+        if (h->ICP == h->IC) {
+            rocket_rk3576_argb_pack((int8_t *)h->in.ptr, sp, h->ICP, px);
+        } else {
+            /* The widened lane has no plane to read, so the interleave cannot own it; the
+             * live plane is scattered around the zeros the allocation left. */
+            int8_t *img = (int8_t *)h->in.ptr;
+            size_t q;
+            for (q = 0; q < px; q++) img[q * h->ICP] = sp[0][q];
+        }
+        rocket_bo_fini(h->fd, &h->in);
+        return ROCKET_OK;
+    }
     if (!h->in.ptr) {
         if (rocket_bo_alloc(h->fd, h->in_bytes, &h->in) < 0) return ROCKET_E_NOMEM;
         rocket_bo_prep(h->fd, &h->in, 1, 0);
@@ -1944,18 +2196,7 @@ static int r76_int8_exec(const char *entry, r76_w *h, const int8_t *W,
         }
         /* The same hoist on the way back: y*ow + x is the pixel index, contiguous in the
          * CHW output and at a fixed C2 stride in the cube. */
-        {
-            const int8_t *o = (const int8_t *)surf->ptr + ooff;
-            size_t px = (size_t)h->oh * h->ow;
-            unsigned c, k;
-            for (c = 0; c < tile_oc; c += C2) {
-                unsigned m = tile_oc - c < C2 ? tile_oc - c : C2;
-                int8_t *dp[C2];
-                for (k = 0; k < m; k++)
-                    dp[k] = out + (size_t)r76_oc_of(h->perm, s->oc0 + c + k) * px;
-                r76_c2_unpack(dp, m, o + (size_t)(c / C2) * h->surf_elems * C2, px);
-            }   /* unchanged shape; the helper took the pointer table */
-        }
+        r76_descatter(h, (const int8_t *)surf->ptr + ooff, out, s->oc0, tile_oc);
         /* THE STAMP RIDES THE DE-SCATTER'S BRACKET. The sentinel STAYS — it is what
          * makes "this task never wrote" a property of the surface rather than a guess,
          * and a conv inherits the wide-output poisoning from whatever ran before it —
@@ -2075,366 +2316,6 @@ static int r76_conv_int8_run(const char *entry, int fd, const rocket_conv2d_desc
     return rc;
 }
 
-/* ============================================================================
- * SECTION — the INT8 first conv, on the packed-image datapath
- *
- * The quantized stem. Same CNA sub-encoding as the fp16 first conv and a different
- * object in three places, each of which had to be read off the part:
- *
- *   - THE WEIGHT CUBE is single bytes in output-channel groups of 32 with the tap row
- *     outside the group and the tap column folded in beside the four lanes, where the
- *     float cube is 16-bit slots in groups of sixteen with the tap axis outermost.
- *     rocket_rk3576_argb_int8_pack_weights() owns it.
- *   - THE LEFT PAD MUST BE NON-ZERO and THE OUTPUT WIDTH MUST BE iw/stride. Neither
- *     holds on the float path, and neither appears in any capture, because every
- *     captured first conv is a SAME convolution and satisfies both by construction. A
- *     zero left pad writes NOTHING; a wrong output width writes a full surface sheared
- *     by one column per row. Both are refused here rather than computed wrong.
- *   - ONE PROGRAM DELIVERS 64 OUTPUT CHANNELS, not the float path's 32.
- *
- * Everything else is the direct int8 path's: the zero-point fold, the coefficient
- * group, the row window, the NC1HWC2 output and its de-scatter.
- * ==========================================================================*/
-/* Output channels one program drives. 32 and 64 are measured — every live weight byte
- * of a 64-channel cube lands on exactly one output position of one channel — and above
- * that the split is the caller's, exactly as on the float path. [HW sweep] */
-#define R76_ARGB_INT8_OC_MAX 64u
-
-static int r76_conv_int8_argb(const char *entry, int fd, const rocket_conv2d_desc *d,
-                              const int8_t *in, const int8_t *W, const int32_t *bias,
-                              float in_scale, float w_scale, float out_scale,
-                              int in_zp, int w_zp, int out_zp, int8_t *out,
-                              unsigned ow, unsigned oh)
-{
-    struct r76_conv_bos b = {0};
-    uint64_t *ops = NULL;
-    rocket_rk3576_row_task *rows = NULL;
-    int32_t *A = NULL;
-    int16_t *B = NULL;
-    int64_t *sum_w = NULL;
-    int8_t *wtile = NULL;
-    unsigned IC = (unsigned)d->ic, OC = (unsigned)d->oc;
-    /* ONE image channel is programmed as TWO. The int8 first conv writes nothing at
-     * ic=1 — an untouched surface, not a wrong one — and what gates it is the feature
-     * DMA's row width: the emitted `line_stride - 1` is correct from ic=2 up, and at
-     * ic=1 the program only writes when that field is raised to `line_stride`, at
-     * which point the DMA reads past the packed row and nothing is exact. So the row
-     * is widened rather than the register: a second interleaved channel of zero
-     * samples against zero weights. The arithmetic is untouched by it — the MAC term
-     * is zero because the weight is, `sum_w` is unchanged so the coefficient A is,
-     * and the asymmetric B multiplies a sum of RAW samples that gains only zeros — so
-     * `taps` below stays the caller's count. The cost is one byte per pixel of host
-     * packing and a doubled feature read. */
-    unsigned ICP = ((unsigned)d->ic == 1u) ? 2u : (unsigned)d->ic;
-    unsigned IH = (unsigned)d->ih, IW = (unsigned)d->iw;
-    unsigned KH = (unsigned)d->kh, KW = (unsigned)d->kw;
-    unsigned SY = (unsigned)d->stride_y, SX = (unsigned)d->stride_x;
-    unsigned PT = (unsigned)d->pad_top,  PL = (unsigned)d->pad_left;
-    unsigned surf_elems = rocket_rk3576_out_surf_elems(ow, oh, 0);
-    unsigned tile = OC < R76_ARGB_INT8_OC_MAX ? OC : R76_ARGB_INT8_OC_MAX;
-    unsigned taps = IC * KH * KW;
-    unsigned oc0, nrow = 0, r, max_tasks = oh + 2u;
-    size_t in_bytes;
-    conv_params_t plan = {0};
-    unsigned char stamp;
-    struct r76_int8_prof prof = {0};
-    struct r76_prof_shape shape;
-    double t0;
-    int rc;
-
-    prof.on = r76_int8_prof_on();
-
-    /* This path's four geometry bounds are jointly the ONNX symmetric-SAME convention, and
-     * an explicit output extent is not one of them: an asymmetric pad is refused here rather
-     * than programmed onto the first conv's own encoding. */
-    if (r76_desc_asym(d)) {
-        ROCKET_LOGE("%s: an output extent this descriptor did not derive is an asymmetric "
-                    "pad, which the packed-image first conv does not claim\n", entry);
-        return ROCKET_E_UNSUPPORTED;
-    }
-
-    if (IW % 16u) {
-        ROCKET_LOGE("%s: the first conv needs iw a multiple of 16 (iw=%u); its DDR row "
-                    "stride and CBUF row are both counted in 16-byte granules\n",
-                    entry, IW);
-        return ROCKET_E_UNSUPPORTED;
-    }
-    /* The two bounds this path adds, both measured and both silent if violated. */
-    if (PL == 0) {
-        ROCKET_LOGE("%s: the int8 first conv needs a NON-ZERO left pad (pad_left=0). At "
-                    "pad_left 0 the DPU writes nothing at all — an untouched surface, not "
-                    "a wrong one — at every plane, stride and kernel. The fp16 form of "
-                    "the same conv has no such bound: rocket_conv2d_fp16_rk3576()\n",
-                    entry);
-        return ROCKET_E_UNSUPPORTED;
-    }
-    /* ONE image channel writes nothing, where two, three and four are bit-exact. The
-     * mode word's ARGB_IN nibble is 8 | (ic-1), so ic=1 is the one value that leaves
-     * its low bits clear, and the fp16 form of the same conv computes at ic=1 — so
-     * this is an int8-side gap rather than a property of the packed datapath. Refused
-     * rather than left to write an untouched surface. */
-    /* The OUTPUT width has its own granule, and it is not implied by the input's: at
-     * ow 24 and 56 — both from an iw that is a multiple of 16 — output row 0 is exact
-     * and every row after it is wrong, while ow 16, 32, 48, 64, 80, 112 are exact.
-     * The direct path carries no such rule; this one comes with the channel fold. */
-    if (ow % 16u || oh == 0u) {
-        ROCKET_LOGE("%s: the int8 first conv needs ow a multiple of 16 (ow=%u from "
-                    "iw=%u stride %u). At any other output width the first output row "
-                    "is exact and every row after it is wrong\n", entry, ow, IW, SX);
-        return ROCKET_E_UNSUPPORTED;
-    }
-    if (ow * SX != IW || oh * SY != IH) {
-        ROCKET_LOGE("%s: the int8 first conv needs the SAME-padding output extent — "
-                    "ow*stride_x == iw and oh*stride_y == ih (got %u*%u vs iw=%u, %u*%u "
-                    "vs ih=%u). Any other output width writes a full surface SHEARED by "
-                    "one column per row, with nothing to fault on\n",
-                    entry, ow, SX, IW, oh, SY, IH);
-        return ROCKET_E_UNSUPPORTED;
-    }
-    /* A NON-ZERO INPUT ZERO POINT COMPUTES A WRONG BORDER HERE, and only the border:
-     * the interior is bit-exact at every zero point tried, the DIRECT path is exact
-     * everywhere including its border at the same zero points and against the same
-     * reference, and this path's border falls to about half exact the moment the zero
-     * point leaves zero. So it is the padded taps and nothing else. CNA_PAD_CON1 is
-     * live — driving it moves the count — but no single centring of it explains the
-     * readings, so the constant's domain on this sub-encoding is not decoded and the
-     * shape is refused rather than computed wrong.
-     *
-     * It was invisible until a graph asked for it: every first-conv shape in every gate
-     * carries a zero input zero point, and a TFLite MobileNet's does too after the
-     * uint8 rebase, so nothing was wrong in anything that had been run.
-     * [HW sweep, H96 MAX M9, tests/rk3576_argb_pad.c] */
-    if (in_zp != 0) {
-        ROCKET_LOGE("%s: the int8 first conv computes a wrong BORDER at a non-zero "
-                    "input zero point (in_zp=%d); its interior is exact and its padded "
-                    "taps are not. Widen the image to eight channels and take the "
-                    "direct path, which is exact at any zero point\n", entry, in_zp);
-        return ROCKET_E_UNSUPPORTED;
-    }
-    if (OC != rocket_rk3576_pad_oc(OC)) {
-        ROCKET_LOGE("%s: oc=%u is a partial 32-channel group and writes nothing; size "
-                    "the output and coefficient buffers for %u channels and pass that "
-                    "count (rocket_rk3576_pad_oc)\n",
-                    entry, OC, rocket_rk3576_pad_oc(OC));
-        return ROCKET_E_UNSUPPORTED;
-    }
-
-    in_bytes = (size_t)IH * IW * ICP;
-    stamp = rocket_rk3576_sentinel_on() ? (unsigned char)ROCKET_RK3576_SENTINEL_BYTE : 0;
-
-    ops   = calloc(RK3576_CONV_TASK_OPS, sizeof *ops);
-    rows  = calloc(max_tasks, sizeof *rows);
-    sum_w = calloc(OC, sizeof *sum_w);
-    wtile = calloc((size_t)tile * ICP * KH * KW, 1);
-    if (!ops || !rows || !sum_w || !wtile) { rc = ROCKET_E_NOMEM; goto done; }
-
-    /* Each output channel's whole filter, for the input zero point's fold. */
-    t0 = R76_PT(prof);
-    {
-        unsigned c, i, y, x;
-        for (c = 0; c < OC; c++) {
-            int64_t s = 0;
-            for (i = 0; i < IC; i++)
-                for (y = 0; y < KH; y++)
-                    for (x = 0; x < KW; x++)
-                        s += W[(((size_t)c * IC + i) * KH + y) * KW + x];
-            sum_w[c] = s;
-        }
-    }
-    R76_ACC(prof, sums_us, t0);
-
-    /* The row window, on the same planner as every other path. Told the precision
-     * because the offsets come back in PACKED-IMAGE row units here — an int8 packed
-     * image is `ic` interleaved bytes per pixel where a float one is halfwords. */
-    plan.ic = (uint16_t)ICP; plan.ih = (uint16_t)IH; plan.iw = (uint16_t)IW;
-    plan.oc = (uint16_t)tile; plan.oh = (uint16_t)oh; plan.ow = (uint16_t)ow;
-    plan.kh = (uint16_t)KH; plan.kw = (uint16_t)KW;
-    plan.stride_y = (uint8_t)SY; plan.stride_x = (uint8_t)SX;
-    plan.pad_top = (uint8_t)PT; plan.pad_left = (uint8_t)PL;
-    plan.ih_full = (uint16_t)IH; plan.oh_full = (uint16_t)oh;
-    t0 = R76_PT(prof);
-    if (rocket_rk3576_plan_rows_prec(&plan, 0, precision_int8, rows, max_tasks,
-                                     &nrow) < 0 || !nrow) {
-        ROCKET_LOGE("%s: no row plan for the first conv (ic=%u %ux%u k%ux%u)\n",
-                    entry, IC, IW, IH, KW, KH);
-        rc = ROCKET_E_UNSUPPORTED; goto done;
-    }
-    R76_ACC(prof, gen_us, t0);
-
-    t0 = R76_PT(prof);
-    if (rocket_bo_alloc(fd, in_bytes, &b.in) < 0 ||
-        rocket_bo_alloc(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
-        rc = ROCKET_E_NOMEM; goto done;
-    }
-
-    /* CHW in, interleaved out — the packed image the CNA reads, shared by every tile.
-     * The sample goes in as PLAIN TWO'S COMPLEMENT and the MAC reads it that way.
-     *
-     * THE CONVERTER'S OFFSET IS INERT, which is the opposite of what the datapath's
-     * description says and is why the zero point is folded exactly as the direct path
-     * folds it. The CVT registers are transcribed from captures that are all zero
-     * point 0, so nothing ever exercised them; driven on the part, an image written at
-     * raw = s + (zp + 0x80) comes back as the raw byte read as a signed int8 with no
-     * subtraction at all — 0x80 reads -128, 0xC0 reads -64, 0xFF reads -1. So the
-     * packed image is signed, and A carries the -in_zp*sum_w correction. */
-    rocket_bo_prep(fd, &b.in, 1, 0);
-    {
-        int8_t *img = (int8_t *)b.in.ptr;
-        unsigned c, y, x;
-        for (y = 0; y < IH; y++)
-            for (x = 0; x < IW; x++)
-                for (c = 0; c < ICP; c++)
-                    img[((size_t)y * IW + x) * ICP + c] =
-                        c < IC ? in[((size_t)c * IH + y) * IW + x] : 0;
-    }
-    rocket_bo_fini(fd, &b.in);
-    R76_ACC(prof, in_us, t0);
-
-    for (oc0 = 0; oc0 < OC; oc0 += tile) {
-        prof.tiles++;
-        unsigned n = OC - oc0 < tile ? OC - oc0 : tile;
-        size_t w_bytes = rocket_rk3576_weight_argb_int8_bytes(n, KH, KW);
-        size_t coeff_bytes = rocket_rk3576_coeff_bytes(n);
-        size_t obytes = (size_t)((n + C2 - 1u) / C2) * surf_elems * C2;
-        conv_params_t p = {0};
-        struct r76_task_extent e = {0};
-        uint32_t in_h[4], out_h[1];
-
-        t0 = R76_PT(prof);
-        if (b.w.ptr)     rocket_bo_free(fd, &b.w);
-        if (b.coeff.ptr) rocket_bo_free(fd, &b.coeff);
-        if (b.out.ptr)   rocket_bo_free(fd, &b.out);
-        memset(&b.w, 0, sizeof b.w);
-        memset(&b.coeff, 0, sizeof b.coeff);
-        memset(&b.out, 0, sizeof b.out);
-        if (rocket_bo_alloc(fd, w_bytes, &b.w) < 0 ||
-            rocket_bo_alloc(fd, coeff_bytes, &b.coeff) < 0 ||
-            rocket_bo_alloc(fd, obytes, &b.out) < 0) { rc = ROCKET_E_NOMEM; goto done; }
-        R76_ACC(prof, free_us, t0);
-
-        /* This tile's channels renumbered from zero — its own whole convolution. */
-        t0 = R76_PT(prof);
-        if (ICP == IC) {
-            memcpy(wtile, W + (size_t)oc0 * IC * KH * KW, (size_t)n * IC * KH * KW);
-        } else {
-            unsigned j, t;
-            memset(wtile, 0, (size_t)tile * ICP * KH * KW);
-            for (j = 0; j < n; j++)
-                for (t = 0; t < IC * KH * KW; t++)
-                    wtile[(size_t)j * ICP * KH * KW + t] =
-                        W[(size_t)(oc0 + j) * IC * KH * KW + t];
-        }
-        rocket_bo_prep(fd, &b.w, 1, 0);
-        rc = rocket_rk3576_argb_int8_pack_weights(b.w.ptr, w_bytes, wtile, n, ICP, KH, KW);
-        rocket_bo_fini(fd, &b.w);
-        if (rc < 0) { rc = ROCKET_E_SHAPE; goto done; }
-        R76_ACC(prof, w_us, t0);
-
-        t0 = R76_PT(prof);
-        free(A); free(B);
-        A = calloc(n, sizeof *A);
-        B = w_zp ? calloc(n, sizeof *B) : NULL;
-        if (!A || (w_zp && !B)) { rc = ROCKET_E_NOMEM; goto done; }
-        r76_fold_coeff(A, bias, oc0, n, sum_w, in_zp, w_zp, taps, NULL);
-        if (B) { unsigned j; for (j = 0; j < n; j++) B[j] = (int16_t)(-w_zp); }
-        rocket_bo_prep(fd, &b.coeff, 1, 0);
-        if (B) rocket_rk3576_pack_coeff_asym(b.coeff.ptr, coeff_bytes, A, n, B, 1);
-        else   rocket_rk3576_pack_coeff(b.coeff.ptr, coeff_bytes, A, n);
-        rocket_bo_fini(fd, &b.coeff);
-        R76_ACC(prof, coeff_us, t0);
-
-        p.ic = (uint16_t)ICP; p.iw = (uint16_t)IW; p.ih = (uint16_t)IH;
-        p.oc = (uint16_t)n;  p.ow = (uint16_t)ow; p.oh = (uint16_t)oh;
-        p.kh = (uint16_t)KH; p.kw = (uint16_t)KW;
-        p.stride_y = (uint8_t)SY; p.stride_x = (uint8_t)SX;
-        p.pad_top = (uint8_t)PT; p.pad_left = (uint8_t)PL;
-        p.ih_full = (uint16_t)IH; p.oh_full = (uint16_t)oh;
-        p.int8_out = 1;
-        p.in_scale = in_scale; p.w_scale = w_scale; p.out_scale = out_scale;
-        /* uint8-centered, as on the direct path: the emitter programs the border
-         * constant as (input_zero_point + 0x80) & 0xFF, and that byte has to BE the
-         * stored zero point, so that a pad tap's true value is zero. The converter
-         * offset the same field feeds is inert (above), so it costs nothing. */
-        p.input_zero_point  = in_zp + 0x80;
-        p.output_zero_point = out_zp + 0x80;
-        p.weight_zero_point = 0x80;
-        p.tasks       = ops;
-        p.input_dma   = b.in.dma_address;
-        p.weights_dma = b.w.dma_address;
-        p.bias_dma    = b.coeff.dma_address;
-        p.output_dma  = b.out.dma_address;
-
-        in_h[0] = b.in.handle; in_h[1] = b.w.handle;
-        in_h[2] = b.coeff.handle; in_h[3] = b.rc.handle;
-        out_h[0] = b.out.handle;
-
-        t0 = R76_PT(prof);
-        if (stamp) {
-            rocket_bo_prep(fd, &b.out, 1, 0);
-            memset(b.out.ptr, stamp, obytes);
-            rocket_bo_fini(fd, &b.out);
-        }
-        R76_ACC(prof, gen_us, t0);
-
-        for (r = 0; r < nrow; r++) {
-            conv_params_t q = p;
-            prof.tasks++;
-            t0 = R76_PT(prof);
-            q.ih = rows[r].ih; q.oh = rows[r].oh;
-            q.pad_top = rows[r].pad_top;
-            q.input_dma  = p.input_dma  + rows[r].feature_off;
-            q.output_dma = p.output_dma + rows[r].output_off;
-            q.ih_full = (uint16_t)IH; q.oh_full = (uint16_t)oh;
-            if (gen_conv2d_int8_rk3576(&q) != 0) {
-                ROCKET_LOGE("%s: the generator refused the first-conv program (ic=%u "
-                            "%ux%u k%ux%u oc %u..%u rows %u..%u)\n", entry, IC, IW, IH,
-                            KW, KH, oc0, oc0 + n, rows[r].oy0, rows[r].oy0 + rows[r].oh);
-                rc = ROCKET_E_UNSUPPORTED; goto done;
-            }
-            /* Per TASK, not per tile: one poisoned submit among several leaves its own
-             * rows stale while its siblings are full. */
-            e.groups      = (n + C2 - 1u) / C2;
-            e.group_bytes = (size_t)surf_elems * C2;
-            e.row_off     = (size_t)rows[r].oy0 * ow * C2;
-            e.span        = (size_t)rows[r].oh * ow * C2;
-            R76_ACC(prof, gen_us, t0);
-            t0 = R76_PT(prof);
-            rc = r76_submit_task(fd, &b, &q, ops, in_h, 4u, out_h, &e, stamp, 0u, entry);
-            R76_ACC(prof, submit_us, t0);
-            if (rc != ROCKET_OK) goto done;
-        }
-
-        t0 = R76_PT(prof);
-        rocket_bo_prep(fd, &b.out, 0, 2000000000ull);
-        R76_ACC(prof, drain_us, t0);
-        t0 = R76_PT(prof);
-        {
-            const int8_t *o = (const int8_t *)b.out.ptr;
-            size_t px = (size_t)oh * ow;
-            unsigned c, k;
-            for (c = 0; c < n; c += C2) {
-                unsigned m = n - c < C2 ? n - c : C2;
-                int8_t *dp[C2];
-                for (k = 0; k < m; k++) dp[k] = out + (size_t)(oc0 + c + k) * px;
-                r76_c2_unpack(dp, m, o + (size_t)(c / C2) * surf_elems * C2, px);
-            }
-        }
-        rocket_bo_fini(fd, &b.out);
-        R76_ACC(prof, read_us, t0);
-    }
-    rc = ROCKET_OK;
-
-done:
-    t0 = R76_PT(prof);
-    free(ops); free(rows); free(A); free(B); free(sum_w); free(wtile);
-    r76_conv_free(fd, &b);
-    R76_ACC(prof, free_us, t0);
-    shape.ic = IC; shape.oc = OC; shape.iw = IW; shape.ih = IH;
-    shape.kw = KW; shape.kh = KH; shape.sx = SX; shape.resident = 0;
-    r76_int8_prof_log(entry, &shape, &prof);
-    return rc;
-}
-
 int rocket_conv2d_int8_rk3576(int fd, const rocket_conv2d_desc *d,
                               const int8_t *in, const int8_t *W, const int32_t *bias,
                               float in_scale, float w_scale, float out_scale,
@@ -2445,23 +2326,11 @@ int rocket_conv2d_int8_rk3576(int fd, const rocket_conv2d_desc *d,
     if (d && d->depthwise)
         return rocket_conv2d_dw_int8_rk3576(fd, d, in, W, bias, in_scale, w_scale,
                                             out_scale, in_zp, w_zp, out_zp, out);
-    /* Four or fewer channels is the packed-image first conv: a different CNA program,
-     * a different feature buffer and a different weight cube. `direct_datapath` is how a
-     * caller asks for the ordinary one instead — cheaper resident, and with none of the
-     * packed-image path's three geometry bounds. */
-    if (d && d->ic <= 4 && !d->direct_datapath) {
-        unsigned ow, oh;
-        int rc = r76_conv_check(entry, fd, d, 0, 1, &ow, &oh);
-        if (rc != ROCKET_OK) return rc;
-        if (!in || !W || !out) return ROCKET_E_SHAPE;
-        if (!(in_scale > 0.0f) || !(w_scale > 0.0f) || !(out_scale > 0.0f))
-            return ROCKET_E_SHAPE;
-        if (in_zp < -128 || in_zp > 127 || w_zp < -128 || w_zp > 127 ||
-            out_zp < -128 || out_zp > 127)
-            return ROCKET_E_SHAPE;
-        return r76_conv_int8_argb(entry, fd, d, in, W, bias, in_scale, w_scale,
-                                  out_scale, in_zp, w_zp, out_zp, out, ow, oh);
-    }
+    /* Four or fewer channels is the packed-image first conv: a different CNA program, a
+     * different feature buffer and a different weight cube — but the SAME handle, so a
+     * transient call and a resident one share one arithmetic. `direct_datapath` is how a
+     * caller asks for the ordinary encoding instead, which carries none of the packed
+     * path's four geometry bounds. */
     return r76_conv_int8_run(entry, fd, d, 0, in, W, bias,
                              in_scale, w_scale, NULL, out_scale,
                              in_zp, w_zp, out_zp, NULL, out);
@@ -2944,22 +2813,13 @@ rocket_conv2d_int8_pack_rk3576(int fd, const rocket_conv2d_desc *d,
     int dw = d && d->depthwise;
 
     if (!W) return NULL;
-    /* The packed-image first conv is a different program with a different weight cube, and
-     * this handle drives neither. It is refused here rather than at the first inference so
-     * a caller learns it while it can still fall back.
-     *
-     * THE DIRECT DATAPATH IS THE ONE TO HOLD, and a narrow-ic layer reaches it with the
-     * flag. Residency is where it wins: the packed-image form's advantage is its smaller
-     * feature read, and a resident handle has already collected the BO churn and the
-     * weight repack that dominated the direct one. */
-    if (d && !dw && d->ic <= 4 && !d->direct_datapath) {
-        ROCKET_LOGE("%s: four or fewer input channels takes the packed-image first conv, "
-                    "whose cube this handle does not pack — set "
-                    "rocket_conv2d_desc.direct_datapath to hold this layer on the direct "
-                    "path, or call rocket_conv2d_int8_rk3576() per inference for it\n",
-                    entry);
-        return NULL;
-    }
+    /* FOUR OR FEWER INPUT CHANNELS PACKS THE PACKED-IMAGE CUBE, which is what makes that
+     * encoding worth having: its advantage is a MAC count 8.0x smaller than the direct
+     * lowering's at a 224x224 k7 s2 stem, and without residency a transient call spent that
+     * saving twice over on a per-call BO teardown. `direct_datapath` still holds a narrow
+     * layer on the ordinary encoding, which carries none of the four geometry bounds
+     * r76_argb_bounds() checks — so a caller whose stem violates one of them has a lowering
+     * to fall back to rather than a refusal to work around. */
     if (r76_w_prepare(entry, fd, d, dw, bias, in_scale, w_scale, w_scale_oc,
                       out_scale, in_zp, w_zp, out_zp, NULL, &h) != ROCKET_OK)
         return NULL;
@@ -3035,8 +2895,22 @@ int rocket_conv2d_int8_prepacked_rk3576(int fd, rocket_conv2d_int8_weights_rk357
  *   the DPU wrote into the padded output channels, which is not zero. Refusing keeps the
  *   arithmetic identical to the row-major path rather than approximately so.
  * ==========================================================================*/
-static int r76_cube_shape_ok(const char *entry, const r76_w *h)
+static int r76_cube_shape_ok(const char *entry, const r76_w *h, int pitch_ok)
 {
+    /* A MATERIALISED-COLUMN STEM WRITES A WIDER PLANE THAN THE CALLER ASKED FOR — at
+     * ResNet-18's stem a 128-wide surface for a 112-wide output — and the surplus columns
+     * sit between the rows a consumer wants. That is a ROW PITCH, and the cube carries one:
+     * the PPU honours a DDR line stride above the extent its windows consume
+     * [HW sweep, tests/rk3576_row_pitch.c], so a POOL reads this surface in place. What
+     * cannot is a placed SLICE, whose geometry is the caller's buffer and not this
+     * handle's. */
+    if (h->ext_crop && !pitch_ok) {
+        ROCKET_LOGE("%s: this handle materialises the packed-image stem's pad columns, so "
+                    "it writes a %u-wide surface for a %u-wide output; that plane can be "
+                    "read as a cube with a row pitch, but not placed in a caller's slice\n",
+                    entry, h->ow, h->dst_ow);
+        return 0;
+    }
     if (h->ntile != 1u) {
         ROCKET_LOGE("%s: this handle splits its %u output channels across %u tiles, and "
                     "each tile owns its own surface — several buffers are not one cube\n",
@@ -3052,7 +2926,7 @@ int rocket_conv2d_int8_cube_of_rk3576(const rocket_conv2d_int8_weights_rk3576 *h
     const char *entry = "rocket_conv2d_int8_cube_of_rk3576";
 
     if (!h || !out) return ROCKET_E_SHAPE;
-    if (!r76_cube_shape_ok(entry, h)) return ROCKET_E_UNSUPPORTED;
+    if (!r76_cube_shape_ok(entry, h, 1)) return ROCKET_E_UNSUPPORTED;
     if (!h->out_ext.ptr && !h->tile[0].out.ptr) {
         ROCKET_LOGE("%s: this handle's output surface is not allocated yet\n", entry);
         return ROCKET_E_SHAPE;
@@ -3060,7 +2934,16 @@ int rocket_conv2d_int8_cube_of_rk3576(const rocket_conv2d_int8_weights_rk3576 *h
     memset(out, 0, sizeof *out);
     out->fd = h->fd;
     out->c = h->OC;
-    out->h = h->oh; out->w = h->ow;
+    out->h = h->oh;
+    /* THE PLANE IS THE CALLER'S TENSOR AND THE PITCH IS WHAT WAS PROGRAMMED. They are
+     * the same width for every producer but a materialising packed-image stem, which
+     * writes surplus columns the caller's output never carried and whose de-scatter
+     * would otherwise crop them out. `pitch_w` says where the next row starts, so the
+     * consumer reads this surface in place — and a consumer that has no register for
+     * that refuses on the field rather than on the width. */
+    out->w = h->ext_crop ? h->dst_ow : h->ow;
+    out->pitch_w = h->ow;
+    out->col_off = h->ext_crop;
     out->groups = h->tile[0].tail_zp
                     ? rocket_rk3576_pad_oc(h->tile[0].ocreg) / C2
                     : (h->tile[0].ocreg + C2 - 1u) / C2;
@@ -3105,6 +2988,16 @@ int rocket_conv2d_int8_cube_in_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
                     "per-fd\n", entry, src->fd, h->fd);
         return ROCKET_E_SHAPE;
     }
+    /* A PACKED-IMAGE HANDLE READS AN IMAGE, NOT A CUBE — `ICP` interleaved bytes per pixel
+     * against NC1HWC2 — so no producer's surface is its feature buffer and there is nothing
+     * for a join to elide. It is always a run's FIRST node, which is the only position a
+     * stem occupies anyway; its OUTPUT side is an ordinary cube and joins normally. */
+    if (h->argb) {
+        ROCKET_LOGE("%s: this handle is the packed-image first conv, whose feature buffer "
+                    "is an interleaved image and not a cube — it can only begin a run. Its "
+                    "output side joins normally\n", entry);
+        return ROCKET_E_UNSUPPORTED;
+    }
     /* AN UNALIGNED INPUT CHANNEL COUNT IS A CONSTRAINT ON THE WEIGHT ZERO POINT, NOT ON
      * THE CHANNEL COUNT — and it is met whenever the cube says what its tail holds. This
      * handle's own cube fills the channels past `ic` with the border constant, its input
@@ -3138,6 +3031,18 @@ int rocket_conv2d_int8_cube_in_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
         ROCKET_LOGE("%s: the cube is %ux%ux%u and this handle reads %ux%ux%u\n",
                     entry, src->c, src->h, src->w, h->IC, h->IH, h->IW);
         return ROCKET_E_SHAPE;
+    }
+    /* A ROW PITCH IS NOT REACHABLE FROM HERE. The CNA's feature DMA carries the row's
+     * granule count (`0x1078`) and its line stride (`0x1090`) as ONE quantity in two
+     * units, so there is no value that describes a plane sitting inside wider rows —
+     * where the PPU has a separate register and honours exactly this. A pool consumer
+     * takes such a cube; a convolution has to be handed a compacted one. */
+    if ((src->pitch_w && src->pitch_w != src->w) || src->col_off) {
+        ROCKET_LOGE("%s: the cube is a %u-wide plane at column %u of %u-element rows, and a "
+                    "convolution's feature DMA has one register for the width and the line "
+                    "stride — only a pool consumer can read a padded row pitch\n",
+                    entry, src->w, src->col_off, src->pitch_w ? src->pitch_w : src->w);
+        return ROCKET_E_UNSUPPORTED;
     }
     /* A PADDED GROUP STRIDE IS A REGISTER, NOT A GEOMETRIC BOUND. The CNA's DDR group
      * jump (0x1094) is emitted rather than fixed, and the part honours a value larger
@@ -3267,6 +3172,29 @@ int rocket_rk3576_cube_slice(const rocket_rk3576_cube *buf, unsigned c0, unsigne
     return ROCKET_OK;
 }
 
+int rocket_rk3576_cube_declare_tail(rocket_rk3576_cube *c, unsigned live, int value)
+{
+    const char *entry = "rocket_rk3576_cube_declare_tail";
+
+    if (!c || !live) return ROCKET_E_SHAPE;
+    if (live > c->groups * C2) {
+        ROCKET_LOGE("%s: %u live channel(s) is past the %u this cube carries\n",
+                    entry, live, c->groups * C2);
+        return ROCKET_E_SHAPE;
+    }
+    c->c = live;
+    /* Nothing to declare when the groups end exactly on the live channels — and saying so
+     * anyway would be a claim about bytes that are not there. */
+    if (live < c->groups * C2) {
+        c->pad_from = live;
+        c->pad_value = value;
+    } else {
+        c->pad_from = 0;
+        c->pad_value = 0;
+    }
+    return ROCKET_OK;
+}
+
 int rocket_conv2d_int8_cube_out_at_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
                                           const rocket_rk3576_cube *dst)
 {
@@ -3304,7 +3232,7 @@ int rocket_conv2d_int8_cube_out_at_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
         }
         return ROCKET_OK;
     }
-    if (!r76_cube_shape_ok(entry, h)) return ROCKET_E_UNSUPPORTED;
+    if (!r76_cube_shape_ok(entry, h, 0)) return ROCKET_E_UNSUPPORTED;
     if (dst->fd != h->fd) {
         ROCKET_LOGE("%s: the buffer belongs to fd %d and this handle to fd %d; an IOVA is "
                     "per-fd\n", entry, dst->fd, h->fd);
@@ -3316,6 +3244,17 @@ int rocket_conv2d_int8_cube_out_at_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
                     "%ux%u at %u\n", entry, dst->w, dst->h, dst->surf_elems,
                     h->ow, h->oh, h->surf_elems);
         return ROCKET_E_SHAPE;
+    }
+    /* A WRITER IGNORES A PITCH IT WAS NEVER TOLD. Both destination strides here are
+     * derived from the output plane, so a slice whose rows sit further apart than its width
+     * — or whose plane starts part way into a row — would be written contiguously and read
+     * back skewed. Nothing this library allocates carries either (`rocket_rk3576_cube_alloc()`
+     * zeroes them and a slice inherits), so this is a refusal rather than a case. */
+    if ((dst->pitch_w && dst->pitch_w != dst->w) || dst->col_off) {
+        ROCKET_LOGE("%s: the slice is a %u-wide plane at column %u of %u-element rows, and "
+                    "this handle writes a contiguous plane\n",
+                    entry, dst->w, dst->col_off, dst->pitch_w ? dst->pitch_w : dst->w);
+        return ROCKET_E_UNSUPPORTED;
     }
     /* The REGISTER channel count, not the caller's: the DPU writes every group it is
      * programmed with, so a slice sized to the live channels alone would have its tail
@@ -3361,7 +3300,7 @@ int rocket_conv2d_int8_cube_out_rk3576(rocket_conv2d_int8_weights_rk3576 *h, int
     if (!h) return ROCKET_E_SHAPE;
     if (!on) { h->cube_out = 0; return ROCKET_OK; }
     if (h->out_ext.ptr) { h->cube_out = 1; return ROCKET_OK; }
-    if (!r76_cube_shape_ok(entry, h)) return ROCKET_E_UNSUPPORTED;
+    if (!r76_cube_shape_ok(entry, h, 1)) return ROCKET_E_UNSUPPORTED;
     h->cube_out = 1;
     /* The stamp rides the de-scatter's bracket, and there is no de-scatter now: this
      * surface is read as an input before this handle runs again, so its sentinel has to be
@@ -3490,6 +3429,12 @@ struct rocket_conv2d_int8_chain_rk3576 {
     uint32_t *in_h, *out_h;
     unsigned  n_in, n_out;
     unsigned  kicks;                   /* hardware kicks the last run took */
+    /* The distinct BOs a guard pass currently holds synced for the CPU. A whole-BO bracket
+     * costs a walk over the WHOLE object however few bytes are touched inside it, and
+     * several layers of one run write SLICES of one buffer whenever a concatenation is
+     * placed — so the pair is spent once per BO here rather than once per layer. */
+    rocket_bo **open;
+    unsigned    n_open;
 };
 
 typedef struct rocket_conv2d_int8_chain_rk3576 r76_chain;
@@ -3525,24 +3470,45 @@ static void r76_chain_params(const r76_w *h, conv_params_t *p)
     p->output_dma  = (uint32_t)r76_surf_dma(h, 0);
 }
 
-/* ---- THE TWO NODE KINDS ------------------------------------------------------------
+/* ---- THE THREE NODE KINDS ----------------------------------------------------------
  * A run is described by nodes rather than by convolution handles, because a pool is its
  * own register program on this part and one runs inside a convolution stream [HW sweep,
  * tests/rk3576_chain_pool.c]. Everything the layout and the eligibility test ask of a
- * layer goes through these six accessors, so there is one set of rules rather than one
- * per kind. A pool's fields come from rocket_rk3576_pool_link(), which is where the
- * pooling entry states them; nothing here reaches into that handle.
+ * layer goes through these accessors, so there is one set of rules rather than one per
+ * kind. A pool's fields come from rocket_rk3576_pool_link(), which is where the pooling
+ * entry states them; nothing here reaches into that handle.
  *
- * A node with neither pointer set is the caller saying "this layer cannot be in a run",
- * which is what a NULL entry means in the convolution-only form. */
+ * The third kind is a PLACEMENT node: a layer with no register program at all, and no
+ * host work either. A channel concatenation whose operands are placed slices of one
+ * buffer is one — its producers wrote those bytes and its consumers read the buffer, so
+ * the layer is a name for an address. It contributes nothing to the stream and is exempt
+ * from both run conditions, because it neither reads a cube nor leaves one.
+ *
+ * A node with nothing set is the caller saying "this layer cannot be in a run", which is
+ * what a NULL entry means in the convolution-only form. */
 static int r76_node_is_pool(const rocket_chain_node_rk3576 *nd)
 {
     return nd && !nd->conv && nd->pool;
 }
 
+static int r76_node_is_placement(const rocket_chain_node_rk3576 *nd)
+{
+    return nd && !nd->conv && !nd->pool && nd->placement;
+}
+
+/* Exactly one kind, which is also what says the node is not the "cannot be in a run" one. */
 static int r76_node_set(const rocket_chain_node_rk3576 *nd)
 {
-    return nd && ((nd->conv && !nd->pool) || (!nd->conv && nd->pool));
+    unsigned k;
+    if (!nd) return 0;
+    k = (nd->conv ? 1u : 0u) + (nd->pool ? 1u : 0u) + (nd->placement ? 1u : 0u);
+    return k == 1u;
+}
+
+/* Whether a node carries a register program. A placement node is set and does not. */
+static int r76_node_runs(const rocket_chain_node_rk3576 *nd)
+{
+    return r76_node_set(nd) && !r76_node_is_placement(nd);
 }
 
 /* A pool handle's link view, rebuilt on demand. Cheap — it regenerates 31 register writes
@@ -3557,7 +3523,7 @@ static int r76_node_pool_link(const rocket_chain_node_rk3576 *nd,
 static int r76_node_cube_in(const rocket_chain_node_rk3576 *nd)
 {
     struct rocket_rk3576_pool_link pl;
-    if (!r76_node_set(nd)) return 0;
+    if (!r76_node_runs(nd)) return 0;
     if (!r76_node_is_pool(nd)) return nd->conv->cube_in;
     return r76_node_pool_link(nd, &pl) && pl.cube_in;
 }
@@ -3565,7 +3531,7 @@ static int r76_node_cube_in(const rocket_chain_node_rk3576 *nd)
 static int r76_node_cube_out(const rocket_chain_node_rk3576 *nd)
 {
     struct rocket_rk3576_pool_link pl;
-    if (!r76_node_set(nd)) return 0;
+    if (!r76_node_runs(nd)) return 0;
     if (!r76_node_is_pool(nd)) return nd->conv->cube_out;
     return r76_node_pool_link(nd, &pl) && pl.cube_out;
 }
@@ -3573,6 +3539,7 @@ static int r76_node_cube_out(const rocket_chain_node_rk3576 *nd)
 static uint64_t r76_node_feat_dma(const rocket_chain_node_rk3576 *nd)
 {
     struct rocket_rk3576_pool_link pl;
+    if (!r76_node_runs(nd)) return 0;
     if (!r76_node_is_pool(nd)) return r76_feat_dma(nd->conv);
     return r76_node_pool_link(nd, &pl) ? pl.feat_dma : 0;
 }
@@ -3580,6 +3547,7 @@ static uint64_t r76_node_feat_dma(const rocket_chain_node_rk3576 *nd)
 static uint64_t r76_node_surf_dma(const rocket_chain_node_rk3576 *nd)
 {
     struct rocket_rk3576_pool_link pl;
+    if (!r76_node_runs(nd)) return 0;
     if (!r76_node_is_pool(nd)) return r76_surf_dma(nd->conv, 0);
     return r76_node_pool_link(nd, &pl) ? pl.surf_dma : 0;
 }
@@ -3630,6 +3598,9 @@ static int r76_run_fed(const rocket_chain_node_rk3576 *nd, unsigned first, unsig
 {
     unsigned i;
 
+    /* A PLACEMENT node reads nothing, so there is no input for the host to prepare and
+     * nothing to feed. It is transparent to the rule rather than exempt from it. */
+    if (r76_node_is_placement(&nd[j])) return 1;
     if (!r76_node_cube_in(&nd[j])) return 0;
     for (i = first; i < j; i++)
         if (r76_node_cube_out(&nd[i]) && r76_node_surf_dma(&nd[i]) ==
@@ -3658,6 +3629,39 @@ unsigned rocket_conv2d_int8_chain_max_programs_rk3576(void)
     return r76_chain_task_cap();
 }
 
+/* A POOL WHOSE DIVISOR CAN LAG IS NOT A RUN NODE, and the reason is the REDO rather than
+ * the program: a chained kick is one submit, so its redo re-runs every program of the run
+ * and every observable pool in it has to come out clean on the SAME attempt. The budget is
+ * per hazard, and a joint attempt spends it geometrically — with two such pools it runs
+ * out. Measured on Inception V3, whose 41-layer kick holds two of them: 3 of 11 runs of 100
+ * inferences ended in "the surface was never right" and returned ROCKET_E_DEVICE, against 0
+ * of 7 with each pool its own submit [HW sweep, H96 MAX M9].
+ *
+ * The RATE moves the same way and is the larger part of it. The same program, same cube,
+ * same data, measured inside a kick and as its own submit over three repeats of 100
+ * inferences each: 36-53% against 0-1%, and 51-82% against 8-36%. So a pool inside a stream
+ * is both likelier to lag and dearer when it does, which is why this is a refusal and not a
+ * bigger budget.
+ *
+ * It costs NOTHING to obey. Splitting Inception V3's run at its two pools is 63-64 submits
+ * against 57-62, and the wall goes from a mean of 70.6 ms (52.8-89.5 over 11 runs) to 51.9
+ * (50.8-53.4 over 7) — faster in the mean AND with the spread gone, because the redos were
+ * most of the variance. The other four graphs have no padded average pool and do not move.
+ *
+ * Scoped to the pools that CAN lag: a max pool, an unpadded average and a count-include-pad
+ * average have no position where the hazard shows, and they stay run nodes. Asked of the
+ * GEOMETRY, not of _lag_observable(), so that turning the check off does not also move the
+ * run structure. ROCKET_RK3576_CHAIN_POOL_LAG=1 puts one back for an RE arm. */
+static int r76_chain_pool_lag_refused(const rocket_chain_node_rk3576 *nd)
+{
+    static int allow = -1;
+    if (allow < 0) {
+        const char *e = getenv("ROCKET_RK3576_CHAIN_POOL_LAG");
+        allow = (e && *e && *e != '0');
+    }
+    return !allow && rocket_pool_int8_rk3576_lag_can_show(nd->pool);
+}
+
 /* Why a node cannot be part of a run, or NULL if it can. `interior` says whether it would
  * sit strictly inside the run — which is the only place a POOL may go, because one that
  * began a run would need its cube scattered into and one that ended a run would need its
@@ -3667,7 +3671,11 @@ static const char *r76_node_why_not(const rocket_chain_node_rk3576 *nd, int inte
     struct rocket_rk3576_pool_link pl;
 
     if (!r76_node_set(nd))
-        return "it is neither a resident convolution nor a resident pool";
+        return "it is not a resident convolution, a resident pool or a placement layer";
+    if (r76_node_is_placement(nd))
+        return interior ? NULL
+                        : "it is a placement layer at the START or the END of the run, "
+                          "where it would extend the run by a layer that emits nothing";
     if (!r76_node_is_pool(nd)) return r76_chain_why_not(nd->conv);
     if (!r76_node_pool_link(nd, &pl))
         return "its register program could not be built, so it was never packed or its "
@@ -3679,12 +3687,19 @@ static const char *r76_node_why_not(const rocket_chain_node_rk3576 *nd, int inte
                "an interior node";
     if (!pl.cube_in || !pl.cube_out)
         return "it is an interior pooling layer that does not both read and leave a cube";
+    if (r76_chain_pool_lag_refused(nd))
+        return "it is a padded average pool whose divisor can lag, and a kick is ONE submit: "
+               "its redo re-runs every program of the run, so two such pools in one stream "
+               "need both clean on the same attempt and the budget runs out";
     return NULL;
 }
 
 unsigned rocket_chain_node_programs_rk3576(const rocket_chain_node_rk3576 *node)
 {
     if (!r76_node_set(node)) return 0;
+    /* A PLACEMENT node emits nothing, which is exactly zero rather than "unchainable" —
+     * a caller reading this to size a stream must not treat the two the same way. */
+    if (r76_node_is_placement(node)) return 0u;
     /* A pool is ONE program whatever its plane: the PPU has no row window. Asked as an
      * interior node, which is the only place one is legal — a caller checking a node at
      * the end of a run gets the refusal from the constructor. */
@@ -3730,34 +3745,46 @@ unsigned rocket_chain_plan_rk3576(const rocket_chain_node_rk3576 *nd, unsigned n
 
     if (!nd || n < 2u) return 0;
     for (i = 0; i + 1u < n; ) {
-        unsigned first = i, count = 0, tasks = 0;
-        /* A pool cannot START a run, so skip past one rather than opening a run on it —
-         * the run that matters begins at the layer after. */
-        if (r76_node_is_pool(&nd[i])) { i++; continue; }
+        unsigned first = i, count = 0, tasks = 0, progs = 0;
+        /* Neither a pool nor a placement layer can START a run, so skip past one rather
+         * than opening a run on it — the run that matters begins at the layer after. */
+        if (r76_node_is_pool(&nd[i]) || r76_node_is_placement(&nd[i])) { i++; continue; }
         while (i < n && !r76_node_why_not(&nd[i], i > first)) {
             unsigned nt = rocket_chain_node_programs_rk3576(&nd[i]);
-            if (!nt) break;
+            int place = r76_node_is_placement(&nd[i]);
+            /* Zero programs is "unchainable" for a node that should have some and the
+             * whole point of a placement one. */
+            if (!nt && !place) break;
             /* One layer past the cap ends the run rather than shortening it below two:
              * a single layer of more programs than the cap is simply not chainable, and
              * the caller runs it through the per-layer path. */
             if (count && tasks + nt > cap) break;
             tasks += nt;
             count++;
+            if (!place) progs++;
             if (i + 1u >= n) { i++; break; }
             /* Growing the run makes nd[i] a non-last layer, so it must leave a cube; and
-             * nd[i+1] must read one that a member already wrote. See r76_run_fed(). */
-            if (!r76_node_cube_out(&nd[i]) || !r76_run_fed(nd, first, i + 1u)) {
+             * nd[i+1] must read one that a member already wrote. See r76_run_fed(). A
+             * placement layer leaves nothing and breaks nothing: it is skipped on both
+             * sides of that test, and the next layer's feeder is an earlier member. */
+            if ((!place && !r76_node_cube_out(&nd[i])) || !r76_run_fed(nd, first, i + 1u)) {
                 i++;
                 break;
             }
             i++;
         }
         /* A run that ENDS on a pool gives that layer back: the chain would have to
-         * de-scatter it, and the layer before is a legal last. */
-        while (count && r76_node_is_pool(&nd[first + count - 1u])) {
+         * de-scatter it, and the layer before is a legal last. A trailing PLACEMENT layer
+         * goes back for a simpler reason — it would add a member that emits nothing. */
+        while (count && (r76_node_is_pool(&nd[first + count - 1u]) ||
+                         r76_node_is_placement(&nd[first + count - 1u]))) {
             count--;
+            if (!r76_node_is_placement(&nd[first + count])) progs--;
             tasks -= rocket_chain_node_programs_rk3576(&nd[first + count]);
         }
+        /* A run is two PROGRAM-carrying layers, not two array entries: one convolution
+         * beside a placement layer is one program and belongs on the per-layer path. */
+        if (progs < 2u) count = 0;
         if (count >= 2u) {
             if (runs && found < max_runs) {
                 runs[found].first = first;
@@ -3817,6 +3844,7 @@ void rocket_conv2d_int8_chain_free_rk3576(int fd, rocket_conv2d_int8_chain_rk357
                     c->fd, fd);
     if (c->rc.ptr) rocket_bo_free(c->fd, &c->rc);
     free(c->layer); free(c->td); free(c->ext); free(c->in_h); free(c->out_h);
+    free(c->open);
     free(c);
 }
 
@@ -3848,17 +3876,20 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
         const char *why;
         int node_fd;
         if (!r76_node_set(&nd[i])) {
-            ROCKET_LOGE("%s: layer %u names neither a convolution nor a pool, or both\n",
-                        entry, i);
+            ROCKET_LOGE("%s: layer %u names none of a convolution, a pool and a placement "
+                        "layer, or more than one\n", entry, i);
             return NULL;
         }
-        node_fd = r76_node_is_pool(&nd[i])
-                      ? (r76_node_pool_link(&nd[i], &pl) ? pl.fd : -1)
-                      : nd[i].conv->fd;
-        if (node_fd != fd) {
-            ROCKET_LOGE("%s: layer %u was packed on fd %d and this chain is on fd %d; an "
-                        "IOVA is per-fd\n", entry, i, node_fd, fd);
-            return NULL;
+        /* A placement layer owns no BO, so it has no fd to disagree with. */
+        if (r76_node_runs(&nd[i])) {
+            node_fd = r76_node_is_pool(&nd[i])
+                          ? (r76_node_pool_link(&nd[i], &pl) ? pl.fd : -1)
+                          : nd[i].conv->fd;
+            if (node_fd != fd) {
+                ROCKET_LOGE("%s: layer %u was packed on fd %d and this chain is on fd %d; "
+                            "an IOVA is per-fd\n", entry, i, node_fd, fd);
+                return NULL;
+            }
         }
         if ((why = r76_node_why_not(&nd[i], i > 0u && i + 1u < n))) {
             ROCKET_LOGE("%s: layer %u cannot be chained: %s\n", entry, i, why);
@@ -3873,6 +3904,7 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
      * still be linked to someone else. See r76_run_fed() for why an earlier member, and not
      * the immediately preceding one, is what the part requires. */
     for (i = 0; i + 1u < n; i++) {
+        if (r76_node_is_placement(&nd[i])) continue;   /* writes nothing to leave */
         if (!r76_node_cube_out(&nd[i])) {
             ROCKET_LOGE("%s: layer %u is not the last and does not leave a cube, so its "
                         "output would need a host de-scatter that a chain cannot insert "
@@ -3915,25 +3947,34 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
     c = calloc(1, sizeof *c);
     if (!c) return NULL;
     c->fd = fd;
-    c->n = n;
     c->layer = calloc(n, sizeof *c->layer);
-    if (!c->layer) { rocket_conv2d_int8_chain_free_rk3576(fd, c); return NULL; }
+    /* One slot per layer is the most distinct BOs a guard pass can hold open. */
+    c->open  = calloc(n, sizeof *c->open);
+    if (!c->layer || !c->open) { rocket_conv2d_int8_chain_free_rk3576(fd, c); return NULL; }
 
     /* Plan every layer's rows first, so the total task count and the stream length are known
      * before anything is allocated. The plan lives on the handle, which is where the
-     * per-layer path keeps it too. */
+     * per-layer path keeps it too.
+     *
+     * A PLACEMENT LAYER IS DROPPED HERE and the chain never sees it again: it emits no
+     * program, owns no surface and has nothing to guard, so carrying it past this point
+     * would mean a NULL case in the layout, the stamp, the verify and the redo. `c->n` is
+     * the count of program-carrying layers from here on, which is what every loop below
+     * means by a layer. */
     for (i = 0; i < n; i++) {
         conv_params_t p, q;
-        unsigned nt = 1u;
+        unsigned nt = 1u, k = c->n;
         r76_w *hi = nd[i].conv;
+        if (r76_node_is_placement(&nd[i])) continue;
         if (!hi) {
             /* A pool is ONE program whatever its plane: the PPU has no row window. Its
              * link view is taken below, where the program it describes is generated, so
              * the layout, the extents and the guard all read one set of addresses. */
-            c->layer[i].p = nd[i].pool;
-            c->layer[i].task0 = c->ntask;
-            c->layer[i].ntask = 1u;
+            c->layer[k].p = nd[i].pool;
+            c->layer[k].task0 = c->ntask;
+            c->layer[k].ntask = 1u;
             c->ntask += 1u;
+            c->n++;
             continue;
         }
         r76_chain_params(hi, &p);
@@ -3944,11 +3985,19 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
             rocket_conv2d_int8_chain_free_rk3576(fd, c);
             return NULL;
         }
-        c->layer[i].h = hi;
-        c->layer[i].task0 = c->ntask;
-        c->layer[i].ntask = nt;
+        c->layer[k].h = hi;
+        c->layer[k].task0 = c->ntask;
+        c->layer[k].ntask = nt;
         c->ntask += nt;
+        c->n++;
     }
+    if (c->n < 2u) {
+        ROCKET_LOGE("%s: %u of the %u layer(s) emit a program, and a chain is two or more\n",
+                    entry, c->n, n);
+        rocket_conv2d_int8_chain_free_rk3576(fd, c);
+        return NULL;
+    }
+    n = c->n;
     if (c->ntask > r76_chain_task_cap()) {
         ROCKET_LOGE("%s: %u program(s) over %u layer(s) is past the %u a MIXED-geometry "
                     "stream is measured good to on this part — past it a kick intermittently "
@@ -4137,12 +4186,19 @@ unsigned rocket_conv2d_int8_chain_kicks_rk3576(const rocket_conv2d_int8_chain_rk
 /* THE FIRST LAYER THE POISON GUARD ASKS ABOUT. Zero — every surface — unless
  * ROCKET_RK3576_GUARD_PER_KICK is set, which reduces the guard to the LAST layer alone.
  *
- * The guard's cost is a PREP_BO/FINI_BO pair per surface per call and both halves sync the
- * whole BO, so on a graph that goes out as one kick it is a bracket per LAYER: 3.1 ms of
- * MobileNetV2's 6.8 and 2.0 of MobileNetV1's 5.2 [measured, the ROCKET_RK3576_I32_SENTINEL=0
- * A/B at `rk3576_net_gate bench 100`]. Asking one surface instead of n is the only way to
- * spend fewer brackets without a ranged cache-maintenance ioctl, which the uAPI does not
- * have — `drm_rocket_prep_bo` is `{handle, reserved, timeout_ns}`.
+ * The guard's cost is a PREP_BO/FINI_BO pair per distinct BO per call and both halves sync
+ * the whole object, so on a graph that goes out as one kick it is a bracket per surface:
+ * 1.9 / 3.0 / 2.1 / 2.8 ms of MobileNetV1's 4.9, MobileNetV2's 6.5, ResNet-18's 6.6 and
+ * Inception V1's 7.0, and 6.5 of Inception V3's 41.6 [measured, the
+ * ROCKET_RK3576_I32_SENTINEL=0 A/B at `rk3576_net_gate bench 100`, ondemand].
+ *
+ * Three things spend fewer of them and only this one is free: naming each BO ONCE (several
+ * layers write slices of one placed concatenation buffer, and the same bytes are checked
+ * either way — see r76_guard_open). Asking one SURFACE instead of n is this knob, and
+ * narrowing the bracket to RANGES is ROCKET_RK3576_GUARD_NARROW over interface 1.5's
+ * DRM_ROCKET_PREP_BO_RANGES; both trade coverage. Per-kick lands on the guard-off floor on
+ * every graph that is ONE kick and collects 2.0 of Inception V3's 6.5, because 21 of that
+ * graph's convolution calls are outside any kick.
  *
  * WHAT IT STILL COVERS. The hazard the guard exists for is the wide-output poisoning: a job
  * whose DPU output element is wider than one byte leaves the next submit of any kind, across
@@ -4184,25 +4240,111 @@ struct r76_chain_prof {
     int      on;
     unsigned kicks;
     double   in_us, stamp_us, submit_us, verify_us, read_us;
+    /* WHAT THE WRITE GUARD SPENDS, in the two units a ranged cache-maintenance ioctl
+     * would change separately. Both PREP_BO and FINI_BO sync the WHOLE BO, so a bracket
+     * costs a per-ioctl floor plus a walk over `guard_bytes`; a ranged ioctl removes the
+     * second term and keeps the first, and the floor is a per-bracket cost whatever the
+     * range. Counting them here is what turns the guard's ms into a prediction:
+     * brackets x the measured pair floor (`tests/rk3576_prep_floor.c`) is the lowest the
+     * guard can go. Only the guard's own brackets are counted — the stamp loop and the
+     * verify loop — not the fence wait or the de-scatter, which a caller pays anyway. */
+    unsigned brackets;
+    size_t   guard_bytes;
+    /* THE OTHER HALF OF THE GUARD, AND THE HALF DEDUPLICATING THE BRACKETS DID NOT REACH.
+     * A bracket is per BO; the memset that puts the sentinel back is per LAYER, because
+     * every slice of a shared buffer still has to be filled. So the guard is
+     * `fill_us` + brackets, and only the second collapsed when several layers of a run
+     * turned out to write into one object. Counted in its own us and its own bytes so the
+     * two can be priced against their own measured rates (fill 0.113 us/KiB, bracket
+     * 0.194 us/KiB + a 2.24 us floor, `tests/rk3576_prep_floor.c`) instead of the second
+     * being inferred as the first's residual.
+     *
+     * A SHARE OF `stamp_us` AND `verify_us`, not a bucket beside them: the pre-submit loop
+     * and a redo's re-stamp land in the first, the verify loop's re-stamp in the second. */
+    double   fill_us;
+    size_t   fill_bytes;
+    /* WHAT THE SUBMIT BUCKET IS MADE OF. `submit_us` is one interval covering three
+     * different things, and a lever exists against only two of them: the ioctl that
+     * queues the job (userspace's own dispatch cost, which scales with the BO count and
+     * the task count, not with the work), the wait for the fence (the part running the
+     * kick's programs, plus whatever the driver spends getting to it and noticing), and
+     * the FINI_BO that hands the surface back. Split here so a share of the wall can be
+     * quoted against the term a change would actually touch.
+     *
+     * The wait is measured through PREP_BO, so it also carries one cache invalidate of
+     * the LAST layer's surface — `wait_bytes` is that surface, and the bracket cost model
+     * (1.33 us + 0.0969 us/KiB, `tests/rk3576_prep_floor.c`) prices it. On every graph
+     * here the last layer is a classifier and that term is under 2 us. */
+    double   ioctl_us, wait_us, fini_us;
+    size_t   wait_bytes;
+    /* THE DIVISOR LAG, AND WHY IT IS NOT PART OF THE WRITE GUARD. The two share a loop
+     * position and nothing else: the guard asks whether a surface was written and is paid
+     * per surface per call, while this asks whether a padded average pool's divisor was one
+     * output position stale and is paid only on a run that HAS such a pool. Counting them
+     * together makes the guard's bracket floor unreadable and hides which of the lag's two
+     * costs a lever would collect.
+     *
+     * `lag_us` is the CHECK — one bracket over the producer's cube plus the arithmetic over
+     * the observable positions — and is paid on every attempt. `redo_us` is the whole cost
+     * of every attempt after the first, whichever hazard asked for it: a kick redo re-runs
+     * the run's programs, its guard and its stamp, so it is not a submit's worth. Both are
+     * shares OF the buckets above rather than extra ones — subtract `lag_us` from
+     * `verify_us` to read the write check alone, and `redo_us` spans submit, verify and
+     * stamp together. */
+    double   lag_us, redo_us;
+    unsigned lag_checks, lag_redos, lag_brackets;
+    size_t   lag_bytes;
 };
 
 static void r76_chain_prof_log(const char *entry, const rocket_conv2d_int8_chain_rk3576 *c,
                                const struct r76_chain_prof *prof)
 {
+    /* The lag check is its own bucket, not a share of the verify: they sit in the same loop
+     * position and answer different questions, and a run with no padded average pool pays
+     * zero for one of them. Summed here so the accounting still closes to the call. */
     double tot = prof->in_us + prof->stamp_us + prof->submit_us + prof->verify_us +
-                 prof->read_us;
+                 prof->lag_us + prof->read_us;
 
     if (!prof->on) return;
     if (tot <= 0.0) tot = 1.0;
     ROCKET_LOGI("%s: %u layer(s), %u task(s), %u kick(s) — %.2f ms: feature %.2f (%.0f%%) "
                 "stamp %.2f (%.0f%%) submit %.2f (%.0f%%) verify %.2f (%.0f%%) "
-                "de-scatter %.2f (%.0f%%)\n",
+                "lag check %.2f (%.0f%%) de-scatter %.2f (%.0f%%)\n",
                 entry, c->n, c->ntask, prof->kicks, tot / 1e3,
                 prof->in_us / 1e3,     100.0 * prof->in_us / tot,
                 prof->stamp_us / 1e3,  100.0 * prof->stamp_us / tot,
                 prof->submit_us / 1e3, 100.0 * prof->submit_us / tot,
                 prof->verify_us / 1e3, 100.0 * prof->verify_us / tot,
+                prof->lag_us / 1e3,    100.0 * prof->lag_us / tot,
                 prof->read_us / 1e3,   100.0 * prof->read_us / tot);
+    ROCKET_LOGI("%s: write guard %u bracket(s) over %.0f KiB — %.2f ms "
+                "(stamp + verify), %.2f us/bracket\n",
+                entry, prof->brackets, prof->guard_bytes / 1024.0,
+                (prof->stamp_us + prof->verify_us) / 1e3,
+                prof->brackets ? (prof->stamp_us + prof->verify_us) / prof->brackets
+                               : 0.0);
+    /* The guard's two halves in their own units. `fill` is the memset alone, measured; the
+     * remainder is the brackets and the two scan loops, of which the scan early-exits at
+     * the first byte a task wrote. Deduplicating the brackets reached the remainder only. */
+    ROCKET_LOGI("%s: write guard = fill %.2f ms over %.0f KiB (%.3f us/KiB) + brackets and "
+                "scan %.2f ms\n",
+                entry, prof->fill_us / 1e3, prof->fill_bytes / 1024.0,
+                prof->fill_bytes ? prof->fill_us / (prof->fill_bytes / 1024.0) : 0.0,
+                (prof->stamp_us + prof->verify_us - prof->fill_us) / 1e3);
+    if (prof->lag_checks || prof->lag_redos)
+        ROCKET_LOGI("%s: divisor lag — check %.2f ms over %u scoring(s) in %u bracket(s) "
+                    "/ %.0f KiB, %u redo(s); every redo together %.2f ms (%.0f%% of the "
+                    "call)\n",
+                    entry, prof->lag_us / 1e3, prof->lag_checks, prof->lag_brackets,
+                    prof->lag_bytes / 1024.0, prof->lag_redos, prof->redo_us / 1e3,
+                    100.0 * prof->redo_us / tot);
+    ROCKET_LOGI("%s: submit %.2f ms = ioctl %.3f (%.0f%%) + wait %.2f (%.0f%%) + "
+                "fini %.3f (%.0f%%), %u kick(s), %u BO(s), last surface %.1f KiB\n",
+                entry, prof->submit_us / 1e3,
+                prof->ioctl_us / 1e3, 100.0 * prof->ioctl_us / (prof->submit_us > 0 ? prof->submit_us : 1),
+                prof->wait_us / 1e3,  100.0 * prof->wait_us  / (prof->submit_us > 0 ? prof->submit_us : 1),
+                prof->fini_us / 1e3,  100.0 * prof->fini_us  / (prof->submit_us > 0 ? prof->submit_us : 1),
+                prof->kicks, c->n_in + c->n_out, prof->wait_bytes / 1024.0);
 }
 
 /* The surface a layer of the stream writes, whichever kind of node it is, and how many
@@ -4231,15 +4373,170 @@ static int r76_layer_restamp_ok(const struct r76_chain_layer *L)
     return L->h && !L->h->out_ext.ptr && !L->h->shared_out;
 }
 
+/* Put the sentinel on one layer's surface, in whichever footprint the guard is asking
+ * for. Wide, that is everything the layer writes; narrow, one cache line per (task,
+ * channel group) — exactly the bytes r76_task_wrote() then reads back. `o` is the BO's
+ * own pointer, because the extents carry their slice's base. */
+static void r76_stamp_layer(const struct r76_chain_layer *L, unsigned char *o, size_t off,
+                            const struct r76_task_extent *ext, unsigned char stamp)
+{
+    unsigned t, g;
+
+    if (!r76_guard_narrow()) {
+        memset(o + off, stamp, r76_layer_obytes(L));
+        return;
+    }
+    for (t = 0; t < L->ntask; t++) {
+        const struct r76_task_extent *e = &ext[t];
+        size_t n = e->span < (size_t)R76_GUARD_LINE ? e->span : (size_t)R76_GUARD_LINE;
+        for (g = 0; g < e->groups; g++)
+            memset(o + e->base + (size_t)g * e->group_bytes + e->row_off, stamp, n);
+    }
+}
+
+/* The bytes that stamp just wrote, in the same footprint, so the fill can be priced in its
+ * own unit rather than in the bracket's. Not `guard_bytes`: a bracket walks the whole BO
+ * and deduplicates per BO, while the fill is per LAYER and covers only what that layer
+ * writes, so the two counts differ in both directions on a graph that places slices. */
+static size_t r76_stamp_bytes(const struct r76_chain_layer *L,
+                              const struct r76_task_extent *ext)
+{
+    size_t bytes = 0;
+    unsigned t;
+
+    if (!r76_guard_narrow()) return r76_layer_obytes(L);
+    for (t = 0; t < L->ntask; t++) {
+        const struct r76_task_extent *e = &ext[t];
+        size_t n = e->span < (size_t)R76_GUARD_LINE ? e->span : (size_t)R76_GUARD_LINE;
+        bytes += n * (size_t)e->groups;
+    }
+    return bytes;
+}
+
+/* The stamp, timed into its own share of whichever bucket the caller is in. */
+static void r76_stamp_timed(struct r76_chain_prof *prof, const struct r76_chain_layer *L,
+                            unsigned char *o, size_t off,
+                            const struct r76_task_extent *ext, unsigned char stamp)
+{
+    double t0 = R76_PT(*prof);
+
+    r76_stamp_layer(L, o, off, ext, stamp);
+    R76_ACC(*prof, fill_us, t0);
+    if (prof->on) prof->fill_bytes += r76_stamp_bytes(L, ext);
+}
+
+/* THE SAME BYTES, AS THE RANGES A CACHE-MAINTENANCE BRACKET TAKES.
+ *
+ * Narrowing the stamp and the check removes the FILL from the guard but not the
+ * BRACKET, because PREP_BO and FINI_BO sync the whole BO however few bytes sit
+ * inside them — and the bracket is the larger half (0.194 us/KiB against the
+ * fill's 0.113, `tests/rk3576_prep_floor.c`). The two are conjunctive: the ranged
+ * ioctls (interface 1.5) can only name a small footprint if the guard HAS one.
+ *
+ * Ordered GROUP-outer so the offsets ascend, which the kernel requires: within
+ * one channel group a layer's tasks are consecutive row windows, and the groups
+ * sit group_bytes apart. Returns 0 — brackets the whole BO, which is always
+ * correct — when the footprint cannot be expressed: the guard is not narrowed,
+ * the kernel has no ranged ioctl, there are more ranges than the cap, or the
+ * extents do not ascend. */
+#define R76_GUARD_MAX_RANGES 256u
+
+static unsigned r76_guard_ranges(const struct r76_chain_layer *L,
+                                 const struct r76_task_extent *ext,
+                                 rocket_bo_range *out)
+{
+    uint64_t prev_end = 0;
+    unsigned t, g, n = 0;
+
+    if (!r76_guard_narrow() || !rocket_bo_ranges_supported())
+        return 0;
+
+    for (g = 0; ; g++) {
+        int any = 0;
+        for (t = 0; t < L->ntask; t++) {
+            const struct r76_task_extent *e = &ext[t];
+            uint64_t off;
+            uint64_t sz;
+
+            if (g >= e->groups)
+                continue;
+            any = 1;
+            off = (uint64_t)e->base + (uint64_t)g * e->group_bytes + e->row_off;
+            sz  = e->span < (size_t)R76_GUARD_LINE ? e->span
+                                                   : (size_t)R76_GUARD_LINE;
+            if (n == R76_GUARD_MAX_RANGES || (n && off < prev_end))
+                return 0;
+            out[n].offset = off;
+            out[n].size   = sz;
+            prev_end = off + sz;
+            n++;
+        }
+        if (!any)
+            break;
+    }
+    return n;
+}
+
+/* What one bracket walked, for the profile: the ranges when it had them, the
+ * whole object when it did not. */
+static size_t r76_guard_walked(const rocket_bo *surf, const rocket_bo_range *r,
+                               unsigned n)
+{
+    size_t b = 0;
+    unsigned i;
+
+    if (!n) return surf->size;
+    for (i = 0; i < n; i++) b += r[i].size;
+    return b;
+}
+
+/* ONE WHOLE-BO BRACKET PER DISTINCT BO, not per layer.
+ *
+ * PREP_BO and FINI_BO each sync the WHOLE object, so a pass that names one buffer once per
+ * layer walks it once per layer. Several layers of one run write SLICES of one buffer
+ * whenever a concatenation is placed — every operand of one — and the check reads a
+ * different slice each time, so syncing the buffer once covers all of them and checks
+ * exactly the same bytes. There is no coverage in this: the guard still asks every task of
+ * every layer whether it wrote.
+ *
+ * Keyed on the KERNEL HANDLE, not on the rocket_bo pointer: a placed slice carries its own
+ * descriptor of the same underlying object, so two slices of one buffer are two pointers
+ * and one BO. Keyed on the pointer the redundancy reads as zero on every graph, including
+ * one with fourteen placed concatenations.
+ *
+ * Returns 1 when the caller has to open the bracket. RANGED brackets are not pooled: two
+ * slices' ranges are disjoint, so there is nothing redundant to remove, and a shared range
+ * list would have to be built as their union. */
+static int r76_guard_open(rocket_conv2d_int8_chain_rk3576 *c, rocket_bo *surf)
+{
+    unsigned k;
+    for (k = 0; k < c->n_open; k++)
+        if (c->open[k]->handle == surf->handle) return 0;
+    c->open[c->n_open++] = surf;
+    return 1;
+}
+
+/* Hands every one of them back, in the order they were opened. Safe wherever the pass
+ * stops: the set holds what was actually synced, so an early exit closes exactly that. */
+static void r76_guard_close(int fd, rocket_conv2d_int8_chain_rk3576 *c)
+{
+    unsigned k;
+    for (k = 0; k < c->n_open; k++) rocket_bo_fini(fd, c->open[k]);
+    c->n_open = 0;
+}
+
 int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 *c,
                                         const int8_t *in, int8_t *out)
 {
     const char *entry = "rocket_conv2d_int8_chain_run_rk3576";
     unsigned char stamp;
-    unsigned attempt, attempts, i, i0;
+    unsigned attempt, attempts, i, i0, nr, lagged = 0;
+    /* The guard's ranges for one layer, reused per bracket. 4 KiB of stack at the
+     * cap, which is why the cap exists. */
+    rocket_bo_range rng[R76_GUARD_MAX_RANGES];
     r76_w *first, *last;
     struct r76_chain_prof prof = {0};
-    double pt;
+    double pt, pt2;
     int rc;
 
     if (!c) return ROCKET_E_SHAPE;
@@ -4262,6 +4559,7 @@ int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 
     stamp = rocket_rk3576_sentinel_on() ? (unsigned char)ROCKET_RK3576_SENTINEL_BYTE : 0;
     attempts = r76_task_attempts();
     c->kicks = 0;
+    c->n_open = 0;                            /* every pass below closes its own set */
     /* Every layer, or only the last. See r76_guard_per_kick(): the same index bounds the
      * stamp, the check and the redo's re-stamp, so an unchecked surface never carries a
      * sentinel and nothing spends a bracket on it. */
@@ -4276,22 +4574,42 @@ int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 
      * is none of them: the verify pass below re-stamps inside its own bracket, so a surface
      * costs one PREP_BO/FINI_BO pair per call rather than two. */
     pt = R76_PT(prof);
-    if (stamp)
+    if (stamp) {
         for (i = i0; i < c->n; i++) {
             struct r76_chain_layer *L = &c->layer[i];
             size_t off = 0;
             rocket_bo *surf = r76_layer_surf(L, &off);
             if (L->h && L->h->tile[0].stamped) continue;
-            rocket_bo_prep(fd, surf, 1, 0);
-            memset((char *)surf->ptr + off, stamp, r76_layer_obytes(L));
-            rocket_bo_fini(fd, surf);
+            int opened;
+            nr = r76_guard_ranges(L, c->ext + L->task0, rng);
+            opened = nr ? 1 : r76_guard_open(c, surf);
+            if (opened) {
+                rocket_bo_prep_ranges(fd, surf, rng, nr, 0);
+                prof.brackets++;
+                prof.guard_bytes += r76_guard_walked(surf, rng, nr);
+            }
+            r76_stamp_timed(&prof, L, (unsigned char *)surf->ptr, off, c->ext + L->task0,
+                            stamp);
+            if (nr) rocket_bo_fini_ranges(fd, surf, rng, nr);
         }
+        r76_guard_close(fd, c);
+    }
     R76_ACC(prof, stamp_us, pt);
 
-    for (attempt = 0; attempt < attempts; attempt++) {
-        unsigned bad = c->n, bad_task = 0;
+    /* `attempt` counts POISONING redos, each of which cycles the power domain; a DIVISOR
+     * LAG redo spends only the kick and is counted against its own, much larger budget —
+     * a kick redoes every pool of the run at once, so two observable pools need both clean
+     * on one attempt and the eight the poisoning gets have been measured to run out. */
+    for (attempt = 0; attempt < attempts; ) {
+        unsigned bad = c->n, bad_task = 0, lag_bad = 0;
         size_t loff = 0;
         rocket_bo *lsurf = r76_surf(last, 0, &loff);
+        /* Every attempt after the first is a REDO, whichever hazard asked for it, and it
+         * costs this whole iteration rather than a submit: the kick runs again, the guard
+         * reads every surface again and the stamp goes back on. Priced here so a rate
+         * lever and a cheaper check can be told apart. */
+        int redoing = prof.kicks > 0;
+        double rt = R76_PT(prof);
 
         c->kicks++;
         prof.kicks++;
@@ -4301,6 +4619,8 @@ int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 
             ROCKET_LOGE("%s: the chained submit failed\n", entry);
             return ROCKET_E_DEVICE;
         }
+        R76_ACC(prof, ioctl_us, pt);
+        pt2 = R76_PT(prof);
         /* One fence for the whole kick, waited on through the LAST layer's surface. Every
          * BO in the job carries it, so any of them would do; the last one is the one whose
          * writes have to have drained before the de-scatter reads it. */
@@ -4308,9 +4628,57 @@ int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 
             ROCKET_LOGE("%s: PREP_BO on the last layer's surface timed out\n", entry);
             return ROCKET_E_DEVICE;
         }
+        R76_ACC(prof, wait_us, pt2);
+        if (prof.on) prof.wait_bytes = lsurf->size;
+        pt2 = R76_PT(prof);
         rocket_bo_fini(fd, lsurf);
+        R76_ACC(prof, fini_us, pt2);
         R76_ACC(prof, submit_us, pt);
-        if (!stamp) break;
+
+        /* THE DIVISOR LAG, WHICH IS A DIFFERENT HAZARD AND HAS TO BE ASKED FIRST.
+         *
+         * A padded average pool intermittently divides an output window by the previous
+         * window's tap count. The surface is written in full, so the check below cannot
+         * see it; the per-layer entry checks it against its own input and redoes its
+         * submit, and inside a kick nothing runs between the programs, so this is where
+         * that check lives. Only a padded average pool has any position where it can show,
+         * so a run with none pays nothing.
+         *
+         * BEFORE the write check because that loop RE-STAMPS as it goes: the check reads
+         * the pool's producer, which is an earlier member of this same run, and a sentinel
+         * written over it first would leave nothing to check against. It also runs when
+         * the sentinel is off entirely, and under ROCKET_RK3576_GUARD_PER_KICK, because
+         * neither is what this hazard is about.
+         *
+         * A surface that was never written at all is the POISONING, and is left to the
+         * loop below with the power cycle it needs — asked here first so a dead kick is
+         * not redone eight times as a lagging divisor. */
+        pt = R76_PT(prof);
+        for (i = 0; i < c->n && !lag_bad; i++) {
+            struct r76_chain_layer *L = &c->layer[i];
+            unsigned missing = 0;
+            size_t off = 0;
+            rocket_bo *surf;
+            if (L->h || !rocket_pool_int8_rk3576_lag_observable(L->p)) continue;
+            surf = r76_layer_surf(L, &off);
+            rocket_bo_prep(fd, surf, 0, 2000000000ull);
+            if (!stamp || r76_all_wrote((const unsigned char *)surf->ptr,
+                                        c->ext + L->task0, L->ntask, stamp, &missing)) {
+                if (!rocket_pool_int8_rk3576_lag_check(fd, L->p,
+                                                       (const char *)surf->ptr + off))
+                    lag_bad = i + 1u;
+                prof.lag_checks++;
+            }
+            rocket_bo_fini(fd, surf);
+            /* This bracket and the one the check takes over the producer's cube are the
+             * LAG's, not the guard's: only a padded average pool pays them and a run
+             * without one pays neither. */
+            prof.lag_brackets += 2;
+            prof.lag_bytes += surf->size + rocket_pool_int8_rk3576_lag_src_bytes(L->p);
+        }
+        R76_ACC(prof, lag_us, pt);
+        if (lag_bad) goto redo;
+        if (!stamp) { R76_ACC_REDO(prof, rt, redoing); break; }
         pt = R76_PT(prof);
 
         /* EVERY LAYER, not the last one. A dead program leaves its own surface holding the
@@ -4323,6 +4691,9 @@ int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 
          * cost of the guard is the BRACKET, not the fill. Reading a surface and then
          * re-stamping it in a second bracket pays that twice for one CPU visit.
          *
+         * AND ONE BRACKET PER BO, not per layer — see r76_guard_open. Every layer is still
+         * checked; the buffer several of them share is only synced once.
+         *
          * The order is safe: the redo path below re-stamps every surface anyway, so a layer
          * stamped here before a LATER one is found bad loses nothing. */
         for (i = i0; i < c->n && bad == c->n; i++) {
@@ -4331,7 +4702,14 @@ int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 
             unsigned missing = 0;
             size_t off = 0;
             rocket_bo *surf = r76_layer_surf(L, &off);
-            rocket_bo_prep(fd, surf, 0, 2000000000ull);
+            int opened;
+            nr = r76_guard_ranges(L, c->ext + L->task0, rng);
+            opened = nr ? 1 : r76_guard_open(c, surf);
+            if (opened) {
+                rocket_bo_prep_ranges(fd, surf, rng, nr, 2000000000ull);
+                prof.brackets++;
+                prof.guard_bytes += r76_guard_walked(surf, rng, nr);
+            }
             /* The extents carry the slice's own base, so this is the BO's pointer. */
             if (!r76_all_wrote((const unsigned char *)surf->ptr,
                                c->ext + L->task0, L->ntask, stamp, &missing)) {
@@ -4353,36 +4731,67 @@ int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 
                 if (!r76_layer_restamp_ok(L)) {
                     if (hi) hi->tile[0].stamped = 0;
                 } else {
-                    memset((char *)surf->ptr + off, stamp, r76_layer_obytes(L));
+                    r76_stamp_timed(&prof, L, (unsigned char *)surf->ptr, off,
+                                    c->ext + L->task0, stamp);
                     hi->tile[0].stamped = 1;
                 }
             }
-            rocket_bo_fini(fd, surf);
+            if (nr) rocket_bo_fini_ranges(fd, surf, rng, nr);
         }
+        r76_guard_close(fd, c);
         R76_ACC(prof, verify_us, pt);
-        if (bad == c->n) break;
+        if (bad == c->n) { R76_ACC_REDO(prof, rt, redoing); break; }
         ROCKET_LOGD("%s: layer %u's row task %u wrote nothing on attempt %u; cycling the "
                     "power domain and redoing the WHOLE chain, which is one kick and "
                     "cannot be restarted in the middle\n",
                     entry, bad, bad_task, attempt + 1u);
+        attempt++;
         rocket_rk3576_power_idle();
+        goto restamp;
+redo:
+        /* A LAG ARRIVES HERE WITHOUT THE POWER CYCLE. It is not the poisoning: the surface
+         * was written, the arithmetic is one output position stale, and a domain collapse
+         * is neither necessary nor sufficient to clear it — redoing the submit is. */
+        ROCKET_LOGD("%s: layer %u's divisor lagged one output position; redoing the WHOLE "
+                    "chain (redo %u)\n", entry, lag_bad - 1u, lagged + 1u);
+        prof.lag_redos++;
+        if (++lagged >= rocket_pool_int8_rk3576_lag_attempts()) {
+            ROCKET_LOGE("%s: layer %u's divisor lagged on %u redo(s) and the surface was "
+                        "never right\n", entry, lag_bad - 1u, lagged);
+            return ROCKET_E_DEVICE;
+        }
+restamp:
         pt = R76_PT(prof);
         /* Every CHECKED surface goes back to the sentinel: a partial chain left some of them
-         * written and a redo has to be able to tell again. */
-        for (i = i0; i < c->n; i++) {
-            struct r76_chain_layer *L = &c->layer[i];
-            size_t off = 0;
-            rocket_bo *surf = r76_layer_surf(L, &off);
-            rocket_bo_prep(fd, surf, 1, 0);
-            memset((char *)surf->ptr + off, stamp, r76_layer_obytes(L));
-            rocket_bo_fini(fd, surf);
+         * written and a redo has to be able to tell again. Nothing to put back when the
+         * sentinel is off — a lag redo reaches here in that state, and a memset of zeros
+         * would be a surface the next kick's consumers read rather than a marker. */
+        if (stamp) {
+            for (i = i0; i < c->n; i++) {
+                struct r76_chain_layer *L = &c->layer[i];
+                size_t off = 0;
+                rocket_bo *surf = r76_layer_surf(L, &off);
+                int opened;
+                nr = r76_guard_ranges(L, c->ext + L->task0, rng);
+                opened = nr ? 1 : r76_guard_open(c, surf);
+                if (opened) {
+                    rocket_bo_prep_ranges(fd, surf, rng, nr, 0);
+                    prof.brackets++;
+                    prof.guard_bytes += r76_guard_walked(surf, rng, nr);
+                }
+                r76_stamp_timed(&prof, L, (unsigned char *)surf->ptr, off,
+                                c->ext + L->task0, stamp);
+                if (nr) rocket_bo_fini_ranges(fd, surf, rng, nr);
+            }
+            r76_guard_close(fd, c);
         }
         R76_ACC(prof, stamp_us, pt);
-        if (attempt + 1u == attempts) {
+        if (!lag_bad && attempt == attempts) {
             ROCKET_LOGE("%s: layer %u wrote nothing over %u attempts\n",
                         entry, bad, attempts);
             return ROCKET_E_DEVICE;
         }
+        R76_ACC_REDO(prof, rt, redoing);
     }
 
     /* The de-scatter, and the next call's sentinel, in ONE bracket — the trick the per-layer
@@ -4393,18 +4802,9 @@ int rocket_conv2d_int8_chain_run_rk3576(int fd, rocket_conv2d_int8_chain_rk3576 
     size_t loff = 0;
     rocket_bo *lsurf = r76_surf(last, 0, &loff);
     rocket_bo_prep(fd, lsurf, 0, 2000000000ull);
-    if (!last->cube_out) {
-        const int8_t *o = (const int8_t *)lsurf->ptr + loff;
-        size_t px = (size_t)last->oh * last->ow;
-        unsigned cc, k, tile_oc = last->tile[0].tile_oc;
-        for (cc = 0; cc < tile_oc; cc += C2) {
-            unsigned m = tile_oc - cc < C2 ? tile_oc - cc : C2;
-            int8_t *dp[C2];
-            for (k = 0; k < m; k++)
-                dp[k] = out + (size_t)r76_oc_of(last->perm, last->tile[0].oc0 + cc + k) * px;
-            r76_c2_unpack(dp, m, o + (size_t)(cc / C2) * last->surf_elems * C2, px);
-        }
-    }
+    if (!last->cube_out)
+        r76_descatter(last, (const int8_t *)lsurf->ptr + loff, out,
+                      last->tile[0].oc0, last->tile[0].tile_oc);
     /* The LAST layer's own sentinel. Every other layer took its stamp in the verify bracket
      * above; this one could not, because the de-scatter here has to read the surface first.
      *

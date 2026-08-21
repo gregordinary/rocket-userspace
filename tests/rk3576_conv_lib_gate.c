@@ -744,6 +744,147 @@ static int rowbound(int fd)
     return 0;
 }
 
+/* ---- the row allowance as a LAW rather than a bound -------------------------------
+ * `rowbound` above measures the shipped planner against the part on the shapes a graph
+ * runs. This asks the question underneath it: WHAT does the part charge the feature
+ * side for the weights beside it? The shipped model charges the whole weight cube —
+ * groups x slice — which is under the one measurement that exists and is therefore a
+ * safe bound and not the rule. Two quantities a real fix needs: whether the deficit
+ * scales with the output-channel GROUP COUNT or is a fixed reserve, and where the
+ * pool's own ceiling is.
+ *
+ * THE INSTRUMENT IS THE PLANE HEIGHT, NOT A FORCED ROW CAP. A cap on a tall plane does
+ * not become the window: the planner counts greedily and then spreads the output rows
+ * EVENLY over that many tasks, so a 112-row plane at a 96-row cap comes out as two
+ * 62-row windows and the footprint under test is never staged. So each case is a plane
+ * of exactly the height being probed, VALID-padded at stride one, which lays out as ONE
+ * task whose feature footprint is exactly `ih * entries` granules. The RE knob
+ * ROCKET_RK3576_ROW_CAP_PROBE is what lets the planner emit a window it would not have
+ * chosen; the emitter's own per-task allowance check still governs, so the reachable
+ * region ends at the data-side cap of 6144 granules.
+ *
+ * The two models this separates, at a fixed slice and a rising group count:
+ *
+ *   whole cube      ceiling = POOL - groups * slice     falls by one slice per group
+ *   fixed reserve   ceiling = POOL - slice - R          does not move at all
+ *
+ * and a third the stem already refutes — that the charge is against the PROGRAMMED
+ * allowance 4096+F rather than the staged footprint — since 48 rows of a 112-granule
+ * row compute at F=2048 where that model allows 45.
+ *
+ * MEASURES, does not assert: it prints the ceiling, the granule arithmetic and the pool
+ * each model backs out to. A failure at the ceiling costs the surface guard's eight
+ * power cycles, and the bisection confirms every failure twice, because a bisection over
+ * an intermittent reports the wrong bound.
+ */
+struct rowlaw_case { const char *name; unsigned ic, oc, iw, k; };
+
+static const struct rowlaw_case ROWLAW[] = {
+    /* A — the output-channel GROUP COUNT, with the slice held at 49 KiB. */
+    { "k7-ic32-g1",  32,  32, 112, 7 },
+    { "k7-ic32-g2",  32,  64, 112, 7 },
+    { "k7-ic32-g3",  32,  96, 112, 7 },
+    { "k7-ic32-g4",  32, 128, 112, 7 },
+    { "k7-ic32-g5",  32, 160, 112, 7 },
+    { "k7-ic32-g6",  32, 192, 112, 7 },
+    /* B — the SLICE, at group counts that put the ceiling inside the reachable
+     *     window. If the deficit is the cube, the step per group tracks the slice. */
+    { "k5-ic32-g4",  32, 128, 112, 5 },
+    { "k5-ic32-g6",  32, 192, 112, 5 },
+    { "k5-ic32-g8",  32, 256, 112, 5 },
+    { "k3-ic64-g4",  64, 128, 112, 3 },
+    { "k3-ic64-g6",  64, 192, 112, 3 },
+    { "k3-ic64-g8",  64, 256, 112, 3 },
+    /* C — the same cube at a different WIDTH, so a per-row term would show up as a
+     *     ceiling that moves with `entries` rather than with the granule total. */
+    { "k7-ic32-g4-w56",  32, 128,  56, 7 },
+    { "k7-ic32-g4-w224", 32, 128, 224, 7 },
+};
+#define N_ROWLAW ((int)(sizeof ROWLAW / sizeof *ROWLAW))
+
+/* One plane height, run as a single task. 0 = computed bit-exactly. */
+static int rowlaw_try_st(int fd, const struct rowlaw_case *s, unsigned ih,
+                         struct lg_stat *st)
+{
+    char buf[32];
+    int rc;
+
+    snprintf(buf, sizeof buf, "%u", ih);
+    setenv("ROCKET_RK3576_ROW_CAP_PROBE", buf, 1);
+    rc = run_one(fd, s->name, s->ic, s->oc, s->iw, ih, s->k, 1, 0 /*VALID*/, 0,
+                 0, 0, 0, 0, st);
+    unsetenv("ROCKET_RK3576_ROW_CAP_PROBE");
+    return rc;
+}
+
+static int rowlaw_try(int fd, const struct rowlaw_case *s, unsigned ih)
+{
+    struct lg_stat st;
+    return rowlaw_try_st(fd, s, ih, &st);
+}
+
+static int rowlaw(int fd)
+{
+    int i;
+
+    printf("rowlaw: the tallest single-task plane the part stages, in granules, against\n"
+           "        the weight cube beside it. `slice` is 32*ic*kh*kw and `cube` is\n"
+           "        groups*slice, both in 64-byte granules. POOL is what each model\n"
+           "        backs out to: feature + cube, and feature + one slice.\n");
+    printf("  %-18s %6s %6s %4s %6s  %5s %7s  %7s %7s\n",
+           "case", "entries", "slice", "grp", "cube", "rows", "feature", "+cube", "+slice");
+    for (i = 0; i < N_ROWLAW; i++) {
+        const struct rowlaw_case *s = &ROWLAW[i];
+        unsigned entries = (s->iw * s->ic + 63u) / 64u;
+        unsigned slice   = (32u * s->ic * s->k * s->k + 63u) / 64u;
+        unsigned groups  = (s->oc + 31u) / 32u;
+        unsigned cube    = groups * slice;
+        unsigned lo = s->k, hi = 6144u / entries, mid, measured = 0;
+        int censored;
+
+        if (hi < lo) { printf("  %-18s a single row is past the data cap\n", s->name);
+                       continue; }
+        /* The top of the range is the data-side cap, which the emitter refuses past.
+         * Confirm it twice before believing it, then bisect. */
+        if (rowlaw_try(fd, s, hi) == 0 && rowlaw_try(fd, s, hi) == 0) {
+            measured = hi;
+        } else {
+            while (lo <= hi) {
+                mid = lo + (hi - lo) / 2u;
+                if (rowlaw_try(fd, s, mid) == 0) { measured = mid; lo = mid + 1u; }
+                else if (rowlaw_try(fd, s, mid) == 0) { measured = mid; lo = mid + 1u; }
+                else { if (mid == s->k) break; hi = mid - 1u; }
+            }
+        }
+        censored = measured && measured == 6144u / entries;
+        if (!measured) { printf("  %-18s nothing computed\n", s->name); continue; }
+        printf("  %-18s %6u %6u %4u %6u  %5u %7u  %7u %7u%s\n",
+               s->name, entries, slice, groups, cube, measured, measured * entries,
+               measured * entries + cube, measured * entries + slice,
+               censored ? "  (at the data cap — a lower bound)" : "");
+        /* WHAT PAST THE ALLOWANCE LOOKS LIKE. A task that never wrote is caught by the
+         * surface guard and costs a fallback; one that writes a WRONG surface is silent,
+         * and the two are a different item entirely. `wrong_zero` is an element the DPU
+         * never emitted (the calloc'd zero) and `wrong_val` is arithmetic. */
+        if (!censored) {
+            struct lg_stat st;
+            int rc = rowlaw_try_st(fd, s, measured + 1u, &st);
+            if (rc == 0)
+                printf("  %-18s   ONE ROW PAST IT COMPUTED — the bound above is not "
+                       "reproducing\n", "");
+            else if (rc != 1 || !st.total)
+                printf("  %-18s   one row past it: the entry refused (rc=%d)\n", "", rc);
+            else
+                printf("  %-18s   one row past it: %d/%d exact, %d never emitted, "
+                       "%d wrong-valued, maxdiff %d, rows %d-%d of %u\n", "",
+                       st.exact, st.total, st.wrong_zero, st.wrong_val, st.maxdiff,
+                       st.span_y0, st.span_y1, measured + 1u - s->k + 1u);
+        }
+    }
+    printf("== rowlaw MEASURES; the assertion is in the conv and net gates ==\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *filter = getenv("ROCKET_LG_FILTER");
@@ -757,10 +898,11 @@ int main(int argc, char **argv)
     const char *groups[16];
     int ngroups = 0;
 
-    int want_rowbound = 0;
+    int want_rowbound = 0, want_rowlaw = 0;
     for (a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-l")) list = 1;
         else if (!strcmp(argv[a], "rowbound")) want_rowbound = 1;
+        else if (!strcmp(argv[a], "rowlaw")) want_rowlaw = 1;
         else if (!strcmp(argv[a], "all")) ngroups = 0;
         else if (ngroups < 16) groups[ngroups++] = argv[a];
     }
@@ -792,8 +934,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (want_rowbound) {
-        int rc = rowbound(fd);
+    if (want_rowbound || want_rowlaw) {
+        int rc = want_rowbound ? rowbound(fd) : 0;
+        if (want_rowlaw) rc |= rowlaw(fd);
         rocket_close(fd);
         return rc;
     }

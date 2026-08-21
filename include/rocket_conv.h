@@ -86,22 +86,40 @@ typedef struct {
      * packed-image sub-encoding, which interleaves the channels per pixel and carries
      * three silent geometry bounds (a non-zero left pad, an output width of exactly
      * iw/stride, and that width also a multiple of 16), and the ordinary direct one,
-     * whose int8 cube is a 32-channel MAC group whatever the count — so ic 3 and ic 32
-     * are the SAME register program, the same weight-cube size and the same feature-cube
-     * size, and the channels past ic are the cube's own zero padding. The zero-point fold
-     * is over the LIVE tap count, so the arithmetic is exact at any zero point.
+     * whose int8 cube is a 32-channel MAC group
+     * whatever the count — so ic 3 and ic 32 are the SAME register program, the same
+     * weight-cube size and the same feature-cube size, and the channels past ic are the
+     * cube's own zero padding. The zero-point fold is over the LIVE tap count, so the
+     * arithmetic is exact at any zero point.
      *
-     * That makes the direct path the general one: no geometry bound, and nothing to
-     * widen on the host. It costs the packed-image path's smaller feature read, which is
-     * why the choice is the caller's — measured on this part, the packed-image form wins
-     * a transient call and loses a resident one, where the host scatter is what remains.
+     * WHAT SEPARATES THEM IS THE MAC COUNT. A convolution's execution on this part is
+     * 0.218 ms + 1.246e-3 ms per PROGRAMMED MMAC, and the direct lowering of a
+     * three-channel stem programs a 32-channel group — so at 224x224 k7 s2 the packed
+     * form is 8.0x fewer MACs and 7.2x on exec+drain, a measured 1.566 ms. What it costs
+     * is the host image pack, which moves ~10x fewer bytes at ~10x worse throughput.
      *
-     * Set it and rocket_conv2d_int8_rk3576(), _pack_rk3576(), _perchannel_rk3576() and
-     * _act_rk3576() take the direct path at any ic. Clear (every caller that memsets this
-     * struct) keeps the packed-image routing at ic <= 4. The RK3576 fp16 entry refuses
-     * it — its direct path has a different channel granularity and no gate at ic <= 4 —
-     * and the RK3588 paths never take a packed-image encoding at all, so it is already
-     * true there and accepted. */
+     * A NON-ZERO INPUT ZERO POINT IS NOT ONE OF ITS BOUNDS. That sub-encoding's pad COLUMNS
+     * feed the MAC a constant 0 whatever CNA_PAD_CON1 holds — its pad rows and corners
+     * honour the register — so the int8 entries MATERIALISE those columns instead of letting
+     * the hardware synthesize them: the image is programmed one 16-output granule wider with
+     * the extension at the input zero point, and the surplus output columns are cropped in
+     * the de-scatter. Bit-exact against the direct lowering over kernels 3/5/7, both
+     * strides, model pads 1/2/3 and both signs of zero point. It is invisible from here —
+     * the descriptor and both buffers are the caller's own geometry — and what it costs is
+     * the surplus columns' MACs and a de-scatter that walks rows. The one thing it forecloses
+     * is leaving a CUBE for the next layer: the surface is wider than the caller's plane, and
+     * a plane's ROW stride is implied by iw with no register to move it.
+     *
+     * That makes the packed form the one to take where its bounds are met, and the direct
+     * path the general one: no geometry bound, nothing to widen on the host, and an output
+     * that can be a consumer's cube. Set the flag and rocket_conv2d_int8_rk3576(), _pack_rk3576(),
+     * _perchannel_rk3576() and _act_rk3576() take the direct path at any ic. Clear (every
+     * caller that memsets this struct) keeps the packed-image routing at ic <= 4, where
+     * the per-axis and fused-activation entries refuse it — those two levers are the
+     * direct path's and are not claimed on this encoding. The RK3576 fp16 entry refuses
+     * the flag — its direct path has a different channel granularity and no gate at
+     * ic <= 4 — and the RK3588 paths never take a packed-image encoding at all, so it is
+     * already true there and accepted. */
     int direct_datapath;
 } rocket_conv2d_desc;
 
@@ -367,10 +385,14 @@ void rocket_conv_transpose2d_ref_fp16(const rocket_conv_transpose2d_desc *d,
  * exactly across the pair. It is the form every per-tensor TFLite depthwise filter
  * carries. The bound is the pair's own range, [-256, 254].
  *
+ * IC <= 4 takes the CNA's packed-image first-conv sub-encoding on the direct entry, and
+ * the depthwise one has no such form to be routed to — the channel fold leaves nothing to
+ * be depthwise over — so it refuses that count. rocket_conv2d_desc.direct_datapath runs a
+ * narrow count on the ordinary datapath instead; the trade is documented there.
+ *
  * Refused rather than approximated: dilation (no RK3576 shape has been run through the
- * rate fields); IC <= 4, which takes the CNA's ARGB first-conv sub-encoding whose
- * weight cube is not decoded; and a shape whose resident weight slice does not fit even
- * one output-channel group, which needs an input-channel split that the on-chip requant
+ * rate fields), and a shape whose resident weight slice does not fit even one
+ * output-channel group, which needs an input-channel split that the on-chip requant
  * forecloses.
  *
  * Bit-exact against a CPU model over tests/rk3576_conv_lib_gate.c. [HW sweep, H96 MAX M9] */
@@ -597,10 +619,14 @@ int rocket_residual_fuse_weight_rk3576(float in_scale, float w_scale, float skip
  * the caller's own W, where a transient call holds one tile's.
  *
  * NOT thread-safe: one handle carries the scratch a call writes through, so concurrent
- * prepacked calls on ONE handle race. Pack per thread, or serialize. Refuses four or
- * fewer input channels on the direct path (the packed-image first conv is a different
- * program whose cube this does not pack) and returns NULL for anything the per-call
- * entries would refuse. */
+ * prepacked calls on ONE handle race. Pack per thread, or serialize. It packs the
+ * PACKED-IMAGE first conv's cube as well as the direct one — four or fewer input channels
+ * take that encoding unless the descriptor sets `direct_datapath` — and returns NULL for
+ * anything the per-call entries would refuse. A packed-image handle may not take a cube
+ * IN (its feature buffer is an interleaved image, so it can only begin a run); its output
+ * side is an ordinary cube and joins normally — UNLESS it materialises its pad columns for
+ * a non-zero input zero point, where the surface is wider than the caller's plane and every
+ * cube entry refuses it. */
 typedef struct rocket_conv2d_int8_weights_rk3576 rocket_conv2d_int8_weights_rk3576;
 
 rocket_conv2d_int8_weights_rk3576 *
@@ -653,6 +679,26 @@ typedef struct rocket_rk3576_cube {
      * is whatever wrote there, and the join is refused at a non-zero weight zero point. */
     unsigned  pad_from;    /* first channel of the constant tail; 0 = not declared    */
     int       pad_value;   /* what channels [pad_from, groups*16) hold                */
+    /* THE ROW PITCH, when the buffer holding this plane is WIDER than the plane. The
+     * packed-image first conv materialises its pad columns and so programs a wider
+     * output extent than the caller asked for — at ResNet-18's stem a 128-wide surface
+     * for a 112-wide tensor — and the surplus columns sit between the rows the consumer
+     * wants. 0 means the rows are contiguous, `pitch_w == w`, which is every other
+     * producer on this part.
+     *
+     * ONLY A POOL CAN READ ONE. The PPU carries the consumed extent (`0x600C`) and the
+     * DDR line stride (`0x7024`) in different registers and honours a pitch above the
+     * extent [HW sweep, tests/rk3576_row_pitch.c: 16 cells over four geometries at gaps
+     * of 1/4/16/64, each against a control that leaves the pitch derived and differs].
+     * The CNA's feature DMA carries the width and the line stride as one quantity in two
+     * units, so a CONVOLUTION consumer has no such register and refuses this cube. */
+    unsigned  pitch_w;     /* elements per row in `bo`; 0 = w (rows contiguous)      */
+    /* THE FIRST COLUMN, when the plane does not start at the left edge of those rows.
+     * A materialising stem discards its leading output column — the one the hardware
+     * still synthesises — so the caller's tensor is a sub-rectangle of the surface and
+     * not a prefix of it. The PPU's source base is a plain address at atom granularity
+     * [HW sweep, tests/rk3576_row_pitch.c: offsets 1/3/8 over four geometries]. */
+    unsigned  col_off;     /* elements into each row where the plane starts; 0 = 0    */
 } rocket_rk3576_cube;
 
 /* ---- a cube that is a SLICE of a larger buffer ------------------------------
@@ -686,6 +732,20 @@ void rocket_rk3576_cube_free(int fd, rocket_rk3576_cube *buf);
  * while `buf` is. Refuses a `c0` that is not a multiple of 16 and a range past the end. */
 int rocket_rk3576_cube_slice(const rocket_rk3576_cube *buf, unsigned c0, unsigned c,
                              rocket_rk3576_cube *out);
+
+/* Narrow a cube to `live` channels and state what the groups past them hold.
+ *
+ * A slice is sized from its LIVE channels, which is what a PRODUCER needs — it writes
+ * exactly its own groups — and one group short of what a CONSUMER needs when its input
+ * count is not a multiple of 32: the feature DMA walks round32(ic), and at a non-zero
+ * weight zero point the coefficient group's B term sums those channels. A concatenation
+ * buffer allocated to the round-32 count carries them; this is how the reader is told
+ * that it does, and with what constant. The caller is asserting a fact about the BYTES —
+ * that nothing writes anything else there — exactly as a producer handle does when it
+ * declares its own partial output group.
+ *
+ * Refuses a `live` count past the channels the cube already carries. */
+int rocket_rk3576_cube_declare_tail(rocket_rk3576_cube *c, unsigned live, int value);
 
 /* Describe this handle's output surface as a cube. Refuses a handle whose output
  * channels are split across more than one tile — each tile owns its own buffer and
@@ -866,11 +926,27 @@ unsigned rocket_conv2d_int8_programs_rk3576(const rocket_conv2d_int8_weights_rk3
  * de-scattered, and both are host work the stream exists to remove; the run finder
  * therefore never starts or ends a run on a pool, and the constructor refuses one.
  *
+ * A third kind carries NO PROGRAM AT ALL. A channel CONCATENATION whose operands are
+ * placed slices of one buffer is a name for an address: its producers wrote those bytes
+ * themselves and its consumers read the buffer as a cube, so there is nothing to run and
+ * nothing for the host to do. Left UNSET such a layer would break every run it sits in,
+ * which on a graph built out of concatenated branches is every run there is — so it is
+ * declared instead, and the finder spans it:
+ *
+ *   nodes[k].placement = 1;           // neither conv nor pool
+ *
+ * A placement node contributes zero programs, is exempt from both run conditions (it
+ * neither reads nor leaves a cube), and like a pool may only be INTERIOR — one at either
+ * end would extend a run by a layer that does nothing. It is the CALLER's statement that
+ * no host work happens at this layer; the library cannot see that, exactly as it cannot
+ * see that a caller prepares a layer's input on the host.
+ *
  * The convolution-only entries above are these with every node a `conv`, and are kept
  * because most callers have no pooling layer to place. There is one implementation. */
 typedef struct {
     rocket_conv2d_int8_weights_rk3576 *conv;
     rocket_pool_int8_rk3576_handle    *pool;
+    int                                placement;  /* a layer with no program at all */
 } rocket_chain_node_rk3576;
 
 rocket_conv2d_int8_chain_rk3576 *

@@ -1,0 +1,219 @@
+A DEBUG INSTRUMENT, NOT A SERIES PATCH. Do not put it in an image.
+
+What it is for. A caller times one interval around a submit -- the ioctl, then a wait
+on the job's fence -- and on a graph that runs as one hardware kick that interval is
+61-81% of the wall. From userspace it is opaque: there is no way to tell the part
+running programs from the driver taking its time getting to them, and a performance
+claim against the biggest term in a profile needs to know which it is.
+
+This adds five microsecond accumulators to the RK3576 polled completion path, exposed
+as writable module parameters, splitting that interval at the events only the driver
+can see: the scheduler wakeup, the register programming, the kick's own execution, the
+writing block's drain, and the fence signal. A sixth (`stat_total_us`, push -> fence
+signal) is what says the five account for the caller's own number.
+
+Applying it. The out-of-tree directories on the board are FLAT, so `patch -p4`, not -p1:
+
+    cp -a ~/rocketoot_range ~/rocketoot_dbg && cd ~/rocketoot_dbg
+    rm -f *.o *.ko *.mod *.mod.c modules.order
+    patch -p4 --forward < rk3576-job-timing-debug.patch
+    make -C ~/ksrc/linux-<ver> M=$PWD modules
+
+The accumulators are `unsigned int`, not `unsigned long long`, deliberately: a rebuild
+that imports a symbol the shipped module never did (`param_ops_ullong`) fails modpost
+with "undefined!" for a symbol the kernel plainly exports, and working around that
+means harvesting a CRC with tools/mksymvers.py. `uint` holds 71 minutes of accumulated
+job time, which is far more than any one measurement arm.
+
+Reading it.
+
+    P=/sys/module/rocket/parameters
+    for s in jobs tasks wakeup_us prologue_us exec_us drain_us signal_us total_us drain0; do
+        echo 0 | sudo tee $P/stat_$s >/dev/null; done
+    ... run the arm ...
+    for s in ...; do printf '%s=%s ' $s "$(cat $P/stat_$s)"; done
+
+A gate binary runs setup jobs before its bench loop, so `jobs` exceeds the iteration
+count and a plain average is contaminated by them. Take bench(2N) minus bench(N): the
+fixed setup cancels and the difference is exactly N clean inferences.
+
+Two things the numbers mean less than they look like. `exec` is quantised UP by the
+poll period (default 50 us), because it ends at the tick that OBSERVES the kick over,
+so it is an upper bound on the part's own time by up to one period -- confirm with an
+A/B on `poll_interval_us`. And `drain` is only the part of the writing block's drain
+that had not already finished when that tick landed: on a one-kick graph it reads near
+zero, and `drain0` counting every job is what says the completion bit was already up.
+
+--- a/drivers/accel/rocket/rocket_job.c	2026-08-02 14:31:04.868415171 -0400
++++ b/drivers/accel/rocket/rocket_job.c	2026-08-02 14:34:57.579745833 -0400
+@@ -91,6 +91,55 @@
+ #define ROCKET_POLL_BACKSTOP_US (JOB_TIMEOUT_MS * USEC_PER_MSEC / 4)
+ 
+ /*
++ * INSTRUMENT -- DEBUG BUILD ONLY, not part of the series.
++ *
++ * A caller times one interval around a submit: the ioctl, then a wait on the
++ * job's fence.  That interval is the largest single bucket of every graph this
++ * driver runs, and from userspace it is opaque -- there is no way to tell the
++ * part running programs from the driver taking its time getting to them.  The
++ * five accumulators below split it at the events only the driver can see:
++ *
++ *   wakeup    the job is pushed to drm_sched -> .run_job is entered
++ *   prologue  .run_job entry -> OPERATION_ENABLE is written (the kick starts).
++ *             Carries pm_runtime_get_sync, the IOMMU attach test and the
++ *             register programming of the first task.
++ *   exec      the kick starts -> a poll sees every task of it retired
++ *             (PC_DONE plus a zero PC_TASK_STATUS).  Quantised UP by the poll
++ *             period, so it is an upper bound on the part's own time by up to
++ *             one period.
++ *   drain     that -> the writing block raises its own completion.  Quantised
++ *             the same way; `drain0` counts the jobs whose completion was
++ *             already up on the tick that saw the kick over, whose true drain
++ *             is therefore under one poll period rather than zero.
++ *   signal    that -> the fence is signalled from the poll work item.
++ *
++ * `total` is push -> fence signal, which a caller's own interval should very
++ * nearly reproduce, and is what says the five terms account for it.
++ *
++ * All are microsecond sums over `jobs` jobs, in unsigned int (71 minutes of
++ * accumulated job time before it wraps -- zero them per arm), writable so a
++ * caller can zero them between arms.  Reading them costs the hot path five ktime_get() calls a job.
++ */
++static unsigned int rkt_stat_jobs;
++static unsigned int rkt_stat_wakeup_us;
++static unsigned int rkt_stat_prologue_us;
++static unsigned int rkt_stat_exec_us;
++static unsigned int rkt_stat_drain_us;
++static unsigned int rkt_stat_signal_us;
++static unsigned int rkt_stat_total_us;
++static unsigned int rkt_stat_drain0;
++static unsigned int rkt_stat_tasks;
++module_param_named(stat_jobs, rkt_stat_jobs, uint, 0644);
++module_param_named(stat_wakeup_us, rkt_stat_wakeup_us, uint, 0644);
++module_param_named(stat_prologue_us, rkt_stat_prologue_us, uint, 0644);
++module_param_named(stat_exec_us, rkt_stat_exec_us, uint, 0644);
++module_param_named(stat_drain_us, rkt_stat_drain_us, uint, 0644);
++module_param_named(stat_signal_us, rkt_stat_signal_us, uint, 0644);
++module_param_named(stat_total_us, rkt_stat_total_us, uint, 0644);
++module_param_named(stat_drain0, rkt_stat_drain0, uint, 0644);
++module_param_named(stat_tasks, rkt_stat_tasks, uint, 0644);
++
++/*
+  * Is this kick over -- every task of it retired?
+  *
+  * PC_DONE is raised per TASK, not per kick.  On a batched job the two PC_DONE
+@@ -443,6 +492,7 @@
+ 
+ 		kref_get(&job->refcount); /* put by scheduler job completion */
+ 
++		job->t_push = ktime_get();	/* INSTRUMENT */
+ 		drm_sched_entity_push_job(&job->base);
+ 	}
+ 
+@@ -519,6 +569,8 @@
+ 	struct rocket_device *rdev = job->rdev;
+ 	struct rocket_core *core = sched_to_core(rdev, sched_job->sched);
+ 	struct dma_fence *fence = NULL;
++	ktime_t t_run = ktime_get();	/* INSTRUMENT */
++	bool first = job->next_task_idx == 0;
+ 	int ret;
+ 
+ 	if (unlikely(job->base.s_fence->finished.error))
+@@ -609,6 +661,14 @@
+ 		rocket_job_hw_submit(core, job);
+ 	}
+ 
++	/* INSTRUMENT: only the first kick of a job has a push to measure from,
++	 * and only the polled path stamps poll_started_at. */
++	if (first && core->soc->poll_completion && job->t_push) {
++		rkt_stat_wakeup_us += ktime_us_delta(t_run, job->t_push);
++		rkt_stat_prologue_us += ktime_us_delta(core->poll_started_at, t_run);
++		rkt_stat_tasks += job->task_count;
++	}
++
+ 	return fence;
+ 
+ err_unstarted:
+@@ -656,12 +716,19 @@
+ 	 */
+ 	raw = rocket_pc_readl(core, INTERRUPT_RAW_STATUS);
+ 	if (rocket_poll_kick_over(core, raw)) {
+-		if (raw & core->poll_done_mask)
+-			goto complete;
++		/* INSTRUMENT: stamp the kick being over BEFORE the completion
++		 * test, so the exec/drain split exists on the path where the
++		 * writing block's bit is already up on this same tick.  The
++		 * grace test below reads 0 >= grace on the tick that sets it,
++		 * so the wait is unchanged. */
+ 		if (!core->poll_kick_over_at)
+ 			core->poll_kick_over_at = ktime_get();
+-		else if (ktime_us_delta(ktime_get(), core->poll_kick_over_at) >=
+-			 (s64)core->poll_grace_us)
++		if (raw & core->poll_done_mask) {
++			rkt_stat_drain0++;
++			goto complete;
++		}
++		if (ktime_us_delta(ktime_get(), core->poll_kick_over_at) >=
++		    (s64)core->poll_grace_us)
+ 			goto complete;
+ 	} else if (ktime_us_delta(ktime_get(), core->poll_started_at) >=
+ 		   (s64)ROCKET_POLL_BACKSTOP_US) {
+@@ -675,6 +742,14 @@
+ 	return HRTIMER_RESTART;
+ 
+ complete:
++	/* INSTRUMENT */
++	core->poll_complete_at = ktime_get();
++	if (core->poll_kick_over_at) {
++		rkt_stat_exec_us += ktime_us_delta(core->poll_kick_over_at,
++						   core->poll_started_at);
++		rkt_stat_drain_us += ktime_us_delta(core->poll_complete_at,
++						    core->poll_kick_over_at);
++	}
+ 	core->poll_kick_over_at = 0;
+ 	atomic_set(&core->poll_active, 0);
+ 	schedule_work(&core->poll_work);
+@@ -719,6 +794,20 @@
+ 				return;
+ 			}
+ 
++			/* INSTRUMENT: the last two intervals, taken here so
++			 * `signal` covers the work-item wakeup AND this
++			 * function's own register writes. */
++			if (core->soc->poll_completion && core->poll_complete_at) {
++				ktime_t now = ktime_get();
++
++				rkt_stat_signal_us += ktime_us_delta(now, core->poll_complete_at);
++				if (core->in_flight_job->t_push)
++					rkt_stat_total_us += ktime_us_delta(now,
++						core->in_flight_job->t_push);
++				rkt_stat_jobs++;
++				core->poll_complete_at = 0;
++			}
++
+ 			dma_fence_signal(core->in_flight_job->done_fence);
+ 			pm_runtime_put_autosuspend(core->dev);
+ 			core->in_flight_job = NULL;
+--- a/drivers/accel/rocket/rocket_job.h	2026-08-02 14:32:01.128936388 -0400
++++ b/drivers/accel/rocket/rocket_job.h	2026-08-02 14:31:42.692166166 -0400
+@@ -71,6 +71,9 @@
+ 
+ 	struct rocket_iommu_domain *domain;
+ 
++	/* INSTRUMENT (debug build only): when this job was pushed to the scheduler. */
++	ktime_t t_push;
++
+ 	struct kref refcount;
+ };
+ 
+--- a/drivers/accel/rocket/rocket_core.h	2026-08-02 14:31:04.869207071 -0400
++++ b/drivers/accel/rocket/rocket_core.h	2026-08-02 14:31:37.215234432 -0400
+@@ -92,6 +92,8 @@
+ 	ktime_t poll_kick_over_at;
+ 	/* When the kick was started, for the backstop below. */
+ 	ktime_t poll_started_at;
++	/* INSTRUMENT (debug build only): when the poll decided the job was over. */
++	ktime_t poll_complete_at;
+ 	/* How many tasks this job's single kick covers. */
+ 	unsigned int poll_tasks;
+ 	/*

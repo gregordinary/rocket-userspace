@@ -294,6 +294,123 @@ int rocket_batch_completion_tracked(void)
     return c;
 }
 
+/* RANGED CACHE MAINTENANCE (interface 1.5).
+ *
+ * PREP_BO and FINI_BO sync the WHOLE object — dma_sync_sgtable_for_cpu /
+ * _for_device over the BO's entire scatterlist — so a bracket costs what the BO
+ * IS rather than what the caller touches. Measured on an RK3576 that is a 1.1 us
+ * per-ioctl floor plus about 10.6 GB/s of cache walk each way
+ * (tests/rk3576_prep_floor.c), which makes the floor 4-7% of a graph's write
+ * guard and the bytes all the rest.
+ *
+ * The ranged forms name the bytes instead. There is no flag to send: an older
+ * kernel does not have the ioctl at all and returns EINVAL/ENOTTY, so the
+ * version is the signal and the fallback is the whole-BO form. */
+#ifndef DRM_ROCKET_PREP_BO_RANGES
+#define DRM_ROCKET_PREP_BO_RANGES  0x04
+#define DRM_ROCKET_FINI_BO_RANGES  0x05
+struct drm_rocket_bo_range {
+    __u64 offset;
+    __u64 size;
+};
+struct drm_rocket_prep_bo_ranges {
+    __u32 handle;
+    __u32 range_count;
+    __u64 ranges;
+    __s64 timeout_ns;
+    __u64 reserved;
+};
+struct drm_rocket_fini_bo_ranges {
+    __u32 handle;
+    __u32 range_count;
+    __u64 ranges;
+    __u64 reserved;
+};
+#define DRM_IOCTL_ROCKET_PREP_BO_RANGES \
+    DRM_IOW(DRM_COMMAND_BASE + DRM_ROCKET_PREP_BO_RANGES, struct drm_rocket_prep_bo_ranges)
+#define DRM_IOCTL_ROCKET_FINI_BO_RANGES \
+    DRM_IOW(DRM_COMMAND_BASE + DRM_ROCKET_FINI_BO_RANGES, struct drm_rocket_fini_bo_ranges)
+#endif
+
+_Static_assert(sizeof(rocket_bo_range) == sizeof(struct drm_rocket_bo_range),
+               "rocket_bo_range must be the uAPI range struct");
+
+int rocket_bo_ranges_supported(void)
+{
+    static _Atomic int cached = -1;
+    int c = atomic_load(&cached);
+    if (c >= 0)
+        return c;
+
+    c = 0;
+    int fd = rocket_open();
+    if (fd >= 0) {
+        struct drm_version dv = {0};
+        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
+            c = (dv.version_major > 1 ||
+                 (dv.version_major == 1 && dv.version_minor >= 5)) ? 1 : 0;
+        rocket_close(fd);
+    }
+    atomic_store(&cached, c);
+    return c;
+}
+
+int rocket_bo_prep_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
+                          unsigned n, uint64_t timeout_ns)
+{
+    struct drm_rocket_prep_bo_ranges prep = {0};
+    int64_t deadline = 0;
+    int rc;
+
+    if (!n || !r || !rocket_bo_ranges_supported())
+        return rocket_bo_prep(fd, bo, 0, timeout_ns);
+
+    /* The same absolute-deadline conversion and the same saturation as
+     * rocket_bo_prep; see the long note there. */
+    if (timeout_ns) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        deadline = (timeout_ns > (uint64_t)(INT64_MAX - now))
+                   ? INT64_MAX : now + (int64_t)timeout_ns;
+    }
+    prep.handle      = bo->handle;
+    prep.range_count = n;
+    prep.ranges      = (uint64_t)(uintptr_t)r;
+    prep.timeout_ns  = deadline;
+    do {
+        rc = ioctl(fd, DRM_IOCTL_ROCKET_PREP_BO_RANGES, &prep);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        int e = errno;
+        if (timeout_ns == 0)
+            ROCKET_LOGE("rocket_bo_prep_ranges handle=%u n=%u: %s\n",
+                        bo->handle, n, strerror(e));
+        return -e;
+    }
+    return 0;
+}
+
+int rocket_bo_fini_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
+                          unsigned n)
+{
+    struct drm_rocket_fini_bo_ranges fini = {0};
+
+    if (!n || !r || !rocket_bo_ranges_supported())
+        return rocket_bo_fini(fd, bo);
+
+    fini.handle      = bo->handle;
+    fini.range_count = n;
+    fini.ranges      = (uint64_t)(uintptr_t)r;
+    if (ioctl(fd, DRM_IOCTL_ROCKET_FINI_BO_RANGES, &fini) < 0) {
+        int e = errno;
+        ROCKET_LOGE("rocket_bo_fini_ranges handle=%u n=%u: %s\n",
+                    bo->handle, n, strerror(e));
+        return -e;
+    }
+    return 0;
+}
+
 /* ============================================================================
  * SECTION — Device lifecycle (open / close)
  * ==========================================================================*/

@@ -52,7 +52,7 @@
  * rate was measured to follow, and no per-op gate makes any.
  *
  * Usage:  rk3576_net_gate [oracle|chain|peraxis|cube|hostchain|all|bench [iters]]
- *         [--net v1|v2|r18] [--blob PATH] [-v]
+ *         [--net v1|v2|r18|iv1] [--blob PATH] [-v]
  * Exit:   0, 1 on a failure, 2 to skip (no NPU, wrong chip, or no blob).
  *
  * `hostchain` needs NO DEVICE — it runs the graph on the CPU three ways and is what
@@ -75,9 +75,11 @@
 #include "rocket_matmul.h"
 #include "rocket_hw_profile.h"
 #include "requant_model.h"
+#include "rocket_graph_rk3576.h"
 
 /* ---- the blob ------------------------------------------------------------------ */
-enum { KIND_CONV = 0, KIND_DWCONV, KIND_AVGPOOL, KIND_SOFTMAX, KIND_ADD, KIND_MAXPOOL };
+enum { KIND_CONV = 0, KIND_DWCONV, KIND_AVGPOOL, KIND_SOFTMAX, KIND_ADD, KIND_MAXPOOL,
+       KIND_CONCAT };
 enum { ACT_NONE = 0, ACT_RELU6, ACT_RELU };
 
 /* Both pooling kinds are the same PPU program with a different reduction, so every site
@@ -87,8 +89,14 @@ enum { ACT_NONE = 0, ACT_RELU6, ACT_RELU };
 /* A layer's operands are named by the LAYER that produced them rather than assumed to be
  * the one before. A feed-forward chain does not need that and a residual one does: a
  * skip's second operand is produced three to five layers back. NO_SRC is the network
- * input, and on `src2` it means the layer has no second operand. */
+ * input, and past `src1` it means the layer has no operand there.
+ *
+ * FOUR of them, because a CONCATENATION has four: an Inception module is a 1x1, a 3x3, a
+ * 5x5 and a pooled branch joined along the channel axis. Every kind reads the same array
+ * and every pass resolves an operand the same way — a resolution written per BRANCH gets
+ * applied to some of them, which has already cost this gate one wrong label. */
 #define NO_SRC 0xFFFFFFFFu
+#define MAX_SRC 4
 
 typedef struct {
     uint32_t kind, act, ic, ih, iw, oc, oh, ow, kh, kw, sy, sx;
@@ -99,7 +107,8 @@ typedef struct {
     uint32_t src1, src2;
     int32_t  in2_zp;
     float    in2_scale;
-    uint32_t pad_[6];
+    uint32_t src3, src4;
+    uint32_t pad_[4];
 } rnet_layer;
 
 typedef struct {
@@ -119,7 +128,7 @@ static const rnet_layer *LAYERS;
 static int VERBOSE;
 
 static const char *KIND_NAME[] = { "conv", "dwconv", "avgpool", "softmax", "add",
-                                   "maxpool" };
+                                   "maxpool", "concat" };
 
 /* A pooling layer's descriptor, in one place: the two kinds differ only in the
  * reduction, and the pad the blob carries is the pad the last window CONSUMES. */
@@ -132,6 +141,18 @@ static void pool_desc_of(const rnet_layer *L, rocket_pool_desc *p)
     p->pad_top = (int)L->pl_y; p->pad_left = (int)L->pl_x;
     p->pad_bottom = (int)L->pt_y; p->pad_right = (int)L->pt_x;
     p->method = L->kind == KIND_MAXPOOL ? POOL_METHOD_MAX : POOL_METHOD_AVG;
+    /* TFLite's AVERAGE_POOL_2D divides a border window by the taps that fell inside the
+     * plane, so this is the model's arithmetic and not a choice. It is set for every
+     * average pool rather than only the padded ones: at pad 0 the two divisors are the
+     * same function, which `rk3576_pool_probe`'s avg-nopad-p0 cell asserts on hardware,
+     * so stating the lowering once is better than a conditional that hides the axis. */
+    /* ROCKET_RK3576_NET_AVGNOPAD=0 puts the count-include-pad divisor back. It is the
+     * control that says whether a defect seen on a padded average pool is the mode bit's
+     * or the pooling path's — the model follows the descriptor either way, so both arms
+     * are scored against the arithmetic they asked for. */
+    p->avg_exclude_pad = L->kind == KIND_AVGPOOL &&
+                         !(getenv("ROCKET_RK3576_NET_AVGNOPAD") &&
+                           *getenv("ROCKET_RK3576_NET_AVGNOPAD") == '0');
 }
 
 static double now_ms(void)
@@ -158,7 +179,7 @@ static int load_blob(const char *path)
     if (got != (size_t)n) return -1;
     BLOB_BYTES = (size_t)n;
     H = (const rnet_hdr *)BLOB;
-    if (memcmp(H->magic, "RKNET\0\0\1", 8) || H->version != 2 ||
+    if (memcmp(H->magic, "RKNET\0\0\1", 8) || H->version != 3 ||
         H->layer_stride != sizeof(rnet_layer) || H->total_bytes != BLOB_BYTES) {
         printf("blob header mismatch (magic/version/stride/size)\n");
         return -1;
@@ -316,11 +337,87 @@ static int needs_prep(const rnet_layer *L)
     return 0;
 }
 
+/*
+ * THE PACKED-IMAGE FIRST CONV, ASKED RATHER THAN PREDICTED.
+ *
+ * A three-channel image on the direct datapath is a 32-channel MAC group, so the stem
+ * programs about 10.6x the MACs it needs and a convolution's execution is its PROGRAMMED
+ * MAC count. The packed-image sub-encoding folds the kernel's columns into the channel
+ * axis instead — 8.0x fewer MACs, 1.24 ms against the direct lowering's 3.09 at
+ * 224x224 k7 s2 as a whole resident call [HW sweep, H96 MAX M9, rk3576_stem_cost].
+ *
+ * WHICH GRAPHS IT REACHES IS A MEASUREMENT, NOT AN ARITHMETIC. Its bounds are the
+ * library's — a non-zero left pad, an output extent of exactly iw/stride, ow a multiple
+ * of 16, a zero input zero point — and this gate does not restate them, because a bound
+ * restated in a harness reads exactly like the part's and goes stale the same way. The
+ * decision is taken by ATTEMPTING the pack: a refusal is printed with the library's own
+ * reason and the layer falls back to the direct lowering, which is exact everywhere.
+ * ARGB[] caches that answer so every pass and every inference takes the same path.
+ *
+ * ROCKET_RK3576_NET_ARGB=0 forces the direct lowering, which is the A/B: the two must
+ * agree byte for byte over the whole surface.
+ *
+ * A MATERIALISING STEM IS REACHABLE AND COSTS A JOIN, so this gate does not take it while
+ * the graph is cube-linked. At a non-zero input zero point the entry materialises the pad
+ * columns, which makes the encoding EXACT on ResNet-18's stem and 1.41 ms against the
+ * direct lowering's 3.13 as a resident per-op call — and its surface is then wider than the
+ * caller's plane, so it cannot be a consumer's cube. Measured on the graph at `bench 100`,
+ * three repeats each: 9.3-9.5 ms in 3 submits against the direct stem's 9.2-9.3 in 1. The
+ * program's 1.7 ms goes back out at the break, and the break ejects TWO layers rather than
+ * one — the stem de-scatters 784 KiB, the max pool scatters the same 784 KiB back, and a
+ * run cannot OPEN on a pool, so both fall outside the kick (stem 1.9, pool 1.4, kick 6.0
+ * against one kick of 9.2).
+ *
+ * So the rule is the frontend's, not the part's: take the packed encoding where it does not
+ * break a join, which is a stem whose input zero point is zero. ROCKET_RK3576_NET_ARGB=2
+ * takes it anyway and is the arm those numbers come from.
+ */
+static signed char *ARGB;                 /* -1 not asked, 0 direct, 1 packed */
+static int CUBE_ON;                       /* set by resident_init(); see cube_link()  */
+
+static int argb_on(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("ROCKET_RK3576_NET_ARGB");
+        cached = !e || !*e ? 1 : (int)strtol(e, NULL, 0);
+    }
+    return cached;
+}
+
+/* Whether this layer is a candidate for the packed-image encoding at all — the shape
+ * question only; whether the part takes it is the pack's answer. */
+static int argb_cand(const rnet_layer *L)
+{
+    if (!argb_on() || L->kind != KIND_CONV || L->ic > 4 || widen_on()) return 0;
+    /* THE MATERIALISING FORM, AND WHO CAN READ WHAT IT WRITES. It programs a wider output
+     * extent than the caller asked for, so its surface is a plane sitting inside wider
+     * rows. A POOL consumer reads that in place — the PPU carries the consumed extent and
+     * the DDR line stride in different registers and honours a pitch above the extent — and
+     * a CONVOLUTION consumer cannot, the CNA having one register for both. So the encoding
+     * is taken where a pool reads it and left alone where a convolution would, which is a
+     * property of the GRAPH rather than a bound of the part's; the library refuses the cube
+     * either way, so a wrong answer here costs a join and not correctness. */
+    if (L->in_zp != 0 && CUBE_ON && argb_on() < 2) {
+        unsigned li = (unsigned)(L - LAYERS), j;
+        if (!LAYERS || !H) return 0;
+        for (j = li + 1u; j < H->n_layers && LAYERS[j].kind == KIND_SOFTMAX; j++) ;
+        if (j >= H->n_layers || !IS_POOL(LAYERS[j].kind)) return 0;
+    }
+    return 1;
+}
+
 /* Whether this layer reaches the direct datapath at a channel count that would otherwise
- * be routed to the packed-image first conv. */
+ * be routed to the packed-image first conv. A candidate whose pack has not been attempted
+ * yet reads as direct, which is the safe answer: ARGB[] is filled by the first pass to
+ * build a handle and every later reader sees the decision it took. */
 static int narrow_direct(const rnet_layer *L)
 {
-    return L->kind == KIND_CONV && L->ic <= 4 && !widen_on();
+    unsigned li;
+    if (L->kind != KIND_CONV || L->ic > 4 || widen_on()) return 0;
+    if (!argb_cand(L) || !ARGB) return 1;
+    li = (unsigned)(L - LAYERS);
+    return ARGB[li] != 1;
 }
 
 static int8_t *prep_input(const rnet_layer *L, const int8_t *in,
@@ -545,13 +642,29 @@ static int8_t **SKIP;            /* [n_layers], non-NULL where the layer feeds a
  * only ever holds the previous layer's output, so every other reader needs this one to
  * have written somewhere of its own. A SOFTMAX is skipped: the gate does not run it as a
  * layer, so its "read" is not one. */
+/* A layer's operands, in order, as LAYER indices — one for a convolution or a pool, two
+ * for an add, up to four for a concatenation. NO_SRC (the network input, or an unused
+ * slot) is dropped, so the count is the number of LAYER operands. */
+static unsigned srcs_of(const rnet_layer *L, unsigned *out)
+{
+    const uint32_t s[MAX_SRC] = { L->src1, L->src2, L->src3, L->src4 };
+    unsigned k, n = 0;
+    for (k = 0; k < MAX_SRC; k++)
+        if (s[k] != NO_SRC) out[n++] = s[k];
+    return n;
+}
+
+/* A layer read by anything other than the layer immediately after it — the planner's own
+ * query, over this blob's operand graph, so the rule has one home. */
 static int skip_is_source(unsigned i)
 {
     unsigned j;
     for (j = i + 1; j < H->n_layers; j++) {
+        unsigned s[MAX_SRC], n, k;
         if (LAYERS[j].kind == KIND_SOFTMAX) continue;
-        if (LAYERS[j].src2 == i && j != i + 1) return 1;
-        if (LAYERS[j].src1 == i && j != i + 1) return 1;
+        n = srcs_of(&LAYERS[j], s);
+        for (k = 0; k < n; k++)
+            if (s[k] == i && j != i + 1) return 1;
     }
     return 0;
 }
@@ -618,6 +731,52 @@ static const int8_t *skip_operand(const rnet_layer *L, int from_golden)
     return SKIP ? SKIP[L->src2] : NULL;
 }
 
+/* WHERE ONE OPERAND LIVES, for any layer and any pass. The oracle hands a layer TFLite's
+ * own tensor; every other pass reads what the graph actually wrote — the producer's own
+ * buffer when it has one, the ping-pong when the producer is the layer immediately
+ * before. NULL when the graph has not kept it, which is a harness bug rather than a
+ * result and is reported as one. */
+static const int8_t *operand_at(unsigned i, unsigned src, int from_golden,
+                                const int8_t *cur)
+{
+    if (from_golden) return at(LAYERS[src].g_off);
+    if (SKIP && SKIP[src]) return SKIP[src];
+    return src + 1u == i ? cur : NULL;
+}
+
+/* Every operand of layer i, resolved the same way. Returns the count, or 0 if any of
+ * them is missing. */
+static unsigned gather_ops(unsigned i, int from_golden, const int8_t *cur,
+                           const int8_t **ops)
+{
+    unsigned s[MAX_SRC], n, k;
+    n = srcs_of(&LAYERS[i], s);
+    for (k = 0; k < n; k++) {
+        ops[k] = operand_at(i, s[k], from_golden, cur);
+        if (!ops[k]) return 0;
+    }
+    return n;
+}
+
+/* A CONCATENATION IS PLACEMENT. Its operands are already in its own quantization — the
+ * blob builder refuses a model where they are not — so there is no arithmetic here at
+ * all: on the host one memcpy per operand into its channel offset, and on the part
+ * nothing whatever, because the producers wrote those bytes themselves.
+ *
+ * The offsets come from the PRODUCERS' channel counts in operand order, which is the one
+ * thing the blob does not spell out and the one thing a wrong answer here would be. */
+static void concat_run(const rnet_layer *L, const int8_t *const *ops, int8_t *out)
+{
+    size_t px = (size_t)L->oh * L->ow;
+    unsigned s[MAX_SRC], n, k, off = 0;
+    n = srcs_of(L, s);
+    for (k = 0; k < n; k++) {
+        unsigned c = LAYERS[s[k]].oc;
+        memcpy(out + (size_t)off * px, ops[k], (size_t)c * px);
+        off += c;
+    }
+}
+
 /* WHERE OPERAND B STARTS, and why it is not always channel `c`. In cube layout the two
  * operands are slices of one buffer and a slice starts every SIXTEEN channels — sixteen
  * of them share each atom, so channel 24 is not an address at all. Rounding operand B's
@@ -627,7 +786,7 @@ static const int8_t *skip_operand(const rnet_layer *L, int from_golden)
  * weights, so they contribute nothing at any content. */
 static unsigned add_boff(const rnet_layer *L)
 {
-    return (L->oc + 15u) & ~15u;
+    return rocket_graph_add_boff(L->oc);
 }
 
 /* The add's operands side by side, which is what the convolution contracts over. In cube
@@ -746,87 +905,101 @@ static int RESIDENT_ON;
 
 /* The pooling layer's own resident handle. Separate from RESIDENT[] because a pool is a
  * different program (PC_OPERATION_ENABLE 0x60 against a convolution's 0x1D) and a
- * different handle type — the graph has one pooling layer, so one slot. */
+ * different handle type. */
 static rocket_pool_int8_rk3576_handle **RESIDENT_POOL;
 
-/* The cube chain's state; see cube_link() below for what it is. */
-static int CUBE_ON;
-static int *CUBE_IN, *CUBE_OUT;   /* per layer */
-static int CUBE_JOINS;
-
-/* THE CONCATENATION BUFFERS. An add's two operands, side by side in one allocation that
- * its two producers write directly — see cat_link() for the whole of it. CAT[j] is the
- * buffer add `j` reads; CAT_OF[i] is non-zero where layer i writes a slice of one, which
- * is what says its output is placed rather than owned. */
-static rocket_rk3576_cube *CAT;
-static int *CAT_OF;
-static int CAT_ON, CAT_ADDS;
-
-/* Whether a cube-out producer's readers are all wired here rather than in the pair loop.
- * Indexed by the PRODUCER, like SKIP[] and CAT_OF[]. */
-static int *MULTI_OF;
-static int MULTI_ON, MULTI_SRCS;
-
 /*
- * THE CROSS-LAYER KICK. A run of consecutive cube-linked layers has no host work between
- * its members at all, and a chained regcmd stream honours read-after-write between its
- * programs — so the whole run can go out as ONE hardware kick instead of one per layer.
- * rocket_conv2d_int8_chain_new_rk3576() owns that; here it is only a matter of finding the
- * maximal runs and letting the layer loop skip over one.
+ * THE PLANNER IS NOT THIS GATE'S.
  *
- * KICK_OF[i] is the chain a run STARTING at layer i, and KICK_END[i] the layer after it, so
- * the loop advances past the layers the kick covered. It is built after cube_link(), because
- * the links are what make a run eligible and the constructor refuses a pair that has none.
+ * Which tensors stay in cube layout, which producers write slices of a shared buffer and
+ * which runs of layers go out as one hardware kick are decided in graph/, over a
+ * frontend-neutral layer description — because a delegate needs exactly the same rules and
+ * a second copy of them would fork silently. What stays here is what a CALLER owns: the
+ * weights, the tensors, the ping-pong, the skip lifetimes and the de-scatter points.
  *
- * ROCKET_RK3576_NET_KICK=0 turns it off, which is the A/B: the same graph one submit per
- * layer must give byte-identical results.
+ * GRAPH[] is this blob's layers in that description. It is built once, and its handle
+ * fields are refreshed just before the plan is built — the handles are packed lazily on a
+ * layer's first call, so a plan built before a warm-up inference would see none of them.
  */
-static rocket_conv2d_int8_chain_rk3576 **KICK_OF;
-static unsigned *KICK_END;
-static int KICK_RUNS, KICK_LAYERS;
+static rocket_graph_layer *GRAPH;
+static rocket_graph_plan *PLAN;
+static int CUBE_ON;                       /* set by resident_init(); see plan_build() */
 
-static int kick_on(void)
+/* The plan's arrays under the names every pass of this gate already reads. NULL before the
+ * plan is built, which is the state a row-major run stays in. */
+#define CUBE_IN     (PLAN ? PLAN->cube_in  : NULL)
+#define CUBE_OUT    (PLAN ? PLAN->cube_out : NULL)
+#define KICK_OF     (PLAN ? PLAN->kick     : NULL)
+#define KICK_END    (PLAN ? PLAN->kick_end : NULL)
+#define CUBE_JOINS  (PLAN ? PLAN->joins       : 0)
+#define KICK_RUNS   (PLAN ? PLAN->kick_runs   : 0)
+#define KICK_LAYERS (PLAN ? PLAN->kick_layers : 0)
+
+static rocket_graph_kind graph_kind_of(uint32_t k)
 {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("ROCKET_RK3576_NET_KICK");
-        cached = !e || !*e || *e != '0';
+    switch (k) {
+    case KIND_CONV:    return ROCKET_GRAPH_CONV;
+    case KIND_DWCONV:  return ROCKET_GRAPH_DWCONV;
+    case KIND_AVGPOOL: return ROCKET_GRAPH_AVGPOOL;
+    case KIND_MAXPOOL: return ROCKET_GRAPH_MAXPOOL;
+    case KIND_ADD:     return ROCKET_GRAPH_ADD;
+    case KIND_CONCAT:  return ROCKET_GRAPH_CONCAT;
+    default:           return ROCKET_GRAPH_HOST;   /* the softmax, run on the host */
     }
-    return cached;
 }
 
-/* Build ONLY the run starting at this layer, leaving every other layer one submit each.
- * The localizer: the byte comparison can only see MATERIALISED layers, so a wrong byte
- * anywhere in a chain first shows up at the next one — with a single run in play, a diff
- * there is a diff caused by THAT run. -1 (the default) builds them all.
- * ROCKET_RK3576_NET_KICK_AT=<i>. */
-static int kick_at(void)
+/* The blob's layers as the planner's description. The geometry and the operand graph are
+ * the blob's; `host_input` is this gate's own lowering, and it is the one field no rule in
+ * graph/ could derive — a layer whose input this gate materialises (an asymmetric border,
+ * a widened or shifted stem) hands the entry a tensor that is not its producer's output. */
+static int graph_desc_build(void)
 {
-    static int cached = -2;
-    if (cached == -2) {
-        const char *e = getenv("ROCKET_RK3576_NET_KICK_AT");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
+    unsigned i, k;
+    GRAPH = calloc(H->n_layers, sizeof *GRAPH);
+    if (!GRAPH) return -1;
+    for (i = 0; i < H->n_layers; i++) {
+        const rnet_layer *L = &LAYERS[i];
+        struct stem_plan sp;
+        rocket_graph_layer *G = &GRAPH[i];
+        const uint32_t s[MAX_SRC] = { L->src1, L->src2, L->src3, L->src4 };
+        G->kind = graph_kind_of(L->kind);
+        G->ic = L->ic; G->oc = L->oc; G->oh = L->oh; G->ow = L->ow;
+        G->w_zp = L->w_zp; G->out_zp = L->out_zp;
+        for (k = 0; k < MAX_SRC; k++)
+            G->src[k] = s[k] == NO_SRC ? ROCKET_GRAPH_NO_SRC : s[k];
+        G->host_input = needs_prep(L) || stem_plan_of(L, &sp);
     }
-    return cached;
+    return 0;
 }
 
-/* The longest run a kick may cover. Not a hardware bound — it is the instrument for
- * bisecting one: a chain that computes at 2 layers and not at 24 is a length effect, and a
- * chain that fails at every length is not. ROCKET_RK3576_NET_KICK_MAX=<n>. */
-static unsigned kick_max(void)
+static void graph_desc_handles(void)
 {
-    static unsigned cached = 0;
-    if (!cached) {
-        const char *e = getenv("ROCKET_RK3576_NET_KICK_MAX");
-        long v = (e && *e) ? strtol(e, NULL, 0) : 0;
-        cached = (v >= 2 && v < 64) ? (unsigned)v : 64u;
+    unsigned i;
+    if (!GRAPH) return;
+    for (i = 0; i < H->n_layers; i++) {
+        GRAPH[i].conv = RESIDENT ? RESIDENT[i] : NULL;
+        GRAPH[i].pool = RESIDENT_POOL ? RESIDENT_POOL[i] : NULL;
     }
-    return cached;
+}
+
+/* Build the plan: the links only. The runs are a second call, so the two are measurable
+ * apart — pass_cube() runs the graph between them. */
+static void plan_build(int fd)
+{
+    if (!CUBE_ON || PLAN) return;
+    graph_desc_handles();
+    PLAN = rocket_graph_plan_new(fd, GRAPH, H->n_layers, 1);
 }
 
 static void resident_init(void)
 {
     const char *e = getenv("ROCKET_RK3576_NET_RESIDENT");
+    /* Allocated whether or not the weights are resident: the decision is about the
+     * ENCODING, and a transient run takes it too. */
+    if (argb_on()) {
+        ARGB = malloc(H->n_layers);
+        if (ARGB) memset(ARGB, -1, H->n_layers);
+    }
     RESIDENT_ON = e && *e && *e != '0';
     if (RESIDENT_ON) RESIDENT = calloc(H->n_layers, sizeof *RESIDENT);
     if (RESIDENT_ON) RESIDENT_POOL = calloc(H->n_layers, sizeof *RESIDENT_POOL);
@@ -834,42 +1007,17 @@ static void resident_init(void)
 
     e = getenv("ROCKET_RK3576_NET_CUBE");
     CUBE_ON = RESIDENT_ON && e && *e && *e != '0';
-    if (CUBE_ON) {
-        CUBE_IN = calloc(H->n_layers, sizeof *CUBE_IN);
-        CUBE_OUT = calloc(H->n_layers, sizeof *CUBE_OUT);
-        KICK_OF = calloc(H->n_layers, sizeof *KICK_OF);
-        KICK_END = calloc(H->n_layers, sizeof *KICK_END);
-        if (!CUBE_IN || !CUBE_OUT || !KICK_OF || !KICK_END) CUBE_ON = 0;
-    }
-    /* The concatenation buffers ride on the cube chain and are its own A/B:
-     * ROCKET_RK3576_NET_CAT=0 leaves every add reading a host-built tensor, which is what
-     * the joins they buy are measured against. */
-    if (CUBE_ON) {
-        e = getenv("ROCKET_RK3576_NET_CAT");
-        CAT_ON = !e || !*e || *e != '0';
-        CAT = calloc(H->n_layers, sizeof *CAT);
-        CAT_OF = calloc(H->n_layers, sizeof *CAT_OF);
-        if (!CAT || !CAT_OF) CAT_ON = 0;
-        /* The shared surfaces are their own A/B for the same reason: they close a whole
-         * refusal bucket and the joins they buy are measured against leaving it open. */
-        e = getenv("ROCKET_RK3576_NET_MULTI");
-        MULTI_ON = !e || !*e || *e != '0';
-        MULTI_OF = calloc(H->n_layers, sizeof *MULTI_OF);
-        if (!MULTI_OF) MULTI_ON = 0;
-    }
+    if (CUBE_ON && graph_desc_build() < 0) CUBE_ON = 0;
 }
 
 static void resident_free(int fd)
 {
     unsigned i;
-    /* The chains BORROW the handles, so they go first — and before the RESIDENT check, since
-     * they are allocated whether or not a handle was ever packed. */
-    if (KICK_OF)
-        for (i = 0; i < H->n_layers; i++)
-            if (KICK_OF[i]) rocket_conv2d_int8_chain_free_rk3576(fd, KICK_OF[i]);
-    free(KICK_OF); free(KICK_END);
-    KICK_OF = NULL; KICK_END = NULL;
-    KICK_RUNS = KICK_LAYERS = 0;
+    free(ARGB); ARGB = NULL;
+    /* The plan BORROWS the handles for its chains, so it goes first. */
+    rocket_graph_plan_free(PLAN);
+    PLAN = NULL;
+    free(GRAPH); GRAPH = NULL;
     if (RESIDENT_POOL) {
         for (i = 0; i < H->n_layers; i++)
             if (RESIDENT_POOL[i]) rocket_pool_int8_free_rk3576(fd, RESIDENT_POOL[i]);
@@ -881,630 +1029,13 @@ static void resident_free(int fd)
         if (RESIDENT[i]) rocket_conv2d_int8_weights_free_rk3576(fd, RESIDENT[i]);
     free(RESIDENT);
     RESIDENT = NULL;
-    free(CUBE_IN); free(CUBE_OUT);
-    CUBE_IN = CUBE_OUT = NULL;
     CUBE_ON = 0;
-    if (CAT) {
-        for (i = 0; i < H->n_layers; i++) rocket_rk3576_cube_free(fd, &CAT[i]);
-        free(CAT);
-        CAT = NULL;
-    }
-    free(CAT_OF);
-    CAT_OF = NULL;
-    CAT_ON = 0;
-    free(MULTI_OF);
-    MULTI_OF = NULL;
-    MULTI_ON = MULTI_SRCS = 0;
-}
-
-/*
- * THE CUBE CHAIN.
- *
- * The entries take and return row-major tensors, so a graph pays the CHW <-> NC1HWC2
- * transpose at both ends of every layer — the two largest host buckets left. It does not
- * have to pay them BETWEEN layers: a direct conv's output surface stride is `ow*oh`
- * exactly, so layer n's surface IS layer n+1's feature cube byte for byte whenever the
- * plane and the channel rounding agree. Both flags live on the resident handle.
- *
- * The linking is a PRE-PASS over already-packed handles rather than a decision taken as
- * the graph runs, because the producer's "leave it in the cube" and the consumer's "read
- * it from there" have to be set as a PAIR: a producer that skipped its de-scatter for a
- * consumer that then refused the cube would have left no row-major tensor at all.
- *
- * ROCKET_RK3576_NET_CUBE=1, and only with the resident weights the flags live on.
- */
-/* Whether layer j can read its input from a producer's surface. Every clause here is a
- * property of the GATE's lowering rather than of the hardware, so it is asked here and the
- * hardware's own bounds are left to the library's refusal:
- *
- *   a materialised border — prep_input() writes the pad into a row-major buffer, so the
- *   tensor the entry sees is not the producer's output at all;
- *   the packed-image stem, which owns a different cube;
- *   a layer that is not a resident convolution (the pooling entry and the host softmax
- *   both take row-major). */
-static int cube_consumer_ok(unsigned j)
-{
-    const rnet_layer *L = &LAYERS[j];
-    struct stem_plan sp;
-    /* The POOLING layer is a consumer too, and it is the same join: the PPU reads the
-     * same NC1HWC2 cube the convolution path packs. It is not a chain member — a pool is
-     * a different program in a BO of its own — so this only removes its host scatter. */
-    if (IS_POOL(L->kind)) return RESIDENT_POOL && RESIDENT_POOL[j] != NULL;
-    /* An ADD reads a CONCATENATION this gate builds on the host out of two tensors from
-     * different places, so there is no single producer surface for it to read. It is a
-     * cube producer like any other convolution; it is never a consumer. */
-    if (L->kind == KIND_ADD) return 0;
-    if (L->kind != KIND_CONV && L->kind != KIND_DWCONV) return 0;
-    if (needs_prep(L)) return 0;
-    if (stem_plan_of(L, &sp)) return 0;
-    return RESIDENT[j] != NULL;
-}
-
-/* WHY A JOIN WAS REFUSED, counted. On a feed-forward chain almost every adjacent pair
- * links and the breakdown is not interesting; on a residual one it is the whole answer to
- * how much of the graph can go out as one kick, so the reasons are separated rather than
- * left as "32 of 63". Each bucket is a DIFFERENT thing to fix, and two of them are
- * properties of this network rather than of the part. */
-enum { NJ_ADD_CONSUMER = 0, NJ_SKIP_SOURCE, NJ_IC_ALIGN, NJ_SURFACE, NJ_OTHER,
-       NJ_FORCED, NJ_N };
-static int NOJOIN[NJ_N];
-static const char *NOJOIN_WHY[NJ_N] = {
-    "the consumer is an ADD, whose input is a host-built concatenation",
-    "the producer feeds a SKIP and so must leave a row-major tensor",
-    "the consumer's input channel count is not a multiple of 32",
-    "the producer's output surface is not a feature cube (padded stride, or tiled)",
-    "the consumer is not a resident convolution",
-    "forced off by ROCKET_RK3576_NET_NOJOIN (the per-pair A/B)",
-};
-static const char *NOJOIN_TAG[NJ_N] = {
-    "add-consumer", "skip-source", "ic-align", "surface", "not-resident", "forced",
-};
-
-/* AND WHAT EACH BUCKET IS WORTH, which the COUNT does not say. What a join removes is the
- * two transposes at it, and those are BYTES — a 56x56 pair moves 64x more than a 7x7 one,
- * so twelve refusals at the deep end and twelve at the shallow end are different numbers.
- * A count prices a submit; only the bytes price the transposes, and on this graph the
- * transposes are the larger term by about 6x. */
-static size_t NOJOIN_BYTES[NJ_N];
-static size_t JOIN_BYTES;
-
-/* The tensor that crosses one adjacent pair: the producer's whole output surface, which
- * is de-scattered at the producer and scattered again at the consumer. */
-static size_t pair_bytes(unsigned i)
-{
-    return (size_t)LAYERS[i].oc * LAYERS[i].oh * LAYERS[i].ow;
-}
-
-/* THE PRODUCER SIDE, for either kind of handle. A POOL is a cube producer like any
- * convolution — the PPU writes the same 16-byte-atom surface, at round4(ow*oh) rather than
- * the plane, which is the consumer's DDR channel-group jump and a register. Keeping the
- * two behind one set of calls is what lets a pool sit on either side of a join instead of
- * only on the consumer side, and ResNet-18's max pool is the case: it feeds the next
- * convolution AND a residual add three layers on. */
-static int prod_ok(unsigned i)
-{
-    if (IS_POOL(LAYERS[i].kind)) return RESIDENT_POOL && RESIDENT_POOL[i] != NULL;
-    return RESIDENT && RESIDENT[i] != NULL;
-}
-
-static int prod_cube_of(unsigned i, rocket_rk3576_cube *c)
-{
-    return IS_POOL(LAYERS[i].kind)
-             ? rocket_pool_int8_cube_of_rk3576(RESIDENT_POOL[i], c)
-             : rocket_conv2d_int8_cube_of_rk3576(RESIDENT[i], c);
-}
-
-static int prod_cube_out(unsigned i, int on)
-{
-    return IS_POOL(LAYERS[i].kind)
-             ? rocket_pool_int8_cube_out_rk3576(RESIDENT_POOL[i], on)
-             : rocket_conv2d_int8_cube_out_rk3576(RESIDENT[i], on);
-}
-
-static int prod_cube_out_at(unsigned i, const rocket_rk3576_cube *dst)
-{
-    return IS_POOL(LAYERS[i].kind)
-             ? rocket_pool_int8_cube_out_at_rk3576(RESIDENT_POOL[i], dst)
-             : rocket_conv2d_int8_cube_out_at_rk3576(RESIDENT[i], dst);
-}
-
-/* A pool is never a chain member — a pooling program lives in a BO of its own — so nothing
- * re-stamps its surface behind its back and it has no declaration to make. */
-static void prod_cube_shared(unsigned i, int on)
-{
-    if (!IS_POOL(LAYERS[i].kind))
-        rocket_conv2d_int8_cube_shared_rk3576(RESIDENT[i], on);
-}
-
-static int cons_cube_in(unsigned j, const rocket_rk3576_cube *c)
-{
-    return IS_POOL(LAYERS[j].kind)
-             ? rocket_pool_int8_cube_in_rk3576(RESIDENT_POOL[j], c)
-             : rocket_conv2d_int8_cube_in_rk3576(RESIDENT[j], c);
-}
-
-/* The layer that follows i in execution order — a SOFTMAX is not run as a layer here, so
- * it is stepped over. H->n_layers when there is none. */
-static unsigned next_layer(unsigned i)
-{
-    unsigned j = i + 1u;
-    while (j < H->n_layers && LAYERS[j].kind == KIND_SOFTMAX) j++;
-    return j;
-}
-
-/* ONE WIRED PRODUCER -> READER RELATION, counted. The headline is "joins of ADJACENT
- * pairs", because that is the unit the refusal buckets are counted in and the unit every
- * earlier measurement is quoted in — so a relation whose reader is not the producer's
- * immediate successor is real work removed and is counted apart rather than folded in.
- * ResNet-18's downsample adds are all of that kind: their distant operand is the 3x3 leg,
- * one layer further back than the 1x1 the add sits behind. */
-static int CUBE_FAR;
-static size_t CUBE_FAR_BYTES;
-
-static void cube_joined(unsigned p, unsigned r)
-{
-    if (next_layer(p) == r) { CUBE_JOINS++; JOIN_BYTES += pair_bytes(p); }
-    else { CUBE_FAR++; CUBE_FAR_BYTES += pair_bytes(p); }
-}
-
-static void cube_unjoined(unsigned p, unsigned r)
-{
-    if (next_layer(p) == r) { CUBE_JOINS--; JOIN_BYTES -= pair_bytes(p); }
-    else { CUBE_FAR--; CUBE_FAR_BYTES -= pair_bytes(p); }
-}
-
-/* The refused pairs, NAMED. A bucket's count prices a submit and its bytes price the
- * transposes, but neither prices a PAIR: the two classes already closed measure 8x apart
- * per join, so the pairs a session proposes to close have to be listed one at a time with
- * the tensor each of them carries. Printed for the refusals only — a joined pair has
- * nothing left to decide, and its price is the A/B below. */
-#define NJ_LIST_MAX 64
-static struct { unsigned i, j; size_t bytes; int why; } NJ_LIST[NJ_LIST_MAX];
-static int NJ_LIST_N;
-
-static void nojoin_note(unsigned i, unsigned j, int why)
-{
-    size_t bytes = pair_bytes(i);
-    NOJOIN[why]++;
-    NOJOIN_BYTES[why] += bytes;
-    if (NJ_LIST_N < NJ_LIST_MAX) {
-        NJ_LIST[NJ_LIST_N].i = i; NJ_LIST[NJ_LIST_N].j = j;
-        NJ_LIST[NJ_LIST_N].bytes = bytes; NJ_LIST[NJ_LIST_N].why = why;
-        NJ_LIST_N++;
-    }
-}
-
-/* THE PER-PAIR A/B. What a join is WORTH is measured, not derived from its bytes: the
- * measurement is the finite difference between the graph as it stands and the same graph
- * with exactly one join refused. ROCKET_RK3576_NET_NOJOIN=<i> refuses the join whose
- * PRODUCER is layer i and leaves every other join intact. A concatenation-wired add is
- * wired as a PAIR, so naming either of its producers takes both of that add's joins off —
- * which is what its price is, since neither half stands alone. */
-static int nojoin_at(void)
-{
-    static int cached = -2;
-    if (cached == -2) {
-        const char *e = getenv("ROCKET_RK3576_NET_NOJOIN");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) : -2;
-    }
-    return cached;
-}
-
-static int nojoin_forced(unsigned i) { return nojoin_at() == (int)i; }
-
-/* THE LOCALIZER for a join whose consumer's channel count is not a multiple of 32 at a
- * non-zero weight zero point. That join is sound only because a direct producer's partial
- * output group carries its output zero point, so it is the one class of join whose
- * correctness rests on a property of the PRODUCER — and a graph that disagrees needs to be
- * able to enable them one at a time. ROCKET_RK3576_NET_PADJOIN=-1 refuses them all (the
- * A/B), =<i> allows only the pair whose producer is layer i, unset allows every one. */
-static int padjoin_at(void)
-{
-    static int cached = -2;
-    if (cached == -2) {
-        const char *e = getenv("ROCKET_RK3576_NET_PADJOIN");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) : -2;
-    }
-    return cached;
-}
-
-static int padjoin_ok(unsigned i, unsigned j)
-{
-    if (LAYERS[j].ic % 32u == 0 || !LAYERS[j].w_zp) return 1;   /* not that class */
-    if (padjoin_at() == -2) return 1;
-    return padjoin_at() == (int)i;
-}
-
-/* Every layer that reads layer i's output. A SOFTMAX is not run as a layer here, so its
- * read is not one. Returns the count and fills `out` up to `max`, or `max + 1` when there
- * are more than that — a caller may not silently wire a subset of a producer's readers. */
-static unsigned consumers_of(unsigned i, unsigned *out, unsigned max)
-{
-    unsigned j, n = 0;
-    for (j = i + 1; j < H->n_layers; j++) {
-        if (LAYERS[j].kind == KIND_SOFTMAX) continue;
-        if (LAYERS[j].src1 != i && LAYERS[j].src2 != i) continue;
-        if (n < max) out[n] = j;
-        n++;
-        if (n > max) return max + 1u;
-    }
-    return n;
-}
-
-/*
- * THE CONCATENATION BUFFERS — what the two big refusal buckets actually wanted.
- *
- * Twenty of MobileNetV2's thirty-one refused joins are one shape of problem: an add reads
- * a CONCATENATION of two tensors from different places, and the layer that produces its
- * second operand therefore has to leave a row-major tensor for it to be copied out of,
- * three to five layers later. Neither is a property of the part. Both are the host
- * building a tensor that the hardware could have been asked to write in the first place.
- *
- * A cube's base is a plain address on both sides of a convolution, so it can be: allocate
- * ONE buffer per add, give operand A the low slice and operand B the high one, and point
- * the two producers at them with rocket_conv2d_int8_cube_out_at_rk3576(). The add then
- * reads the whole buffer as its feature cube and no concatenation is built at all.
- *
- * WHAT MAKES IT A PAIR, and why it is refused as one. Operand B's producer is also the
- * layer BEFORE the block's expand convolution, so making it write a slice means that
- * layer has to read the same slice as its cube — a producer that leaves no row-major
- * tensor for a consumer that cannot take a cube would leave the graph with nothing at
- * all. So an add is wired only when BOTH producers can be placed, and every OTHER reader
- * of either producer can read the slice back.
- *
- * NEITHER OPERAND IS "THE LAYER BEFORE", AND NEITHER IS THE PLACEMENT RULE. MobileNetV2's
- * adds take operand A from the layer before and operand B from a skip three to five layers
- * back; a ResNet block that changes width takes them the OTHER WAY ROUND, operand B from
- * the 1x1 downsample immediately before the add and operand A from the 3x3 leg past it. A
- * pass keyed on "operand A's producer is the previous layer" wires the first family and
- * refuses the second — which is what left ResNet-18's three downsample adds reading a host
- * concatenation. The buffer is a dedicated allocation per add and each slice has exactly
- * one writer, so the ORDER the two producers run in does not matter at all; what has to
- * hold is that both precede the add, which they do by construction.
- *
- * The gap between operand A's channels and the group boundary operand B starts on carries
- * zero weights (add_boff), so it contributes nothing at any content.
- */
-static void cat_link(int fd)
-{
-    unsigned j;
-    if (!CUBE_ON || !CAT_ON) return;
-    for (j = 0; j < H->n_layers; j++) {
-        const rnet_layer *L = &LAYERS[j];
-        rocket_rk3576_cube lo, hi, all;
-        rocket_rk3576_cube pc[2];
-        unsigned a, b, boff, chans, p, ok = 1;
-        unsigned rd[2][4], nrd[2];
-        if (L->kind != KIND_ADD || L->src2 == NO_SRC || L->src1 == NO_SRC) continue;
-        a = L->src1; b = L->src2;
-        /* ONE of the two producers is the layer immediately before the add — either one.
-         * Without that the add has no adjacent producer at all and the layer between them
-         * would be reading and writing the buffer this pass is placing. */
-        if (a + 1u != j && b + 1u != j) continue;
-        /* The per-pair A/B: naming either producer refuses the whole wiring, and the two
-         * joins it would have made fall to the buckets below like any other refusal. */
-        if (nojoin_forced(a) || nojoin_forced(b)) continue;
-        if (!prod_ok(a) || !prod_ok(b) || !RESIDENT[j]) continue;
-        /* EVERY OTHER READER OF EITHER PRODUCER has to be able to read the slice: a placed
-         * producer leaves no row-major tensor, so a reader that cannot take a cube would be
-         * left with nothing. MobileNetV2's operand B has one such reader (the next block's
-         * expand convolution); ResNet-18's downsample operands have none. */
-        for (p = 0; p < 2 && ok; p++) {
-            unsigned q, src = p ? b : a, n;
-            n = consumers_of(src, rd[p], 4u);
-            if (n > 4u) { ok = 0; break; }
-            nrd[p] = n;
-            for (q = 0; q < n; q++)
-                if (rd[p][q] != j && !cube_consumer_ok(rd[p][q])) ok = 0;
-        }
-        if (!ok) continue;
-        /* Neither producer may be a layer this gate prepares on the host, and the add
-         * itself has to be a plain resident convolution. */
-        if (needs_prep(&LAYERS[a]) || needs_prep(&LAYERS[b])) continue;
-        boff = add_boff(L);
-        /* The buffer is as deep as the add's feature DMA WALKS, which is the register
-         * count rounded to the 32-channel MAC group — not the live channels. */
-        chans = (boff + L->oc + 31u) & ~31u;
-        if (rocket_rk3576_cube_alloc(fd, chans, L->oh, L->ow, &CAT[j]) != ROCKET_OK)
-            continue;
-        /* The add reads `boff + oc` channels, which is what its descriptor says and not
-         * the whole allocation — the groups past it are the 32-channel rounding the
-         * feature DMA walks and the cube's own size check covers. */
-        if (rocket_rk3576_cube_slice(&CAT[j], 0u, boff + L->oc, &all) != ROCKET_OK ||
-            rocket_rk3576_cube_slice(&CAT[j], 0u, L->oc, &lo) != ROCKET_OK ||
-            rocket_rk3576_cube_slice(&CAT[j], boff, L->oc, &hi) != ROCKET_OK ||
-            prod_cube_out_at(a, &lo) != ROCKET_OK ||
-            prod_cube_out_at(b, &hi) != ROCKET_OK ||
-            rocket_conv2d_int8_cube_in_rk3576(RESIDENT[j], &all) != ROCKET_OK) {
-            prod_cube_out_at(a, NULL);
-            prod_cube_out_at(b, NULL);
-            rocket_conv2d_int8_cube_in_rk3576(RESIDENT[j], NULL);
-            rocket_rk3576_cube_free(fd, &CAT[j]);
-            continue;
-        }
-        /* THE OTHER READERS ARE ASKED FOR THE PRODUCER'S CUBE, NOT FOR THE SLICE THIS PASS
-         * BUILT. The two name the same bytes, but only the producer can say what its tail
-         * holds — a partial output group lands on its output zero point — and a consumer
-         * whose own channel count is not a multiple of 32 needs exactly that to be stated. */
-        if (prod_cube_of(a, &pc[0]) != ROCKET_OK ||
-            prod_cube_of(b, &pc[1]) != ROCKET_OK) ok = 0;
-        for (p = 0; p < 2 && ok; p++) {
-            unsigned q;
-            for (q = 0; q < nrd[p]; q++) {
-                unsigned r = rd[p][q];
-                if (r == j) continue;
-                if (cons_cube_in(r, &pc[p]) != ROCKET_OK) { ok = 0; break; }
-                CUBE_IN[r] = 1;
-                cube_joined(p ? b : a, r);
-            }
-        }
-        if (!ok) {
-            for (p = 0; p < 2; p++) {
-                unsigned q;
-                for (q = 0; q < nrd[p]; q++) {
-                    unsigned r = rd[p][q];
-                    if (r == j || !CUBE_IN[r]) continue;
-                    cons_cube_in(r, NULL);
-                    CUBE_IN[r] = 0;
-                    cube_unjoined(p ? b : a, r);
-                }
-            }
-            prod_cube_out_at(a, NULL);
-            prod_cube_out_at(b, NULL);
-            rocket_conv2d_int8_cube_in_rk3576(RESIDENT[j], NULL);
-            rocket_rk3576_cube_free(fd, &CAT[j]);
-            continue;
-        }
-        CUBE_OUT[a] = 1; CUBE_OUT[b] = 1;
-        CUBE_IN[j] = 1;
-        CAT_OF[a] = 1; CAT_OF[b] = 1;
-        /* Counted HERE or not at all: an adjacent pair the loop below then skips would
-         * otherwise leave the joined-bytes total understating the denominator every
-         * refusal ratio is quoted against. */
-        cube_joined(a, j); cube_joined(b, j);
-        CAT_ADDS++;
-    }
-    if (CAT_ADDS)
-        printf("   concatenation buffers: %d of the adds read a buffer their two producers "
-               "wrote directly — no host concatenation, and the skip source no longer has "
-               "to materialise\n", CAT_ADDS);
-}
-
-/*
- * A SKIP SOURCE MAY WRITE A CUBE AFTER ALL — when every layer that reads it can read one.
- *
- * "A producer some later layer reads must materialise" is a statement about the HOST
- * buffers, not about the part: it holds because the reader three layers on wants a
- * row-major tensor. A resident handle owns its output surface and nothing else writes
- * there until that handle runs again, so the surface outlives the whole inference — which
- * is exactly the lifetime a distant reader needs. Two readers of one surface is not a
- * second copy of anything; it is the same cube described twice.
- *
- * That closes the class this graph loses the most to. ResNet-18's identity blocks end in
- * an add whose output is read TWICE — by the next block's 3x3 convolution and, three
- * layers later, by that block's 1x1 downsample — and both are ordinary convolutions.
- *
- * WHAT IT COSTS THE CHAIN, and why the library has to be told. A cross-layer kick
- * re-stamps every interior layer's surface in its verify bracket, sound only because the
- * next kick rewrites it before anything reads it. A shared surface is read first, so the
- * stamp would replace the layer's output with 0xA5 and the outside reader would compute a
- * full and plausible surface from it — invisible until the next materialised layer.
- * rocket_conv2d_int8_cube_shared_rk3576() moves that stamp to the start of the producer's
- * next call, one PREP/FINI pair and nothing else.
- *
- * ROCKET_RK3576_NET_MULTI=0 refuses them all, which is the A/B.
- */
-static void multi_link(void)
-{
-    unsigned i;
-    if (!CUBE_ON || !MULTI_ON) return;
-    for (i = 0; i < H->n_layers; i++) {
-        rocket_rk3576_cube c;
-        unsigned rd[4], n, q, ok = 1;
-        if (!SKIP[i] || CAT_OF[i] || CUBE_OUT[i]) continue;
-        if (!prod_ok(i) || nojoin_forced(i)) continue;
-        n = consumers_of(i, rd, 4u);
-        if (!n || n > 4u) continue;
-        for (q = 0; q < n; q++)
-            if (!cube_consumer_ok(rd[q]) || CUBE_IN[rd[q]] || !padjoin_ok(i, rd[q])) ok = 0;
-        if (!ok) continue;
-        if (prod_cube_of(i, &c) != ROCKET_OK) continue;
-        for (q = 0; q < n && ok; q++)
-            if (cons_cube_in(rd[q], &c) != ROCKET_OK) ok = 0;
-        if (ok && prod_cube_out(i, 1) != ROCKET_OK) ok = 0;
-        if (!ok) {
-            for (q = 0; q < n; q++) cons_cube_in(rd[q], NULL);
-            continue;
-        }
-        prod_cube_shared(i, 1);
-        CUBE_OUT[i] = 1; MULTI_OF[i] = 1;
-        for (q = 0; q < n; q++) { CUBE_IN[rd[q]] = 1; cube_joined(i, rd[q]); }
-        MULTI_SRCS++;
-    }
-    if (MULTI_SRCS)
-        printf("   shared surfaces: %d skip source(s) leave a cube that every one of their "
-               "readers takes, so they no longer materialise\n", MULTI_SRCS);
-}
-
-/* Link every adjacent pair the library accepts. Called once, after a warm-up inference has
- * packed the handles. */
-static void cube_link(int fd)
-{
-    unsigned i, pairs = 0;
-    if (!CUBE_ON) return;
-    /* The concatenation buffers first: they decide two of the refusal buckets below, and
-     * a pair they wire is a join this pass must not undo. The shared surfaces then take
-     * what is left of the skip sources — placement first, because a placed producer's
-     * slice is cheaper than its own surface (one buffer for the add instead of two). */
-    cat_link(fd);
-    multi_link();
-    for (i = 0; i + 1 < H->n_layers; i++) {
-        rocket_rk3576_cube c;
-        unsigned j = i + 1;
-        while (j < H->n_layers && LAYERS[j].kind == KIND_SOFTMAX) j++;
-        if (j >= H->n_layers) break;
-        pairs++;
-        /* Already wired as a concatenation: layer i writes a slice and layer j reads it.
-         * Counted there, and nothing left to do here. */
-        if (CUBE_OUT[i] && CUBE_IN[j]) continue;
-        if (nojoin_forced(i)) { nojoin_note(i, j, NJ_FORCED); continue; }
-        if (!prod_ok(i)) { nojoin_note(i, j, NJ_OTHER); continue; }
-        if (LAYERS[j].kind == KIND_ADD) { nojoin_note(i, j, NJ_ADD_CONSUMER); continue; }
-        if (!cube_consumer_ok(j)) { nojoin_note(i, j, NJ_OTHER); continue; }
-        /* A SKIP SOURCE MUST MATERIALISE unless it was PLACED. A cube-out layer writes no
-         * row-major tensor, and the add that names it as an operand runs three to five
-         * layers later with host work in between — so unless that add reads the slice this
-         * layer wrote, there would be nothing for it to read. */
-        if (SKIP[i] && !CAT_OF[i] && !MULTI_OF[i]) {
-            nojoin_note(i, j, NJ_SKIP_SOURCE); continue; }
-        if (CUBE_OUT[i] || CUBE_IN[j]) { nojoin_note(i, j, NJ_OTHER); continue; }
-        if (!padjoin_ok(i, j)) { nojoin_note(i, j, NJ_IC_ALIGN); continue; }
-        if (prod_cube_of(i, &c) != ROCKET_OK) {
-            nojoin_note(i, j, NJ_SURFACE); continue;
-        }
-        if (cons_cube_in(j, &c) != ROCKET_OK) {
-            /* The library refuses a cube whose channel count is not a multiple of 32 —
-             * the consumer's own cube relies on the zero it memset into the padding
-             * channels, which a producer does not control. Every other reason it can
-             * refuse (plane, stride, fd) is impossible for an adjacent pair here. */
-            nojoin_note(i, j, LAYERS[j].ic % 32u ? NJ_IC_ALIGN : NJ_OTHER);
-            continue;
-        }
-        if (prod_cube_out(i, 1) != ROCKET_OK) {
-            /* The consumer took the cube and the producer will not leave one, so the pair
-             * has to come apart again — the consumer's row-major input is the only thing
-             * that still exists. */
-            cons_cube_in(j, NULL);
-            nojoin_note(i, j, NJ_SURFACE);
-            continue;
-        }
-        CUBE_OUT[i] = 1; CUBE_IN[j] = 1;
-        cube_joined(i, j);
-    }
-    printf("   cube chain: %d join(s) of %u adjacent pair(s) — layer n's output surface is "
-           "layer n+1's feature cube, so neither transpose runs at those joins\n",
-           CUBE_JOINS, pairs);
-    if (CUBE_FAR)
-        printf("      and %d NON-adjacent link(s), %.0f KiB: a reader further on than the "
-               "next layer takes the same cube, which is real work removed but not an "
-               "adjacent pair\n", CUBE_FAR, CUBE_FAR_BYTES / 1024.0);
-    {
-        size_t refused = 0;
-        int k;
-        for (k = 0; k < NJ_N; k++) refused += NOJOIN_BYTES[k];
-        for (k = 0; k < NJ_N; k++)
-            if (NOJOIN[k])
-                printf("      %2d refused, %5.0f KiB: %s\n", NOJOIN[k],
-                       NOJOIN_BYTES[k] / 1024.0, NOJOIN_WHY[k]);
-        /* THE REFUSED PAIRS, ONE LINE EACH. The bytes ratio above is an ordering, NOT a
-         * cap: scaling the existing joins' measured value by it puts more milliseconds on
-         * the refusals than the whole wall holds. What prices a pair is the finite
-         * difference with that one join forced off — ROCKET_RK3576_NET_NOJOIN=<producer>,
-         * over the joins that EXIST — read against these tensor sizes. */
-        if (refused) {
-            printf("      the joins that exist carry %.0f KiB and the refused ones %.0f "
-                   "KiB (%.2fx) — an ORDERING, not a cap: price a pair with "
-                   "ROCKET_RK3576_NET_NOJOIN\n",
-                   JOIN_BYTES / 1024.0, refused / 1024.0,
-                   JOIN_BYTES ? (double)refused / (double)JOIN_BYTES : 0.0);
-            for (k = 0; k < NJ_LIST_N; k++)
-                printf("      pair %2u -> %2u  %6.1f KiB  %s\n",
-                       NJ_LIST[k].i, NJ_LIST[k].j, NJ_LIST[k].bytes / 1024.0,
-                       NOJOIN_TAG[NJ_LIST[k].why]);
-        }
-        /* The producers the A/B has to sweep, so the list does not have to be reconstructed
-         * from the graph by hand. */
-        if (CUBE_JOINS) {
-            unsigned m;
-            printf("      joined at producer(s):");
-            for (m = 0; m < H->n_layers; m++) if (CUBE_OUT[m]) printf(" %u", m);
-            printf("\n");
-        }
-    }
-}
-
-/* Build one chain per run of two or more cube-linked layers.
- *
- * FINDING the runs is the library's, not this gate's: it is the same thirty lines every
- * frontend with a graph would write, it needs no hardware knowledge, and duplicating it
- * was the smell. rocket_conv2d_int8_chain_plan_rk3576() does it, and this is what gates
- * it — including its program-count split, which is why the build-and-shorten loop that
- * used to be here is gone.
- *
- * What stays here is the part that is a property of THIS caller's lowering rather than of
- * the handles: a NULL entry is how the finder is told a layer cannot be in a run, and the
- * array below is built with a NULL wherever this gate would prepare the layer's input on
- * the host. A chain scatters the tensor it is handed and has no way to know a widened or
- * bordered copy was meant. */
-static void kick_build(int fd)
-{
-    rocket_chain_node_rk3576 *cand;
-    rocket_conv2d_int8_run_rk3576 runs[32];
-    unsigned i, nruns, r;
-
-    if (!CUBE_ON || !KICK_OF || !kick_on()) {
-        if (CUBE_ON && !kick_on())
-            printf("   cross-layer kick: OFF (ROCKET_RK3576_NET_KICK=0) — one submit per "
-                   "layer, which is the A/B control\n");
-        return;
-    }
-    cand = calloc(H->n_layers, sizeof *cand);
-    if (!cand) return;
-    for (i = 0; i < H->n_layers; i++) {
-        if (needs_prep(&LAYERS[i])) continue;         /* a host-prepared input */
-        /* An ADD reading a host-built concatenation, and a SKIP SOURCE whose output is
-         * read on the host later, are both host work between two programs — so neither
-         * can sit inside a stream, and a NULL here is how the finder is told so. A WIRED
-         * one is neither: its operands and its consumer are slices of one buffer, and
-         * there is nothing left between the two programs at all. */
-        if ((LAYERS[i].kind == KIND_ADD && !(CUBE_IN && CUBE_IN[i])) ||
-            (SKIP[i] && !(CAT_OF && CAT_OF[i]) && !(MULTI_OF && MULTI_OF[i]))) continue;
-        /* THE LOCALIZER. The finder returns MAXIMAL runs, so naming a layer that sits
-         * inside a longer one would name no run at all — cut the array before it instead,
-         * and the run the finder then finds is the one that starts there. */
-        if (kick_at() >= 0 && i < (unsigned)kick_at()) continue;
-        /* A POOLING layer is a node of the run rather than a break in it: a pool program
-         * runs inside a convolution stream on this part [HW sweep, rk3576_chain_pool].
-         * The finder places it — it may only be interior — so this only has to offer it. */
-        if (IS_POOL(LAYERS[i].kind)) {
-            if (RESIDENT_POOL) cand[i].pool = RESIDENT_POOL[i];
-            continue;
-        }
-        cand[i].conv = RESIDENT[i];
-    }
-    nruns = rocket_chain_plan_rk3576(cand, H->n_layers, runs,
-                                     (unsigned)(sizeof runs / sizeof *runs));
-    if (nruns > sizeof runs / sizeof *runs) nruns = sizeof runs / sizeof *runs;
-    for (r = 0; r < nruns; r++) {
-        unsigned first = runs[r].first, n = runs[r].count;
-        if (kick_at() >= 0 && (unsigned)kick_at() != first) continue;
-        if (n > kick_max()) n = kick_max();          /* the bisection instrument */
-        if (n < 2u) continue;
-        KICK_OF[first] = rocket_chain_new_rk3576(fd, cand + first, n);
-        if (!KICK_OF[first]) {
-            printf("   cross-layer kick: the run at layer %u (%u layers, %u programs) was "
-                   "refused; those layers keep one submit each\n",
-                   first, n, runs[r].programs);
-            continue;
-        }
-        KICK_END[first] = first + n;
-        KICK_RUNS++;
-        KICK_LAYERS += (int)n;
-    }
-    free(cand);
-    if (KICK_RUNS)
-        printf("   cross-layer kick: %d run(s) covering %d layer(s) — one hardware kick "
-               "each where the per-layer path takes one per layer\n",
-               KICK_RUNS, KICK_LAYERS);
-    else
-        printf("   cross-layer kick: no run of two or more linked layers, so nothing to "
-               "chain\n");
 }
 
 /* Run one layer. `how` is set to the path it took. `in2` is the second operand of an add
  * and NULL everywhere else. */
 static int layer_run(int fd, const rnet_layer *L, const int8_t *in, const int8_t *in2,
-                     int8_t *out, const char **how)
+                     const int8_t *const *ops, int8_t *out, const char **how)
 {
     const int8_t *W = L->w_bytes ? at(L->w_off) : NULL;
     const int32_t *bias = L->b_bytes ? (const int32_t *)(BLOB + L->b_off) : NULL;
@@ -1512,6 +1043,19 @@ static int layer_run(int fd, const rnet_layer *L, const int8_t *in, const int8_t
     int8_t *pin = NULL, *pw = NULL;
     unsigned icx = L->ic, ihx = L->ih, iwx = L->iw;
     int rc;
+
+    if (L->kind == KIND_CONCAT) {
+        unsigned li = (unsigned)(L - LAYERS);
+        /* WIRED, there is nothing to do at all: the four producers wrote their own slices
+         * of the buffer the next layer reads as its cube, so this layer is a name for an
+         * address. Otherwise it is the host copy, which is the control that lever is
+         * measured against. */
+        if (CUBE_OUT && CUBE_OUT[li]) { *how = ">concat<"; return ROCKET_OK; }
+        if (!ops || !ops[0]) { *how = "NO-OPERAND"; return ROCKET_E_SHAPE; }
+        concat_run(L, ops, out);
+        *how = "host-concat";
+        return ROCKET_OK;
+    }
 
     if (L->kind == KIND_ADD) {
         unsigned li = (unsigned)(L - LAYERS);
@@ -1569,6 +1113,17 @@ static int layer_run(int fd, const rnet_layer *L, const int8_t *in, const int8_t
         unsigned li = (unsigned)(L - LAYERS);
         rocket_pool_desc p;
         pool_desc_of(L, &p);
+        /* PAST THE PER-TASK OUTPUT-WIDTH ALLOWANCE THE PART IS SILENTLY WRONG, so the
+         * plan function refuses and the layer runs on the CPU model of the part's own
+         * arithmetic — which keeps the graph's numbers identical to what the part would
+         * have computed, so a fallback shows up as a submit and never as a divergence.
+         * Inception V3 is the first graph here to have one: its 147-wide max pool and
+         * its three 35-wide branch averages. */
+        if (rocket_pool_int8_rk3576_plan(&p) != ROCKET_OK) {
+            *how = "host-pool";
+            rocket_pool_ref_int8_rk3576(&p, L->in_zp, in, out);
+            return ROCKET_OK;
+        }
         *how = rocket_pool_int8_rk3576_exact(&p) ? "npu-pool" : "npu-pool*";
         if (RESIDENT_ON) {
             if (!RESIDENT_POOL[li])
@@ -1657,6 +1212,31 @@ static int layer_run(int fd, const rnet_layer *L, const int8_t *in, const int8_t
                rocket_conv2d_oh(&d), rocket_conv2d_ow(&d), L->oh, L->ow);
         free(pin); free(pw);
         return ROCKET_E_SHAPE;
+    }
+
+    /* THE PACKED-IMAGE STEM IS TRIED HERE, and once. `direct_datapath` clear is what routes
+     * an ic <= 4 convolution to it; the pack answers with the part's own bounds, and a
+     * refusal leaves this layer on the direct lowering for the rest of the run. */
+    if (ARGB && argb_cand(L) && !pin) {
+        unsigned li = (unsigned)(L - LAYERS);
+        if (ARGB[li] < 0) {
+            rocket_conv2d_desc t = d;
+            rocket_conv2d_int8_weights_rk3576 *h;
+            t.direct_datapath = 0;
+            h = rocket_conv2d_int8_pack_rk3576(fd, &t, W, bias, L->in_scale, L->w_scale,
+                                               NULL, L->out_scale, L->in_zp, L->w_zp,
+                                               L->out_zp);
+            ARGB[li] = h ? 1 : 0;
+            printf("   layer %u stem (ic=%u %ux%u k%u s%u pad %u,%u): the packed-image "
+                   "first conv %s\n", li, L->ic, L->ih, L->iw, L->kh, L->sy,
+                   L->pl_y, L->pl_x,
+                   h ? "TAKES this geometry" : "refused it — the direct lowering runs");
+            if (h) {
+                if (RESIDENT_ON && !RESIDENT[li]) RESIDENT[li] = h;
+                else rocket_conv2d_int8_weights_free_rk3576(fd, h);
+            }
+        }
+        d.direct_datapath = !ARGB[li];
     }
 
     {
@@ -1832,6 +1412,149 @@ static void print_top5(const char *what, const int t[5])
     printf("\n");
 }
 
+/* ===========================================================================
+ * WHICH DIVISOR A PADDED AVERAGE POOL USED WHEN IT USED THE WRONG ONE.
+ *
+ * A wrong-element count says a pooling layer disagreed; it cannot say what function the
+ * part evaluated instead, and on this part the two candidates differ only in a per-window
+ * DIVISOR. So a failing pool is scored against three rivals as well as its own model:
+ *
+ *   incl    count-include-pad, the other mode bit
+ *   lag-x   the in-plane COLUMN count taken one output column late
+ *   lag-y   the same one output ROW late
+ *
+ * The two `lag` models are the shape the failures have, not a guess about a mechanism: a
+ * wrong set confined to output columns 1 and ow-1 is a column count that is right
+ * everywhere except one column early and one column late.
+ * ==========================================================================*/
+static int pool_inplane(int o, int stride, int k, int pad, int extent)
+{
+    int lo, hi;
+    if (o < 0) o = 0;
+    lo = o * stride - pad;
+    hi = lo + k;
+    if (lo < 0) lo = 0;
+    if (hi > extent) hi = extent;
+    return hi > lo ? hi - lo : 0;
+}
+
+/* rocket_pool_ref_int8_rk3576()'s own rounding over a divisor pair this caller chooses,
+ * including the wrap to int8 with no saturation — which is what makes a divisor of 6
+ * where 9 was meant read as +79 rather than as a clamp. */
+static int8_t pool_round(long sum, int dw, int dh)
+{
+    long n = (long)dw * dh, half, q, r;
+    if (n <= 0) { n = 1; dw = dh = 1; }
+    half = n / 2;
+    q = sum >= 0 ? (sum + half) / n : -(((-sum) + half) / n);
+    if ((n & 1) == 0) {
+        int exact_recip = (0x10000 % dw) == 0 && (0x10000 % dh) == 0;
+        r = sum - q * n;
+        if ((r == half || r == -half) && (!exact_recip || (q & 1)))
+            q += (sum >= 0) ? -1 : 1;
+    }
+    return (int8_t)q;
+}
+
+/* The divisor pair the part is asked for at (y,x), and the one the RASTER PREDECESSOR
+ * carries. A one-window lag on the divisor is the model every failure fits: the taps are
+ * summed for this window and divided by the count belonging to the one before it. */
+static void pool_prev_window(const rocket_pool_desc *d, int ow, int y, int x,
+                             int *dw, int *dh)
+{
+    int py = y, px = x - 1;
+    if (px < 0) { px = ow - 1; py = y - 1; }
+    if (py < 0) { py = y; px = x; }
+    *dw = pool_inplane(px, d->stride_x, d->kw, d->pad_left, d->iw);
+    *dh = pool_inplane(py, d->stride_y, d->kh, d->pad_top, d->ih);
+}
+
+static void pool_divisor_readout(const rnet_layer *L, const int8_t *in,
+                                 const int8_t *got, const int8_t *ref)
+{
+    static const char *NAME[4] = { "incl", "lag-x", "lag-y", "prev-window" };
+    rocket_pool_desc d;
+    long wrong = 0, expl[4] = { 0, 0, 0, 0 };
+    int c, y, x, kh, kw, m;
+
+    if (L->kind != KIND_AVGPOOL) return;
+    pool_desc_of(L, &d);
+    for (c = 0; c < d.c; c++)
+        for (y = 0; y < (int)L->oh; y++)
+            for (x = 0; x < (int)L->ow; x++) {
+                size_t i = ((size_t)c * L->oh + y) * L->ow + x;
+                long sum = 0;
+                int dw0, dh0;
+                if (got[i] == ref[i]) continue;
+                wrong++;
+                for (kh = 0; kh < d.kh; kh++)
+                    for (kw = 0; kw < d.kw; kw++) {
+                        int iy = y * d.stride_y + kh - d.pad_top;
+                        int ix = x * d.stride_x + kw - d.pad_left;
+                        /* The pad value is zero on every arm here: the mode bit moves the
+                         * divisor and not the sum, so an outside tap adds nothing whichever
+                         * divisor is under test. The graph's averages all run it. */
+                        if (iy < 0 || ix < 0 || iy >= d.ih || ix >= d.iw) continue;
+                        sum += in[((size_t)c * d.ih + iy) * d.iw + ix];
+                    }
+                dw0 = pool_inplane(x, d.stride_x, d.kw, d.pad_left, d.iw);
+                dh0 = pool_inplane(y, d.stride_y, d.kh, d.pad_top, d.ih);
+                for (m = 0; m < 4; m++) {
+                    int dw = dw0, dh = dh0;
+                    if (m == 0) { dw = d.kw; dh = d.kh; }
+                    else if (m == 1)
+                        dw = pool_inplane(x - 1, d.stride_x, d.kw, d.pad_left, d.iw);
+                    else if (m == 2)
+                        dh = pool_inplane(y - 1, d.stride_y, d.kh, d.pad_top, d.ih);
+                    else
+                        pool_prev_window(&d, (int)L->ow, y, x, &dw, &dh);
+                    if (got[i] == pool_round(sum, dw, dh)) expl[m]++;
+                }
+            }
+    printf("      the divisor the part used, over the %ld wrong elements:", wrong);
+    for (m = 0; m < 4; m++) printf("  %s %ld", NAME[m], expl[m]);
+    printf("\n");
+
+    /* AND THE MAP ITSELF, for the first channel that has one. A count says how well a
+     * candidate fits; this says what the part actually divided by at each position, by
+     * solving for the divisor pair rather than proposing one. `.` is exact, a digit is
+     * the tap count that reproduces the part's value, `?` is none of the kh*kw pairs. */
+    for (c = 0; c < d.c; c++) {
+        int any = 0;
+        for (y = 0; y < (int)L->oh && !any; y++)
+            for (x = 0; x < (int)L->ow; x++)
+                if (got[((size_t)c * L->oh + y) * L->ow + x] !=
+                    ref[((size_t)c * L->oh + y) * L->ow + x]) { any = 1; break; }
+        if (!any) continue;
+        printf("      channel %d, `.` exact / digit = the tap count the part divided by "
+               "/ `?` none of the %d:\n", c, d.kh * d.kw);
+        for (y = 0; y < (int)L->oh && y < 24; y++) {
+            printf("        ");
+            for (x = 0; x < (int)L->ow && x < 40; x++) {
+                size_t i = ((size_t)c * L->oh + y) * L->ow + x;
+                long sum = 0;
+                int dw, dh, hit = 0;
+                if (got[i] == ref[i]) { printf(" ."); continue; }
+                for (kh = 0; kh < d.kh; kh++)
+                    for (kw = 0; kw < d.kw; kw++) {
+                        int iy = y * d.stride_y + kh - d.pad_top;
+                        int ix = x * d.stride_x + kw - d.pad_left;
+                        if (iy < 0 || ix < 0 || iy >= d.ih || ix >= d.iw) continue;
+                        sum += in[((size_t)c * d.ih + iy) * d.iw + ix];
+                    }
+                for (dh = 1; dh <= d.kh && !hit; dh++)
+                    for (dw = 1; dw <= d.kw; dw++)
+                        if (got[i] == pool_round(sum, dw, dh)) {
+                            printf("%2d", dw * dh); hit = 1; break;
+                        }
+                if (!hit) printf(" ?");
+            }
+            printf("\n");
+        }
+        break;
+    }
+}
+
 /*
  * A layer that disagrees with a model of the part's own arithmetic is one of two very
  * different things, and one run cannot tell them apart:
@@ -1873,7 +1596,7 @@ static void diagnose(int fd, const rnet_layer *L, const int8_t *in, const int8_t
 
     for (r = 0; r < 2; r++) {
         long diff_now = 0, moved = 0;
-        if (layer_run(fd, L, in, in2, again, &how) != ROCKET_OK) break;
+        if (layer_run(fd, L, in, in2, NULL, again, &how) != ROCKET_OK) break;
         for (i = 0; i < n; i++) {
             int w1 = first[i] != ref[i], w2 = again[i] != ref[i];
             if (w2) diff_now++;
@@ -1945,7 +1668,7 @@ static int stem_ab(int fd, const rnet_layer *L, const int8_t *in, size_t cap)
         STEM_OFF = (v != 0);
         WIDEN_ON = (v == 2);
         if (RESIDENT_ON && v != 0) { held = RESIDENT[li]; RESIDENT[li] = NULL; }
-        if (layer_run(fd, L, in, NULL, buf[v], &how[v]) != ROCKET_OK) rc = 1;
+        if (layer_run(fd, L, in, NULL, NULL, buf[v], &how[v]) != ROCKET_OK) rc = 1;
         if (RESIDENT_ON && v != 0) {
             if (RESIDENT[li]) rocket_conv2d_int8_weights_free_rk3576(fd, RESIDENT[li]);
             RESIDENT[li] = held;
@@ -2023,7 +1746,11 @@ static int pass_oracle(int fd)
 
         if (L->kind == KIND_SOFTMAX) continue;       /* host, and rank-preserving */
         t0 = now_ms();
-        rc = layer_run(fd, L, in, in2, out, &how);
+        {
+            const int8_t *ops[MAX_SRC] = { NULL, NULL, NULL, NULL };
+            if (L->kind == KIND_CONCAT) gather_ops(i, 1, NULL, ops);
+            rc = layer_run(fd, L, in, in2, ops, out, &how);
+        }
         ms = now_ms() - t0;
         if (rc != ROCKET_OK) {
             printf("%2u %-8s %-13s ENTRY RETURNED %d\n", i, KIND_NAME[L->kind], how, rc);
@@ -2073,6 +1800,7 @@ static int pass_oracle(int fd)
                    "%ld/%ld, maxdiff %d, first (c%ld y%ld x%ld)\n",
                    hw.exact, hw.total, hw.maxdiff, hw.first_c, hw.first_y, hw.first_x);
             wrong_extent(L, out, ref);
+            pool_divisor_readout(L, in, out, ref);
             diagnose(fd, L, in, in2, out, ref, cap);
             failed++;
         } else if (tf.maxdiff > tflite_slack(L)) {
@@ -2229,7 +1957,15 @@ static int pass_chain(int fd, int iters)
                 i = last;
                 continue;
             }
-            rc = layer_run(fd, L, chain_input(i, cur), chain_operand_b(L, i, cur), dst, &how);
+            {
+                const int8_t *ops[MAX_SRC] = { NULL, NULL, NULL, NULL };
+                if (L->kind == KIND_CONCAT && !gather_ops(i, 0, cur, ops)) {
+                    printf("%2u concat: an operand the graph did not keep\n", i);
+                    failed++; break;
+                }
+                rc = layer_run(fd, L, chain_input(i, cur), chain_operand_b(L, i, cur),
+                               ops, dst, &how);
+            }
             lt = now_ms() - lt;
             if (rc != ROCKET_OK) {
                 printf("%2u %-8s ENTRY RETURNED %d\n", i, KIND_NAME[L->kind], rc);
@@ -2240,12 +1976,23 @@ static int pass_chain(int fd, int iters)
             /* A cube-out layer wrote no row-major tensor, so there is nothing here to
              * score and `dst` still holds an older layer's output — reading it would
              * report a fabricated distance. The join is asserted by pass_cube(), which
-             * compares the whole chain against the row-major one. */
-            if (CUBE_OUT && CUBE_OUT[i]) {
-                s.exact = s.total = 0; s.maxdiff = 0;
-            } else {
-                score_vs(L, dst, at(L->g_off), &s);
-                if (s.maxdiff > tflite_slack(L) && drift < 0) drift = (int)i;
+             * compares the whole chain against the row-major one.
+             *
+             * SCORED ON THE FIRST ITERATION ONLY, because `s` and `drift` are both read
+             * only there and a per-element scan of every materialised layer is not free:
+             * it is a full pass over the tensor, outside the per-layer `lt` but inside
+             * `wall`, so it was 10.1 ms of Inception V1's 28.9 ms — 35% of the number the
+             * bench reported as the graph's. The three older graphs are each one kick with
+             * one materialised layer and could not show it, which is the shape of the trap:
+             * an instrument's overhead is a function of the GRAPH, so a corpus where it is
+             * zero says nothing about the one where it is not. [HW sweep, H96 MAX M9] */
+            if (it == 0) {
+                if (CUBE_OUT && CUBE_OUT[i]) {
+                    s.exact = s.total = 0; s.maxdiff = 0;
+                } else {
+                    score_vs(L, dst, at(L->g_off), &s);
+                    if (s.maxdiff > tflite_slack(L) && drift < 0) drift = (int)i;
+                }
             }
             if (it == 0)
                 printf("%2u %-8s %4ux%-3ux%-4u -> %4ux%-3ux%-4u %-13s %8.2f ms  "
@@ -2325,6 +2072,29 @@ static int pass_chain(int fd, int iters)
                    LAYERS[best].iw, LAYERS[best].oc, LAYERS[best].oh, LAYERS[best].ow,
                    paths[best] ? paths[best] : "?", bv / iters, 100.0 * bv / tot);
             acc[best] = -1.0;
+        }
+        /* WHERE THE DIVISOR LAG ACTUALLY FIRES. The rate is what the check's cost and
+         * every redo are a function of, and a rate averaged over a GEOMETRY cannot say
+         * whether every pool of that shape lags or one placement does. Read off the
+         * handles, which count it themselves. */
+        if (RESIDENT_POOL) {
+            unsigned any = 0;
+            for (i = 0; i < H->n_layers; i++) {
+                unsigned fires = 0, calls = 0;
+                if (!RESIDENT_POOL[i]) continue;
+                rocket_pool_int8_rk3576_lag_counts(RESIDENT_POOL[i], &fires, &calls);
+                if (!calls) continue;
+                if (!any++)
+                    printf("   the divisor lag, per pooling layer (fires / scored):\n");
+                printf("      %2u %-8s %4ux%-3ux%-4u  %5u / %-5u  %5.1f%%   %lu discr, "
+                       "src bo %u / %.0f KiB, path %s\n",
+                       i, KIND_NAME[LAYERS[i].kind], LAYERS[i].ic, LAYERS[i].ih,
+                       LAYERS[i].iw, fires, calls, 100.0 * fires / calls,
+                       rocket_pool_int8_rk3576_lag_discr(RESIDENT_POOL[i]) / calls,
+                       rocket_pool_int8_rk3576_lag_src_handle(RESIDENT_POOL[i]),
+                       rocket_pool_int8_rk3576_lag_src_bytes(RESIDENT_POOL[i]) / 1024.0,
+                       paths[i] ? paths[i] : "?");
+            }
         }
     }
     free(acc); free(paths);
@@ -2593,7 +2363,14 @@ static int pass_peraxis(int fd)
             /* Pooling and the residual add carry no per-channel weights — the add's are
              * two diagonal blocks, not a quantized tensor — so both stay on the
              * per-tensor path either way. */
-            rc = layer_run(fd, L, in, chain_operand_b(L, i, cur), dst, &how);
+            {
+                const int8_t *ops[MAX_SRC] = { NULL, NULL, NULL, NULL };
+                if (L->kind == KIND_CONCAT && !gather_ops(i, 0, cur, ops)) {
+                    printf("%2u concat: an operand the graph did not keep\n", i);
+                    failed++; break;
+                }
+                rc = layer_run(fd, L, in, chain_operand_b(L, i, cur), ops, dst, &how);
+            }
             if (rc != ROCKET_OK) { printf("%2u %-8s RETURNED %d\n", i,
                                           KIND_NAME[L->kind], rc); failed++; break; }
             printf("%2u %-8s %-11s (no per-channel weights)\n", i,
@@ -2618,7 +2395,12 @@ static int pass_peraxis(int fd)
         d.stride_y = (int)L->sy; d.stride_x = (int)L->sx;
         d.dil_y = d.dil_x = 1;
         d.depthwise = (L->kind == KIND_DWCONV);
-        d.direct_datapath = narrow_direct(L);
+        /* A PER-AXIS REQUANT IS REFUSED ON THE PACKED-IMAGE ENCODING — its output-channel
+         * tiling and scale sort are the direct path's — so this pass asks for the direct
+         * lowering at a narrow channel count whatever the per-tensor path chose. It is
+         * exact at any zero point and any spread, so nothing about the accuracy question
+         * this pass asks depends on which encoding the other one took. */
+        d.direct_datapath = L->kind == KIND_CONV && L->ic <= 4 && !widen_on();
         /* THE SAME LOWERING THE PER-TENSOR PATH TAKES, and it has to be: `pin` here only
          * widens the channels when the extent form is on, so a pad_top of zero would put
          * the reference and the hardware on different grids and the layer would report a
@@ -2750,8 +2532,14 @@ static int pass_peraxis(int fd)
  * rather than a quantized tensor, so both stay per-tensor in either arm, exactly as the
  * per-axis NPU pass leaves them. */
 static int host_layer(const rnet_layer *L, const struct peraxis_layer *P,
-                      const int8_t *in, const int8_t *in2, int8_t *out)
+                      const int8_t *in, const int8_t *in2, const int8_t *const *ops,
+                      int8_t *out)
 {
+    if (L->kind == KIND_CONCAT) {
+        if (!ops || !ops[0]) return ROCKET_E_SHAPE;
+        concat_run(L, ops, out);
+        return ROCKET_OK;
+    }
     if (L->kind == KIND_ADD) {
         int8_t *aw = NULL, *cat;
         int32_t *ab = NULL;
@@ -2802,8 +2590,16 @@ static const int8_t *host_chain(const struct peraxis_layer *P, int threaded,
 
         if (L->kind == KIND_SOFTMAX) continue;
         in = (threaded && weighted) ? cur : chain_input(i, cur);
-        rc = host_layer(L, (P && weighted) ? &P[i] : NULL, in,
-                        chain_operand_b(L, i, cur), dst);
+        {
+            const int8_t *ops[MAX_SRC] = { NULL, NULL, NULL, NULL };
+            if (L->kind == KIND_CONCAT && !gather_ops(i, 0, cur, ops)) {
+                printf("%2u concat: an operand the host chain did not keep\n", i);
+                (*failed)++;
+                return NULL;
+            }
+            rc = host_layer(L, (P && weighted) ? &P[i] : NULL, in,
+                            chain_operand_b(L, i, cur), ops, dst);
+        }
         if (rc != ROCKET_OK) {
             printf("%2u %-8s THE HOST LAYER RETURNED %d\n", i, KIND_NAME[L->kind], rc);
             (*failed)++;
@@ -2978,7 +2774,10 @@ static int graph_once(int fd, int8_t **snap, const int8_t **logits, int8_t *a, i
             i = last;
             continue;
         }
-        if (layer_run(fd, L, chain_input(i, cur), chain_operand_b(L, i, cur), dst, &how) != ROCKET_OK) {
+        const int8_t *ops[MAX_SRC] = { NULL, NULL, NULL, NULL };
+        if (L->kind == KIND_CONCAT && !gather_ops(i, 0, cur, ops)) return 1;
+        if (layer_run(fd, L, chain_input(i, cur), chain_operand_b(L, i, cur), ops,
+                      dst, &how) != ROCKET_OK) {
             failed++; break;
         }
         if (CUBE_OUT && CUBE_OUT[i]) continue;      /* no row-major tensor to keep */
@@ -3033,7 +2832,7 @@ static int pass_cube(int fd)
     if (failed) goto out;
     if (l1) { memcpy(lb1, l1, H->n_classes); l1 = lb1; }
 
-    cube_link(fd);
+    plan_build(fd);
     if (!CUBE_JOINS) {
         printf("   no join was accepted, so there is nothing to compare — this is a "
                "REFUSAL to explain, not a pass\n");
@@ -3084,9 +2883,9 @@ static int pass_cube(int fd)
      * both at once and neither on its own, and a wrong byte inside a kick would read as a
      * cube-chain defect. */
     printf("\n== CROSS-LAYER KICK: the same cube-chained graph as fewer hardware kicks ==\n");
-    kick_build(fd);
+    rocket_graph_plan_kicks(PLAN);
     if (!KICK_RUNS) {
-        if (kick_on()) {
+        if (rocket_graph_kick_on()) {
             printf("   no run of two or more linked layers was accepted — this is a "
                    "REFUSAL to explain, not a pass\n");
             failed++;
@@ -3166,15 +2965,24 @@ int main(int argc, char **argv)
         } else mode = argv[a];
     }
     if (!blob) {
+        /* The blob's own name carries the input resolution, so a network at anything
+         * other than 224 needs the table rather than a suffix. */
+        static const struct { const char *net, *stem; } BLOBS[] = {
+            { "v1",  "mobilenet_v1_224"   }, { "v2",  "mobilenet_v2_224"   },
+            { "r18", "resnet18_224"       }, { "iv1", "inception_v1_224"   },
+            { "iv3", "inception_v3_299"   },
+        };
         const char *root = getenv("ROCKET_SRC_DIR");
-        const char *stem = !strcmp(net, "r18") ? "resnet18" : NULL;
-        if (stem)
-            snprintf(def, sizeof def, "%s/tests/data/rk3576-net/%s_224_quant.rnet",
-                     root ? root : ".", stem);
-        else
-            snprintf(def, sizeof def,
-                     "%s/tests/data/rk3576-net/mobilenet_%s_224_quant.rnet",
-                     root ? root : ".", net);
+        const char *stem = NULL;
+        size_t k;
+        for (k = 0; k < sizeof BLOBS / sizeof *BLOBS; k++)
+            if (!strcmp(net, BLOBS[k].net)) { stem = BLOBS[k].stem; break; }
+        if (!stem) {
+            printf("unknown network %s (v1 v2 r18 iv1 iv3)\n", net);
+            return 2;
+        }
+        snprintf(def, sizeof def, "%s/tests/data/rk3576-net/%s_quant.rnet",
+                 root ? root : ".", stem);
         blob = def;
     }
 
@@ -3292,8 +3100,8 @@ int main(int argc, char **argv)
             const int8_t *lg = NULL;
             int8_t *wa = malloc(max_tensor()), *wb = malloc(max_tensor());
             if (!wa || !wb) failed++;
-            else { failed += graph_once(fd, NULL, &lg, wa, wb); cube_link(fd);
-                   kick_build(fd); }
+            else { failed += graph_once(fd, NULL, &lg, wa, wb); plan_build(fd);
+                   rocket_graph_plan_kicks(PLAN); }
             free(wa); free(wb);
         }
         failed += pass_chain(fd, iters);

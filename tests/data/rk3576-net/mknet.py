@@ -68,6 +68,7 @@ from tflite.Conv2DOptions import Conv2DOptions
 from tflite.DepthwiseConv2DOptions import DepthwiseConv2DOptions
 from tflite.Pool2DOptions import Pool2DOptions
 from tflite.AddOptions import AddOptions
+from tflite.ConcatenationOptions import ConcatenationOptions
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -78,14 +79,17 @@ NETS = {
     "v1": ("mobilenet_v1_1.0_224_quant.tflite", "mobilenet_v1_224_quant.rnet"),
     "v2": ("mobilenet_v2_1.0_224_quant.tflite", "mobilenet_v2_224_quant.rnet"),
     "r18": ("resnet18_224_quant.tflite", "resnet18_224_quant.rnet"),
+    "iv1": ("inception_v1_224_quant.tflite", "inception_v1_224_quant.rnet"),
+    "iv3": ("inception_v3_299_quant.tflite", "inception_v3_299_quant.rnet"),
 }
 
 MAGIC = b"RKNET\0\0\1"
-VERSION = 2
+VERSION = 3
 LAYER_STRIDE = 160
 
 KIND_CONV, KIND_DWCONV, KIND_AVGPOOL, KIND_SOFTMAX, KIND_ADD = 0, 1, 2, 3, 4
-KIND_MAXPOOL = 5
+KIND_MAXPOOL, KIND_CONCAT = 5, 6
+MAX_SRC = 4                  # a concatenation's operands; every other kind uses one or two
 ACT_NONE, ACT_RELU6, ACT_RELU = 0, 1, 2
 
 NO_SRC = 0xFFFFFFFF          # the network input, or "this layer has no second operand"
@@ -219,7 +223,7 @@ def build(model_path, out_path):
         L = dict(kind=None, act=ACT_NONE, kh=1, kw=1, sy=1, sx=1,
                  pl_y=0, pl_x=0, pt_y=0, pt_x=0,
                  w_zp=0, w_scale=1.0, w_off=0, w_bytes=0, b_off=0, b_bytes=0,
-                 src2=NO_SRC, in2_zp=0, in2_scale=0.0)
+                 src2=NO_SRC, src3=NO_SRC, src4=NO_SRC, in2_zp=0, in2_scale=0.0)
 
         # An explicit pad ahead of this op is this op's own lead/trail, and the plane it
         # reads is the one BEFORE the pad -- which is what the previous layer wrote.
@@ -284,6 +288,79 @@ def build(model_path, out_path):
             ow_c, L["pl_x"], L["pt_x"] = resolve(iw, L["kw"], L["sx"], o.Padding(),
                                                  explicit[2:] if explicit else None)
             assert (oh_c, ow_c) == (oh, ow)
+        elif name == "CONCATENATION":
+            # A CONCATENATION IS PLACEMENT, NOT ARITHMETIC — but only when every operand
+            # is already in the output's quantization. TFLite's own kernel requantizes an
+            # operand that is not, and this format cannot carry that, so it is refused
+            # rather than copied through. Every operand of these models is already there,
+            # which is what makes the whole op free on the part: each producer writes its
+            # own slice of one buffer and the consumer reads the buffer as its cube.
+            o = ConcatenationOptions(); o.Init(bo.Bytes, bo.Pos)
+            if o.FusedActivationFunction() != tflite.ActivationFunctionType.NONE:
+                sys.exit("a fused activation on concat %d is not lowered here" % i)
+            if o.Axis() not in (3, -1):
+                sys.exit("concat %d joins axis %d; only the channel axis is lowered here"
+                         % (i, o.Axis()))
+            if len(ins) > MAX_SRC:
+                sys.exit("concat %d has %d operands; the blob carries %d"
+                         % (i, len(ins), MAX_SRC))
+            L["kind"] = KIND_CONCAT
+            off = 0
+            for k, t in enumerate(ins):
+                sc, zp = quant(t)
+                if abs(sc - osc) > 1e-9 * max(abs(osc), 1e-30) or zp != ozp:
+                    sys.exit("concat %d operand %d: (%g, %d) is not the output's (%g, %d)"
+                             % (i, k, sc, zp, osc, ozp))
+                src = src_of.get(t, NO_SRC)
+                if src == NO_SRC:
+                    sys.exit("concat %d: operand %d is not produced by a layer" % (i, k))
+                if shape(t)[-1] != layers[src]["oc"]:
+                    sys.exit("concat %d: operand %d is %d channels, its producer writes %d"
+                             % (i, k, shape(t)[-1], layers[src]["oc"]))
+                # A PLACED SLICE STARTS ON A 16-CHANNEL ATOM, which is what one cube
+                # interleaves. An operand order that lands one anywhere else can still be
+                # run by copying on the host, but it cannot be wired, so it is worth
+                # knowing at build time rather than as a silent fallback.
+                if off % 16:
+                    sys.exit("concat %d: operand %d starts at channel %d, which is not a "
+                             "16-channel atom" % (i, k, off))
+                L["src%d" % (k + 1)] = src
+                off += int(shape(t)[-1])
+            if off != oc:
+                sys.exit("concat %d: operands sum to %d channels, output is %d"
+                         % (i, off, oc))
+            ic, ih, iw = oc, oh, ow          # the layer IS its output; operands are slices
+        elif name == "QUANTIZE":
+            # A REQUANTIZATION EDGE, and the first op here that is neither arithmetic nor
+            # placement. TFLite emits one where a tensor is consumed at a different scale
+            # from the one its producer wrote: on Inception V3, on the output of a
+            # concatenation whose operands were calibrated somewhere the consumer is not.
+            # The values change, so it cannot be dropped the way a RESHAPE is.
+            #
+            # IT LOWERS ONTO A DEPTHWISE 1x1 IDENTITY — the same idiom the DPU LUT uses to
+            # put one input value at one table index. A unit weight at unit scale leaves the
+            # convolution's own epilogue computing
+            #     out = requant((in - in_zp) * in_scale / out_scale) + out_zp,
+            # which is exactly TFLite's kernel. So a requantization needs no new layer kind,
+            # no new blob field and no new library entry: the part already gates a depthwise
+            # 1x1, and the layer can write straight into a concatenation's slice like any
+            # other producer.
+            if shape(ins[0]) != shape(outs[0]) or \
+               g.Tensors(ins[0]).Type() != g.Tensors(outs[0]).Type():
+                sys.exit("quantize %d changes shape or storage type; only a rescale is "
+                         "lowered here" % i)
+            L["w_scale"], L["w_zp"] = 1.0, 0
+            L["b_off"], L["b_bytes"] = put(np.zeros(ic, dtype=np.int32))
+            if os.environ.get("MKNET_REQUANT_DIRECT"):
+                # The same arithmetic as a DIRECT 1x1 convolution over an identity
+                # matrix. Quadratic in the channel count where the depthwise form is
+                # linear, so it is the control rather than the lowering.
+                L["kind"] = KIND_CONV
+                L["w_off"], L["w_bytes"] = put(
+                    np.eye(ic, dtype=np.int8).reshape(ic, ic, 1, 1))
+            else:
+                L["kind"] = KIND_DWCONV
+                L["w_off"], L["w_bytes"] = put(np.ones((ic, 1, 1), dtype=np.int8))
         elif name == "SOFTMAX":
             L["kind"] = KIND_SOFTMAX
         else:
@@ -358,6 +435,7 @@ def build(model_path, out_path):
         struct.pack_into("<2I", tbl, i * LAYER_STRIDE + 120, L["src1"], L["src2"])
         struct.pack_into("<i", tbl, i * LAYER_STRIDE + 128, L["in2_zp"])
         struct.pack_into("<f", tbl, i * LAYER_STRIDE + 132, L["in2_scale"])
+        struct.pack_into("<2I", tbl, i * LAYER_STRIDE + 136, L["src3"], L["src4"])
 
     base = 128 + len(tbl)
     for i in range(len(layers)):                                # data offsets are absolute
@@ -372,12 +450,15 @@ def build(model_path, out_path):
     with open(out_path, "wb") as f:
         f.write(hdr); f.write(tbl); f.write(data)
 
-    kinds = ("conv", "dwconv", "avgpool", "softmax", "add", "maxpool")
+    kinds = ("conv", "dwconv", "avgpool", "softmax", "add", "maxpool", "concat")
     for i, L in enumerate(layers):
         edge = ""
         if L["kind"] == KIND_ADD:
             edge = "  + layer %d (s=%.6g zp=%d)" % (L["src2"], L["in2_scale"],
                                                     L["in2_zp"])
+        if L["kind"] == KIND_CONCAT:
+            edge = "  <- " + " ".join(str(L[k]) for k in ("src1", "src2", "src3", "src4")
+                                      if L[k] != NO_SRC)
         print("%2d %-8s %4dx%-3dx%-4d -> %4dx%-3dx%-4d k%dx%d s%d pad %d/%d %d/%d "
               "act%d zp %d/%d/%d%s" %
               (i, kinds[L["kind"]], L["ic"], L["ih"], L["iw"], L["oc"], L["oh"],
