@@ -274,6 +274,58 @@ int rocket_conv_transpose2d_fp16_ctx(rocket_conv_ctx *ctx,
 void rocket_conv_transpose2d_ref_fp16(const rocket_conv_transpose2d_desc *d,
                                       const _Float16 *in, const _Float16 *W, _Float16 *out);
 
+/* ---- RK3576: the per-chip convolution entries ------------------------------
+ * The RK3576 NPU is the same IP family and runs through the same uAPI, but its
+ * CNA/CORE/DPU blocks use a different geometry-register encoding at the same block
+ * bases, so a program built for the RK3588 there submits, completes, and writes
+ * nothing. These are that part's own encoders, driven.
+ *
+ * WHERE THE PUBLIC ENTRIES DISPATCH HERE, and where they cannot:
+ *
+ *   rocket_conv2d_dw_int8() and rocket_conv2d_fp16() have the semantics this part
+ *   computes, so on an RK3576 they route to the two entries below and a caller writes
+ *   nothing chip-specific.
+ *
+ *   rocket_conv2d_int8() does not. It writes a RAW int32 accumulator and requants on
+ *   the host; the RK3576's direct int8 datapath requantizes ON CHIP and writes a byte.
+ *   Emulating one with the other is not a wrapper — it is a different arithmetic — so
+ *   that entry refuses on this part and names rocket_conv2d_int8_rk3576(), which takes
+ *   the quant parameters and writes int8. Same reasoning, and the same answer, as
+ *   rocket_matmul_int8() and rocket_matmul_int8_rk3576().
+ *
+ * Layouts and descriptor semantics are the ones above: in [IC][IH][IW], W
+ * [OC][IC][KH][KW] (direct) or [C][KH][KW] (depthwise), out [OC][OH][OW], all
+ * row-major. Any IC and OC are accepted — the driver pads to the part's own granules
+ * — and rows and output channels tile automatically.
+ *
+ * The quant contract is per-tensor and the zero points are MODEL DOMAIN signed int8.
+ * bias may be NULL. The input zero point and the weight zero point are folded into the
+ * coefficient buffer exactly; the output zero point becomes the DPU's OUT_CVT offset.
+ *
+ * Refused rather than approximated: dilation (no RK3576 shape has been run through the
+ * rate fields); IC <= 4, which takes the CNA's ARGB first-conv sub-encoding whose
+ * weight cube is not decoded; a weight zero point on the depthwise path, whose
+ * coefficient group has no B field; and a shape whose resident weight slice does not
+ * fit even one output-channel group, which needs an input-channel split that the
+ * on-chip requant forecloses.
+ *
+ * Bit-exact against a CPU model over tests/rk3576_conv_lib_gate.c. [HW sweep, H96 MAX M9] */
+int rocket_conv2d_int8_rk3576(int fd, const rocket_conv2d_desc *d,
+                              const int8_t *in, const int8_t *W, const int32_t *bias,
+                              float in_scale, float w_scale, float out_scale,
+                              int in_zp, int w_zp, int out_zp, int8_t *out);
+int rocket_conv2d_dw_int8_rk3576(int fd, const rocket_conv2d_desc *d,
+                                 const int8_t *in, const int8_t *w, const int32_t *bias,
+                                 float in_scale, float w_scale, float out_scale,
+                                 int in_zp, int w_zp, int out_zp, int8_t *out);
+
+/* fp16 -> fp16 through the input-channel split: one fp16 task on this part contracts
+ * exactly sixteen input channels, so an arbitrary count is ic/16 submits summed on the
+ * host. A plane whose 16-channel slice still overflows the CBUF is refused — composing
+ * the split with the row window is not wired — and the depthwise fp16 cube is not
+ * decoded, so desc.depthwise is refused too. */
+int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
+                              const _Float16 *in, const _Float16 *W, _Float16 *out);
 
 #ifdef __cplusplus
 }

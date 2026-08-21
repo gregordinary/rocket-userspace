@@ -141,6 +141,58 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
  *
  * rocket_matmul_plan_int8 previews the tiling (pure, no HW); returns NPU job count
  * or <0 on unsupported shape. rocket_matmul_int8 runs it on `fd`. */
+/* ---- the RK3576's own int8 matmul --------------------------------------
+ *
+ * Same C[M,N] = A[M,K] * B[N,K]^T convention, and a DIFFERENT contract from
+ * rocket_matmul_int8 above, which is why it is a separate entry rather than a
+ * dispatch behind it: the RK3576's DPU writes an int8 surface through its requant,
+ * where the RK3588 writes the raw int32. So:
+ *
+ *     C[m][n] = sat8( round( ( sum_k A[m][k]*B[n][k] + bias[n] ) * scale ) )
+ *
+ * `bias` may be NULL. `scale` is per-tensor and must be positive — the DPU's OUT_CVT
+ * multiplier gates the whole bias stage, and a zero there writes a full, correctly
+ * sized, entirely empty surface with nothing to fault on. Requires K%32 and N%32.
+ *
+ * WHAT IT WILL AND WILL NOT DO, both measured on the part:
+ *
+ *   - M carries NO constraint. M=1 computes, and so does every plane the M rows can
+ *     be cut into. This is the opposite of the RK3588, where rows are the conv's
+ *     spatial height, height < 4 mis-computes, and M==1 is padded to 4.
+ *   - N is TILED, and the tile is what buys throughput: a submit costs ~1.4 ms
+ *     whatever it carries, so MACs per submit is the only lever and N is the only
+ *     free axis. ROCKET_RK3576_MM_NT overrides the default tile.
+ *   - K IS tiled, past what one task contracts, through the int32-output entry below,
+ *     and the requant is then applied on the host. Inside one task's contraction the
+ *     requant is the DPU's own. The boundary is not visible in the result but it is in
+ *     the cost — see the int32 entry.
+ *
+ * rocket_matmul_plan_int8_rk3576 previews the tiling (pure, no HW) and returns the
+ * NPU job count, or <0 on a shape this part cannot run. It reports the SINGLE-TASK
+ * plan, so a K past one contraction returns ROCKET_E_SHAPE there while
+ * rocket_matmul_int8_rk3576 still runs it. [HW sweep, H96 MAX M9] */
+int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *Nt);
+int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
+                              const int8_t *A, const int8_t *B,
+                              const int32_t *bias, float scale, int8_t *C);
+
+/* ---- the RK3576's int32-output matmul, and the K split ------------------
+ *
+ *     C[m][n] = sum_k A[m][k]*B[n][k] + bias[n]          (raw int32, no requant)
+ *
+ * K is split internally and the partials are summed on the host, so K is bounded only
+ * by memory. `bias` may be NULL. Requires K%32 and N%32.
+ *
+ * WHAT IT COSTS. The DPU's 32-bit writer keeps the INT8 surface's byte budget whatever
+ * the output element width is, so it delivers only the first eight output channels of
+ * every thirty-two. This entry gets around that by programming four times the output
+ * channels and scattering the real ones into the delivered slots — correct, and a
+ * quarter of the int8 path's MACs per submit. Use it for the K a single task cannot
+ * contract, not as the default matmul. [HW sweep, H96 MAX M9] */
+int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
+                                  const int8_t *A, const int8_t *B,
+                                  const int32_t *bias, int32_t *C);
+
 int rocket_matmul_plan_int8(int M, int K, int N, int *Mt, int *Kt, int *Nt);
 int rocket_matmul_int8(int fd, int M, int K, int N,
                        const int8_t *A, const int8_t *B, int32_t *C);

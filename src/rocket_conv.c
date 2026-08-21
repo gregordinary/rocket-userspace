@@ -880,9 +880,42 @@ static int conv2d_run(int fd, rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
  * ##########################################################################*/
 
 /* Public entry points: the legacy per-call path (ctx=NULL) and the resident-BO path. */
+/* ============================================================================
+ * SECTION — the per-chip dispatch point
+ *
+ * Every generator this file drives emits the RK3588 geometry-register encoding, and
+ * that encoding is IP-revision-specific: the RK3576 re-packs the CNA/CORE/DPU blocks
+ * at the same block bases, so a program built here does not compute slowly or
+ * approximately there — it submits, the job completes, and the DPU writes nothing.
+ *
+ * Where the RK3576's own entry has the SAME semantics, the public entry routes to it
+ * and a caller writes nothing chip-specific. Where it does not, the entry refuses and
+ * names the one that does; emulating an on-chip requant with a host one is a different
+ * arithmetic, not a wrapper. This mirrors rocket_matmul.c's mm_wrong_encoding().
+ */
+static int conv_is_rk3576(void)
+{
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+    return hw && hw->name && !strcmp(hw->name, "rk3576");
+}
+
+static int conv_wrong_encoding(const char *entry, const char *instead)
+{
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+    if (hw && hw->name && !strcmp(hw->name, "rk3588")) return 0;
+    ROCKET_LOGE("%s emits the RK3588 geometry-register encoding, which the %s does not "
+                "run — the job would complete and write nothing. Use %s\n",
+                entry, hw && hw->name ? hw->name : "?", instead);
+    return 1;
+}
+
 int rocket_conv2d_fp16(int fd, const rocket_conv2d_desc *d,
                        const _Float16 *in, const _Float16 *W, _Float16 *out)
 {
+    if (conv_is_rk3576())
+        return rocket_conv2d_fp16_rk3576(fd, d, in, W, out);
+    if (conv_wrong_encoding("rocket_conv2d_fp16", "the chip's own conv encoder"))
+        return ROCKET_E_UNSUPPORTED;
     return conv2d_run(fd, NULL, d, NULL, in, W, out);
 }
 
@@ -1567,6 +1600,12 @@ static int conv2d_int8_run(int fd, rocket_conv_ctx *ctx, rocket_conv_pool *pool,
 int rocket_conv2d_int8(int fd, const rocket_conv2d_desc *d,
                        const int8_t *in, const int8_t *W, int32_t *out)
 {
+    if (conv_wrong_encoding("rocket_conv2d_int8",
+                            "rocket_conv2d_int8_rk3576, which takes the quant "
+                            "parameters and writes int8 — this part's direct int8 "
+                            "datapath requantizes on chip rather than writing a raw "
+                            "int32 accumulator"))
+        return ROCKET_E_UNSUPPORTED;
     return conv2d_int8_run(fd, NULL, NULL, d, in, W, out);
 }
 
@@ -1851,6 +1890,11 @@ int rocket_conv2d_dw_int8(int fd, const rocket_conv2d_desc *d,
                           float in_scale, float w_scale, float out_scale,
                           int in_zp, int w_zp, int out_zp, int8_t *out)
 {
+    if (conv_is_rk3576())
+        return rocket_conv2d_dw_int8_rk3576(fd, d, in, w, bias, in_scale, w_scale,
+                                            out_scale, in_zp, w_zp, out_zp, out);
+    if (conv_wrong_encoding("rocket_conv2d_dw_int8", "the chip's own conv encoder"))
+        return ROCKET_E_UNSUPPORTED;
     return conv2d_dw_int8_run(fd, NULL, d, in, w, bias, in_scale, w_scale, out_scale,
                               in_zp, w_zp, out_zp, out);
 }

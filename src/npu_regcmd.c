@@ -390,8 +390,35 @@ static int gen_matmul_task(uint64_t *ops, npu_cna_desc *cna_desc,
  * SECTION — Matmul regcmd generators (fp16)
  * ==========================================================================*/
 
+/* THE RK3588 GEOMETRY-REGISTER ENCODING, REFUSED ON A PART THAT DOES NOT RUN IT.
+ *
+ * The datapath SEMANTICS in this file are IP-inherent and shared across the family, but
+ * the CNA/CORE/DPU geometry registers are not: another revision re-packs the same block
+ * bases, so a program emitted here reaches a foreign part as a valid-looking job that
+ * completes in the usual time, faults nothing, and writes nothing. Silence is the whole
+ * hazard, so every entry point that emits one of these programs refuses instead.
+ *
+ * It sits at the GENERATOR rather than at the op entries because the op library composes
+ * these: conv, pooling, the LUT activations, the norms, the FFN, softmax, reduce and the
+ * ViT encoders all reach the part through the functions below, and a guard here covers
+ * every one of them by construction rather than by enumeration. Callers already treat a
+ * generator failure as fatal.
+ *
+ * A chip that grows its own encoder dispatches ahead of this — see
+ * rocket_matmul_int8_rk3576() and npu_regcmd_rk3576.c. */
+static int rk3588_encoding_only(const char *gen)
+{
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+    if (!strcmp(hw->name, "rk3588")) return 0;
+    ROCKET_LOGE("%s emits the RK3588 geometry-register encoding, which the %s does not "
+                "run — the job would complete and write nothing. This datapath has no "
+                "encoder for this part yet\n", gen, hw->name);
+    return 1;
+}
+
 int gen_matmul_fp16(matmul_params_t *params)
 {
+    if (rk3588_encoding_only("gen_matmul_fp16")) return -1;
    npu_cna_desc cna_desc;
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer fields; all used fields set below */
@@ -643,6 +670,7 @@ static int emit_lut_tables(uint64_t *ops, int i, const uint16_t *lut)
  * --------------------------------------------------------------------------- */
 int gen_lut_activation_fp16(lut_act_params_t *p)
 {
+    if (rk3588_encoding_only("gen_lut_activation_fp16")) return -1;
   if (p->n <= 0 || (p->n & 0x7)) return -1;     /* must be a +ve multiple of 8 */
   uint32_t cols  = (uint32_t)p->n / 8;          /* C2=8 fp16 per cube position */
   if (cols > 0x1FFF) return -2;                 /* DATA_CUBE_WIDTH is 13 bits  */
@@ -749,6 +777,7 @@ int gen_lut_activation_fp16(lut_act_params_t *p)
  * feeds flat fp16 vectors. --------------------------------------------------- */
 int gen_ew_mul_fp16(ew_mul_params_t *p)
 {
+    if (rk3588_encoding_only("gen_ew_mul_fp16")) return -1;
   if (p->n <= 0 || (p->n & 0x7)) return -1;
   uint32_t cols = (uint32_t)p->n / 8;
   if (cols > 0x1FFF) return -2;
@@ -867,6 +896,7 @@ int gen_ew_mul_fp16(ew_mul_params_t *p)
  */
 int gen_matmul_int8(matmul_params_t *params)
 {
+    if (rk3588_encoding_only("gen_matmul_int8")) return -1;
    npu_cna_desc cna_desc;
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer fields; all used fields set below */
@@ -1182,6 +1212,7 @@ int gen_matmul_int8(matmul_params_t *params)
  * K-accumulates, so no EW geometry is needed here. */
 int gen_matmul_int4(matmul_params_t *params)
 {
+    if (rk3588_encoding_only("gen_matmul_int4")) return -1;
    npu_cna_desc cna_desc;
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer fields; all used fields set below */
@@ -1381,6 +1412,7 @@ int gen_matmul_int4(matmul_params_t *params)
  * The single-task path does one K-pass. */
 int gen_matmul_int16(matmul_params_t *params)
 {
+    if (rk3588_encoding_only("gen_matmul_int16")) return -1;
    npu_cna_desc cna_desc;
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer fields; all used fields set below */
@@ -1618,6 +1650,7 @@ int gen_matmul_int16(matmul_params_t *params)
  * DMA is <=16-bit, the same wall int8/int16 int32-accum hit). */
 int gen_matmul_bf16(matmul_params_t *params)
 {
+    if (rk3588_encoding_only("gen_matmul_bf16")) return -1;
    npu_cna_desc cna_desc;
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer + EW fields; inert at accumulate=0 */
@@ -1815,6 +1848,7 @@ int gen_matmul_bf16(matmul_params_t *params)
  * HOST in fp32 (do NOT attempt NPU EW K-accum; the EW operand DMA is <=16-bit). */
 int gen_matmul_tf32(matmul_params_t *params)
 {
+    if (rk3588_encoding_only("gen_matmul_tf32")) return -1;
    npu_cna_desc cna_desc;
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer + EW fields; inert at accumulate=0 */
@@ -2450,6 +2484,7 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
  * <0 if a single feature/weight tile overflows the CBUF (caller must tile). */
 static int gen_conv2d_fill(conv_params_t *params, int depthwise)
 {
+    if (rk3588_encoding_only("gen_conv2d_fill")) return -1;
    npu_cna_desc cna_desc = {0};
    npu_core_desc core_desc = {0};
    npu_dpu_desc dpu_desc = {0};
@@ -2725,6 +2760,7 @@ int gen_conv2d_dw_fp16(conv_params_t *params) { return gen_conv2d_fill(params, 1
  */
 static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
 {
+    if (rk3588_encoding_only("gen_conv2d_int8_fill")) return -1;
    npu_cna_desc cna_desc = {0};
    npu_core_desc core_desc = {0};
    npu_dpu_desc dpu_desc = {0};
@@ -3018,6 +3054,7 @@ int gen_conv2d_dw_int8(conv_params_t *params) { return gen_conv2d_int8_fill(para
  */
 int gen_pool_fp16(pool_params_t *p)
 {
+    if (rk3588_encoding_only("gen_pool_fp16")) return -1;
   const int C2 = 8;     /* fp16 feature cube channel atom */
   const int esz = 2;    /* fp16 element bytes */
   uint64_t *ops = p->tasks;

@@ -87,27 +87,49 @@ const struct rocket_hw_profile rocket_hw_rk3576 = {
                                             * 8 x 32768 = 262144 B = 4096 granules  */
     .cbuf_bank_size = NPU_CBUF_BANK_SIZE,  /* 32768, assumed equal to the RK3588's  */
 
-    /* Matmul parameters, carried over from the RK3588 and NOT validated here: there
-     * is no RK3576 matmul at all yet, only the int8 conv encoder, so nothing on this
-     * part reads them. They are placeholders to be measured when a matmul path
-     * lands, not findings. */
-    .max_tile       = 256,
+    /* Matmul parameters, measured on this part against rocket_matmul_int8_rk3576.
+     *
+     * max_tile is the OUTPUT-CHANNEL tile, and here that is the whole of the tiling
+     * question. A submit costs about 1.4 ms whatever it carries, so throughput is MACs
+     * per submit; M*K is capped by the feature budget above and K by the resident
+     * weight slice, which leaves N as the only axis worth spending. Throughput rises
+     * almost linearly with it — 12 GOP/s at N=32 to about 1.0 TOP/s at N=2560 — up to
+     * a boundary past which the trailing output channels simply do not reach DDR: 2944
+     * channels computes and 3072 is intermittent, and independently a weight cube of
+     * 6 MiB computes where 6.75 MiB does not. 2048 is the largest power of two
+     * comfortably inside both, so the bound stays a guard rather than the operating
+     * point. It is NOT the RK3588's 256, whose reason (letting Kt grow in the CBUF)
+     * does not apply where K is not tiled at all. [HW sweep, H96 MAX M9]
+     *
+     * The weight cube groups BOTH channel axes by 32 here, where the RK3588 groups the
+     * N axis by 16 — so ngroup is 32, and it is measured rather than inherited: ic and
+     * oc of 8, 16, 17 and 48 compute wrong at every geometry while 32 and 64 are
+     * exact, and ic=17 fails despite spanning two whole C2=16 surfaces.
+     *
+     * kgroup_4b is the one still unmeasured: no 4-byte input path has been run on this
+     * part, so the RK3588's value is carried and nothing reads it. */
+    .max_tile       = 2048,
     .kgroup_2b      = 32,
-    .kgroup_4b      = 16,
-    .ngroup         = 16,
+    .kgroup_4b      = 16,                  /* unmeasured: no 4-byte path here yet */
+    .ngroup         = 32,
 
-    /* int8 only. The vendor captures the encoder was transcribed from are int8, so
-     * the fp16 and other precision fields have never been exercised on this part —
-     * an unset bit here means unvalidated, which for a bring-up chip is the same
-     * thing as unsupported. */
-    .dtype_supported = ROCKET_DT_BIT(precision_int8),
+    /* int8 and fp16 DIRECT CONV_2D, both transcribed from vendor captures and both
+     * gap-free in their output: fp16 contracts 16 input channels per task
+     * (rocket_rk3576_plan_ic splits past that) and delivers every output channel.
+     * Every other precision is unexercised here, and an unset bit on a bring-up chip
+     * means unvalidated, which is the same thing as unsupported. */
+    .dtype_supported = ROCKET_DT_BIT(precision_int8) |
+                       ROCKET_DT_BIT(precision_float16),
 
     .select_warning =
-        "rk3576: machine parameters are measured, but only the int8 DIRECT CONV_2D "
-        "path computes on this part (gen_conv2d_int8_rk3576). Its depthwise sibling "
-        "is transcribed but does NOT compute, and every other operation still emits "
-        "the RK3588 encoding, which this part does not run — expect no output from "
-        "matmul, fp16 and the op library.",
+        "rk3576: machine parameters are measured. CONV_2D computes — direct at int8 "
+        "(gen_conv2d_int8_rk3576, gap-free) and at fp16 (gen_conv2d_fp16_rk3576 + "
+        "rocket_rk3576_plan_ic, 16 input channels per task), and depthwise at int8 "
+        "(gen_conv2d_dw_int8_rk3576). MATMUL computes at int8 through this part's own "
+        "entry, rocket_matmul_int8_rk3576, whose output is int8 through the DPU's "
+        "requant and whose K is bounded by one task's contraction. The op library and "
+        "every other matmul entry still emit the RK3588 encoding, which this part does "
+        "not run: those refuse rather than write nothing.",
 
     .default_workers = 8,                  /* not swept on this part */
 };

@@ -43,8 +43,11 @@ set(ROCKETNPU_SOURCES
     src/rocket_npu.c          # DRM-accel shim over /dev/accel/accel0
     src/rocket_hw_profile.c   # the chip machine-parameter profile (RK3588 today)
     src/npu_regcmd.c     # regcmd generators (fp16/int8/int4/int16/bf16/tf32)
+    src/npu_regcmd_rk3576.c   # RK3576 int8 conv regcmd (its own geometry-register encoding)
     src/rocket_chain.c        # contiguous self-chaining regcmd layout (batched submit, shared)
     src/rocket_matmul.c       # tiled single-fd matmul (CBUF-fit, CPU K-accum)
+    src/rocket_matmul_rk3576.c # the RK3576 int8 matmul (1x1 conv, its own cubes + envelope)
+    src/rocket_conv2d_rk3576.c # the RK3576 CONV_2D entries (int8 direct/depthwise, fp16)
     src/rocket_conv.c         # general fp16 CONV_2D (KxK/stride/pad/dilation)
     src/rocket_conv_transpose.c # ConvTranspose2d (deconv) lowered onto the forward conv
     src/rocket_resize.c       # nearest/bilinear upsample via depthwise ConvTranspose
@@ -255,6 +258,14 @@ if(ROCKETNPU_BUILD_TESTS)
             dump_regcmd            # host-only: diff the matmul regcmd accumulate=0 vs 1 (no HW)
             dump_dw_regcmd         # host-only: emit depthwise-conv regcmd for the Mesa decoder
             chain_layout_rocket    # host-only GATE: batched-submit contiguous layout + trailer link (no HW)
+            regcmd_rk3576_gate     # host-only GATE: RK3576 conv regcmd vs the vendor capture (no HW)
+            rk3576_first_light     # RK3576 board: does the RK3576 emitter make the NPU compute?
+            rk3576_conv_gate       # RK3576 board GATE: the int8 conv envelope + row windows + depthwise
+            rk3576_conv_lib_gate   # RK3576 board GATE: the same envelope through the LIBRARY entries
+            rk3576_fp16_sweep      # RK3576 board: settle the fp16 / asymmetric encodings against a CPU model
+            rk3576_matmul_probe    # RK3576 board: the matmul-as-1x1-conv envelope (M axis, cost, precision)
+            rk3576_matmul_gate     # RK3576 board GATE: the int8 matmul library entry vs a CPU model
+            rk3576_refusal_gate    # RK3576 board GATE: ops with no encoder refuse, not write nothing
             membench               # DRAM bandwidth + NPU readback de-tile microbench
             fabench)               # flash-attention QK/AV submit-chaining A/B (ROCKET_FA_CHAIN 0 vs 1)
         add_executable(${t} tests/${t}.c)
@@ -268,6 +279,13 @@ if(ROCKETNPU_BUILD_TESTS)
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
     endforeach()
+
+    # the RK3576 regcmd gate compiles the decoded vendor register programs in
+    # (tests/data/rk3576-vendor-capture/rk3576_vendor_golden.h)
+    if(TARGET regcmd_rk3576_gate)
+        target_include_directories(regcmd_rk3576_gate PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rk3576-vendor-capture)
+    endif()
 
     # the int8 depthwise ground-truth gates load the vendored Teflon capture fixtures
     # (tests/data/teflon-dw-capture); bake the absolute path at build time so the gate
@@ -313,6 +331,20 @@ if(ROCKETNPU_BUILD_TESTS)
     set_tests_properties(bytes_moved_rocket PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME conv2d_fp16_rocket COMMAND conv2d_fp16_rocket)
     add_test(NAME chain_layout_rocket COMMAND chain_layout_rocket)  # host-only; no NPU, never skips
+    add_test(NAME regcmd_rk3576_gate COMMAND regcmd_rk3576_gate)    # host-only; no NPU, never skips
+    # the RK3576 conv + matmul correctness gates. Both skip on any other chip (and with
+    # no NPU), so they are inert in an RK3588 ctest run. The conv gate runs `all` — every
+    # group including depthwise, which computes bit-exactly on this part.
+    add_test(NAME rk3576_conv_gate COMMAND rk3576_conv_gate all)
+    set_tests_properties(rk3576_conv_gate PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME rk3576_conv_lib_gate COMMAND rk3576_conv_lib_gate)
+    set_tests_properties(rk3576_conv_lib_gate PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME rk3576_matmul_gate COMMAND rk3576_matmul_gate)
+    set_tests_properties(rk3576_matmul_gate PROPERTIES SKIP_RETURN_CODE 2)
+    # A datapath with no encoder for the running part must fail loudly rather than emit
+    # the RK3588 program, which that part completes without writing anything.
+    add_test(NAME rk3576_refusal_gate COMMAND rk3576_refusal_gate)
+    set_tests_properties(rk3576_refusal_gate PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME conv1d_rocket COMMAND conv1d_rocket)
     set_tests_properties(conv1d_rocket PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME conv_transpose_rocket COMMAND conv_transpose_rocket)

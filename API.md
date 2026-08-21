@@ -90,6 +90,8 @@ tests/                         standalone tests + benchmarks (see below)
 | `rocket_matmul_bf16_mt` | multicore bf16: split N across `nthreads` worker fds over the unchanged single-fd path (~3 cores) |
 | `rocket_bf16_stream` / `rocket_matmul_bf16_stream` | **streaming bf16** for LLM prefill: persistent worker fds + per-shape resident scratch BOs, re-pack A/B per call (the bf16 sibling of `rocket_matmul_fp16_stream`; bit-identical to single-fd at `nthreads=1`). The in-model bf16 path. ~3.2× single-fd warm |
 | `rocket_matmul_tf32` / `rocket_matmul_plan_tf32` | tf32×tf32→fp32 tiled (raw fp32 in, HW rounds to 10-bit mantissa; the first 4-byte-input path) |
+| `rocket_matmul_int8_rk3576` / `rocket_matmul_plan_int8_rk3576` | **the RK3576's own int8 matmul**, and a different contract from `rocket_matmul_int8`: `C = sat8(round((A·Bᵀ + bias)·scale))`, an int8 surface through the DPU's requant rather than raw int32. That is why it is a separate entry and not a routing. Requires `K%32, N%32`; **M carries no constraint at all** on that part, so `M=1` is simply correct. N is tiled and is what buys throughput (a submit costs ~1.4 ms whatever it carries; `ROCKET_RK3576_MM_NT` overrides the tile). K past one task's contraction is split through the int32 entry below, with the requant done on the host |
+| `rocket_matmul_int8_rk3576_i32` | **the RK3576's int32-output matmul, and its K split**: `C = A·Bᵀ + bias` in raw int32, K split internally and the partials summed on the host, so K is bounded only by memory. Requires `K%32, N%32`. The DPU's 32-bit writer keeps the INT8 surface's byte budget whatever the element width is, so it delivers only the first eight output channels of every thirty-two; this entry programs four times the output channels and scatters the real ones into the delivered slots, which is correct and costs a quarter of the int8 path's MACs per submit. It also idles ~150 ms between its submits and once on the way out, because an int32 job leaves the next submit of ANY kind writing nothing until 50-100 ms have passed (`ROCKET_RK3576_MM_GAP_MS` overrides). Use it for the K a single task cannot contract, not as a default matmul |
 
 Alignment requirements differ by dtype (the native tile atoms): fp16 `K%32, N%16`;
 int8 `K%32, N%32`; int4 `K%32, N%64`; int16-exact follows int8 `K%32, N%32`; bf16
@@ -99,6 +101,12 @@ dtype — the conv feature-height-1 geometry mis-computes — so the one-shot en
 internally** and return row 0, while the pure planners and resident/streaming paths
 reject it (pad single vectors to 4 caller-side). The plan functions are pure (no
 hardware) and preview the tiling.
+
+Everything in that table except `rocket_matmul_int8_rk3576` emits the **RK3588**
+geometry-register encoding. On a part that does not run it the entries **refuse**
+(`ROCKET_E_UNSUPPORTED`, naming the entry that does work) rather than submit a job that
+completes and writes nothing. The M rule above is one of the things that does not carry:
+on the RK3576 every M computes, including 1.
 
 ## Conv API (`rocket_conv.h`)
 

@@ -80,17 +80,42 @@ int8/int4/bf16/tf32 entry points — and the conv / activation / transformer op 
 
 ## Hardware support
 
-Validated bit-exact on the RK3588 (rknpu v2 — 3 NPU cores), the only supported target today. The
-regcmd approach generalizes to the wider Rockchip NPU family, and RK3576 and RK3566 are the intended
-next targets — but each differs in CBUF size, core count, and possibly the datatype set, so its
-values must be confirmed on-device (re-running the `tests/` bit-exact gates), not inferred.
+**RK3588** (rknpu v2, 3 NPU cores) is the full target: every datatype, the whole op library, and
+every `tests/` gate bit-exact.
 
-Portability is by construction: the chip-specific machine parameters (CBUF banks + size, tile caps,
-tile-group sizes, datatype mask, worker default) live in one `rocket_hw_profile`
-(`include/rocket_hw_profile.h` — the `rocket_hw_rk3588` instance read via `rocket_hw_current()`),
-which the tiling planners read instead of bare literals. Adding a chip is a second profile with
-HW-validated values plus a `compatible`-string autodetect (and a `ROCKET_CHIP` override for
-bring-up); the regcmd datapath is shared across the IP family, so only the profile changes.
+**RK3576** (2 cores) runs a growing subset through its own encoder. `CONV_2D` computes bit-exactly —
+direct at int8 and fp16, and depthwise at int8 — and so does an int8 **matmul**
+(`rocket_matmul_int8_rk3576()`). Three of that matmul's properties are the RK3588's inverted, and a
+caller porting between the two should expect all three: int8 is the matmul precision here (one int8
+task contracts up to 4608 input channels where one fp16 task contracts sixteen); the M axis carries
+no constraint at all, so `M=1` is simply correct; and the output is int8 through the DPU's requant
+rather than raw int32. K past one task's contraction is split through
+`rocket_matmul_int8_rk3576_i32()`, which reads the DPU's raw 32-bit accumulator and sums the partials
+on the host — correct at any K, and a quarter of the int8 path's MACs per submit, because that writer
+delivers only the first eight output channels of every thirty-two and the way round it is to program
+four times as many. The rest of the
+op library still emits the RK3588 encoding, and on this part the matmul entries **refuse** rather than
+submit a program the hardware will not run.
+
+**RK3566/RK3568** are named but unprofiled: they are recognized from the device tree and warned about,
+not supported.
+
+Portability is by construction, but it is two layers and not one — the RK3576 is what settled that:
+
+1. **Machine parameters** — CBUF banks + size, tile caps, tile-group sizes, datatype mask, worker
+   default — live in one `rocket_hw_profile` (`include/rocket_hw_profile.h`, read via
+   `rocket_hw_current()`), which the tiling planners consult instead of bare literals. These must be
+   *measured* on the part: the RK3576's CBUF, matmul tile cap (2048, not 256) and weight N-group (32,
+   not 16) all differ from the RK3588's.
+2. **A regcmd encoder for the CNA/CORE/DPU geometry registers**, which is *not* a shared offset table.
+   The RK3576 re-packs those blocks at the same block bases — registers move, the bit-packing differs
+   at shared offsets, and it drives offsets the RK3588 leaves at reset — so the emission itself is
+   per-chip (`src/npu_regcmd_rk3576.c`). What stays shared is the datapath *semantics*: the precision
+   encodings, the CNA→CORE→DPU sequence, the BS/BN/EW/LUT field meanings, the block bases.
+
+Chip selection reads the NPU's device-tree `compatible` (with a `ROCKET_CHIP` override for bring-up)
+and logs which datapaths the selected chip actually has an encoder for. A part with no profile falls
+back to the RK3588's and says so, rather than silently applying the wrong parameters.
 
 ## Performance
 

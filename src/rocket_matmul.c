@@ -1914,9 +1914,41 @@ done:
  * ##########################################################################*/
 
 /* ---- one-shot public entry point: pack weights + input + compute, per call ---- */
+/* ============================================================================
+ * SECTION — the per-chip dispatch point
+ *
+ * Every generator in this file emits the RK3588 geometry-register encoding, and that
+ * encoding is IP-revision-specific: the RK3576 re-packs the CNA/CORE/DPU blocks at the
+ * same block bases, so a program built here does not compute slowly or approximately
+ * there — it submits, the job completes, and the DPU writes nothing.
+ *
+ * The dtype mask cannot catch that. It says which PRECISIONS a chip can run, and the
+ * RK3576 runs int8 and fp16 perfectly well — through its own encoder, not this one.
+ * The check that belongs here is on the ENCODING.
+ *
+ * This is the first per-chip dispatch in the op library, so its shape is the one the
+ * ops ported after it should take: refuse rather than emit a program the part will not
+ * run, and name the per-chip entry that does work. A chip whose profile is not
+ * recognized still falls back to the RK3588 profile and warns at selection, so this
+ * fires only where a real, different encoder is known to be needed.
+ */
+static int mm_wrong_encoding(const char *entry, const char *instead)
+{
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+    if (!strcmp(hw->name, "rk3588")) return 0;
+    ROCKET_LOGE("%s emits the RK3588 geometry-register encoding, which the %s does "
+                "not run — the job would complete and write nothing. Use %s\n",
+                entry, hw->name, instead);
+    return 1;
+}
+
 int rocket_matmul_fp16(int fd, int M, int K, int N,
                        const _Float16 *A, const _Float16 *B, _Float16 *C)
 {
+    if (mm_wrong_encoding("rocket_matmul_fp16",
+                          "rocket_matmul_int8_rk3576 (int8 is this part's matmul "
+                          "precision; its fp16 conv contracts 16 channels a task)"))
+        return ROCKET_E_UNSUPPORTED;
     /* dtype capability gate: a chip declares its usable datatype menu in the hw
      * profile. RK3588's mask is all-ones (the datatype matrix is complete), so this
      * never fires here; it states the chip-dependency by construction. */
@@ -2407,6 +2439,12 @@ int rocket_matmul_plan_int8(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 int rocket_matmul_int8(int fd, int M, int K, int N,
                        const int8_t *A, const int8_t *B, int32_t *C)
 {
+    /* NOT a routing to rocket_matmul_int8_rk3576: that entry writes an int8 surface
+     * through the DPU's requant where this one returns the raw int32 accumulation, so
+     * silently substituting it would change the contract under the caller. */
+    if (mm_wrong_encoding("rocket_matmul_int8", "rocket_matmul_int8_rk3576, whose "
+                          "output is int8 through the requant rather than raw int32"))
+        return ROCKET_E_UNSUPPORTED;
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
         return ROCKET_E_UNSUPPORTED;
     /* M==1 GEMV: height-1 HW geometry is broken (same as fp16, see
