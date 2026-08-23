@@ -45,6 +45,8 @@ set(ROCKETNPU_SOURCES
     src/npu_regcmd.c     # regcmd generators (fp16/int8/int4/int16/bf16/tf32)
     src/npu_regcmd_rk3576.c   # RK3576 int8 conv regcmd (its own geometry-register encoding)
     src/rocket_chain.c        # contiguous self-chaining regcmd layout (batched submit, shared)
+    src/rocket_fanout.c       # worker pool + per-shape scratch cache, shared by every resident path
+    src/rocket_op.c           # the one-shot op scaffolding (regcmd bound, submit, fence wait)
     src/rocket_matmul.c       # tiled single-fd matmul (CBUF-fit, CPU K-accum)
     src/rocket_matmul_rk3576.c # the RK3576 int8 matmul (1x1 conv, its own cubes + envelope)
     src/rocket_rk3576_cube_pack.c # the CHW <-> NC1HWC2 transpose (16x16 NEON block), shared
@@ -261,6 +263,7 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_batch_rocket    # batched same-shape matmul (one job/group) bit-exact vs per-item (attn QK/AV chaining)
             matmul_prepacked_rocket # pack-weights-once path vs mt vs CPU ref
             matmul_prepacked_crossm_rocket # resident weight reused across compatible M (no re-pack)
+            scratch_cache_gate     # GATE: the per-shape scratch cache recycles instead of refusing
             matmul_stream_vs_prepacked_rocket # per-call packB cost (stream vs resident)
             iova_ceiling_rocket    # NPU 32-bit IOVA window size + per-fd vs shared
             prototype_shared_scratch_rocket # shared-scratch ownership prototype
@@ -287,6 +290,7 @@ if(ROCKETNPU_BUILD_TESTS)
             dump_regcmd            # host-only: diff the matmul regcmd accumulate=0 vs 1 (no HW)
             dump_dw_regcmd         # host-only: emit depthwise-conv regcmd for the Mesa decoder
             chain_layout_rocket    # host-only GATE: batched-submit contiguous layout + trailer link (no HW)
+            matmul_plan_gate       # host-only GATE: the shared matmul tiling policy's invariants (no HW)
             regcmd_rk3576_gate     # host-only GATE: RK3576 conv regcmd vs the vendor capture (no HW)
             rk3576_first_light     # RK3576 board: does the RK3576 emitter make the NPU compute?
             rk3576_conv_gate       # RK3576 board GATE: the int8 conv envelope + row windows + depthwise
@@ -416,6 +420,10 @@ if(ROCKETNPU_BUILD_TESTS)
     set_tests_properties(bytes_moved_rocket PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME conv2d_fp16_rocket COMMAND conv2d_fp16_rocket)
     add_test(NAME chain_layout_rocket COMMAND chain_layout_rocket)  # host-only; no NPU, never skips
+    add_test(NAME matmul_plan_gate COMMAND matmul_plan_gate)        # host-only; no NPU, skips off-RK3588
+    set_tests_properties(matmul_plan_gate PROPERTIES SKIP_RETURN_CODE 2)
+    add_test(NAME scratch_cache_gate COMMAND scratch_cache_gate)
+    set_tests_properties(scratch_cache_gate PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME regcmd_rk3576_gate COMMAND regcmd_rk3576_gate)    # host-only; no NPU, never skips
     # the RK3576 conv + matmul correctness gates. Both skip on any other chip (and with
     # no NPU), so they are inert in an RK3588 ctest run. The conv gate runs `all` — every

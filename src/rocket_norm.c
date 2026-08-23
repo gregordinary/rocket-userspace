@@ -5,11 +5,14 @@
  * scale primitive, composed from the feature-axis reduce + the DPU elementwise multiply.
  * See rocket_norm.h for the cost model and the NPU/host work split.
  */
+#include <limits.h>    /* INT_MAX — the element-count truncation guard */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
+#include "rocket_npu.h"    /* ROCKET_E_* — this library's error codes */
+#include "rocket_norm_internal.h"  /* rocket_square_prescale_k (the fp16-square guard) */
 #include "rocket_norm.h"
 #include "rocket_reduce.h"      /* rocket_reduce_feature_fp16 (the H-contraction)        */
 #include "rocket_activation.h"  /* rocket_ew_mul_fp16 (the DPU elementwise multiply)     */
@@ -32,14 +35,19 @@ void rocket_scale_rows_ref_fp16(int M, int N,
 int rocket_scale_rows_fp16(int fd, int M, int N,
                            const _Float16 *in, const float *r, _Float16 *out)
 {
-    if (M < 1 || N < 1) return -1;
+    if (M < 1 || N < 1) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_scale_rows_ref_fp16(M, N, in, r, out); return 0; }
+    /* The element count M*N is handed to the activation / EW entries as an int below.
+     * The buffers are sized in size_t, so a truncating product would UNDER-process the
+     * op and return a silently partial surface — the harder of the two failures to
+     * diagnose. rocket_ffn_fp16 guards the same way and for the same reason. */
+    if ((size_t)M * N > INT_MAX) return ROCKET_E_SHAPE;
 
     /* materialize the per-row scalar across the columns: rb[m][n] = (fp16)r[m].
      * The broadcast is a pure host fill (no arithmetic) — the DPU does the multiply. */
     size_t MN = (size_t)M * N;
     _Float16 *rb = malloc(MN * sizeof(_Float16));
-    if (!rb) return -2;
+    if (!rb) return ROCKET_E_NOMEM;
     for (int m = 0; m < M; m++) {
         _Float16 rv = (_Float16)r[m];
         _Float16 *row = rb + (size_t)m * N;
@@ -72,19 +80,22 @@ void rocket_rmsnorm_ref_fp16(int M, int H, const _Float16 *x,
 int rocket_rmsnorm_fp16(int fd, int M, int H, const _Float16 *x,
                         const _Float16 *weight, float eps, _Float16 *out)
 {
-    if (M < 1 || H < 1) return -1;
+    if (M < 1 || H < 1) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_rmsnorm_ref_fp16(M, H, x, weight, eps, out); return 0; }
+    /* The element count M*H is handed to the activation / EW entries as an int below.
+     * The buffers are sized in size_t, so a truncating product would UNDER-process the
+     * op and return a silently partial surface — the harder of the two failures to
+     * diagnose. rocket_ffn_fp16 guards the same way and for the same reason. */
+    if ((size_t)M * H > INT_MAX) return ROCKET_E_SHAPE;
 
     const size_t MH = (size_t)M * H;
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *xs_buf = NULL, *sq = NULL, *s = NULL;
     float *ms = NULL, *rrow = NULL;
 
     /* 1. fp16-square overflow guard: scale x by p = 2^-k so (|x|max * p)^2 stays well under
      *    fp16 max (~65504); k=0 for the common |x|<=223 case (no copy, x used directly). */
-    float amax = 0.f;
-    for (size_t i = 0; i < MH; i++) { float a = fabsf((float)x[i]); if (a > amax) amax = a; }
-    int k = (amax > 223.f) ? (int)ceilf(log2f(amax / 223.f)) : 0;
+    int k = rocket_square_prescale_k(x, MH);
     const float p = ldexpf(1.f, -k);            /* 2^-k exact */
     const _Float16 *xs = x;
     if (k > 0) {
@@ -152,19 +163,22 @@ void rocket_layernorm_ref_fp16(int M, int H, const _Float16 *x, const _Float16 *
 int rocket_layernorm_fp16(int fd, int M, int H, const _Float16 *x, const _Float16 *gamma,
                           const _Float16 *beta, float eps, _Float16 *out)
 {
-    if (M < 1 || H < 1) return -1;
+    if (M < 1 || H < 1) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_layernorm_ref_fp16(M, H, x, gamma, beta, eps, out); return 0; }
+    /* The element count M*H is handed to the activation / EW entries as an int below.
+     * The buffers are sized in size_t, so a truncating product would UNDER-process the
+     * op and return a silently partial surface — the harder of the two failures to
+     * diagnose. rocket_ffn_fp16 guards the same way and for the same reason. */
+    if ((size_t)M * H > INT_MAX) return ROCKET_E_SHAPE;
 
     const size_t MH = (size_t)M * H;
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *xs_buf = NULL, *sq = NULL, *stack = NULL, *A = NULL, *B = NULL, *tmp = NULL;
     float *csum = NULL, *mean = NULL, *rrow = NULL;
 
     /* fp16-square overflow guard (matches RMSNorm): prescale x by p=2^-k for the x^2 branch
      * only — the mean(x) branch uses x directly (no square, no overflow). */
-    float amax = 0.f;
-    for (size_t i = 0; i < MH; i++) { float a = fabsf((float)x[i]); if (a > amax) amax = a; }
-    int k = (amax > 223.f) ? (int)ceilf(log2f(amax / 223.f)) : 0;
+    int k = rocket_square_prescale_k(x, MH);
     const float p = ldexpf(1.f, -k);
     const _Float16 *xs = x;
     if (k > 0) {

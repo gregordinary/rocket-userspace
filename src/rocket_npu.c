@@ -23,13 +23,16 @@
 #include <stddef.h>         /* offsetof */
 #include <dirent.h>         /* the bound-core count */
 #include <sys/stat.h>
+#include <limits.h>         /* INT_MAX — a major above 1 outranks every known minor */
 #include <stdatomic.h>      /* the cached capability probe */
 
 #include <libdrm/drm.h>
 #include <drm/rocket_accel.h>   /* DRM_IOCTL_ROCKET_*, struct drm_rocket_*    */
 
 #include "rocket_npu.h"
-#include "rocket_log.h"            // centralized log channel
+#include "rocket_log.h"
+#include "rocket_sysfs.h"        /* the one enumeration of the bound NPU cores */
+#include "rocket_rk3576_internal.h"   /* rocket_rk3576_bo_pool_drain, called from rocket_close */            // centralized log channel
 #include "rocket_hw_profile.h"     // chip detection (warn on unprofiled silicon)
 
 /*
@@ -119,13 +122,34 @@ static void rkt_job_init(rkt_job *j, struct drm_rocket_task *dt, uint32_t n_task
 }
 
 /* Every ROCKET_SUBMIT this process issues, and the tasks it carried. Counted at the
- * two ioctl sites so no caller can bypass them. See rocket_submit_ioctl_count(). */
-static uint64_t rkt_ioctl_submits;
-static uint64_t rkt_submitted_tasks;
+ * two ioctl sites so no caller can bypass them. See rocket_submit_ioctl_count().
+ *
+ * _Atomic because every fan-out path in this library submits from N worker threads at
+ * once: a plain `++` from several of them drops counts, and these feed the benchmarks'
+ * submits-per-inference. relaxed ordering is enough — nothing else is published through
+ * them — so the cost is an LDADD next to an ioctl, i.e. nothing. */
+static _Atomic uint64_t rkt_ioctl_submits;
+static _Atomic uint64_t rkt_submitted_tasks;
 
-uint64_t rocket_submit_ioctl_count(void) { return rkt_ioctl_submits; }
-uint64_t rocket_submit_task_count(void)  { return rkt_submitted_tasks; }
-void     rocket_submit_counters_reset(void) { rkt_ioctl_submits = 0; rkt_submitted_tasks = 0; }
+static inline void rkt_count_submit(uint32_t n_tasks)
+{
+    atomic_fetch_add_explicit(&rkt_ioctl_submits, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&rkt_submitted_tasks, n_tasks, memory_order_relaxed);
+}
+
+uint64_t rocket_submit_ioctl_count(void)
+{
+    return atomic_load_explicit(&rkt_ioctl_submits, memory_order_relaxed);
+}
+uint64_t rocket_submit_task_count(void)
+{
+    return atomic_load_explicit(&rkt_submitted_tasks, memory_order_relaxed);
+}
+void rocket_submit_counters_reset(void)
+{
+    atomic_store_explicit(&rkt_ioctl_submits, 0, memory_order_relaxed);
+    atomic_store_explicit(&rkt_submitted_tasks, 0, memory_order_relaxed);
+}
 
 /* Submit one job (n_tasks tasks) on `fd`, optionally with the per-job batched
  * flag set. Returns 0 / negative errno. */
@@ -142,8 +166,7 @@ static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tas
         .job_count       = 1,
         .job_struct_size = sizeof(jx),
     };
-    rkt_ioctl_submits++;
-    rkt_submitted_tasks += n_tasks;
+    rkt_count_submit(n_tasks);
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
         ROCKET_LOGE("ROCKET_SUBMIT(%u tasks, flags=0x%x): %s\n",
                     n_tasks, job_flags, strerror(errno));
@@ -155,6 +178,46 @@ static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tas
 /* ============================================================================
  * SECTION — Kernel capabilities
  * ==========================================================================*/
+
+/* ── The DRM interface version, resolved ONCE ───────────────────────────────────
+ *
+ * Four capability probes below key on the minor number the kernel advertises. Each used
+ * to answer by calling rocket_open(), which is wrong twice: it is four DRM client
+ * open/close round trips per process for one unchanging number, and on an RK3576 whose
+ * device tree enables core 1 — the stock configuration this file spends thirty lines
+ * warning about — rocket_open() REFUSES a second fd while the library already holds one.
+ * A probe that ran mid-flight therefore got -EBUSY, cached "unsupported" for the process
+ * lifetime, and silently turned off three built and shipped levers (ranged cache sync,
+ * PPU_DONE completion, the chained task cap) while logging a scary refusal from a call
+ * site that submits nothing.
+ *
+ * So resolve it here, on a raw fd that never touches the multi-fd counter. Same device
+ * selection and same driver-name check as rocket_open(), because a probe against some
+ * other accel device must not report rocket's interface.
+ *
+ * Returns the minor number, or -1 if the device could not be identified as rocket.
+ * Mainline reports 0.0.0; a major above 1 reads as "newer than everything we know". */
+static int rocket_iface_minor(void)
+{
+    static _Atomic int cached = -2;                  /* -2 = unresolved, >= -1 = answer */
+    int c = atomic_load(&cached);
+    if (c >= -1)
+        return c;
+
+    c = -1;
+    const char *dev = getenv("ROCKET_DEV");
+    if (!dev || !*dev) dev = "/dev/accel/accel0";
+    int fd = open(dev, O_RDWR | O_CLOEXEC);
+    if (fd >= 0) {
+        char name[32] = {0};
+        struct drm_version dv = { .name = name, .name_len = sizeof(name) - 1 };
+        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0 && strcmp(name, "rocket") == 0)
+            c = (dv.version_major > 1) ? INT_MAX : (int)dv.version_minor;
+        close(fd);
+    }
+    atomic_store(&cached, c);
+    return c;
+}
 
 /*
  * Does the running kernel actually honor DRM_ROCKET_JOB_BATCHED?
@@ -202,15 +265,7 @@ int rocket_batched_submit_supported(void)
         return c;
     }
 
-    c = 0;
-    int fd = rocket_open();
-    if (fd >= 0) {
-        struct drm_version dv = {0};
-        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
-            c = (dv.version_major > 1 ||
-                 (dv.version_major == 1 && dv.version_minor >= 1)) ? 1 : 0;
-        rocket_close(fd);
-    }
+    c = rocket_iface_minor() >= 1;
     atomic_store(&cached, c);
     return c;
 }
@@ -238,15 +293,7 @@ int rocket_ppu_done_supported(void)
     if (c >= 0)
         return c;
 
-    c = 0;
-    int fd = rocket_open();
-    if (fd >= 0) {
-        struct drm_version dv = {0};
-        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
-            c = (dv.version_major > 1 ||
-                 (dv.version_major == 1 && dv.version_minor >= 3)) ? 1 : 0;
-        rocket_close(fd);
-    }
+    c = rocket_iface_minor() >= 3;
     atomic_store(&cached, c);
     return c;
 }
@@ -281,15 +328,7 @@ int rocket_batch_completion_tracked(void)
     if (c >= 0)
         return c;
 
-    c = 0;
-    int fd = rocket_open();
-    if (fd >= 0) {
-        struct drm_version dv = {0};
-        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
-            c = (dv.version_major > 1 ||
-                 (dv.version_major == 1 && dv.version_minor >= 4)) ? 1 : 0;
-        rocket_close(fd);
-    }
+    c = rocket_iface_minor() >= 4;
     atomic_store(&cached, c);
     return c;
 }
@@ -342,15 +381,7 @@ int rocket_bo_ranges_supported(void)
     if (c >= 0)
         return c;
 
-    c = 0;
-    int fd = rocket_open();
-    if (fd >= 0) {
-        struct drm_version dv = {0};
-        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
-            c = (dv.version_major > 1 ||
-                 (dv.version_major == 1 && dv.version_minor >= 5)) ? 1 : 0;
-        rocket_close(fd);
-    }
+    c = rocket_iface_minor() >= 5;
     atomic_store(&cached, c);
     return c;
 }
@@ -438,31 +469,51 @@ int rocket_bo_fini_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
  * ROCKET_RK3576_ALLOW_MULTI_FD=1 lifts the refusal, for the probes that provoke the
  * corruption on purpose and for anyone who has serialized submits themselves.
  */
-static int rocket_bound_core_count(void)
+int rocket_sysfs_bound_devices(char names[][ROCKET_SYSFS_NAME_MAX], int max)
 {
     static const char *dir = "/sys/bus/platform/drivers/rocket";
-    static int cached = -1;
-    DIR *d;
+    DIR *d = opendir(dir);
     struct dirent *e;
     int n = 0;
 
-    if (cached >= 0) return cached;
-    d = opendir(dir);
-    if (!d) { cached = 0; return 0; }
-    while ((e = readdir(d))) {
-        char path[256];
+    if (!d) return 0;
+    while ((e = readdir(d)) && n < max) {
+        char path[512];
         struct stat st;
         if (e->d_name[0] == '.') continue;
         /* The directory also holds bind/unbind/uevent and a `module` link; a bound
          * device is whatever carries a power/ subdirectory. */
         if (snprintf(path, sizeof path, "%s/%s/power", dir, e->d_name) >= (int)sizeof path)
             continue;
-        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) n++;
+        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (names) {
+            /* Truncate rather than skip: a name this long is not a device we can use
+             * either way, and a truncated one simply fails to open. */
+            snprintf(names[n], ROCKET_SYSFS_NAME_MAX, "%.*s",
+                     ROCKET_SYSFS_NAME_MAX - 1, e->d_name);
+        }
+        n++;
     }
     closedir(d);
-    cached = n;
     return n;
 }
+
+int rocket_sysfs_bound_core_count(void)
+{
+    /* Cached: the bind set does not change under a running process that is using the
+     * device, and the RK3576 fd guard asks on every open. _Atomic because that guard
+     * can be reached from several threads at once; the probe is idempotent, so a race
+     * costs a second enumeration and nothing else. */
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
+        c = rocket_sysfs_bound_devices(NULL, ROCKET_SYSFS_MAX_DEVS);
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
+    }
+    return c;
+}
+
+static int rocket_bound_core_count(void) { return rocket_sysfs_bound_core_count(); }
 
 /* fds this library currently has open, so the guard fires on the SECOND one. */
 static atomic_int rocket_open_fds = 0;
@@ -527,6 +578,11 @@ int rocket_open(void)
 void rocket_close(int fd)
 {
     if (fd < 0) return;
+    /* BEFORE the close: the pool holds GEM handles on this file, and close() destroys
+     * them. Draining after would free handles that no longer exist and, worse, leave the
+     * entries for the next fd that lands on this number to hand out. No-op unless
+     * ROCKET_RK3576_BO_POOL is on. */
+    rocket_rk3576_bo_pool_drain(fd);
     close(fd);
     if (atomic_load(&rocket_open_fds) > 0) atomic_fetch_sub(&rocket_open_fds, 1);
 }
@@ -562,6 +618,33 @@ int rocket_bo_alloc(int fd, size_t size, rocket_bo *bo)
     bo->mmap_offset = create.offset;
     bo->size        = size;
     bo->ptr         = ptr;
+    return 0;
+}
+
+int rocket_bo_ensure32(int fd, rocket_bo *bo, size_t need)
+{
+    if (bo->handle && bo->size >= need)
+        return 0;                       /* reuse: contents, including padding, intact */
+    rocket_bo_free(fd, bo);             /* grow: release the old one first            */
+    int rc = rocket_bo_alloc32(fd, need, bo);
+    return rc == 0 ? 1 : rc;            /* 1 = REALLOCATED, so any zero padding is gone */
+}
+
+int rocket_bo_alloc32(int fd, size_t size, rocket_bo *bo)
+{
+    int rc = rocket_bo_alloc(fd, size, bo);
+    if (rc != 0)
+        return rc;
+    /* The LAST byte is what has to be encodable, not the first: a BO based just under
+     * 4 GB whose tail crosses it programs an address the hardware reads as wrapped. */
+    if (((bo->dma_address + size) >> 32) != 0) {
+        ROCKET_LOGE("rocket_bo_alloc32(%zu): IOVA 0x%llx..0x%llx leaves the low 4 GB the "
+                    "regcmd's 32-bit address fields can encode\n", size,
+                    (unsigned long long)bo->dma_address,
+                    (unsigned long long)(bo->dma_address + size));
+        rocket_bo_free(fd, bo);
+        return ROCKET_E_DEVICE;   /* an address constraint, not a shortage of memory */
+    }
     return 0;
 }
 
@@ -861,6 +944,15 @@ int rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs)
 
     int r = 0;
     for (uint32_t j = 0; j < n_jobs; j++) {
+        /* A task-less job is a caller bug, and it must be caught HERE rather than by the
+         * allocation below: calloc(0, ...) is permitted to return NULL, which would read
+         * as -ENOMEM and send the caller looking for memory pressure that is not there.
+         * (glibc returns non-NULL, so this is portability, not a live failure -- but the
+         * sibling rocket_submit_tasks guards exactly this case and says so.) */
+        if (jobs[j].n_tasks == 0) {
+            ROCKET_LOGE("rocket_submit_jobs: job %u carries no tasks\n", j);
+            r = ROCKET_E_SHAPE; goto cleanup;
+        }
         dts[j] = calloc(jobs[j].n_tasks, sizeof(struct drm_rocket_task));
         if (!dts[j]) { r = -ENOMEM; goto cleanup; }
         for (uint32_t i = 0; i < jobs[j].n_tasks; i++) {
@@ -878,8 +970,9 @@ int rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs)
         .job_count       = n_jobs,
         .job_struct_size = sizeof(rkt_job),
     };
-    rkt_ioctl_submits++;
-    for (uint32_t j = 0; j < n_jobs; j++) rkt_submitted_tasks += jobs[j].n_tasks;
+    uint32_t ntask = 0;
+    for (uint32_t j = 0; j < n_jobs; j++) ntask += jobs[j].n_tasks;
+    rkt_count_submit(ntask);
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
         ROCKET_LOGE("ROCKET_SUBMIT(%u jobs): %s\n", n_jobs, strerror(errno));
         r = -errno;

@@ -14,6 +14,7 @@
 #ifndef ROCKET_MATMUL_INTERNAL_H
 #define ROCKET_MATMUL_INTERNAL_H
 
+#include "rocket_fanout.h"   /* rocket_rup_sz */
 #include <stddef.h>
 #include <stdio.h>
 #include "rocket_npu.h"
@@ -46,6 +47,23 @@ typedef struct {
     int nMt, nNt, nKt;
     size_t in_slot, wt_slot, out_slot;
 } mm_plan;
+
+/* Fill the DERIVED half of a plan from its tiles. The tile counts and the per-tile slot
+ * sizes follow from (M,K,N,Mt,Kt,Nt) by the same arithmetic for every dtype that shares
+ * the fp16/bf16 geometry, and it was written out three times (mm_plan_init,
+ * mm_plan_init_pin, bfs_plan_init) with the alignments spelled out each time. The
+ * alignments ARE the geometry: 4 rows, 32 along K, 16 along N. */
+static inline void mm_plan_derive(mm_plan *pl, int M, int K, int N, int Mt, int Kt, int Nt)
+{
+    pl->M = M;  pl->K = K;  pl->N = N;
+    pl->Mt = Mt; pl->Kt = Kt; pl->Nt = Nt;
+    pl->nMt = (M + Mt - 1) / Mt;
+    pl->nNt = (N + Nt - 1) / Nt;
+    pl->nKt = (K + Kt - 1) / Kt;
+    pl->in_slot  = rocket_rup_sz(Mt, 4)  * rocket_rup_sz(Kt, 32);
+    pl->wt_slot  = rocket_rup_sz(Nt, 16) * rocket_rup_sz(Kt, 32);
+    pl->out_slot = rocket_rup_sz(Mt, 4)  * rocket_rup_sz(Nt, 16);
+}
 
 /* The BOs a tiled matmul drives: weights (resident across calls when prepacked)
  * plus per-problem scratch (input/output/regcmd + the low-IOVA guard). */
@@ -81,6 +99,13 @@ typedef struct {
     size_t *boff;                             /* BATCH (mm_compute)                */
     float  *acc;                              /* M*N fp32 accumulator (mm_compute) */
     size_t  acc_cap;                          /* allocated float count in acc      */
+    /* This worker's dense M*nsub output slice, before it is scattered into the
+     * caller's C. Same lazy sizing as `acc`, and for the same reason: it is
+     * M*N/nworkers fp16 elements — megabytes at a prefill shape — and a malloc/free
+     * of that on EVERY matmul call is a page-fault storm on the hot path, not a
+     * pointer bump. NULL until a fan-out worker asks for one. */
+    _Float16 *csub;
+    size_t    csub_cap;                       /* allocated _Float16 count in csub  */
     void   *submit_dt;                        /* BATCH drm_rocket_task[] scratch for
                                                * rocket_submit_tasks_pre;
                                                * opaque (uapi type) — sized via
@@ -167,11 +192,24 @@ double mm_pack_input_buf(const mm_plan *pl, _Float16 *dst, const _Float16 *A);
 double mm_scatter_input(const mm_plan *pl, _Float16 *dst, const _Float16 *A);
 double mm_load_input(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *packed);
 
-/* Add externally-measured pack time to the ROCKET_MM_PROFILE aggregate. _pack
- * attributes to the input(A) scatter, _pack_b to the weight(B) scatter (the
- * streaming path re-packs B per call, so it reports it separately). */
+/* This worker's resident dense output slice, grown to `elems` and NOT zeroed (the
+ * compute writes every live element). NULL if the allocation failed. */
+_Float16 *mm_csub(mm_bos *b, size_t elems);
+
+/* Add externally-measured phase time to the ROCKET_MM_PROFILE aggregate, for a path
+ * that runs its own compute core rather than mm_compute*. _pack attributes to the
+ * input(A) scatter, _pack_b to the weight(B) scatter (the streaming path re-packs B
+ * per call, so it reports it separately); _phase takes the rest by name.
+ *
+ * `phase` is one of 'g' gen, 's' cache sync, 'u' submit, 'w' fence wait, 'r' readback.
+ * Free when ROCKET_MM_PROFILE is unset (one relaxed load), so a caller may time
+ * unconditionally only if its clock reads are also cheap — mm_prof_on() says whether
+ * they are worth taking at all. */
 void mm_prof_add_pack(double ms);
 void mm_prof_add_pack_b(double ms);
+void mm_prof_add_phase(char phase, double ms);
+void mm_prof_add_call(void);
+int  mm_prof_on(void);
 
 /* ============================================================================
  * SECTION — Tile compute dispatchers (plain / kacc / cube / pipe / reuse)

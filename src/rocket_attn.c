@@ -14,7 +14,8 @@
 #include "rocket_npu.h"       /* rocket_open / rocket_close (the mt worker fds)  */
 #include "rocket_matmul.h"    /* rocket_matmul_fp16 (C = A·B^T) */
 #include "rocket_softmax.h"   /* rocket_softmax_fp16 (row-wise) */
-#include "rocket_affinity.h"  /* rocket_pin_worker (keep mt workers off the A55s) */
+#include "rocket_affinity.h"  /* rocket_pin_worker_based (keep mt workers off the A55s) */
+#include "rocket_log.h"       /* centralized log channel */
 
 /* ############################################################################
  * PART 1 — Encoder multi-head self-attention (q/k/v + on-NPU/host softmax)
@@ -46,11 +47,19 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
 {
     const int dh = d / n_head;
     const double scale = 1.0 / sqrt((double)dh);
-    double *q = malloc((size_t)T*d*sizeof(double));
-    double *k = malloc((size_t)T*d*sizeof(double));
-    double *v = malloc((size_t)T*d*sizeof(double));
-    double *ctx = malloc((size_t)T*d*sizeof(double));
-    double *sc  = malloc((size_t)T*sizeof(double));
+    /* ONE allocation, and checked. This is the golden oracle, but it is also the fd < 0
+     * host fallback, so it runs in production; five unchecked mallocs meant an OOM read
+     * through NULL. The signature is void, so a failure has nowhere to go but a zeroed
+     * output and a loud log. */
+    const size_t td = (size_t)T * d;
+    double *pool = malloc((4 * td + (size_t)T) * sizeof(double));
+    if (!pool) {
+        ROCKET_LOGE("rocket_mha_self_ref_fp16: no memory for the T=%d d=%d fp64 "
+                    "workspace; returning a ZEROED output\n", T, d);
+        memset(out, 0, td * sizeof(_Float16));
+        return;
+    }
+    double *q = pool, *k = q + td, *v = k + td, *ctx = v + td, *sc = ctx + td;
     /* projections q/k/v = x·W^T + b */
     for (int t = 0; t < T; t++) for (int o = 0; o < d; o++) {
         double aq=0, ak=0, av=0; const _Float16 *xr = x + (size_t)t*d;
@@ -79,7 +88,7 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
         for (int i = 0; i < d; i++) a += cr[i]*(double)wo[i];
         out[(size_t)t*d+o] = (_Float16)(a + (bo?(double)bo[o]:0));
     }
-    free(q);free(k);free(v);free(ctx);free(sc);
+    free(pool);
 }
 
 /* add bias b[N] (broadcast over the M rows) into C[M*N], in place, on the host (O(MN) glue). */
@@ -95,14 +104,14 @@ int rocket_mha_self_fp16(int fd, int T, int d, int n_head, const _Float16 *x,
                          const _Float16 *Wv, const _Float16 *bv,
                          const _Float16 *Wo, const _Float16 *bo, _Float16 *out)
 {
-    if (T < 1 || d < 1 || n_head < 1 || d % n_head) return -1;
+    if (T < 1 || d < 1 || n_head < 1 || d % n_head) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_mha_self_ref_fp16(T,d,n_head,x,Wq,bq,Wk,bk,Wv,bv,Wo,bo,out); return 0; }
 
     const int dh = d / n_head;
     const int Tp = (T + 3) & ~3;                 /* matmul M%4 (query rows)            */
     const int Tn = (T + 31) & ~31;               /* matmul N/K align (key count)       */
     const float scale = 1.f / sqrtf((float)dh);
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
 
     _Float16 *xp = NULL, *q=NULL,*k=NULL,*v=NULL,*ctx=NULL;
     _Float16 *qh=NULL,*kh=NULL,*vhT=NULL,*sc=NULL,*P=NULL;
@@ -349,7 +358,7 @@ static int fa_grow(_Float16 **buf, size_t *cap, size_t need)
 {
     if (*cap >= need) return 0;
     _Float16 *n = realloc(*buf, need * sizeof(_Float16));
-    if (!n) return -1;
+    if (!n) return ROCKET_E_SHAPE;
     *buf = n; *cap = need;
     return 0;
 }
@@ -358,7 +367,7 @@ static int fa_grow_f(float **buf, size_t *cap, size_t need)
 {
     if (*cap >= need) return 0;
     float *n = realloc(*buf, need * sizeof(float));
-    if (!n) return -1;
+    if (!n) return ROCKET_E_SHAPE;
     *buf = n; *cap = need;
     return 0;
 }
@@ -396,7 +405,7 @@ static int fa_batch_ensure(fa_scratch *s, int Gmax, int Tp, int Kn, int dh)
         fa_grow(&s->bP,  &s->c_bP,  (size_t)Gmax * tk) ||
         fa_grow(&s->bvh, &s->c_bvh, (size_t)Gmax * kd) ||
         fa_grow(&s->bcx, &s->c_bcx, (size_t)Gmax * qd))
-        return -1;
+        return ROCKET_E_SHAPE;
     if (s->c_ptr < (size_t)Gmax) {
         const _Float16 **na = realloc(s->pA, (size_t)Gmax * sizeof(*na));
         const _Float16 **nb = realloc(s->pB, (size_t)Gmax * sizeof(*nb));
@@ -404,7 +413,7 @@ static int fa_batch_ensure(fa_scratch *s, int Gmax, int Tp, int Kn, int dh)
         if (na) s->pA = na;
         if (nb) s->pB = nb;
         if (nc) s->pC = nc;
-        if (!na || !nb || !nc) return -1;
+        if (!na || !nb || !nc) return ROCKET_E_SHAPE;
         s->c_ptr = Gmax;
     }
     return 0;
@@ -515,7 +524,7 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
      * pC are refilled for QK then AV (qh,kh->sc ; P,vh->cx). s->qk/s->av are the resident
      * batched-matmul contexts (one per shape) on the persistent path; on the stateless /
      * single-fd path they are NULL and the matmul allocates its BOs per call. */
-    if (fa_batch_ensure(s, Gmax, Tp, Kn, dh)) return -2;
+    if (fa_batch_ensure(s, Gmax, Tp, Kn, dh)) return ROCKET_E_NOMEM;
     _Float16 *qh = s->bqh, *kh = s->bkh, *sc = s->bsc, *P = s->bP, *vh = s->bvh, *cx = s->bcx;
     const _Float16 **pA = s->pA, **pB = s->pB;
     _Float16       **pC = s->pC;
@@ -730,8 +739,8 @@ int rocket_flash_attn_fp16(int fd, int n_tokens, int n_kv, int head_dim, int dv,
                            const _Float16 *Q, const _Float16 *K, const _Float16 *V,
                            const _Float16 *mask, _Float16 *out)
 {
-    if (n_tokens < 1 || n_kv < 1 || head_dim < 1 || dv < 1 || n_head < 1 || n_kv_heads < 1) return -1;
-    if (n_head % n_kv_heads != 0 || head_dim % 32 != 0 || dv % 16 != 0) return -1;   /* GQA + QK K%32 + AV N%16 */
+    if (n_tokens < 1 || n_kv < 1 || head_dim < 1 || dv < 1 || n_head < 1 || n_kv_heads < 1) return ROCKET_E_SHAPE;
+    if (n_head % n_kv_heads != 0 || head_dim % 32 != 0 || dv % 16 != 0) return ROCKET_E_SHAPE;   /* GQA + QK K%32 + AV N%16 */
     if (fd < 0) {
         rocket_flash_attn_ref_fp16(n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
                                    scale, softcap, Q, K, V, mask, out);
@@ -739,7 +748,7 @@ int rocket_flash_attn_fp16(int fd, int n_tokens, int n_kv, int head_dim, int dv,
     }
     fa_scratch s = {0};
     if (fa_scratch_ensure(&s, (n_tokens + 3) & ~3, (n_kv + 31) & ~31, head_dim, dv)) {
-        fa_scratch_free(&s); return -2;
+        fa_scratch_free(&s); return ROCKET_E_NOMEM;
     }
     int rc = fa_heads_range(fd, n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
                             scale, softcap, Q, K, V, mask, out, &s, 0, n_head, fa_host_softmax());
@@ -770,13 +779,16 @@ typedef struct {
     const _Float16 *Q, *K, *V, *mask;
     _Float16 *out;
     int h0, h1, host_sm, idx;
+    int core_base;         /* big-core rotation base inherited from the CALLING thread   */
     int ret;
 } fa_mt_arg;
 
 static void *fa_mt_worker(void *a)
 {
     fa_mt_arg *w = (fa_mt_arg *)a;
-    rocket_pin_worker(w->idx);          /* keep the gather/softmax off the A55 littles */
+    /* _based, not rocket_pin_worker: the rotation base is __thread, so a freshly created
+     * worker always reads 0 and two in-process pools would collide on the same A76s. */
+    rocket_pin_worker_based(w->idx, w->core_base);   /* keep gather/softmax off the A55s */
     int fd = w->own_fd ? rocket_open() : w->fd;
     if (fd < 0) { w->ret = fd; return NULL; }
 
@@ -813,6 +825,7 @@ static int fa_fan_heads(const int *fds, fa_scratch *scratch, int nt,
     fa_mt_arg args[8];
     int joinable[8] = {0};
     const int base = n_head / nt, rem = n_head % nt;
+    const int core_base = rocket_affinity_get_base();   /* read on the CALLING thread */
     int h0 = 0, n = 0;
     for (int t = 0; t < nt; t++) {
         const int cnt = base + (t < rem ? 1 : 0);
@@ -822,7 +835,8 @@ static int fa_fan_heads(const int *fds, fa_scratch *scratch, int nt,
             .n_tokens = n_tokens, .n_kv = n_kv, .head_dim = head_dim, .dv = dv,
             .n_head = n_head, .n_kv_heads = n_kv_heads, .scale = scale, .softcap = softcap,
             .Q = Q, .K = K, .V = V, .mask = mask, .out = out,
-            .h0 = h0, .h1 = h0 + cnt, .host_sm = host_sm, .idx = n, .ret = 0 };
+            .h0 = h0, .h1 = h0 + cnt, .host_sm = host_sm, .idx = n,
+            .core_base = core_base, .ret = 0 };
         if (pthread_create(&th[n], NULL, fa_mt_worker, &args[n]) == 0)
             joinable[n] = 1;
         h0 += cnt;
@@ -844,8 +858,8 @@ int rocket_flash_attn_fp16_mt(int fd, int n_tokens, int n_kv, int head_dim, int 
                               const _Float16 *Q, const _Float16 *K, const _Float16 *V,
                               const _Float16 *mask, _Float16 *out, int nthreads)
 {
-    if (n_tokens < 1 || n_kv < 1 || head_dim < 1 || dv < 1 || n_head < 1 || n_kv_heads < 1) return -1;
-    if (n_head % n_kv_heads != 0 || head_dim % 32 != 0 || dv % 16 != 0) return -1;   /* GQA + QK K%32 + AV N%16 */
+    if (n_tokens < 1 || n_kv < 1 || head_dim < 1 || dv < 1 || n_head < 1 || n_kv_heads < 1) return ROCKET_E_SHAPE;
+    if (n_head % n_kv_heads != 0 || head_dim % 32 != 0 || dv % 16 != 0) return ROCKET_E_SHAPE;   /* GQA + QK K%32 + AV N%16 */
     if (fd < 0) {
         rocket_flash_attn_ref_fp16(n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
                                    scale, softcap, Q, K, V, mask, out);
@@ -859,7 +873,7 @@ int rocket_flash_attn_fp16_mt(int fd, int n_tokens, int n_kv, int head_dim, int 
     if (nthreads == 1) {
         fa_scratch s = {0};
         if (fa_scratch_ensure(&s, (n_tokens + 3) & ~3, (n_kv + 31) & ~31, head_dim, dv)) {
-            fa_scratch_free(&s); return -2;
+            fa_scratch_free(&s); return ROCKET_E_NOMEM;
         }
         int rc = fa_heads_range(fd, n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
                                 scale, softcap, Q, K, V, mask, out, &s, 0, n_head, host_sm);
@@ -927,9 +941,9 @@ int rocket_flash_attn_fp16_ctx(rocket_fa_ctx *c, int n_tokens, int n_kv, int hea
                                const _Float16 *Q, const _Float16 *K, const _Float16 *V,
                                const _Float16 *mask, _Float16 *out)
 {
-    if (!c) return -1;
-    if (n_tokens < 1 || n_kv < 1 || head_dim < 1 || dv < 1 || n_head < 1 || n_kv_heads < 1) return -1;
-    if (n_head % n_kv_heads != 0 || head_dim % 32 != 0 || dv % 16 != 0) return -1;   /* GQA + QK K%32 + AV N%16 */
+    if (!c) return ROCKET_E_SHAPE;
+    if (n_tokens < 1 || n_kv < 1 || head_dim < 1 || dv < 1 || n_head < 1 || n_kv_heads < 1) return ROCKET_E_SHAPE;
+    if (n_head % n_kv_heads != 0 || head_dim % 32 != 0 || dv % 16 != 0) return ROCKET_E_SHAPE;   /* GQA + QK K%32 + AV N%16 */
     const int host_sm = fa_host_softmax();
 
     int nt = c->nthreads;
@@ -938,7 +952,7 @@ int rocket_flash_attn_fp16_ctx(rocket_fa_ctx *c, int n_tokens, int n_kv, int hea
     /* Grow each worker's resident scratch up-front on this thread (each worker touches only its
      * own sc[t], so the workers never realloc concurrently). */
     for (int t = 0; t < nt; t++)
-        if (fa_scratch_ensure(&c->sc[t], Tp, Kn, head_dim, dv)) return -2;
+        if (fa_scratch_ensure(&c->sc[t], Tp, Kn, head_dim, dv)) return ROCKET_E_NOMEM;
 
     if (nt == 1)
         return fa_heads_range(c->fd[0], n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,

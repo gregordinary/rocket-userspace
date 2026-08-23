@@ -12,6 +12,7 @@
 #include <math.h>
 #include <limits.h>
 
+#include "rocket_npu.h"    /* ROCKET_E_* — this library's error codes */
 #include "rocket_encoder.h"
 #include "rocket_norm.h"        /* rocket_layernorm_fp16 */
 #include "rocket_attn.h"        /* rocket_mha_self_fp16  */
@@ -71,14 +72,14 @@ int rocket_encoder_block_fp16(int fd, int T, int d, int n_head, int d_ff,
                                const _Float16 *Wf2, const _Float16 *bf2,
                                float eps, _Float16 *out)
 {
-    if (T<1||d<1||n_head<1||d_ff<1||d%n_head) return -1;
+    if (T<1||d<1||n_head<1||d_ff<1||d%n_head) return ROCKET_E_SHAPE;
     if (fd<0) { rocket_encoder_block_ref_fp16(T,d,n_head,d_ff,x,ln1_g,ln1_b,Wq,bq,Wk,bk,Wv,bv,Wo,bo,ln2_g,ln2_b,Wf1,bf1,Wf2,bf2,eps,out); return 0; }
 
     const int Tp = (T+3)&~3;                        /* matmul M%4 */
     /* Tp*d_ff is passed as int to the GELU/EW ops below; reject a truncating product. */
-    if ((size_t)Tp * d_ff > INT_MAX) return -1;
+    if ((size_t)Tp * d_ff > INT_MAX) return ROCKET_E_SHAPE;
     const size_t Td = (size_t)T*d;
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *ln=NULL,*attn=NULL,*xa=NULL,*hp=NULL,*f1=NULL,*act=NULL,*f2=NULL;
 
     ln   = malloc(Td*sizeof(_Float16));
@@ -125,7 +126,7 @@ int rocket_encoder_block_fp16(int fd, int T, int d, int n_head, int d_ff,
     /* out = xa + f2  (NPU residual add over the real T rows) */
     {
         _Float16 *f2c = malloc(Td*sizeof(_Float16));
-        if (!f2c) { rc = -2; goto out; }
+        if (!f2c) { rc = ROCKET_E_NOMEM; goto out; }
         for (int t=0;t<T;t++) memcpy(f2c+(size_t)t*d, f2+(size_t)t*d, (size_t)d*sizeof(_Float16));
         rc = rocket_ew_add_fp16(fd, xa, f2c, out, (int)Td);
         free(f2c);

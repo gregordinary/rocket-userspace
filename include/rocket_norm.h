@@ -62,6 +62,13 @@ void rocket_scale_rows_ref_fp16(int M, int N,
  * fp16-square OVERFLOW (|x|>~223 => x^2 > fp16 max) is handled by a power-of-2 prescale
  * p=2^-k applied to x before squaring (exact, no rounding); the true mean-square is recovered
  * on the host as ms*4^k. fd<0 computes the exact host reference. Returns 0, <0 on error.
+ *
+ * The RECIPROCAL side has no such guard, and cannot: r[m] = 1/sqrt(ms[m]+eps) is combined
+ * with `weight` into a single fp16 scale s[m][h] = r[m]*weight[h] for one ew_mul, so a row
+ * whose mean-square is near zero against a small `eps` makes r large and can push that
+ * product past fp16's 65504 -> inf, where the fp64 reference stays finite. The input is
+ * assumed away from that edge (a normalization input at |x| ~ 0 for a whole row is a
+ * degenerate activation, not a shape this op refuses); raise `eps` if it is not.
  */
 int  rocket_rmsnorm_fp16(int fd, int M, int H, const _Float16 *x,
                          const _Float16 *weight, float eps, _Float16 *out);

@@ -5,7 +5,9 @@
  * rocket_affinity.h. Keeps the pack/readback-heavy worker threads off the A55
  * little cores so a parked worker doesn't stall the join.
  */
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE        /* CPU_SETSIZE, cpu_set_t, pthread_setaffinity_np */
+#endif
 #include <sched.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -45,7 +47,10 @@ static long read_long_file(const char *path)
     return v;
 }
 
-/* Parse a CPU list ("4-7", "4,5,6,7", "0,4-7") into out[]; returns the count. */
+/* Parse a CPU list ("4-7", "4,5,6,7", "0,4-7") into out[]; returns the count.
+ * Ids at or above CPU_SETSIZE are dropped: CPU_SET() on one is undefined behaviour
+ * (in practice a write past the cpu_set_t), and ROCKET_CPU_AFFINITY is an operator
+ * string, so "0-99999" is a typo away. */
 static int parse_cpu_list(const char *s, int *out, int max)
 {
     int n = 0;
@@ -64,6 +69,7 @@ static int parse_cpu_list(const char *s, int *out, int max)
             s = end;
         }
         if (a < 0) a = 0;
+        if (b >= CPU_SETSIZE) b = CPU_SETSIZE - 1;
         for (long c = a; c <= b && n < max; c++) out[n++] = (int)c;
     }
     return n;
@@ -151,6 +157,7 @@ void rocket_pin_worker_based(int worker_idx, int core_base)
     if (core_base < 0) core_base = 0;
 
     int cpu = g_big[(core_base + worker_idx) % g_n_big];
+    if (cpu < 0 || cpu >= CPU_SETSIZE) return;   /* parse_cpu_list bounds this; belt to it */
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);

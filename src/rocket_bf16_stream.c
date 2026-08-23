@@ -38,69 +38,40 @@
 #include "rocket_npu.h"
 #include "rocket_hw_profile.h"
 #include "rocket_matmul.h"
+#include "rocket_matmul_internal.h"  /* mm_plan + mm_plan_derive (bf16 shares the geometry) */
 #include "npu_matmul.h"        // matmul_params_t + gen_matmul_bf16
 #include "rocket_affinity.h"
+#include "rocket_cube.h"       /* the NPU cube index math + blocked moves */
+#include "rocket_fanout.h"
 #include "rocket_log.h"
 
-#define BFS_MAX_WORKERS 8
-#define BFS_MAX_SLOTS   32
-#define BFS_BATCH       64           /* tiles (tasks) per NPU job (== rocket_matmul.c)  */
-#define BFS_RC_STRIDE   128          /* u64 words reserved per task in the regcmd BO    */
+#define BFS_MAX_WORKERS ROCKET_FANOUT_MAX_WORKERS
+#define BFS_BATCH       ROCKET_FANOUT_BATCH
+#define BFS_RC_STRIDE   ROCKET_FANOUT_RC_STRIDE
 #define BFS_CBUF_BANK   NPU_CBUF_BANK_SIZE
 
 /* ============================================================================
  * SECTION — bf16 tile-layout index math and small helpers
  * ==========================================================================*/
 
-static int rup(int x, int a) { return ((x + a - 1) / a) * a; }
-
-/* bf16 input geometry == fp16/int16 input geometry (feature cube C2=8, weight tile
- * (N/16,K/32,16,32)); output cube is the 4-byte C2=4 the int32/fp32-out paths use. */
-static inline size_t bfs_feat_idx(int H, int ch, int h) {   /* input, C2=8 */
-    return ((size_t)(ch - 1) / 8) * (size_t)H * 8 + 8 * (size_t)(h - 1) + (ch - 1) % 8;
-}
-static inline size_t bfs_wt_idx(int C, int k, int c) {      /* weight, (N/16,K/32,16,32) */
-    return (size_t)((c - 1) / 32) * 32 * 16 + (size_t)((k - 1) / 16) * 16 * C
-         + (size_t)((c - 1) % 32) + (size_t)((k - 1) % 16) * 32;
-}
-static inline size_t bfs_out_idx(int H, int ch, int h) {    /* output fp32 elem, C2=4 */
-    return ((size_t)(ch - 1) / 4) * (size_t)H * 4 + 4 * (size_t)(h - 1) + (ch - 1) % 4;
-}
-/* fp32 -> bf16 by truncation (high 16 bits) — matches rocket_matmul_bf16. */
-static inline uint16_t f32_to_bf16(float f) {
-    uint32_t b; memcpy(&b, &f, sizeof b); return (uint16_t)(b >> 16);
-}
-static long bfs_wait_ns(void) {
-    const char *e = getenv("ROCKET_WAIT_MS");
-    long ms = e ? atol(e) : 8000;
-    if (ms < 1) ms = 8000;
-    return ms * 1000000L;
-}
 
 /* ============================================================================
  * SECTION — Tiling plan, BO scratch, and pack/compute primitives
  * ==========================================================================*/
 
 /* Resolved tiling plan + per-tile slot sizes (input/weight in bf16 elems, output in
- * fp32 elems) for one worker's (M,K,nsub). */
-typedef struct {
-    int M, K, N;
-    int Mt, Kt, Nt, nMt, nNt, nKt;
-    size_t in_slot, wt_slot, out_slot;   /* elems */
-} bfs_plan;
+ * fp32 elems) for one worker's (M,K,nsub). Field-for-field the fp16 path's mm_plan,
+ * because it IS that plan: bf16 shares the 2-byte input geometry and the C2=4 output
+ * cube exactly, and rocket_matmul_plan_bf16 delegates to the int16 planner. Declaring a
+ * structurally identical twin only made mm_plan_derive a thing that had to be written
+ * twice. */
+typedef mm_plan bfs_plan;
 
 static int bfs_plan_init(bfs_plan *pl, int M, int K, int N)
 {
     int Mt, Kt, Nt;
     if (rocket_matmul_plan_bf16(M, K, N, &Mt, &Kt, &Nt) < 0) return -1;
-    pl->M = M; pl->K = K; pl->N = N;
-    pl->Mt = Mt; pl->Kt = Kt; pl->Nt = Nt;
-    pl->nMt = (M + Mt - 1) / Mt;
-    pl->nNt = (N + Nt - 1) / Nt;
-    pl->nKt = (K + Kt - 1) / Kt;
-    pl->in_slot  = (size_t)rup(Mt, 4)  * rup(Kt, 32);
-    pl->wt_slot  = (size_t)rup(Nt, 16) * rup(Kt, 32);
-    pl->out_slot = (size_t)rup(Mt, 4)  * rup(Nt, 16);
+    mm_plan_derive(pl, M, K, N, Mt, Kt, Nt);
     return 0;
 }
 
@@ -181,10 +152,8 @@ static void bfs_scatter_A(const bfs_plan *pl, uint16_t *dst, const float *A)
         for (int ki = 0; ki < pl->nKt; ki++) {
             int k0 = ki * pl->Kt, Ktile = (pl->K - k0 < pl->Kt) ? (pl->K - k0) : pl->Kt;
             uint16_t *slot = dst + (size_t)(mi * pl->nKt + ki) * pl->in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[bfs_feat_idx(Mtile, c, h)] =
-                        f32_to_bf16(A[(size_t)(m0 + h - 1) * pl->K + (k0 + c - 1)]);
+            MM_CUBE_SCATTER(uint16_t, float, 8, feat_idx_i16,
+                            slot, A, pl->K, m0, k0, Mtile, Ktile, f32_to_bf16);
         }
     }
 }
@@ -220,10 +189,8 @@ static int bfs_pack_B(int fd, const bfs_plan *pl, bfs_bos *b, const float *Bslic
         for (int ki = 0; ki < pl->nKt; ki++) {
             int k0 = ki * pl->Kt, Ktile = (pl->K - k0 < pl->Kt) ? (pl->K - k0) : pl->Kt;
             uint16_t *slot = (uint16_t *)b->wt_all.ptr + (size_t)(ni * pl->nKt + ki) * pl->wt_slot;
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[bfs_wt_idx(Ktile, kk, c)] =
-                        f32_to_bf16(Bslice[(size_t)(n0 + kk - 1) * pl->K + (k0 + c - 1)]);
+            MM_WT_SCATTER(uint16_t, float, 32, 16, wt_idx_i16,
+                          slot, Bslice, pl->K, n0, k0, Ntile, Ktile, f32_to_bf16);
         }
     }
     rocket_bo_fini(fd, &b->wt_all);
@@ -235,6 +202,11 @@ static int bfs_pack_B(int fd, const bfs_plan *pl, bfs_bos *b, const float *Bslic
 static int bfs_compute(int fd, const bfs_plan *pl, bfs_bos *b, float *Csub)
 {
     int M = pl->M, N = pl->N;
+    /* DOUBLE, not the fp32 the fp16 path K-accumulates in, and deliberately: bf16 has
+     * EIGHT mantissa bits against fp16's ten, so a K-partial sum carries visibly more
+     * rounding and this path's only claim is that it matches its fp64 oracle. It costs
+     * twice the accumulator traffic on a term that is not the wall here (the readback
+     * is), so it stays until something measures it. */
     memset(b->acc, 0, (size_t)M * N * sizeof(double));
     uint64_t npu_regs[256] = {0};
     int total = pl->nMt * pl->nNt * pl->nKt, done = 0, nb = 0, ret = 0;
@@ -281,7 +253,7 @@ static int bfs_compute(int fd, const bfs_plan *pl, bfs_bos *b, float *Csub)
                     /* Resident submit scratch (b->submit_dt), no per-job calloc/free; batched=0
                      * keeps the stock gapped per-task layout (matches the prior behavior). */
                     if ((ret = rocket_submit_tasks_pre(fd, b->submit_dt, b->tasks, nb, in_h, 3, out_h, 1, 0)) != 0) return ret;
-                    if ((ret = rocket_bo_prep(fd, &b->out_all, 0, bfs_wait_ns())) != 0) {
+                    if ((ret = rocket_bo_prep(fd, &b->out_all, 0, rocket_fanout_wait_ns())) != 0) {
                         ROCKET_LOGE("bf16_stream: WAIT TIMEOUT (%d) M=%d K=%d N=%d batch=%d %d/%d\n",
                                 ret, M, pl->K, N, nb, done, total);
                         return ret;
@@ -289,10 +261,11 @@ static int bfs_compute(int fd, const bfs_plan *pl, bfs_bos *b, float *Csub)
                     float *ob = (float *)b->out_all.ptr;
                     for (int j = 0; j < nb; j++) {
                         float *slot = ob + b->boff[j];
-                        for (int h = 1; h <= b->bMtile[j]; h++)
-                            for (int nn = 1; nn <= b->bNtile[j]; nn++)
-                                b->acc[(size_t)(b->bm0[j] + h - 1) * N + (b->bn0[j] + nn - 1)] +=
-                                    (double)slot[bfs_out_idx(b->bMtile[j], nn, h)];
+#define MM_ACC_(h_, nn_, v_) \
+    (b->acc[(size_t)(b->bm0[j] + (h_) - 1) * N + (b->bn0[j] + (nn_) - 1)] += (double)(v_))
+                        MM_CUBE_GATHER(float, 4, out_idx_i16, slot,
+                                       b->bMtile[j], b->bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     rocket_bo_fini(fd, &b->out_all);
                     nb = 0;
@@ -312,13 +285,15 @@ typedef struct {
     int M, K, N, n0, nsub;
     const float *A, *B;
     float *C;
-    int ret, idx;
+    int ret, idx, core_base;
 } bfs_mt_arg;
 
 static void *bfs_mt_worker(void *a)
 {
     bfs_mt_arg *w = (bfs_mt_arg *)a;
-    rocket_pin_worker(w->idx);
+    /* _based, not rocket_pin_worker: the rotation base is __thread, so a freshly created
+     * worker always reads 0 and two in-process pools would collide on the same A76s. */
+    rocket_pin_worker_based(w->idx, w->core_base);
     int fd = rocket_open();
     if (fd < 0) { w->ret = fd; return NULL; }
     float *Csub = malloc((size_t)w->M * w->nsub * sizeof(float));
@@ -337,8 +312,7 @@ static void *bfs_mt_worker(void *a)
 
 static int bfs_nstep(int N, int nthreads)
 {
-    int s = ((N + nthreads - 1) / nthreads + 15) / 16 * 16;
-    return s < 16 ? 16 : s;
+    return rocket_fanout_nstep(N, nthreads, 16);   /* the generator needs N%16 */
 }
 
 int rocket_matmul_bf16_mt(int M, int K, int N,
@@ -348,22 +322,19 @@ int rocket_matmul_bf16_mt(int M, int K, int N,
     if (nthreads > BFS_MAX_WORKERS) nthreads = BFS_MAX_WORKERS;
     int Nstep = bfs_nstep(N, nthreads);
 
-    pthread_t th[BFS_MAX_WORKERS];
     bfs_mt_arg args[BFS_MAX_WORKERS];
-    int joinable[BFS_MAX_WORKERS] = {0};
+    const int core_base = rocket_affinity_get_base();  /* read on the CALLING thread */
     int nt = 0;
     for (int t = 0; t < nthreads; t++) {
         int n0 = t * Nstep;
         if (n0 >= N) break;
         int n1 = n0 + Nstep; if (n1 > N) n1 = N;
-        args[nt] = (bfs_mt_arg){ M, K, N, n0, n1 - n0, A, B, C, 0, nt };
-        if (pthread_create(&th[nt], NULL, bfs_mt_worker, &args[nt]) == 0) joinable[nt] = 1;
+        args[nt] = (bfs_mt_arg){ M, K, N, n0, n1 - n0, A, B, C, 0, nt, core_base };
         nt++;
     }
-    for (int t = 0; t < nt; t++) if (!joinable[t]) bfs_mt_worker(&args[t]);
+    rocket_fanout_run(nt, args, sizeof args[0], bfs_mt_worker);
     int ret = 0;
     for (int t = 0; t < nt; t++) {
-        if (joinable[t]) pthread_join(th[t], NULL);
         if (args[t].ret) ret = args[t].ret;
     }
     return ret;
@@ -388,8 +359,7 @@ typedef struct {
 struct rocket_bf16_stream {
     int nthreads;
     int fd[BFS_MAX_WORKERS];
-    bfs_scratch *scache[BFS_MAX_SLOTS];
-    int nscache;
+    rocket_slot_cache scache;
 };
 
 rocket_bf16_stream *rocket_bf16_stream_create(int nthreads)
@@ -420,10 +390,23 @@ static void bfs_scratch_free(rocket_bf16_stream *s, bfs_scratch *sc)
     free(sc);
 }
 
+static bfs_scratch *bfs_scratch_alloc(rocket_bf16_stream *s, int M, int K, int N);
+
+/* How the shared slot cache builds and releases one of our per-shape scratches. */
+static void *bfs_slot_alloc(void *owner, const rocket_shape_key *k)
+{
+    return bfs_scratch_alloc((rocket_bf16_stream *)owner, k->M, k->K, k->N);
+}
+static void bfs_slot_release(void *owner, void *slot)
+{
+    bfs_scratch_free((rocket_bf16_stream *)owner, (bfs_scratch *)slot);
+}
+static const rocket_slot_ops bfs_slot_ops = { bfs_slot_alloc, bfs_slot_release };
+
 void rocket_bf16_stream_free(rocket_bf16_stream *s)
 {
     if (!s) return;
-    for (int i = 0; i < s->nscache; i++) bfs_scratch_free(s, s->scache[i]);
+    rocket_slot_cache_clear(&s->scache, s, &bfs_slot_ops);
     for (int t = 0; t < s->nthreads; t++)
         if (s->fd[t] >= 0) rocket_close(s->fd[t]);
     free(s);
@@ -457,16 +440,12 @@ fail:
     return NULL;
 }
 
+/* Find (or build + cache) the per-shape scratch. NULL only on an alloc failure: a full
+ * cache recycles its least recently used shape rather than refusing. */
 static bfs_scratch *bfs_ctx_scratch(rocket_bf16_stream *s, int M, int K, int N)
 {
-    for (int i = 0; i < s->nscache; i++)
-        if (s->scache[i]->M == M && s->scache[i]->K == K && s->scache[i]->N == N)
-            return s->scache[i];
-    if (s->nscache >= BFS_MAX_SLOTS) return NULL;
-    bfs_scratch *sc = bfs_scratch_alloc(s, M, K, N);
-    if (!sc) return NULL;
-    s->scache[s->nscache++] = sc;
-    return sc;
+    const rocket_shape_key k = { M, K, N, 0 };
+    return rocket_slot_get(&s->scache, s, &k, &bfs_slot_ops);
 }
 
 typedef struct {
@@ -476,13 +455,15 @@ typedef struct {
     const uint16_t *packed;    /* shared pre-scattered A, or NULL                 */
     const float *B;            /* full B[N,K] to re-pack this call                */
     float *C;                  /* full C[M,N]                                      */
-    int M, N, ret, idx;
+    int M, N, ret, idx, core_base;
 } bfs_run_arg;
 
 static void *bfs_run_worker(void *a)
 {
     bfs_run_arg *t = (bfs_run_arg *)a;
-    rocket_pin_worker(t->idx);
+    /* _based, not rocket_pin_worker: the rotation base is __thread, so a freshly created
+     * worker always reads 0 and two in-process pools would collide on the same A76s. */
+    rocket_pin_worker_based(t->idx, t->core_base);
     bfs_worker *ww = t->ww;
     int nsub = ww->nsub;
 
@@ -532,17 +513,13 @@ int rocket_matmul_bf16_stream(rocket_bf16_stream *s, int M, int K, int N,
         /* alloc failure -> packed stays NULL -> per-worker packing fallback */
     }
 
-    pthread_t th[BFS_MAX_WORKERS];
     bfs_run_arg args[BFS_MAX_WORKERS];
-    int joinable[BFS_MAX_WORKERS] = {0};
-    for (int t = 0; t < sc->nt; t++) {
-        args[t] = (bfs_run_arg){ s->fd[t], &sc->w[t], A, packed, B, C, M, N, 0, t };
-        if (pthread_create(&th[t], NULL, bfs_run_worker, &args[t]) == 0) joinable[t] = 1;
-    }
-    for (int t = 0; t < sc->nt; t++) if (!joinable[t]) bfs_run_worker(&args[t]);
+    const int core_base = rocket_affinity_get_base();  /* read on the CALLING thread */
+    for (int t = 0; t < sc->nt; t++)
+        args[t] = (bfs_run_arg){ s->fd[t], &sc->w[t], A, packed, B, C, M, N, 0, t, core_base };
+    rocket_fanout_run(sc->nt, args, sizeof args[0], bfs_run_worker);
     int ret = 0;
     for (int t = 0; t < sc->nt; t++) {
-        if (joinable[t]) pthread_join(th[t], NULL);
         if (args[t].ret) ret = args[t].ret;
     }
     return ret;

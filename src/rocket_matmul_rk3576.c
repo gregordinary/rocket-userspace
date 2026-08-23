@@ -44,12 +44,14 @@
  */
 #include <dirent.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "rocket_npu.h"
+#include "rocket_sysfs.h"      /* the one enumeration of the bound NPU cores */
 #include "rocket_matmul.h"
 #include "rocket_hw_profile.h"
 #include "rocket_log.h"
@@ -319,17 +321,31 @@ int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *N
  * poisoning sentinel stamps the output BO per task either way — what a pooled BO
  * skips is only the kernel's zero-fill, which the sentinel never relied on.
  * ==========================================================================*/
+/* Both knobs are read on EVERY pool get and put, so they are resolved once — the rest
+ * of this file caches its knobs for exactly this reason. */
 static int r76_bo_pool_on(void)
 {
-    const char *e = getenv("ROCKET_RK3576_BO_POOL");
-    return e && atoi(e) != 0;
+    static _Atomic int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        const char *e = getenv("ROCKET_RK3576_BO_POOL");
+        c = e && atoi(e) != 0;
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return c;
 }
 static size_t r76_bo_pool_cap(void)
 {
-    const char *e = getenv("ROCKET_RK3576_BO_POOL_MB");
-    long mb = e ? atol(e) : 64;
-    if (mb < 0) mb = 0;
-    return (size_t)mb << 20;
+    static _Atomic long v = -1;
+    long c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        const char *e = getenv("ROCKET_RK3576_BO_POOL_MB");
+        long mb = e ? atol(e) : 64;
+        if (mb < 0) mb = 0;
+        c = mb << 20;
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return (size_t)c;
 }
 #define R76_BO_POOL_SLOTS 16
 static pthread_mutex_t g_r76_bo_pool_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -359,7 +375,7 @@ static int r76_bo_get(int fd, size_t size, rocket_bo *bo)
         }
         pthread_mutex_unlock(&g_r76_bo_pool_mu);
     }
-    return rocket_bo_alloc(fd, size, bo);
+    return rocket_bo_alloc32(fd, size, bo);
 }
 static void r76_bo_put(int fd, rocket_bo *bo)
 {
@@ -433,7 +449,7 @@ int rocket_rk3576_wbo_create(int fd, int K, int N, const int8_t *B,
     bytes = (size_t)((unsigned)N / 32u) * nK1 * 1024u;
     w = calloc(1, sizeof *w);
     if (!w) return ROCKET_E_NOMEM;
-    if (rocket_bo_alloc(fd, bytes, &w->bo) < 0) { free(w); return ROCKET_E_NOMEM; }
+    if (rocket_bo_alloc32(fd, bytes, &w->bo) < 0) { free(w); return ROCKET_E_NOMEM; }
     rocket_bo_prep(fd, &w->bo, 1, 0);
     /* The same blocked copy the per-call path uses, over the whole N. K and N are
      * multiples of 32, so every 1024-byte (n-group, k-group) block is fully written
@@ -496,7 +512,6 @@ static int r76_mm_int8(int fd, int M, int K, int N,
     const struct rocket_hw_profile *hw = rocket_hw_current();
     struct r76_mm_bos b = {0};
     uint64_t *ops = NULL;
-    int8_t *stage = NULL;
     int32_t *tile_bias = NULL;
     int16_t *cmul = NULL;
     /* `sum_abs_own` is this call's, and is freed; `sum_abs_w` is what the planner reads
@@ -623,8 +638,7 @@ static int r76_mm_int8(int fd, int M, int K, int N,
 
     ops   = calloc(RK3576_CONV_TASK_OPS, sizeof *ops);
     plan  = calloc(max_tasks, sizeof *plan);
-    stage = calloc(in_bytes, 1);
-    if (!ops || !plan || !stage) { rc = ROCKET_E_NOMEM; goto done; }
+    if (!ops || !plan) { rc = ROCKET_E_NOMEM; goto done; }
     PROF_ADD(setup, pt0);
 
     /* THE C RAMP IS CAPPED BY THE ACCUMULATOR, so the plan needs each column's own
@@ -672,29 +686,30 @@ static int r76_mm_int8(int fd, int M, int K, int N,
      * consecutive bytes at BOTH ends — a copy rather than a scatter. K is a multiple of
      * 32 on this path, so every run is a whole sixteen. The per-element form is what
      * the index function above spells out and is the reference for this one. */
+    /* Straight into the mapping, not via a host stage buffer. The BO is acquired FIRST
+     * so the pack has somewhere to land: staging it and then copying costs a calloc and
+     * a free of in_bytes plus a second full pass over them, and the profiler attributed
+     * both halves to packA, which is where they hid. The memset is what the calloc used
+     * to do — ih*iw exceeds M, and the pixels past M must read zero. */
     pt0 = PROF_T0();
+    if (r76_bo_get(fd, in_bytes, &b.in) < 0) { rc = ROCKET_E_NOMEM; goto done; }
+    PROF_ADD(alloc, pt0);
+    pt0 = PROF_T0();
+    rocket_bo_prep(fd, &b.in, 1, 0);
+    memset(b.in.ptr, 0, in_bytes);
     {
         size_t plane = (size_t)ih * iw * C2;
         unsigned k1, ngrp = (unsigned)K / C2;
         int m;
         for (m = 0; m < M; m++) {
             const int8_t *src = A + (size_t)m * K;
-            int8_t *dst = stage + (size_t)C2 * (unsigned)m;
+            int8_t *dst = (int8_t *)b.in.ptr + (size_t)C2 * (unsigned)m;
             for (k1 = 0; k1 < ngrp; k1++)
                 memcpy(dst + (size_t)k1 * plane, src + (size_t)k1 * C2, C2);
         }
     }
-    PROF_ADD(packA, pt0);
-    pt0 = PROF_T0();
-    if (r76_bo_get(fd, in_bytes, &b.in) < 0) { rc = ROCKET_E_NOMEM; goto done; }
-    PROF_ADD(alloc, pt0);
-    pt0 = PROF_T0();
-    rocket_bo_prep(fd, &b.in, 1, 0);
-    memcpy(b.in.ptr, stage, in_bytes);
     rocket_bo_fini(fd, &b.in);
     PROF_ADD(packA, pt0);
-    free(stage);
-    stage = NULL;
 
     pt0 = PROF_T0();
     if (r76_bo_get(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
@@ -946,7 +961,7 @@ static int r76_mm_int8(int fd, int M, int K, int N,
     rc = ROCKET_OK;
 
 done:
-    free(ops); free(plan); free(stage); free(tile_bias);
+    free(ops); free(plan); free(tile_bias);
     free(cmul); free(sum_abs_own);
     pt0 = PROF_T0();
     r76_mm_free(fd, &b);
@@ -1094,21 +1109,18 @@ static FILE *r76_pm_open(int i, const char *leaf, const char *mode)
  * devices are set to (they share one policy, so the first readable one is it), or -1. */
 static int r76_pm_probe(void)
 {
-    static const char *dir = "/sys/bus/platform/drivers/rocket";
-    DIR *d = opendir(dir);
-    struct dirent *e;
-    int delay = -1;
+    char names[ROCKET_SYSFS_MAX_DEVS][ROCKET_SYSFS_NAME_MAX];
+    int ndev = rocket_sysfs_bound_devices(names, ROCKET_SYSFS_MAX_DEVS);
+    int delay = -1, i;
 
     r76_pm_ndev = 0;
-    if (!d) return -1;
-    while ((e = readdir(d)) && r76_pm_ndev < R76_PM_MAX_DEVS) {
+    if (ndev <= 0) return -1;
+    for (i = 0; i < ndev && r76_pm_ndev < R76_PM_MAX_DEVS; i++) {
         FILE *fp;
         long v;
-        if (e->d_name[0] == '.') continue;
-        /* The directory also holds bind/unbind/uevent and a `module` link; a device is
-         * whatever carries a readable power/autosuspend_delay_ms. */
-        if (snprintf(r76_pm_dir[r76_pm_ndev], sizeof r76_pm_dir[0], "%s/%s/power/",
-                     dir, e->d_name) >= (int)sizeof r76_pm_dir[0])
+        if (snprintf(r76_pm_dir[r76_pm_ndev], sizeof r76_pm_dir[0],
+                     "/sys/bus/platform/drivers/rocket/%s/power/",
+                     names[i]) >= (int)sizeof r76_pm_dir[0])
             continue;
         fp = r76_pm_open(r76_pm_ndev, "autosuspend_delay_ms", "r");
         if (!fp) continue;
@@ -1118,7 +1130,6 @@ static int r76_pm_probe(void)
         }
         fclose(fp);
     }
-    closedir(d);
     return r76_pm_ndev ? delay : -1;
 }
 
@@ -1800,8 +1811,8 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
         size_t in_max = (size_t)((ks + C2 - 1) / C2) * ih * iw * C2;
         in_slot = (in_max + 63u) & ~(size_t)63u;
         nslices = ((unsigned)K + ks - 1u) / ks;
-        if (rocket_bo_alloc(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0 ||
-            rocket_bo_alloc(fd, in_slot * nslices, &b.in) < 0) {
+        if (rocket_bo_alloc32(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0 ||
+            rocket_bo_alloc32(fd, in_slot * nslices, &b.in) < 0) {
             rc = ROCKET_E_NOMEM; goto done;
         }
     }
@@ -1972,9 +1983,9 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
              * can share a line with a surface byte either. */
             guard_off = (surf_bytes + 63u) & ~(size_t)63u;
             o_surf_max = surf_bytes;
-            if (rocket_bo_alloc(fd, w_bytes, &b.w) < 0 ||
-                rocket_bo_alloc(fd, coeff_bytes, &b.coeff) < 0 ||
-                rocket_bo_alloc(fd, guard_off + (size_t)surf_elems * C2, &b.out) < 0) {
+            if (rocket_bo_alloc32(fd, w_bytes, &b.w) < 0 ||
+                rocket_bo_alloc32(fd, coeff_bytes, &b.coeff) < 0 ||
+                rocket_bo_alloc32(fd, guard_off + (size_t)surf_elems * C2, &b.out) < 0) {
                 rc = ROCKET_E_NOMEM; goto done;
             }
 
@@ -2222,11 +2233,11 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                          * for a stretch was emitted with the wrong data, which is the
                          * wide writer's own defect and is indifferent to idle, so that
                          * redo is immediate and costs one submit. */
-                        unsigned A = iw * plan[t].oh;
-                        unwritten = r76_i32_diag_task(sp, A, oc_prog,
+                        unsigned npx = iw * plan[t].oh;   /* pixels this task wrote */
+                        unwritten = r76_i32_diag_task(sp, npx, oc_prog,
                                                       (unsigned)atoms_per_px, k0, n0, t,
                                                       blank, "unwritten", 1);
-                        suspect = r76_i32_wide_suspect(sp, A, oc_prog);
+                        suspect = r76_i32_wide_suspect(sp, npx, oc_prog);
                         holes   = unwritten + suspect;
                         twrote  = holes == 0;
                     } else {
@@ -2354,17 +2365,17 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                 const unsigned char *sp = (const unsigned char *)b.out.ptr;
                 unsigned dropped = 0, zeros = 0;
                 for (t = 0; t < ntask; t++) {
-                    unsigned A = iw * plan[t].oh;
-                    dropped += r76_i32_diag_task(sp + task_off[t], A, oc_prog,
+                    unsigned npx = iw * plan[t].oh;   /* pixels this task wrote */
+                    dropped += r76_i32_diag_task(sp + task_off[t], npx, oc_prog,
                                                  (unsigned)atoms_per_px, k0, n0, t,
                                                  blank, "UNWRITTEN (still the sentinel)",
                                                  0);
                     if (blank)
-                        zeros += r76_i32_diag_task(sp + task_off[t], A, oc_prog,
+                        zeros += r76_i32_diag_task(sp + task_off[t], npx, oc_prog,
                                                    (unsigned)atoms_per_px, k0, n0, t,
                                                    0, "ZERO (emitted, wrong data)", 0);
                     if (diag >= 2) {
-                        size_t gb = task_off[t] + (size_t)atoms_per_px * A * C2, g;
+                        size_t gb = task_off[t] + (size_t)atoms_per_px * npx * C2, g;
                         for (g = 0; g < R76_DIAG_TASK_GUARD; g++)
                             if (sp[gb + g] != blank) {
                                 ROCKET_LOGI("rk3576 i32 diag: k0=%u n0=%u task=%u wrote "

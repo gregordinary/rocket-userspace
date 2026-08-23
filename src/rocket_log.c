@@ -11,12 +11,21 @@
 #include "rocket_log.h"
 
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static rocket_log_callback g_cb       = NULL;
-static void               *g_cb_user  = NULL;
+/* The callback and its user pointer are ONE decision and are published as one: two
+ * plain stores let a concurrent rocket_log() observe the new callback with the old
+ * user data, which for a host whose logger dereferences that pointer is a crash in
+ * the logging path. The struct is swapped through a single atomic pointer; the
+ * previous cell is deliberately not freed, because a logger may be mid-call on it and
+ * there is no reader count to wait on. Installs are a startup-time event (one per
+ * host), so the leak is bounded by how many times a host changes its mind. */
+typedef struct { rocket_log_callback cb; void *user; } rocket_log_sink;
+static rocket_log_sink  g_sink_default = { NULL, NULL };
+static rocket_log_sink *_Atomic g_sink = &g_sink_default;
 static _Atomic int         g_level    = -1; /* <0 = not yet resolved from the env */
 static _Atomic int         g_tee      = -1; /* ROCKET_LOG_STDERR: <0 = unresolved */
 
@@ -26,7 +35,7 @@ static _Atomic int         g_tee      = -1; /* ROCKET_LOG_STDERR: <0 = unresolve
  * llama-bench installs a no-op ggml callback (unless -v), which — because our
  * driver channel forwards into ggml — swallows every rocket diagnostic,
  * including the resident-budget decision that changes the benchmarked number.
- * The tee fires ONLY when a callback is installed (g_cb != NULL); with the
+ * The tee fires ONLY when a callback is installed (sink->cb != NULL); with the
  * default stderr sink there is nothing to tee, so no double-print.
  */
 static int stderr_tee_enabled(void)
@@ -65,8 +74,16 @@ static int active_level(void)
 
 void rocket_log_set_callback(rocket_log_callback cb, void *user_data)
 {
-    g_cb      = cb;
-    g_cb_user = user_data;
+    if (!cb) {                       /* uninstall: back to the static default cell */
+        g_sink_default.cb = NULL;
+        g_sink_default.user = user_data;
+        atomic_store(&g_sink, &g_sink_default);
+        return;
+    }
+    rocket_log_sink *s = malloc(sizeof *s);
+    if (!s) return;                  /* keep the current sink rather than tear it */
+    s->cb = cb; s->user = user_data;
+    atomic_store(&g_sink, s);
 }
 
 void rocket_log_set_level(rocket_log_level level)
@@ -114,14 +131,15 @@ void rocket_log(rocket_log_level level, const char *fmt, ...)
         /* malloc failure: fall back to the truncated stack buffer. */
     }
 
-    if (g_cb) {
-        g_cb(level, msg, g_cb_user);
+    const rocket_log_sink *sink = atomic_load(&g_sink);
+    if (sink->cb) {
+        sink->cb(level, msg, sink->user);
         /* Host callback may silence output (e.g. llama-bench's no-op logger);
          * tee to stderr when the operator asked to see the channel regardless. */
         if (stderr_tee_enabled())
             fputs(msg, stderr);
     } else {
-        default_sink(level, msg, g_cb_user);
+        default_sink(level, msg, sink->user);
     }
 
     if (msg != buf)

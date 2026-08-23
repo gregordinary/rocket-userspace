@@ -28,15 +28,20 @@
  * No-op (leaves affinity untouched) when pinning is disabled, when no distinct
  * big cluster is found (all CPUs same max freq, or cpufreq not exposed), or when
  * pthread_setaffinity_np fails. Detection runs once (pthread_once); thread-safe.
- * Logs the detected set and each pin under ROCKET_DEBUG. */
+ * Logs the detected set and each pin under ROCKET_DEBUG.
+ *
+ * ONLY correct on a thread that set its own base — i.e. a caller pinning ITSELF. The
+ * base is __thread, so a freshly pthread_create'd worker always reads 0 no matter what
+ * base its spawner set, and every pool's worker i would land on the same big core i.
+ * A worker takes rocket_pin_worker_based() with a base read on the spawning thread. */
 void rocket_pin_worker(int worker_idx);
 
 /* Same as rocket_pin_worker but with an explicit rotation BASE: pins to
- * g_big[(core_base + worker_idx) % n_big]. rocket_pin_worker(idx) ==
- * rocket_pin_worker_based(idx, <calling thread's affinity base>). Worker threads
- * carry the base from their spawning context (see rocket_affinity_set_base in
- * rocket_npu.h) so N in-process context pools spread across the big cluster
- * instead of every pool's worker 0 stacking on the same core. */
+ * g_big[(core_base + worker_idx) % n_big]. This is the form a WORKER wants —
+ * see the caveat above. The spawner reads rocket_affinity_get_base() on its own
+ * thread and passes it in its worker arg, so N in-process context pools spread
+ * across the big cluster instead of every pool's worker 0 stacking on one core.
+ * (See rocket_affinity_set_base in rocket_npu.h for who sets the base.) */
 void rocket_pin_worker_based(int worker_idx, int core_base);
 
 #endif /* ROCKET_AFFINITY_H */

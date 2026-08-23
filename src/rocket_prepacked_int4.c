@@ -29,53 +29,20 @@
 #include "rocket_hw_profile.h"
 #include "npu_matmul.h"
 #include "rocket_matmul.h"
+#include "rocket_cube.h"       /* the NPU cube index math + blocked moves */
 #include "rocket_affinity.h"
+#include "rocket_fanout.h"
 #include "rocket_log.h"     // centralized log channel
 #include "rocket_chain.h"   // contiguous self-chaining regcmd layout (batched submit)
 
-#define RK4_MAX_WORKERS 8
-#define RK4_MAX_SLOTS   32
-#define I4_BATCH        64
-#define I4_RC_STRIDE    128
-#define I4_CBUF_BANK    32768
+#define RK4_MAX_WORKERS ROCKET_FANOUT_MAX_WORKERS
+#define I4_BATCH        ROCKET_FANOUT_BATCH
+#define I4_RC_STRIDE    ROCKET_FANOUT_RC_STRIDE
+#define I4_CBUF_BANK    NPU_CBUF_BANK_SIZE
 
 /* ============================================================================
  * SECTION — int4 tile-layout index math and small helpers
  * ==========================================================================*/
-
-/* Round x up to a multiple of a, in size_t (these feed slot/BO allocation sizes;
- * computing in int would truncate before the widen at the call site). */
-static size_t i4_rup(int x, int a) { return (((size_t)x + a - 1) / a) * a; }
-
-static long i4_wait_ns(void) {
-    static _Atomic long ns = -1;
-    if (ns < 0) {
-        const char *e = getenv("ROCKET_WAIT_MS");
-        long ms = e ? atol(e) : 8000;
-        if (ms < 1) ms = 8000;
-        ns = ms * 1000000L;
-    }
-    return ns;
-}
-
-/* int4 NPU layout index math — identical to rocket_matmul.c's static inlines. */
-static inline size_t i4_feat_idx(int H, int ch, int h) {   /* input nibble, C2=32 */
-    return ((size_t)(ch - 1) / 32) * (size_t)H * 32 + 32 * (size_t)(h - 1) + (ch - 1) % 32;
-}
-static inline size_t i4_wt_idx(int C, int k, int c) {      /* weight nibble, (N/64,K/32,64,32) */
-    size_t nKgrp   = (size_t)((C + 31) / 32);
-    size_t Ngrp    = (size_t)(k - 1) / 64, Nwithin = (size_t)(k - 1) % 64;
-    size_t Kgrp    = (size_t)(c - 1) / 32, Kwithin = (size_t)(c - 1) % 32;
-    return Ngrp * nKgrp * 64 * 32 + Kgrp * 64 * 32 + Nwithin * 32 + Kwithin;
-}
-static inline size_t i4_out_idx(int H, int ch, int h) {    /* output int16 elem, C2=8 */
-    return ((size_t)(ch - 1) / 8) * (size_t)H * 8 + 8 * (size_t)(h - 1) + (ch - 1) % 8;
-}
-static inline void i4_put_nib(uint8_t *buf, size_t idx, int8_t v) {
-    uint8_t nib = (uint8_t)(v & 0xF);
-    if (idx & 1) buf[idx >> 1] = (uint8_t)((buf[idx >> 1] & 0x0F) | (nib << 4));
-    else         buf[idx >> 1] = (uint8_t)((buf[idx >> 1] & 0xF0) | nib);
-}
 
 typedef struct {
     int n0, nsub;
@@ -95,18 +62,20 @@ typedef struct {
  * use different K-tiling so they cannot share scratch. */
 typedef struct { int M, K, N, nt, group; rk4_worker w[RK4_MAX_WORKERS]; } rk4_scratch;
 
+/* A SIGNATURE, not a pointer to the scratch it was packed against: the slot cache
+ * recycles its least recently used shape, so a held pointer would be one unrelated
+ * shape away from dereferencing freed memory. See rocket_fanout.h. */
 struct rocket_i4_weights {
     int M, K, N, nt, group;
     rocket_bo   wt[RK4_MAX_WORKERS];
-    rk4_scratch *sc;
+    rocket_wsig sig[RK4_MAX_WORKERS];
 };
 
 struct rocket_i4_ctx {
     int nthreads;
     const struct rocket_hw_profile *hw; /* active machine-parameter profile (the multi-chip profile seam) */
     int fd[RK4_MAX_WORKERS];
-    rk4_scratch *scache[RK4_MAX_SLOTS];
-    int nscache;
+    rocket_slot_cache scache;
 };
 
 /* ============================================================================
@@ -115,8 +84,7 @@ struct rocket_i4_ctx {
 
 /* N over nthreads, rounded up to a multiple of 64 (int4 N-group). */
 static int rk4_nstep(int N, int nthreads) {
-    int s = ((N + nthreads - 1) / nthreads + 63) / 64 * 64;
-    return s < 64 ? 64 : s;
+    return rocket_fanout_nstep(N, nthreads, 64);
 }
 
 rocket_i4_ctx *rocket_i4_ctx_create(int nthreads) {
@@ -151,9 +119,20 @@ static void rk4_scratch_free(rocket_i4_ctx *ctx, rk4_scratch *sc) {
     free(sc);
 }
 
+static rk4_scratch *rk4_scratch_alloc(rocket_i4_ctx *ctx, int M, int K, int N, int group);
+
+/* How the shared slot cache builds and releases one of our per-shape scratches. */
+static void *rk4_slot_alloc(void *owner, const rocket_shape_key *k) {
+    return rk4_scratch_alloc((rocket_i4_ctx *)owner, k->M, k->K, k->N, k->group);
+}
+static void rk4_slot_release(void *owner, void *slot) {
+    rk4_scratch_free((rocket_i4_ctx *)owner, (rk4_scratch *)slot);
+}
+static const rocket_slot_ops rk4_slot_ops = { rk4_slot_alloc, rk4_slot_release };
+
 void rocket_i4_ctx_free(rocket_i4_ctx *ctx) {
     if (!ctx) return;
-    for (int i = 0; i < ctx->nscache; i++) rk4_scratch_free(ctx, ctx->scache[i]);
+    rocket_slot_cache_clear(&ctx->scache, ctx, &rk4_slot_ops);
     for (int t = 0; t < ctx->nthreads; t++)
         if (ctx->fd[t] >= 0) rocket_close(ctx->fd[t]);
     free(ctx);
@@ -176,9 +155,9 @@ static int rk4_worker_alloc(int fd, rk4_worker *w, int M, int tileM, int K, int 
     w->nMt = (M + w->Mt - 1) / w->Mt;
     w->nNt = (nsub + w->Nt - 1) / w->Nt;
     w->nKt = (K + w->Kt - 1) / w->Kt;
-    w->in_slot  = (size_t)i4_rup(w->Mt, 4)  * i4_rup(w->Kt, 32);   /* int4 nibbles */
-    w->wt_slot  = (size_t)i4_rup(w->Nt, 64) * i4_rup(w->Kt, 32);   /* int4 nibbles */
-    w->out_slot = (size_t)i4_rup(w->Mt, 4)  * i4_rup(w->Nt, 16);   /* int16 elems  */
+    w->in_slot  = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Kt, 32);   /* int4 nibbles */
+    w->wt_slot  = (size_t)rocket_rup_sz(w->Nt, 64) * rocket_rup_sz(w->Kt, 32);   /* int4 nibbles */
+    w->out_slot = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Nt, 16);   /* int16 elems  */
 
     size_t in_sz  = (size_t)w->nMt * w->nKt * (w->in_slot / 2) + I4_CBUF_BANK;
     size_t rc_sz  = (size_t)I4_BATCH * I4_RC_STRIDE * sizeof(uint64_t);
@@ -235,16 +214,19 @@ fail:
     free(sc); return NULL;
 }
 
+/* Find (or build + cache) the per-shape scratch. NULL only on an alloc failure: a full
+ * cache recycles its least recently used shape rather than refusing. */
 static rk4_scratch *rk4_ctx_scratch(rocket_i4_ctx *ctx, int M, int K, int N, int group) {
-    for (int i = 0; i < ctx->nscache; i++)
-        if (ctx->scache[i]->M == M && ctx->scache[i]->K == K &&
-            ctx->scache[i]->N == N && ctx->scache[i]->group == group)
-            return ctx->scache[i];
-    if (ctx->nscache >= RK4_MAX_SLOTS) return NULL;
-    rk4_scratch *sc = rk4_scratch_alloc(ctx, M, K, N, group);
-    if (!sc) return NULL;
-    ctx->scache[ctx->nscache++] = sc;
-    return sc;
+    const rocket_shape_key k = { M, K, N, group };
+    return rocket_slot_get(&ctx->scache, ctx, &k, &rk4_slot_ops);
+}
+
+/* This scratch's per-worker weight layout, as a signature a resident weight can hold.
+ * wt_bytes is exactly what rk4_scatter_weights allocates (nibbles -> bytes). */
+static rocket_wsig rk4_wsig(const rk4_scratch *sc, int t) {
+    const rk4_worker *w = &sc->w[t];
+    return (rocket_wsig){ w->n0, w->nsub, w->Kt, w->Nt, w->nKt, w->nNt, w->wt_slot,
+                          (size_t)w->nNt * w->nKt * (w->wt_slot / 2) + I4_CBUF_BANK };
 }
 
 /* The CALL's M must satisfy M%4, and nothing upstream checks it: the pack-time shape
@@ -268,14 +250,13 @@ static int rk4_call_m_ok(const char *who, int M) {
  * on the N-split + Nt/Kt/nNt/nKt/wt_slot; canonical tiling makes these M-independent, so
  * this holds for every M — but check defensively (e.g. a ROCKET_MM_* env override between
  * pack and compute) so a genuine mismatch returns -2 instead of miscomputing. */
-static int rk4_weight_fits(const rk4_scratch *packed, const rk4_scratch *sc) {
-    if (!packed || !sc) return 0;
-    if (packed->K != sc->K || packed->N != sc->N ||
-        packed->group != sc->group || packed->nt != sc->nt) return 0;
+static int rk4_weight_fits(const rocket_i4_weights *w, const rk4_scratch *sc) {
+    if (!w || !sc) return 0;
+    if (w->K != sc->K || w->N != sc->N || w->group != sc->group || w->nt != sc->nt)
+        return 0;
     for (int t = 0; t < sc->nt; t++) {
-        const rk4_worker *a = &packed->w[t], *b = &sc->w[t];
-        if (a->n0  != b->n0  || a->nsub != b->nsub || a->Nt != b->Nt || a->Kt != b->Kt ||
-            a->nNt != b->nNt || a->nKt  != b->nKt  || a->wt_slot != b->wt_slot) return 0;
+        const rocket_wsig now = rk4_wsig(sc, t);
+        if (!rocket_wsig_eq(&w->sig[t], &now)) return 0;
     }
     return 1;
 }
@@ -309,8 +290,7 @@ static int rk4_scatter_weights(rocket_i4_ctx *ctx, rk4_scratch *sc, rocket_i4_we
                 int k0 = ki * ww->Kt, Ktile = (K - k0 < ww->Kt) ? (K - k0) : ww->Kt;
                 uint8_t *slot = (uint8_t *)w->wt[t].ptr + (size_t)(ni * ww->nKt + ki) * (ww->wt_slot / 2);
                 for (int kk = 1; kk <= Ntile; kk++)
-                    for (int c = 1; c <= Ktile; c++)
-                        i4_put_nib(slot, i4_wt_idx(Ktile, kk, c), Bslice[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)]);
+                    i4_wt_scatter(slot, Bslice, (size_t)K, n0, k0, Ntile, Ktile);
             }
         }
         rocket_bo_fini(ctx->fd[t], &w->wt[t]);
@@ -335,7 +315,8 @@ rocket_i4_weights *rocket_i4_weights_pack(rocket_i4_ctx *ctx, int M, int K, int 
     if (!sc) return NULL;
     rocket_i4_weights *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
-    w->M = M; w->K = K; w->N = N; w->nt = sc->nt; w->group = 0; w->sc = sc;
+    w->M = M; w->K = K; w->N = N; w->nt = sc->nt; w->group = 0;
+    for (int t = 0; t < sc->nt; t++) w->sig[t] = rk4_wsig(sc, t);
     if (rk4_scatter_weights(ctx, sc, w, B, K) < 0) { free(w); return NULL; }
     return w;
 }
@@ -361,7 +342,8 @@ rocket_i4_weights *rocket_i4_weights_pack_gw(rocket_i4_ctx *ctx, int M, int K, i
     if (!sc) return NULL;
     rocket_i4_weights *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
-    w->M = M; w->K = K; w->N = N; w->nt = sc->nt; w->group = group; w->sc = sc;
+    w->M = M; w->K = K; w->N = N; w->nt = sc->nt; w->group = group;
+    for (int t = 0; t < sc->nt; t++) w->sig[t] = rk4_wsig(sc, t);
     if (rk4_scatter_weights(ctx, sc, w, B, K) < 0) { free(w); return NULL; }
     return w;
 }
@@ -388,12 +370,14 @@ size_t rocket_i4_weights_bytes(const rocket_i4_weights *w) {
 typedef struct {
     int fd; rk4_worker *ww; const rocket_bo *wt;
     const int8_t *A; int32_t *C;
-    int M, K, N, idx, ret;
+    int M, K, N, idx, core_base, ret;
 } rk4_arg;
 
 static void *rk4_thread(void *a) {
     rk4_arg *t = (rk4_arg *)a;
-    rocket_pin_worker(t->idx);
+    /* _based, not rocket_pin_worker: the rotation base is __thread, so a freshly created
+     * worker always reads 0 and two in-process pools would collide on the same A76s. */
+    rocket_pin_worker_based(t->idx, t->core_base);
     rk4_worker *w = t->ww;
     int fd = t->fd, M = t->M, K = t->K, N = t->N, nsub = w->nsub;
     int Mt = w->Mt, Kt = w->Kt, Nt = w->Nt, nMt = w->nMt, nNt = w->nNt, nKt = w->nKt;
@@ -407,9 +391,7 @@ static void *rk4_thread(void *a) {
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             uint8_t *slot = (uint8_t *)w->in_all.ptr + (size_t)(mi * nKt + ki) * (w->in_slot / 2);
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    i4_put_nib(slot, i4_feat_idx(Mtile, c, h), t->A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)]);
+            i4_feat_scatter(slot, t->A, (size_t)K, m0, k0, Mtile, Ktile);
         }
     }
     /* Flush the packed input before the NPU reads it (propagate sync failure). */
@@ -462,7 +444,7 @@ static void *rk4_thread(void *a) {
                     uint32_t in_h[]  = { w->in_all.handle, t->wt->handle, w->regcmd.handle };
                     uint32_t out_h[] = { w->out_all.handle };
                     if ((t->ret = rocket_submit_tasks_pre(fd, w->submit_dt, tasks, nb, in_h, 3, out_h, 1, 0)) != 0) return NULL;
-                    if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, i4_wait_ns())) != 0) {
+                    if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, rocket_fanout_wait_ns())) != 0) {
                         ROCKET_LOGE("rocket_matmul_int4_prepacked: WAIT TIMEOUT (%d) M=%d K=%d N=%d slice=%d\n",
                                 t->ret, M, K, nsub, w->n0);
                         return NULL;
@@ -470,10 +452,11 @@ static void *rk4_thread(void *a) {
                     int16_t *ob = (int16_t *)w->out_all.ptr;
                     for (int j = 0; j < nb; j++) {
                         int16_t *slot = ob + w->boff[j];
-                        for (int h = 1; h <= w->bMtile[j]; h++)
-                            for (int nn = 1; nn <= w->bNtile[j]; nn++)
-                                acc[(size_t)(w->bm0[j] + h - 1) * nsub + (w->bn0[j] + nn - 1)] +=
-                                    (int64_t)slot[i4_out_idx(w->bMtile[j], nn, h)];
+#define MM_ACC_(h_, nn_, v_) \
+    (acc[(size_t)(w->bm0[j] + (h_) - 1) * nsub + (w->bn0[j] + (nn_) - 1)] += (int64_t)(v_))
+                        MM_CUBE_GATHER(int16_t, 8, out_idx_i4, slot,
+                                       w->bMtile[j], w->bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     if ((t->ret = rocket_bo_fini(fd, &w->out_all)) != 0) return NULL;
                     nb = 0;
@@ -489,7 +472,7 @@ static void *rk4_thread(void *a) {
 
 int rocket_matmul_int4_prepacked(rocket_i4_ctx *ctx, int M, int K, int N,
                                  const int8_t *A, int32_t *C, rocket_i4_weights *w) {
-    if (!ctx || !w || !w->sc) return -1;
+    if (!ctx || !w) return -1;
     if (!rk4_call_m_ok("rocket_matmul_int4_prepacked", M)) return -1;
     if (K != w->K || N != w->N) {
         ROCKET_LOGE("rocket_matmul_int4_prepacked: shape K=%d N=%d != packed %d/%d\n",
@@ -501,25 +484,19 @@ int rocket_matmul_int4_prepacked(rocket_i4_ctx *ctx, int M, int K, int N,
      * only a genuine tiling mismatch (-2) so the caller re-packs. */
     rk4_scratch *sc = rk4_ctx_scratch(ctx, M, K, N, w->group);
     if (!sc) return -1;
-    if (!rk4_weight_fits(w->sc, sc)) {
+    if (!rk4_weight_fits(w, sc)) {
         ROCKET_LOGE("rocket_matmul_int4_prepacked: weight tiling (packed M=%d) "
                 "incompatible with M=%d — re-pack needed\n", w->M, M);
         return -2;
     }
-    pthread_t th[RK4_MAX_WORKERS];
-    rk4_arg   args[RK4_MAX_WORKERS];
-    int joinable[RK4_MAX_WORKERS] = {0};
+    rk4_arg args[RK4_MAX_WORKERS];
+    const int core_base = rocket_affinity_get_base();  /* read on the CALLING thread */
     for (int t = 0; t < sc->nt; t++) {
-        args[t] = (rk4_arg){ ctx->fd[t], &sc->w[t], &w->wt[t], A, C, M, K, N, t, 0 };
-        if (pthread_create(&th[t], NULL, rk4_thread, &args[t]) == 0) joinable[t] = 1;
-        /* else: run inline AFTER the loop (see rocket_matmul_fp16_mt) so a create
-         * failure doesn't serialize the remaining workers behind its ~8s NPU wait. */
+        args[t] = (rk4_arg){ ctx->fd[t], &sc->w[t], &w->wt[t], A, C, M, K, N, t, core_base, 0 };
     }
-    for (int t = 0; t < sc->nt; t++)
-        if (!joinable[t]) rk4_thread(&args[t]);
+    rocket_fanout_run(sc->nt, args, sizeof args[0], rk4_thread);
     int ret = 0;
     for (int t = 0; t < sc->nt; t++) {
-        if (joinable[t]) pthread_join(th[t], NULL);
         if (args[t].ret) ret = args[t].ret;
     }
     return ret;
@@ -540,12 +517,14 @@ int rocket_matmul_int4_prepacked(rocket_i4_ctx *ctx, int M, int K, int N,
 typedef struct {
     int fd; rk4_worker *ww; const rocket_bo *wt;
     const int8_t *A; const float *a_scale; const float *b_scale; float *Cf;
-    int M, K, N, group, idx, ret;
+    int M, K, N, group, idx, core_base, ret;
 } rk4_arg_gw;
 
 static void *rk4_thread_gw(void *a) {
     rk4_arg_gw *t = (rk4_arg_gw *)a;
-    rocket_pin_worker(t->idx);
+    /* _based, not rocket_pin_worker: the rotation base is __thread, so a freshly created
+     * worker always reads 0 and two in-process pools would collide on the same A76s. */
+    rocket_pin_worker_based(t->idx, t->core_base);
     rk4_worker *w = t->ww;
     int fd = t->fd, M = t->M, K = t->K, nsub = w->nsub, group = t->group;
     int Mt = w->Mt, Kt = w->Kt, Nt = w->Nt, nMt = w->nMt, nNt = w->nNt, nKt = w->nKt;
@@ -560,9 +539,7 @@ static void *rk4_thread_gw(void *a) {
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             uint8_t *slot = (uint8_t *)w->in_all.ptr + (size_t)(mi * nKt + ki) * (w->in_slot / 2);
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    i4_put_nib(slot, i4_feat_idx(Mtile, c, h), t->A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)]);
+            i4_feat_scatter(slot, t->A, (size_t)K, m0, k0, Mtile, Ktile);
         }
     }
     if ((t->ret = rocket_bo_fini(fd, &w->in_all)) != 0) return NULL;
@@ -615,7 +592,7 @@ static void *rk4_thread_gw(void *a) {
                     uint32_t in_h[]  = { w->in_all.handle, t->wt->handle, w->regcmd.handle };
                     uint32_t out_h[] = { w->out_all.handle };
                     if ((t->ret = rocket_submit_tasks_pre(fd, w->submit_dt, tasks, nb, in_h, 3, out_h, 1, 0)) != 0) return NULL;
-                    if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, i4_wait_ns())) != 0) {
+                    if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, rocket_fanout_wait_ns())) != 0) {
                         ROCKET_LOGE("rocket_matmul_int4_prepacked_gw: WAIT TIMEOUT (%d) M=%d K=%d N=%d slice=%d\n",
                                 t->ret, M, K, nsub, w->n0);
                         return NULL;
@@ -624,17 +601,16 @@ static void *rk4_thread_gw(void *a) {
                     for (int j = 0; j < nb; j++) {
                         int16_t *slot = ob + w->boff[j];
                         int g = w->bki[j];                       /* this tile's K-group */
-                        for (int h = 1; h <= w->bMtile[j]; h++) {
-                            int mrow = w->bm0[j] + h - 1;
-                            float as = t->a_scale[(size_t)mrow * nG + g];
-                            for (int nn = 1; nn <= w->bNtile[j]; nn++) {
-                                int ncol_loc = w->bn0[j] + nn - 1;       /* within this worker's N-slice */
-                                int ncol     = w->n0 + ncol_loc;         /* global N index (b_scale) */
-                                facc[(size_t)mrow * nsub + ncol_loc] +=
-                                    as * t->b_scale[(size_t)ncol * nG + g] *
-                                    (float)slot[i4_out_idx(w->bMtile[j], nn, h)];
-                            }
-                        }
+#define MM_ACC_(h_, nn_, v_) do {                                                  \
+    size_t mrow_ = (size_t)(w->bm0[j] + (h_) - 1);                                 \
+    int ncol_loc_ = w->bn0[j] + (nn_) - 1;   /* within this worker's N-slice */    \
+    int ncol_ = w->n0 + ncol_loc_;           /* global N index (b_scale)     */    \
+    facc[mrow_ * nsub + ncol_loc_] += t->a_scale[mrow_ * nG + g] *                 \
+        t->b_scale[(size_t)ncol_ * nG + g] * (float)(v_);                          \
+} while (0)
+                        MM_CUBE_GATHER(int16_t, 8, out_idx_i4, slot,
+                                       w->bMtile[j], w->bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     if ((t->ret = rocket_bo_fini(fd, &w->out_all)) != 0) return NULL;
                     nb = 0;
@@ -651,7 +627,7 @@ static void *rk4_thread_gw(void *a) {
 int rocket_matmul_int4_prepacked_gw(rocket_i4_ctx *ctx, int M, int K, int N,
                                     const int8_t *A, const float *a_scale,
                                     const float *b_scale, float *Cf, rocket_i4_weights *w) {
-    if (!ctx || !w || !w->sc || w->group <= 0) return -1;
+    if (!ctx || !w || w->group <= 0) return -1;
     if (!rk4_call_m_ok("rocket_matmul_int4_prepacked_gw", M)) return -1;
     if (K != w->K || N != w->N) {
         ROCKET_LOGE("rocket_matmul_int4_prepacked_gw: shape K=%d N=%d != packed %d/%d\n",
@@ -662,24 +638,20 @@ int rocket_matmul_int4_prepacked_gw(rocket_i4_ctx *ctx, int M, int K, int N,
      * so reuse it across M with no re-pack. Reject a genuine tiling mismatch (-2). */
     rk4_scratch *sc = rk4_ctx_scratch(ctx, M, K, N, w->group);
     if (!sc) return -1;
-    if (!rk4_weight_fits(w->sc, sc)) {
+    if (!rk4_weight_fits(w, sc)) {
         ROCKET_LOGE("rocket_matmul_int4_prepacked_gw: weight tiling (packed M=%d) "
                 "incompatible with M=%d — re-pack needed\n", w->M, M);
         return -2;
     }
-    pthread_t th[RK4_MAX_WORKERS];
     rk4_arg_gw args[RK4_MAX_WORKERS];
-    int joinable[RK4_MAX_WORKERS] = {0};
+    const int core_base = rocket_affinity_get_base();  /* read on the CALLING thread */
     for (int t = 0; t < sc->nt; t++) {
         args[t] = (rk4_arg_gw){ ctx->fd[t], &sc->w[t], &w->wt[t], A, a_scale, b_scale, Cf,
-                                M, K, N, w->group, t, 0 };
-        if (pthread_create(&th[t], NULL, rk4_thread_gw, &args[t]) == 0) joinable[t] = 1;
+                                M, K, N, w->group, t, core_base, 0 };
     }
-    for (int t = 0; t < sc->nt; t++)
-        if (!joinable[t]) rk4_thread_gw(&args[t]);
+    rocket_fanout_run(sc->nt, args, sizeof args[0], rk4_thread_gw);
     int ret = 0;
     for (int t = 0; t < sc->nt; t++) {
-        if (joinable[t]) pthread_join(th[t], NULL);
         if (args[t].ret) ret = args[t].ret;
     }
     return ret;

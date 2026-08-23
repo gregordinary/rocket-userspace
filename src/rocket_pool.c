@@ -18,6 +18,7 @@
 #include "rocket_npu.h"
 #include "rocket_pool.h"
 #include "npu_matmul.h"   /* feature_data (NC1HWC2 cube index) */
+#include "rocket_op.h"      /* the shared one-shot scaffolding */
 #include "rocket_log.h"     // centralized log channel
 
 /* slack past the scattered cube, so a DMA burst over-read can't run off the BO */
@@ -29,9 +30,9 @@
 
 int rocket_pool_fp16_plan(const rocket_pool_desc *d)
 {
-    if (!d) return -1;
-    if (d->c < 1 || d->ih < 1 || d->iw < 1) return -2;
-    if (d->kh < 1 || d->kw < 1 || d->stride_y < 1 || d->stride_x < 1) return -3;
+    if (!d) return ROCKET_E_SHAPE;
+    if (d->c < 1 || d->ih < 1 || d->iw < 1) return ROCKET_E_NOMEM;
+    if (d->kh < 1 || d->kw < 1 || d->stride_y < 1 || d->stride_x < 1) return ROCKET_E_UNSUPPORTED;
     if (d->method != POOL_METHOD_MAX && d->method != POOL_METHOD_AVG) return -4;
     /* count-include-pad = FALSE is claimed on the RK3576 int8 path alone
      * (rocket_pool_int8_rk3576()). These entries always divide by kh*kw, so a 1 here is
@@ -177,9 +178,9 @@ int rocket_pool_fp16(int fd, const rocket_pool_desc *d, const _Float16 *in, _Flo
         rocket_bo_alloc(fd, out_cube_elems * sizeof(_Float16) + POOL_BO_SLACK, &out_bo)) {
         ROCKET_LOGE("rocket_pool_fp16: BO alloc failed\n"); goto out;
     }
-    if (((in_bo.dma_address + in_bo.size) | (out_bo.dma_address + out_bo.size) |
-         (rc_bo.dma_address + rc_bo.size)) >> 32) {
-        ROCKET_LOGE("rocket_pool_fp16: a BO dma_address exceeds 32 bits\n"); goto out;
+    {
+        rocket_bo *const set[] = { &in_bo, &rc_bo, &out_bo };
+        if (rocket_op_iova_overflow("rocket_pool_fp16", set, 3)) goto out;
     }
 
     /* scatter input feature -> NC1HWC2 cube (C2=8) */
@@ -215,25 +216,19 @@ int rocket_pool_fp16(int fd, const rocket_pool_desc *d, const _Float16 *in, _Flo
         ROCKET_LOGE("rocket_pool_fp16: regcmd overflow (task_count %u)\n", p.task_count);
         ret = -1; goto out;
     }
-    rocket_bo_prep(fd, &rc_bo, 1, 0);
-    memcpy(rc_bo.ptr, regs, (size_t)p.task_count * sizeof(uint64_t));
-    rocket_bo_fini(fd, &rc_bo);
 
+    /* Prezero the output: a partial channel group's dead lanes are read back with the
+     * live ones, and the de-scatter below indexes past them. */
     rocket_bo_prep(fd, &out_bo, 1, 0);
     memset(out_bo.ptr, 0, out_bo.size);
     rocket_bo_fini(fd, &out_bo);
 
     {
-        rocket_task_desc task = { .regcmd = (uint32_t)rc_bo.dma_address,
-                                  .regcmd_count = p.task_count };
-        uint32_t in_h[]  = { in_bo.handle, rc_bo.handle };
-        uint32_t out_h[] = { out_bo.handle };
-        ret = rocket_submit_tasks(fd, &task, 1, in_h, 2, out_h, 1);
-        if (ret) { ROCKET_LOGE("rocket_pool_fp16: submit failed (%d)\n", ret); goto out; }
+        rocket_bo *const ins[] = { &in_bo };
+        ret = rocket_op_submit_one(fd, "rocket_pool_fp16", &rc_bo, regs, p.task_count,
+                                   ins, 1, &out_bo);
     }
-
-    ret = rocket_bo_prep(fd, &out_bo, 0, 2000000000ULL);   /* 2s wait */
-    if (ret) { ROCKET_LOGE("rocket_pool_fp16: wait timeout (%d)\n", ret); goto out; }
+    if (ret) goto out;
     {
         _Float16 *src = out_bo.ptr;
         for (int c = 0; c < C; c++)

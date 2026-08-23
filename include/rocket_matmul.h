@@ -615,6 +615,21 @@ void            rocket_ctx_free(rocket_ctx *ctx);
 rocket_weights *rocket_weights_pack(rocket_ctx *ctx, int M, int K, int N, const _Float16 *B);
 void            rocket_weights_free(rocket_ctx *ctx, rocket_weights *w);
 
+/* The segmented spelling of rocket_weights_pack, for a resident FUSED weight: several
+ * static weights concatenated along N and packed as ONE resident weight of combined N.
+ * Each Bs[i] is [Ns[i], K] row-major and occupies output columns [sum(Ns[0..i-1]),
+ * +Ns[i]); the scatter resolves each global column to its source segment, so the caller
+ * does NOT materialize a [sum(Ns), K] concat buffer -- which at a transformer's gate|up
+ * group is hundreds of MB of transient host memory per group. This is the resident
+ * counterpart of rocket_matmul_fp16_stream_fused's segmented scatter.
+ *
+ * N is sum(Ns[0..nseg-1]) and the returned handle is an ordinary rocket_weights: compute
+ * with rocket_matmul_fp16_prepacked at that combined N and split the [M, N] output's
+ * columns back into each member's own destination. nseg in [1, ROCKET_MAX_FUSE].
+ * Same M-independence, threading and teardown rules as rocket_weights_pack. */
+rocket_weights *rocket_weights_pack_seg(rocket_ctx *ctx, int M, int K, int N,
+                                        const _Float16 *const *Bs, const int *Ns, int nseg);
+
 int rocket_matmul_fp16_prepacked(rocket_ctx *ctx, int M, int K, int N,
                                  const _Float16 *A, _Float16 *C, rocket_weights *w);
 

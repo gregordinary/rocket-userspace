@@ -27,6 +27,12 @@
  * ownership (correctness + no cross-weight aliasing + capacity) was validated standalone
  * in tests/prototype_shared_scratch_rocket.c before this refactor.
  *
+ * The pool shape, the slot cache, the fence deadline, the column split and the
+ * spawn/join orchestrator are rocket_fanout.h's, shared with the int8/int4/bf16 paths.
+ * What stays per-dtype is the COMPUTE core, because the operand element types, the BO
+ * geometry and the K-accumulator type genuinely differ -- fp16 accumulates K on the NPU
+ * through a ping-pong the integer paths cannot use at all.
+ *
  * Lifetime: free every rocket_weights (its resident wt BOs) before rocket_ctx_free,
  * which frees the shared scratch (BOs) and then closes the fds.
  */
@@ -40,10 +46,10 @@
 #include "rocket_matmul.h"
 #include "rocket_matmul_internal.h"
 #include "rocket_affinity.h"
+#include "rocket_fanout.h"
 #include "rocket_log.h"     // centralized log channel
 
-#define RKW_MAX_WORKERS 8
-#define RKS_MAX_SLOTS   32
+#define RKW_MAX_WORKERS ROCKET_FANOUT_MAX_WORKERS
 
 /* one worker's N-slice: its column range, tiling plan, and shared compute scratch. */
 typedef struct {
@@ -64,22 +70,13 @@ typedef struct {
                                * sized to mm_input_elems(w[0].pl), fixed per shape.    */
 } mm_scratch;
 
-/* Per-worker weight-layout signature: the determinants of the scattered weight BO
- * (all independent of M — see rocket_weights_pack). Two matmul shapes whose per-worker
- * signatures match can SHARE one resident weight, even at different M. */
-typedef struct {
-    int    n0, nsub;      /* output-column slice */
-    int    Kt, Nt, nKt;   /* K/N tiling that fixes the weight scatter positions */
-    size_t wt_size;       /* resident weight BO byte size (== scratch wt_all.size) */
-} rkw_wsig;
-
 /* Per-NAME prepacked resident weight: the scattered weight BOs (per worker N-slice) +
  * the layout signature. NOT bound to a single (M,K,N) scratch: the compute uses the
  * scratch for the CALL's M, reusing this weight whenever the tiling matches. */
 struct rocket_weights {
     int M, K, N, nt;                   /* M = the pack-time M (reference only)                  */
-    rocket_bo wt[RKW_MAX_WORKERS];     /* resident weight per worker (the only per-name alloc)  */
-    rkw_wsig  sig[RKW_MAX_WORKERS];    /* per-worker layout signature for compatibility checks  */
+    rocket_bo   wt[RKW_MAX_WORKERS];   /* resident weight per worker (the only per-name alloc)  */
+    rocket_wsig sig[RKW_MAX_WORKERS];  /* per-worker layout signature for compatibility checks  */
 };
 
 struct rocket_ctx {
@@ -87,21 +84,12 @@ struct rocket_ctx {
     const struct rocket_hw_profile *hw; /* active machine-parameter profile (RK3588 today);
                                          * the per-device autodetect seam for multi-chip support.       */
     int fd[RKW_MAX_WORKERS];
-    mm_scratch *scache[RKS_MAX_SLOTS]; /* shared per-shape scratch (streaming + prepacked) */
-    int nscache;
+    rocket_slot_cache scache;          /* shared per-shape scratch (streaming + prepacked) */
 };
 
 /* ============================================================================
  * SECTION — Context lifecycle (worker fds) and shared per-shape scratch
  * ==========================================================================*/
-
-/* Same column split as rocket_matmul_fp16_mt: N over nthreads, rounded up to a
- * multiple of 16 (the generator requires N%16==0). */
-static int rkw_nstep(int N, int nthreads)
-{
-    int s = ((N + nthreads - 1) / nthreads + 15) / 16 * 16;
-    return s < 16 ? 16 : s;
-}
 
 rocket_ctx *rocket_ctx_create(int nthreads)
 {
@@ -134,11 +122,24 @@ static void scratch_free(rocket_ctx *ctx, mm_scratch *sc)
     free(sc);
 }
 
+static mm_scratch *scratch_alloc(rocket_ctx *ctx, int M, int K, int N);
+
+/* How the shared slot cache builds and releases one of our per-shape scratches. */
+static void *rkw_slot_alloc(void *owner, const rocket_shape_key *k)
+{
+    return scratch_alloc((rocket_ctx *)owner, k->M, k->K, k->N);
+}
+static void rkw_slot_release(void *owner, void *slot)
+{
+    scratch_free((rocket_ctx *)owner, (mm_scratch *)slot);
+}
+static const rocket_slot_ops rkw_slot_ops = { rkw_slot_alloc, rkw_slot_release };
+
 void rocket_ctx_free(rocket_ctx *ctx)
 {
     if (!ctx) return;
     /* free shared scratch (holds BOs on the fds) BEFORE closing the fds */
-    for (int i = 0; i < ctx->nscache; i++) scratch_free(ctx, ctx->scache[i]);
+    rocket_slot_cache_clear(&ctx->scache, ctx, &rkw_slot_ops);
     for (int t = 0; t < ctx->nthreads; t++)
         if (ctx->fd[t] >= 0) rocket_close(ctx->fd[t]);
     free(ctx);
@@ -151,7 +152,7 @@ static mm_scratch *scratch_alloc(rocket_ctx *ctx, int M, int K, int N)
     if (!sc) return NULL;
     sc->M = M; sc->K = K; sc->N = N;
 
-    int Nstep = rkw_nstep(N, ctx->nthreads);
+    int Nstep = rocket_fanout_nstep(N, ctx->nthreads, 16);  /* the generator needs N%16 */
     int t = 0;
     for (; t < ctx->nthreads; t++) {
         int n0 = t * Nstep;
@@ -176,25 +177,26 @@ fail:
     return NULL;
 }
 
-/* Find (or create + cache) the shared per-shape scratch. NULL if the cache is full
- * (caller falls back) or alloc fails. */
+/* Find (or build + cache) the shared per-shape scratch. NULL only on an alloc failure:
+ * a full cache recycles its least recently used shape rather than refusing. */
 static mm_scratch *ctx_scratch(rocket_ctx *ctx, int M, int K, int N)
 {
-    for (int i = 0; i < ctx->nscache; i++)
-        if (ctx->scache[i]->M == M && ctx->scache[i]->K == K && ctx->scache[i]->N == N)
-            return ctx->scache[i];
-    if (ctx->nscache >= RKS_MAX_SLOTS) return NULL;
-    mm_scratch *sc = scratch_alloc(ctx, M, K, N);
-    if (!sc) return NULL;
-    ctx->scache[ctx->nscache++] = sc;
-    return sc;
+    const rocket_shape_key k = { M, K, N, 0 };
+    return rocket_slot_get(&ctx->scache, ctx, &k, &rkw_slot_ops);
 }
 
 /* ============================================================================
  * SECTION — Resident weight packing (pack-once: scatter B into per-worker BOs)
  * ==========================================================================*/
 
-rocket_weights *rocket_weights_pack(rocket_ctx *ctx, int M, int K, int N, const _Float16 *B)
+/* The body of both resident-weight packs. `B` is a whole [N,K] weight; `segs`/`nseg` are
+ * a concatenated-along-N one, resolved per global column so no host concat buffer is
+ * needed. Exactly one of the two is non-NULL -- everything else about the two entries
+ * (scratch lookup, the per-worker BO alloc + prezero, the layout signature, the failure
+ * unwind) is identical, so it is written once. */
+static rocket_weights *rkw_weights_pack(rocket_ctx *ctx, int M, int K, int N,
+                                        const _Float16 *B,
+                                        const mm_wt_seg *segs, int nseg)
 {
     if (!ctx) return NULL;
     mm_scratch *sc = ctx_scratch(ctx, M, K, N);
@@ -209,8 +211,9 @@ rocket_weights *rocket_weights_pack(rocket_ctx *ctx, int M, int K, int N, const 
         rkw_worker *ww = &sc->w[t];
         /* Record the M-independent layout signature so a later compute at a different
          * (compatible) M can reuse this resident weight without re-packing. */
-        w->sig[t] = (rkw_wsig){ ww->n0, ww->nsub, ww->pl.Kt, ww->pl.Nt, ww->pl.nKt,
-                                ww->bos.wt_all.size };
+        w->sig[t] = (rocket_wsig){ ww->n0, ww->nsub, ww->pl.Kt, ww->pl.Nt,
+                                   ww->pl.nKt, ww->pl.nNt, ww->pl.wt_slot,
+                                   ww->bos.wt_all.size };
         /* resident weight BO for this worker's N-slice: same size/layout as the shared
          * scratch's wt_all (same plan). Prezero it once (mirrors mm_bos_alloc) so the
          * scatter below -- which runs with the scratch's prezeroed flag set -- writes
@@ -230,7 +233,9 @@ rocket_weights *rocket_weights_pack(rocket_ctx *ctx, int M, int K, int N, const 
          * point its wt_all at our BO, pack, restore. Serial (pack time), so safe. */
         rocket_bo saved = ww->bos.wt_all;
         ww->bos.wt_all = w->wt[t];
-        double mb = mm_pack_weights(ctx->fd[t], &ww->pl, &ww->bos, B + (size_t)ww->n0 * K);
+        double mb = segs
+            ? mm_pack_weights_seg(ctx->fd[t], &ww->pl, &ww->bos, segs, nseg, ww->n0)
+            : mm_pack_weights(ctx->fd[t], &ww->pl, &ww->bos, B + (size_t)ww->n0 * K);
         ww->bos.wt_all = saved;
         if (mb < 0) { rocket_bo_free(ctx->fd[t], &w->wt[t]); goto fail; }  /* sync failed (logged) */
     }
@@ -240,6 +245,27 @@ fail:
     for (int u = 0; u < t; u++) rocket_bo_free(ctx->fd[u], &w->wt[u]);
     free(w);
     return NULL;
+}
+
+rocket_weights *rocket_weights_pack(rocket_ctx *ctx, int M, int K, int N, const _Float16 *B)
+{
+    if (!B) return NULL;
+    return rkw_weights_pack(ctx, M, K, N, B, NULL, 0);
+}
+
+rocket_weights *rocket_weights_pack_seg(rocket_ctx *ctx, int M, int K, int N,
+                                        const _Float16 *const *Bs, const int *Ns, int nseg)
+{
+    if (!Bs || !Ns || nseg < 1 || nseg > ROCKET_MAX_FUSE) return NULL;
+    mm_wt_seg segs[ROCKET_MAX_FUSE];
+    int g0 = 0;
+    for (int i = 0; i < nseg; i++) {
+        if (!Bs[i] || Ns[i] <= 0) return NULL;
+        segs[i] = (mm_wt_seg){ Bs[i], g0, Ns[i] };
+        g0 += Ns[i];
+    }
+    if (g0 != N) return NULL;              /* N must be the sum of the segments */
+    return rkw_weights_pack(ctx, M, K, N, NULL, segs, nseg);
 }
 
 void rocket_weights_free(rocket_ctx *ctx, rocket_weights *w)
@@ -278,7 +304,9 @@ static void *rkw_thread(void *a)
     rkw_worker *ww = t->ww;
     int nsub = ww->nsub;
 
-    _Float16 *Csub = malloc((size_t)t->M * nsub * sizeof(_Float16));
+    /* Resident, not a per-call malloc: at a prefill shape this is megabytes, and
+     * faulting them in on every matmul cost more than the copy out of them does. */
+    _Float16 *Csub = mm_csub(&ww->bos, (size_t)t->M * nsub);
     if (!Csub) { t->ret = -1; return NULL; }
 
     /* Prepacked: use this weight's RESIDENT BO for the compute. Swap it into the
@@ -298,7 +326,7 @@ static void *rkw_thread(void *a)
             : mm_pack_weights(t->fd, &ww->pl, &ww->bos, t->B + (size_t)ww->n0 * ww->pl.K);
         if (mb < 0) {   /* weight cache-sync failed (logged): restore the swap and bail */
             if (t->wt) ww->bos.wt_all = saved_wt;
-            t->ret = -1; free(Csub); return NULL;
+            t->ret = -1; return NULL;
         }
         mm_prof_add_pack_b(mb);
     }
@@ -309,7 +337,7 @@ static void *rkw_thread(void *a)
                               : mm_pack_input(t->fd, &ww->pl, &ww->bos, t->A);
     if (t_pack < 0) {   /* input cache-sync failed (logged): restore the swap and bail */
         if (t->wt) ww->bos.wt_all = saved_wt;
-        t->ret = -1; free(Csub); return NULL;
+        t->ret = -1; return NULL;
     }
     if (t->kacc) {
         t->ret = mm_compute_kacc(t->fd, &ww->pl, &ww->bos, Csub, t_pack);
@@ -328,8 +356,6 @@ static void *rkw_thread(void *a)
             memcpy(t->C + (size_t)m * t->N + ww->n0,
                    Csub + (size_t)m * nsub,
                    (size_t)nsub * sizeof(_Float16));
-
-    free(Csub);
     return NULL;
 }
 
@@ -351,7 +377,7 @@ static int rkw_run(rocket_ctx *ctx, int M, int K, int N,
      * of them — scatter it ONCE here and hand workers the buffer to memcpy.
      * ROCKET_NO_SHARED_PACK=1 forces per-worker mm_pack_input instead. */
     const mm_plan *p0 = &sc->w[0].pl;
-    int shared = (getenv("ROCKET_NO_SHARED_PACK") == NULL);
+    int shared = rocket_fanout_shared_pack();
     for (int t = 1; shared && t < sc->nt; t++) {
         const mm_plan *pt = &sc->w[t].pl;
         if (pt->Mt != p0->Mt || pt->Kt != p0->Kt ||
@@ -370,9 +396,7 @@ static int rkw_run(rocket_ctx *ctx, int M, int K, int N,
         /* alloc failure -> packed == NULL -> per-worker packing fallback */
     }
 
-    pthread_t th[RKW_MAX_WORKERS];
-    rkw_arg   args[RKW_MAX_WORKERS];
-    int joinable[RKW_MAX_WORKERS] = {0};
+    rkw_arg args[RKW_MAX_WORKERS];
     /* Mode is fixed by what the scratch was ALLOCATED with (mm_bos_alloc set these
      * from env), not a fresh env read — so the compute path always matches the BOs
      * present (no silent mm_compute_pipe -1 / .handle==0 pong if env changed since
@@ -386,21 +410,12 @@ static int rkw_run(rocket_ctx *ctx, int M, int K, int N,
         const rocket_bo *wt = rw ? &rw->wt[t] : NULL;
         args[t] = (rkw_arg){ ctx->fd[t], &sc->w[t], A, packed, B, wt, C,
                              M, N, 0, t, segs, nseg, kacc, pipe, base };
-        if (pthread_create(&th[t], NULL, rkw_thread, &args[t]) == 0)
-            joinable[t] = 1;
-        /* else: run inline AFTER the spawn loop (see rocket_matmul_fp16_mt) so a create
-         * failure doesn't serialize the remaining workers behind its ~8s NPU wait. */
     }
-
-    /* Workers whose pthread_create failed run inline now, overlapping the spawned ones. */
-    for (int t = 0; t < sc->nt; t++)
-        if (!joinable[t]) rkw_thread(&args[t]);
+    rocket_fanout_run(sc->nt, args, sizeof args[0], rkw_thread);
 
     int ret = 0;
-    for (int t = 0; t < sc->nt; t++) {
-        if (joinable[t]) pthread_join(th[t], NULL);
+    for (int t = 0; t < sc->nt; t++)
         if (args[t].ret) ret = args[t].ret;
-    }
     return ret;
 }
 
@@ -412,11 +427,11 @@ static int weights_fit_scratch(const rocket_weights *w, const mm_scratch *sc)
 {
     if (w->K != sc->K || w->N != sc->N || w->nt != sc->nt) return 0;
     for (int t = 0; t < sc->nt; t++) {
-        const rkw_wsig *s = &w->sig[t];
         const rkw_worker *ww = &sc->w[t];
-        if (s->n0  != ww->n0  || s->nsub != ww->nsub ||
-            s->Kt  != ww->pl.Kt || s->Nt != ww->pl.Nt || s->nKt != ww->pl.nKt ||
-            s->wt_size != ww->bos.wt_all.size) return 0;
+        const rocket_wsig now = { ww->n0, ww->nsub, ww->pl.Kt, ww->pl.Nt,
+                                  ww->pl.nKt, ww->pl.nNt, ww->pl.wt_slot,
+                                  ww->bos.wt_all.size };
+        if (!rocket_wsig_eq(&w->sig[t], &now)) return 0;
     }
     return 1;
 }

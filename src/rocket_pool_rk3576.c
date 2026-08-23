@@ -655,9 +655,9 @@ rocket_pool_int8_pack_rk3576(int fd, const rocket_pool_desc *d, int in_zp)
     h->in_bytes  = (size_t)(h->creg / C2) * h->in_surf * C2;
     h->out_bytes = (size_t)(h->creg / C2) * h->out_surf * C2;
 
-    if (rocket_bo_alloc(fd, h->in_bytes, &h->in) < 0 ||
-        rocket_bo_alloc(fd, h->out_bytes, &h->out) < 0 ||
-        rocket_bo_alloc(fd, RK3576_POOL_TASK_OPS * sizeof(uint64_t), &h->rc) < 0) {
+    if (rocket_bo_alloc32(fd, h->in_bytes, &h->in) < 0 ||
+        rocket_bo_alloc32(fd, h->out_bytes, &h->out) < 0 ||
+        rocket_bo_alloc32(fd, RK3576_POOL_TASK_OPS * sizeof(uint64_t), &h->rc) < 0) {
         ROCKET_LOGE("%s: BO allocation failed\n", entry);
         rocket_pool_int8_free_rk3576(fd, h);
         return NULL;
@@ -731,7 +731,7 @@ int rocket_pool_int8_cube_in_rk3576(rocket_pool_int8_rk3576_handle *h,
     }
     if (!src) {
         if (!h->cube_in) return ROCKET_OK;
-        if (rocket_bo_alloc(h->fd, h->in_bytes, &h->in) < 0) return ROCKET_E_NOMEM;
+        if (rocket_bo_alloc32(h->fd, h->in_bytes, &h->in) < 0) return ROCKET_E_NOMEM;
         rocket_bo_prep(h->fd, &h->in, 1, 0);
         memset(h->in.ptr, 0, h->in_bytes);
         rocket_bo_fini(h->fd, &h->in);
@@ -871,7 +871,7 @@ int rocket_pool_int8_cube_out_at_rk3576(rocket_pool_int8_rk3576_handle *h,
         /* Back onto a surface of its own, which is the stride the emitter derives. */
         h->out_surf  = r76p_round4(h->ow * h->oh);
         h->out_bytes = (size_t)(h->creg / C2) * h->out_surf * C2;
-        if (rocket_bo_alloc(h->fd, h->out_bytes, &h->out) < 0) return ROCKET_E_NOMEM;
+        if (rocket_bo_alloc32(h->fd, h->out_bytes, &h->out) < 0) return ROCKET_E_NOMEM;
         memset(&h->out_ext, 0, sizeof h->out_ext);
         h->out_off = 0;
         h->cube_out = 0;
@@ -1558,6 +1558,9 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
         unsigned cap = h->oh * h->ow;
         lagpos = (struct r76p_lag_pos *)malloc((size_t)cap * sizeof *lagpos);
         if (lagpos) nlag = r76p_lag_positions(h, lagpos, cap);
+        else        ROCKET_LOGW("%s: no memory for the %u-position divisor-lag list; "
+                                "the padded-average lag check is OFF for this call\n",
+                                entry, cap);
     }
     /* `attempt` counts POISONING redos, each of which cycles the power domain. A LAG redo
      * spends nothing but a submit and is counted separately, against its own budget. */
@@ -1587,14 +1590,21 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
                                        rocket_ppu_done_supported()
                                            ? ROCKET_JOB_PPU_DONE : 0u) != 0) {
             ROCKET_LOGE("%s: submit failed\n", entry);
-            return ROCKET_E_DEVICE;
+            /* The stamp opened a PREP/FINI bracket on osurf above and this exit is inside
+             * it. Close it before leaving: this file's own hazard note is that a CPU write
+             * to an output BO outside the bracket races the DPU's DMA, and an error path is
+             * not exempt — the caller is failing out, but the BO outlives the call. */
+            if (stamp) rocket_bo_fini(fd, osurf);
+            rc = ROCKET_E_DEVICE;
+            goto out;
         }
         R76P_ACC(prof, submit_us, t0);
         t0 = R76P_T(prof);
         tw = R76P_T(prof);
         if (rocket_bo_prep(fd, osurf, 0, 2000000000ull) < 0) {
             ROCKET_LOGE("%s: PREP_BO on the output timed out\n", entry);
-            return ROCKET_E_DEVICE;
+            rc = ROCKET_E_DEVICE;
+            goto out;
         }
         R76P_ACC(prof, wait_us, tw);
         prof.surf_kib += (double)h->out_bytes / 1024.0;
@@ -1655,6 +1665,7 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
         cycled++;
         confirmed += rocket_rk3576_power_idle();
     }
+out:
     free(lagpos);
     if (rc != ROCKET_OK) {
         if (lagged)

@@ -25,7 +25,7 @@
 #include "rocket_matmul.h"    /* rocket_matmul_fp16 + prepacked/stream */
 #include "rocket_conv.h"      /* rocket_conv2d_fp16 (neck conv3x3)     */
 #include "rocket_npu.h"       /* rocket_open / rocket_close            */
-#include "rocket_affinity.h"  /* rocket_pin_worker                    */
+#include "rocket_affinity.h"  /* rocket_pin_worker_based              */
 #include "rocket_log.h"
 
 #define SAM_MAGIC   0x53414D42   /* "SAMB" */
@@ -630,6 +630,7 @@ void rocket_sam_ctx_free(rocket_sam_ctx *c)
  * own (window,head) slices of cc (disjoint), using its own stream + head scratch -> no locking. */
 typedef struct {
     rocket_sam_ctx *c; int tid, lo, hi;
+    int core_base;              /* big-core rotation base inherited from the CALLING thread */
     const _Float16 *qkv; _Float16 *cc;
     const _Float16 *Rh, *Rw;
     int S, S2, d, dh, nh; float scale;
@@ -639,7 +640,9 @@ typedef struct {
 static void *sam_attn_worker(void *p)
 {
     sam_attn_arg *a = p;
-    rocket_pin_worker(a->tid);
+    /* _based, not rocket_pin_worker: the rotation base is __thread, so a freshly created
+     * worker always reads 0 and two in-process pools would collide on the same A76s. */
+    rocket_pin_worker_based(a->tid, a->core_base);
     wk_prov wp = { a->c->strm[a->tid], a->c->aux_fd };
     mm_provider P = { &wp, wk_run };
     head_scratch *hs = &a->c->hs[a->tid];
@@ -685,10 +688,14 @@ static int ctx_layer(rocket_sam_ctx *c, int l, _Float16 *x, attn_scratch *s)
         int nw = c->nworkers; if (nw > ntask) nw = ntask;
         pthread_t th[SAM_MAX_WORKERS]; sam_attn_arg wa[SAM_MAX_WORKERS]; int started[SAM_MAX_WORKERS] = {0};
         const int per = (ntask + nw - 1) / nw;
+        const int core_base = rocket_affinity_get_base();   /* read on the CALLING thread */
         for (int w = 0; w < nw; w++) {
             int lo = w * per, hi = lo + per; if (lo >= ntask) { nw = w; break; } if (hi > ntask) hi = ntask;
-            wa[w] = (sam_attn_arg){ c, w, lo, hi, s->qkv, cc, m->Rh[l], m->Rw[l], S, S2, d, dh, nh, scale,
-                                    s->ip, s->jp, 0 };
+            wa[w] = (sam_attn_arg){ .c = c, .tid = w, .lo = lo, .hi = hi,
+                                    .core_base = core_base,
+                                    .qkv = s->qkv, .cc = cc, .Rh = m->Rh[l], .Rw = m->Rw[l],
+                                    .S = S, .S2 = S2, .d = d, .dh = dh, .nh = nh,
+                                    .scale = scale, .ip = s->ip, .jp = s->jp, .rc = 0 };
             if (nw > 1 && pthread_create(&th[w], NULL, sam_attn_worker, &wa[w]) == 0) started[w] = 1;
             else sam_attn_worker(&wa[w]);   /* nw==1 or spawn failed: run inline */
         }

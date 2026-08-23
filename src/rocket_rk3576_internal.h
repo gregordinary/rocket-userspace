@@ -34,6 +34,16 @@
  * different fact from a redo after an idle that may never have cleared anything. */
 int rocket_rk3576_power_idle(void);
 
+/* Free everything the RK3576 transient-BO pool (ROCKET_RK3576_BO_POOL) holds for `fd`.
+ *
+ * Declared here as well as in rocket_matmul.h because rocket_close() must call it: the
+ * pool is a PROCESS-global table keyed on the raw fd integer, and the kernel recycles
+ * fd numbers. Without this, a process that closes NPU fd 7 and later opens anything that
+ * lands on 7 is handed BOs whose GEM handle and dma_address belong to a dead file --
+ * and the handles were already destroyed with it, so the addresses are stale rather
+ * than merely wrong. Draining at close makes the pool's lifetime the fd's. */
+void rocket_rk3576_bo_pool_drain(int fd);
+
 /* Whether an output BO is stamped with a sentinel before the tasks that write it.
  *
  * A fresh BO arrives zeroed and zero is also a legitimate result, so a zeroed surface

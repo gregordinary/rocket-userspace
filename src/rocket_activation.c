@@ -28,6 +28,7 @@
 #include "rocket_activation.h"
 #include "npu_activation.h"
 #include "npu_matmul.h"   /* gen_matmul_fp16 + feature_data/weight_fp16 (on-NPU EW mul) */
+#include "rocket_op.h"      /* the shared one-shot scaffolding */
 #include "rocket_log.h"     // centralized log channel
 
 #define CBUF_BANK 4096   /* pad BOs so a feature DMA never reads past the alloc */
@@ -342,7 +343,7 @@ static void build_lut_shifted_elu(double alpha, double lambda, double x_lo, doub
  * so the two can never drift (the signed/wide-LUT split is handled here). */
 int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
 {
-    if (!lut || !ep) return -1;
+    if (!lut || !ep) return ROCKET_E_SHAPE;
     memset(ep, 0, sizeof *ep);
     ep->kind            = kind;     /* host reference only (oracle); generator ignores */
     ep->lut             = lut;
@@ -393,7 +394,7 @@ int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
         case ROCKET_ACTIVATION_TANH: x_lo=-8;  x_hi=8;  out_lo=-1.0; S=2.0;  break;
         case ROCKET_ACTIVATION_SILU: x_lo=-12; x_hi=12; out_lo=-0.5; S=16.0; break;
         case ROCKET_ACTIVATION_GELU: x_lo=-12; x_hi=12; out_lo=-0.5; S=16.0; break;
-        default: return -3;
+        default: return ROCKET_E_UNSUPPORTED;
         }
         { const char *e;
           if ((e=getenv("ROCKET_LUT_XLO"))) x_lo=atof(e);
@@ -428,7 +429,7 @@ int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
         index_scale = 1024.0; lo = -0.5; Sexp = 5; break;
     case ROCKET_ACTIVATION_HARDSWISH:
         index_scale = 5461.0; lo = -0.5; Sexp = 2; break;
-    default: return -3;
+    default: return ROCKET_E_UNSUPPORTED;
     }
     { const char *e;
       if ((e = getenv("ROCKET_LUT_IDXSCALE"))) index_scale = atof(e);
@@ -472,7 +473,7 @@ static int run_dpu_lut(int fd, lut_act_params_t *p, const _Float16 *in, _Float16
 {
     rocket_bo guard = {0}, in_bo = {0}, out_bo = {0}, rc_bo = {0};
     uint64_t  regs[2048] = {0};
-    int rc = -1;
+    int rc = ROCKET_E_SHAPE;
 
     /* alloc the BOs once at the tile cap (or the whole vector if smaller) and reuse them
      * across chunks — the LUT params in `p` are identical per chunk, only width (n) changes. */
@@ -485,10 +486,9 @@ static int run_dpu_lut(int fd, lut_act_params_t *p, const _Float16 *in, _Float16
         ROCKET_LOGE("run_dpu_lut: BO alloc failed\n");
         goto out;
     }
-    if (((in_bo.dma_address + in_bo.size) | (out_bo.dma_address + out_bo.size) |
-         (rc_bo.dma_address + rc_bo.size)) >> 32) {
-        ROCKET_LOGE("run_dpu_lut: a BO dma_address exceeds 32 bits\n");
-        goto out;
+    {
+        rocket_bo *const set[] = { &in_bo, &out_bo, &rc_bo };
+        if (rocket_op_iova_overflow("run_dpu_lut", set, 3)) goto out;
     }
 
     for (int base = 0; base < n; base += DPU_LUT_MAXN) {
@@ -499,8 +499,15 @@ static int run_dpu_lut(int fd, lut_act_params_t *p, const _Float16 *in, _Float16
         p->tasks      = regs;
 
         rocket_bo_prep(fd, &in_bo, 1, 0);
-        memset(in_bo.ptr, 0, in_bo.size);
+        /* Zero only the TAIL the chunk does not cover. The BO is sized at the tile cap
+         * and reused across chunks, so the memcpy overwrites all but that tail -- zeroing
+         * the whole thing was a second full pass over the cap on every chunk, and the
+         * last chunk is the only one that leaves any of it stale. */
         memcpy(in_bo.ptr, in + base, (size_t)cn * sizeof(_Float16));
+        {
+            size_t used = (size_t)cn * sizeof(_Float16);
+            if (used < in_bo.size) memset((char *)in_bo.ptr + used, 0, in_bo.size - used);
+        }
         rocket_bo_fini(fd, &in_bo);
 
         int g = gen_lut_activation_fp16(p);
@@ -509,24 +516,15 @@ static int run_dpu_lut(int fd, lut_act_params_t *p, const _Float16 *in, _Float16
             ROCKET_LOGE("run_dpu_lut: gen failed (%d, count=%d)\n", g, p->task_count);
             goto out;
         }
-        rocket_bo_prep(fd, &rc_bo, 1, 0);
-        memcpy(rc_bo.ptr, regs, (size_t)p->task_count * sizeof(uint64_t));
-        rocket_bo_fini(fd, &rc_bo);
-
         rocket_bo_prep(fd, &out_bo, 1, 0);
         memset(out_bo.ptr, 0, out_bo.size);
         rocket_bo_fini(fd, &out_bo);
 
-        rocket_task_desc task = { .regcmd = (uint32_t)rc_bo.dma_address,
-                                  .regcmd_count = (uint32_t)p->task_count };
-        uint32_t in_h[]  = { in_bo.handle, rc_bo.handle };
-        uint32_t out_h[] = { out_bo.handle };
-        if (rocket_submit_tasks(fd, &task, 1, in_h, 2, out_h, 1)) {
-            ROCKET_LOGE("run_dpu_lut: submit failed\n"); goto out;
-        }
-        if (rocket_bo_prep(fd, &out_bo, 0, 2000000000ULL)) {   /* 2s wait */
-            ROCKET_LOGE("run_dpu_lut: wait timeout\n");
-            goto out;
+        {
+            rocket_bo *const ins[] = { &in_bo };
+            if (rocket_op_submit_one(fd, "run_dpu_lut", &rc_bo, regs,
+                                     (uint32_t)p->task_count, ins, 1, &out_bo) != 0)
+                goto out;
         }
         memcpy(out + base, out_bo.ptr, (size_t)cn * sizeof(_Float16));
         rocket_bo_fini(fd, &out_bo);
@@ -547,7 +545,7 @@ out:
 
 int rocket_activation_fp16(int fd, int kind, const _Float16 *in, _Float16 *out, int n)
 {
-    if (fd < 0 || n <= 0) return -1;
+    if (fd < 0 || n <= 0) return ROCKET_E_SHAPE;
 
     /* Gated activations: f(x) = x * gate(x). The nonlinear gate (a [0,1]-output
      * LUT activation) runs ON THE NPU. The elementwise multiply by x can run
@@ -605,7 +603,7 @@ int rocket_activation_fp16(int fd, int kind, const _Float16 *in, _Float16 *out, 
         kind != ROCKET_ACTIVATION_LOG &&
         kind != ROCKET_ACTIVATION_GELU_GATE && kind != ROCKET_ACTIVATION_SOFTPLUS &&
         kind != ROCKET_ACTIVATION_MISH_GATE && kind != ROCKET_ACTIVATION_ABS)
-        return -3;   /* single-pass LUT kinds (HARDSWISH/SILU here only via WIDE_LUT) */
+        return ROCKET_E_UNSUPPORTED;   /* single-pass LUT kinds (HARDSWISH/SILU here only via WIDE_LUT) */
 
     const int np = (n + 7) & ~7;          /* pad element count to the C2=8 atom */
 
@@ -673,8 +671,8 @@ int rocket_activation_fp16(int fd, int kind, const _Float16 *in, _Float16 *out, 
 
 int rocket_leaky_relu_fp16(int fd, float alpha, const _Float16 *in, _Float16 *out, int n)
 {
-    if (fd < 0 || n <= 0) return -1;
-    if (alpha <= 0.f) return -3;   /* alpha=0 is plain ReLU (all-zero/flat negative branch
+    if (fd < 0 || n <= 0) return ROCKET_E_SHAPE;
+    if (alpha <= 0.f) return ROCKET_E_UNSUPPORTED;   /* alpha=0 is plain ReLU (all-zero/flat negative branch
                                     * trips the flat-region LUT quirk); use the native ReLU. */
 
     /* R = the table half-width (ROCKET_LEAKY_R, default 16; covers post-norm activations).
@@ -761,7 +759,7 @@ enum { EW_OP_ADD = 0, EW_OP_MUL = 1, EW_OP_SUB = 2, EW_OP_MAX = 3, EW_OP_MIN = 4
 static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
                           _Float16 *out, int n, int op)
 {
-    if (fd < 0 || n <= 0) return -1;
+    if (fd < 0 || n <= 0) return ROCKET_E_SHAPE;
 
     const int NN = 32;                 /* N == K; identity I_32                    */
     /* rows/tile cap: gen_matmul_task asserts feature_grains (= M+1) <= 0x3FF, so
@@ -780,7 +778,7 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
 
     rocket_bo wt = {0}, in_bo = {0}, op_bo = {0}, out_bo = {0}, rc_bo = {0};
     uint64_t  regs[256] = {0};
-    int rc = -1;
+    int rc = ROCKET_E_SHAPE;
 
     size_t cube_sz = (size_t)alloc_M * NN * sizeof(_Float16) + CBUF_BANK;
     size_t wt_sz   = (size_t)NN * NN * sizeof(_Float16) + CBUF_BANK;
@@ -792,11 +790,9 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
         ROCKET_LOGE("rocket_ew_mul_fp16: BO alloc failed\n");
         goto out;
     }
-    if (((in_bo.dma_address + in_bo.size) | (op_bo.dma_address + op_bo.size) |
-         (out_bo.dma_address + out_bo.size) | (rc_bo.dma_address + rc_bo.size) |
-         (wt.dma_address + wt.size)) >> 32) {
-        ROCKET_LOGE("rocket_ew_mul_fp16: a BO dma_address exceeds 32 bits\n");
-        goto out;
+    {
+        rocket_bo *const set[] = { &in_bo, &op_bo, &out_bo, &rc_bo, &wt };
+        if (rocket_op_iova_overflow("rocket_ew_mul_fp16", set, 5)) goto out;
     }
 
     /* identity weights I_NN (built once, reused for every tile) */
@@ -844,19 +840,11 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
             goto out;
         }
 
-        rocket_bo_prep(fd, &rc_bo, 1, 0);
-        memcpy(rc_bo.ptr, regs, (size_t)p.task_count * sizeof(uint64_t));
-        rocket_bo_fini(fd, &rc_bo);
-
-        rocket_task_desc task = { .regcmd = (uint32_t)rc_bo.dma_address,
-                                  .regcmd_count = (uint32_t)p.task_count };
-        uint32_t in_h[]  = { in_bo.handle, wt.handle, rc_bo.handle, op_bo.handle };
-        uint32_t out_h[] = { out_bo.handle };
-        if (rocket_submit_tasks(fd, &task, 1, in_h, 4, out_h, 1)) {
-            ROCKET_LOGE("rocket_ew_mul_fp16: submit failed\n"); goto out;
-        }
-        if (rocket_bo_prep(fd, &out_bo, 0, 2000000000ULL)) {
-            ROCKET_LOGE("rocket_ew_mul_fp16: wait timeout\n"); goto out;
+        {
+            rocket_bo *const ins[] = { &in_bo, &wt, &op_bo };
+            if (rocket_op_submit_one(fd, "rocket_ew_mul_fp16", &rc_bo, regs,
+                                     (uint32_t)p.task_count, ins, 3, &out_bo) != 0)
+                goto out;
         }
         {
             _Float16 *ob = out_bo.ptr;
@@ -885,8 +873,8 @@ out:
  * sign-mux glitch and NO host repair). Shared body; the public wrappers fix (alpha,lambda). */
 static int elu_run(int fd, double alpha, double lambda, const _Float16 *in, _Float16 *out, int n)
 {
-    if (fd < 0 || n <= 0) return -1;
-    if (alpha <= 0.0) return -3;
+    if (fd < 0 || n <= 0) return ROCKET_E_SHAPE;
+    if (alpha <= 0.0) return ROCKET_E_UNSUPPORTED;
 
     /* SYMMETRIC domain [-R,R] (R from ROCKET_ELU_R, default 8 — the negative branch is fully
      * captured since e^-8~3e-4). scale = 16384/(2R); x=0 -> index 8192 (the middle sample, the
@@ -974,7 +962,7 @@ int rocket_ew_min_fp16(int fd, const _Float16 *a, const _Float16 *b, _Float16 *o
  * fd<0 = host reference. 0 on success, <0 on error. */
 int rocket_clip_fp16(int fd, float lo, float hi, const _Float16 *in, _Float16 *out, int n)
 {
-    if (n <= 0) return -1;
+    if (n <= 0) return ROCKET_E_SHAPE;
     if (fd < 0) {
         for (int i = 0; i < n; i++) {
             float x = (float)in[i];
@@ -983,7 +971,7 @@ int rocket_clip_fp16(int fd, float lo, float hi, const _Float16 *in, _Float16 *o
         return 0;
     }
     _Float16 *cst = malloc((size_t)n * sizeof(_Float16));
-    if (!cst) return -2;
+    if (!cst) return ROCKET_E_NOMEM;
     for (int i = 0; i < n; i++) cst[i] = (_Float16)lo;
     int r = rocket_ew_max_fp16(fd, in, cst, out, n);          /* out = max(x, lo)     */
     if (!r) {
@@ -1002,7 +990,7 @@ int rocket_clip_fp16(int fd, float lo, float hi, const _Float16 *in, _Float16 *o
  * scales or adds/subtracts a zero). */
 int rocket_prelu_fp16(int fd, int C, int S, const _Float16 *x, const float *alpha, _Float16 *out)
 {
-    if (C < 1 || S < 1) return -1;
+    if (C < 1 || S < 1) return ROCKET_E_SHAPE;
     const size_t N = (size_t)C * S;
     if (fd < 0) { rocket_prelu_ref_fp16(C, S, x, alpha, out); return 0; }
 
@@ -1012,7 +1000,7 @@ int rocket_prelu_fp16(int fd, int C, int S, const _Float16 *x, const float *alph
     /* broadcast the per-channel slope across the spatial axis: ab[c][s] = (fp16)alpha[c] */
     _Float16 *ab = malloc(N * sizeof(_Float16));
     _Float16 *s  = malloc(N * sizeof(_Float16));
-    if (!ab || !s) { free(ab); free(s); return -2; }
+    if (!ab || !s) { free(ab); free(s); return ROCKET_E_NOMEM; }
     for (int c = 0; c < C; c++) {
         _Float16 a = (_Float16)alpha[c];
         for (int j = 0; j < S; j++) ab[(size_t)c * S + j] = a;
@@ -1024,7 +1012,7 @@ int rocket_prelu_fp16(int fd, int C, int S, const _Float16 *x, const float *alph
         if (!rc) rc = rocket_ew_max_fp16(fd, x, s, out, (int)N);   /* out = max(x, s)      */
     } else {
         _Float16 *z = calloc(N, sizeof(_Float16));                 /* zeros (for relu)     */
-        if (!z) { free(ab); free(s); return -2; }
+        if (!z) { free(ab); free(s); return ROCKET_E_NOMEM; }
         rc = rocket_ew_max_fp16(fd, x, z, out, (int)N);            /* out = relu(x) = p    */
         if (!rc) rc = rocket_ew_sub_fp16(fd, x, out, s, (int)N);   /* s = x - p = min(x,0) */
         if (!rc) rc = rocket_ew_mul_fp16(fd, s, ab, s, (int)N);    /* s = alpha_c*min(x,0) */
@@ -1039,14 +1027,14 @@ int rocket_prelu_fp16(int fd, int C, int S, const _Float16 *x, const float *alph
  * `b` must be positive and within the reciprocal LUT domain (see header). fd<0 = host. */
 int rocket_ew_div_fp16(int fd, const _Float16 *a, const _Float16 *b, _Float16 *out, int n)
 {
-    if (n <= 0) return -1;
+    if (n <= 0) return ROCKET_E_SHAPE;
     if (fd < 0) {                                  /* host reference path */
         for (int i = 0; i < n; i++)
             out[i] = (_Float16)((float)a[i] / (float)b[i]);
         return 0;
     }
     _Float16 *recip = malloc((size_t)n * sizeof(_Float16));
-    if (!recip) return -2;
+    if (!recip) return ROCKET_E_NOMEM;
     int r = rocket_activation_fp16(fd, ROCKET_ACTIVATION_RECIPROCAL, b, recip, n);
     if (!r) r = rocket_ew_mul_fp16(fd, a, recip, out, n);
     free(recip);

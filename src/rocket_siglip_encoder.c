@@ -24,7 +24,7 @@
 #include "rocket_norm.h"        /* rocket_layernorm_fp16        */
 #include "rocket_softmax.h"     /* rocket_softmax_fp16          */
 #include "rocket_npu.h"         /* rocket_open / rocket_close (aux fd) */
-#include "rocket_affinity.h"    /* rocket_pin_worker (keep host workers off the A55s) */
+#include "rocket_affinity.h"    /* rocket_pin_worker_based (keep host workers off the A55s) */
 #include "rocket_log.h"     // centralized log channel
 
 #define SIGLIP_MAGIC   0x53474C50
@@ -257,11 +257,16 @@ static pthread_once_t sl_pin_once = PTHREAD_ONCE_INIT;
 static void sl_pin_init(void) { const char *e = getenv("ROCKET_SIGLIP_PIN"); if (e && atoi(e) == 0) sl_pin = 0; }
 static int sl_pin_enabled(void) { pthread_once(&sl_pin_once, sl_pin_init); return sl_pin; }
 
-typedef struct { void (*fn)(void *, int, int); void *arg; int lo, hi, idx; } prange_t;
+typedef struct {
+    void (*fn)(void *, int, int); void *arg; int lo, hi, idx;
+    int core_base;   /* big-core rotation base inherited from the CALLING thread */
+} prange_t;
 static void *prange_thunk(void *p)
 {
     prange_t *r = p;
-    if (sl_pin_enabled()) rocket_pin_worker(r->idx);
+    /* _based, not rocket_pin_worker: the rotation base is __thread, so a freshly created
+     * worker always reads 0 and two in-process pools would collide on the same A76s. */
+    if (sl_pin_enabled()) rocket_pin_worker_based(r->idx, r->core_base);
     r->fn(r->arg, r->lo, r->hi);
     return NULL;
 }
@@ -269,6 +274,7 @@ static void parallel_for(int n, int nt, void (*fn)(void *, int, int), void *arg)
 {
     if (nt < 2 || n < 2 * nt) { fn(arg, 0, n); return; }
     if (nt > 8) nt = 8;
+    const int core_base = rocket_affinity_get_base();   /* read on the CALLING thread */
     pthread_t th[8]; prange_t r[8];
     int chunk = (n + nt - 1) / nt, spawned = 0;
     for (int i = 0; i < nt; i++) {
@@ -276,7 +282,7 @@ static void parallel_for(int n, int nt, void (*fn)(void *, int, int), void *arg)
         if (lo >= n) break;
         if (hi > n) hi = n;
         r[spawned].fn = fn; r[spawned].arg = arg; r[spawned].lo = lo; r[spawned].hi = hi;
-        r[spawned].idx = spawned;
+        r[spawned].idx = spawned; r[spawned].core_base = core_base;
         if (pthread_create(&th[spawned], NULL, prange_thunk, &r[spawned]) == 0) spawned++;
         else fn(arg, lo, hi);   /* spawn failed: run this chunk inline */
     }
@@ -532,6 +538,8 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
                              _Float16 *out, _Float16 *hidden_opt)
 {
     if (!c || !pixels_chw || !out) return -1;
+    /* rocket_pin_worker, not _based: this pins the CALLING thread, which is the one
+     * case where reading the __thread base is right. Workers use _based. */
     if (sl_pin_enabled()) rocket_pin_worker(0);   /* keep this thread's serial parts on an A76 */
     const rocket_siglip_model *m = c->m;
     const int d = m->d, L = m->L, pdim = m->patch_dim, dff = m->d_ff, nh = m->n_head, dh = d / nh;

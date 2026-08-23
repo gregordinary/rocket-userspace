@@ -6,11 +6,13 @@
  * a host reciprocal, and the per-row broadcast scale. See rocket_softmax.h for the work split
  * and why the row-max is on the host (no max-reduce datapath; the PPU-max is the resident path).
  */
+#include <limits.h>    /* INT_MAX — the element-count truncation guard */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
+#include "rocket_npu.h"    /* ROCKET_E_* — this library's error codes */
 #include "rocket_softmax.h"
 #include "rocket_activation.h"   /* ROCKET_ACTIVATION_EXP (the new LUT) */
 #include "rocket_reduce.h"       /* rocket_reduce_feature_fp16 (the row-sum) */
@@ -34,13 +36,39 @@ void rocket_softmax_ref_fp16(int M, int N, const _Float16 *in, _Float16 *out)
     }
 }
 
+/* xs[m][n] = x[m][n] - max_n x[m][n], the shift that puts every row into EXP's domain
+ * (all entries <= 0, so exp cannot overflow). Optionally records the row max, which the
+ * cross-entropy path needs for the log-sum-exp.
+ *
+ * Written out three times before this, identically, including the fp32 intermediate: the
+ * max and the subtract happen in float and only the result narrows, so a row spanning
+ * more than fp16's dynamic range still shifts exactly. The row max is on the HOST because
+ * this part has no max-reduce datapath (the PPU-max is the resident path's, not this
+ * one's) -- see rocket_softmax.h. */
+static void rows_sub_max(int M, int N, const _Float16 *x, _Float16 *xs, float *rowmax)
+{
+    for (int m = 0; m < M; m++) {
+        const _Float16 *xp = x + (size_t)m * N;
+        _Float16 *sp = xs + (size_t)m * N;
+        float mx = -INFINITY;
+        for (int n = 0; n < N; n++) { float v = (float)xp[n]; if (v > mx) mx = v; }
+        if (rowmax) rowmax[m] = mx;
+        for (int n = 0; n < N; n++) sp[n] = (_Float16)((float)xp[n] - mx);
+    }
+}
+
 int rocket_softmax_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *out)
 {
-    if (M < 1 || N < 1) return -1;
+    if (M < 1 || N < 1) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_softmax_ref_fp16(M, N, in, out); return 0; }
+    /* The element count M*N is handed to the activation / EW entries as an int below.
+     * The buffers are sized in size_t, so a truncating product would UNDER-process the
+     * op and return a silently partial surface — the harder of the two failures to
+     * diagnose. rocket_ffn_fp16 guards the same way and for the same reason. */
+    if ((size_t)M * N > INT_MAX) return ROCKET_E_SHAPE;
 
     const size_t MN = (size_t)M * N;
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *xs = malloc(MN * sizeof(_Float16));   /* x - rowmax (<=0) */
     _Float16 *e  = malloc(MN * sizeof(_Float16));   /* exp(xs)          */
     float    *s  = malloc((size_t)M * sizeof(float));
@@ -48,13 +76,7 @@ int rocket_softmax_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *out)
     if (!xs || !e || !s || !inv) goto out;
 
     /* 1. host row-max + subtract: xs[m][n] = x[m][n] - max_n x[m][n] (<=0, the EXP domain). */
-    for (int m = 0; m < M; m++) {
-        const _Float16 *xp = in + (size_t)m * N;
-        _Float16 *sp = xs + (size_t)m * N;
-        float mx = -INFINITY;
-        for (int n = 0; n < N; n++) { float v = (float)xp[n]; if (v > mx) mx = v; }
-        for (int n = 0; n < N; n++) sp[n] = (_Float16)((float)xp[n] - mx);
-    }
+    rows_sub_max(M, N, in, xs, NULL);
 
     /* 2. e = exp(xs) on the NPU (DPU LUT, default domain [-16,0]; deep tail clamps to ~0). */
     if ((rc = rocket_activation_fp16(fd, ROCKET_ACTIVATION_EXP, xs, e, (int)MN)) != 0) goto out;
@@ -93,11 +115,16 @@ void rocket_logsoftmax_ref_fp16(int M, int N, const _Float16 *in, _Float16 *out)
 
 int rocket_logsoftmax_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *out)
 {
-    if (M < 1 || N < 1) return -1;
+    if (M < 1 || N < 1) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_logsoftmax_ref_fp16(M, N, in, out); return 0; }
+    /* The element count M*N is handed to the activation / EW entries as an int below.
+     * The buffers are sized in size_t, so a truncating product would UNDER-process the
+     * op and return a silently partial surface — the harder of the two failures to
+     * diagnose. rocket_ffn_fp16 guards the same way and for the same reason. */
+    if ((size_t)M * N > INT_MAX) return ROCKET_E_SHAPE;
 
     const size_t MN = (size_t)M * N;
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *xs  = malloc(MN * sizeof(_Float16));   /* x - rowmax (<=0)            */
     _Float16 *e   = malloc(MN * sizeof(_Float16));   /* exp(xs)                     */
     _Float16 *lsb = malloc(MN * sizeof(_Float16));   /* log(s[m]) broadcast over n  */
@@ -105,13 +132,7 @@ int rocket_logsoftmax_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *o
     if (!xs || !e || !lsb || !s) goto out;
 
     /* 1. host row-max + subtract: xs = x - rowmax (<=0, the EXP domain). */
-    for (int m = 0; m < M; m++) {
-        const _Float16 *xp = in + (size_t)m * N;
-        _Float16 *sp = xs + (size_t)m * N;
-        float mx = -INFINITY;
-        for (int n = 0; n < N; n++) { float v = (float)xp[n]; if (v > mx) mx = v; }
-        for (int n = 0; n < N; n++) sp[n] = (_Float16)((float)xp[n] - mx);
-    }
+    rows_sub_max(M, N, in, xs, NULL);
 
     /* 2. e = exp(xs) on the NPU (DPU LUT). 3. s[m] = sum_n e (NPU fp32 reduce). */
     if ((rc = rocket_activation_fp16(fd, ROCKET_ACTIVATION_EXP, xs, e, (int)MN)) != 0) goto out;
@@ -157,11 +178,16 @@ void rocket_cross_entropy_ref_fp16(int M, int N,
 int rocket_cross_entropy_fp16(int fd, int M, int N,
                               const _Float16 *logits, const int *target, float *loss)
 {
-    if (M < 1 || N < 1) return -1;
+    if (M < 1 || N < 1) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_cross_entropy_ref_fp16(M, N, logits, target, loss); return 0; }
+    /* The element count M*N is handed to the activation / EW entries as an int below.
+     * The buffers are sized in size_t, so a truncating product would UNDER-process the
+     * op and return a silently partial surface — the harder of the two failures to
+     * diagnose. rocket_ffn_fp16 guards the same way and for the same reason. */
+    if ((size_t)M * N > INT_MAX) return ROCKET_E_SHAPE;
 
     const size_t MN = (size_t)M * N;
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *xs  = malloc(MN * sizeof(_Float16));        /* logits - rowmax (<=0)  */
     _Float16 *e   = malloc(MN * sizeof(_Float16));        /* exp(xs)                */
     float    *s   = malloc((size_t)M * sizeof(float));    /* row sums of e (NPU)    */
@@ -169,14 +195,7 @@ int rocket_cross_entropy_fp16(int fd, int M, int N,
     if (!xs || !e || !s || !rmx) goto out;
 
     /* 1. host row-max + subtract: xs = logits - rowmax (<=0, the EXP domain). Keep rowmax for lse. */
-    for (int m = 0; m < M; m++) {
-        const _Float16 *xp = logits + (size_t)m * N;
-        _Float16 *sp = xs + (size_t)m * N;
-        float mx = -INFINITY;
-        for (int n = 0; n < N; n++) { float v = (float)xp[n]; if (v > mx) mx = v; }
-        rmx[m] = mx;
-        for (int n = 0; n < N; n++) sp[n] = (_Float16)((float)xp[n] - mx);
-    }
+    rows_sub_max(M, N, logits, xs, rmx);
 
     /* 2. e = exp(xs) on the NPU (DPU LUT). 3. s[m] = sum_n e (NPU fp32 reduce). */
     if ((rc = rocket_activation_fp16(fd, ROCKET_ACTIVATION_EXP, xs, e, (int)MN)) != 0) goto out;

@@ -26,6 +26,7 @@
 #include <math.h>
 #include <pthread.h>
 
+#include "rocket_cube.h"   /* the NPU cube index math + blocked moves */
 #include "rocket_npu.h"
 #include "rocket_hw_profile.h"   /* CBUF bank count from the active hardware profile */
 #include "npu_matmul.h"
@@ -229,14 +230,6 @@ void rocket_conv_pool_free(rocket_conv_pool *p)
     free(p);
 }
 
-/* Ensure *bo holds an allocation of >= need bytes: reuse if already big enough, else
- * (re)allocate (freeing the old, smaller BO first). Returns 0 / <0. */
-static int conv_bo_ensure(int fd, rocket_bo *bo, size_t need)
-{
-    if (bo->ptr && bo->size >= need) return 0;  /* reuse */
-    if (bo->ptr) rocket_bo_free(fd, bo);        /* grow: release the old one first */
-    return rocket_bo_alloc(fd, need, bo);
-}
 
 /* ############################################################################
  * PART 2 — CPU reference oracles + descriptor validation
@@ -438,17 +431,12 @@ static int conv2d_one_job(int fd, rocket_conv_ctx *ctx,
     uint64_t regs[2048] = {0};
     int rc = -1;
 
-    if (conv_bo_ensure(fd, guard, 4096) ||                                       /* off IOVA 0 */
-        conv_bo_ensure(fd, in_bo,  in_elems  * sizeof(_Float16) + CBUF_BANK) ||
-        conv_bo_ensure(fd, wt_bo,  wt_elems  * sizeof(_Float16) + CBUF_BANK) ||
-        conv_bo_ensure(fd, rc_bo,  (size_t)NREGS * sizeof(uint64_t))        ||
-        conv_bo_ensure(fd, out_bo, out_elems * sizeof(_Float16) + CBUF_BANK)) {
+    if (rocket_bo_ensure32(fd, guard, 4096) < 0 ||                                       /* off IOVA 0 */
+        rocket_bo_ensure32(fd, in_bo,  in_elems  * sizeof(_Float16) + CBUF_BANK) < 0 ||
+        rocket_bo_ensure32(fd, wt_bo,  wt_elems  * sizeof(_Float16) + CBUF_BANK) < 0 ||
+        rocket_bo_ensure32(fd, rc_bo,  (size_t)NREGS * sizeof(uint64_t)) < 0        ||
+        rocket_bo_ensure32(fd, out_bo, out_elems * sizeof(_Float16) + CBUF_BANK) < 0) {
         ROCKET_LOGE("rocket_conv2d_fp16: BO alloc failed\n");
-        goto out;
-    }
-    if (((in_bo->dma_address + in_bo->size) | (wt_bo->dma_address + wt_bo->size) |
-         (out_bo->dma_address + out_bo->size) | (rc_bo->dma_address + rc_bo->size)) >> 32) {
-        ROCKET_LOGE("rocket_conv2d_fp16: a BO dma_address exceeds 32 bits\n");
         goto out;
     }
 
@@ -478,12 +466,7 @@ static int conv2d_one_job(int fd, rocket_conv_ctx *ctx,
                         dst[weight_conv_dw_fp16(IC, KH, KW, G, c + 1, kh + 1, kw + 1)] =
                             W[((size_t)c * KH + kh) * KW + kw];   /* W[c][0][kh][kw] */
         } else {
-            for (int oc = 0; oc < OC; oc++)
-                for (int ic = 0; ic < IC; ic++)
-                    for (int kh = 0; kh < KH; kh++)
-                        for (int kw = 0; kw < KW; kw++)
-                            dst[weight_conv_fp16(OC, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
-                                W[(((size_t)oc * IC + ic) * KH + kh) * KW + kw];
+            ROCKET_CONV_WT_SCATTER(_Float16, 16, dst, W, OC, IC, KH, KW);
         }
     }
     rocket_bo_fini(fd, wt_bo);
@@ -1052,17 +1035,12 @@ static int conv2d_int8_one_job(int fd, rocket_conv_ctx *ctx,
     uint64_t regs[256] = {0};
     int rc = -1;
 
-    if (conv_bo_ensure(fd, guard, 4096) ||                                       /* off IOVA 0 */
-        conv_bo_ensure(fd, in_bo,  in_elems  * sizeof(int8_t)  + CBUF_BANK) ||
-        conv_bo_ensure(fd, wt_bo,  wt_elems  * sizeof(int8_t)  + CBUF_BANK) ||
-        conv_bo_ensure(fd, rc_bo,  256 * sizeof(uint64_t))                  ||
-        conv_bo_ensure(fd, out_bo, out_elems * sizeof(int32_t) + CBUF_BANK)) {
+    if (rocket_bo_ensure32(fd, guard, 4096) < 0 ||                                       /* off IOVA 0 */
+        rocket_bo_ensure32(fd, in_bo,  in_elems  * sizeof(int8_t)  + CBUF_BANK) < 0 ||
+        rocket_bo_ensure32(fd, wt_bo,  wt_elems  * sizeof(int8_t)  + CBUF_BANK) < 0 ||
+        rocket_bo_ensure32(fd, rc_bo,  256 * sizeof(uint64_t)) < 0                  ||
+        rocket_bo_ensure32(fd, out_bo, out_elems * sizeof(int32_t) + CBUF_BANK) < 0) {
         ROCKET_LOGE("rocket_conv2d_int8: BO alloc failed\n");
-        goto out;
-    }
-    if (((in_bo->dma_address + in_bo->size) | (wt_bo->dma_address + wt_bo->size) |
-         (out_bo->dma_address + out_bo->size) | (rc_bo->dma_address + rc_bo->size)) >> 32) {
-        ROCKET_LOGE("rocket_conv2d_int8: a BO dma_address exceeds 32 bits\n");
         goto out;
     }
 
@@ -1084,12 +1062,7 @@ static int conv2d_int8_one_job(int fd, rocket_conv_ctx *ctx,
     memset(wt_bo->ptr, 0, wt_bo->size);
     {
         int8_t *dst = wt_bo->ptr;
-        for (int oc = 0; oc < OC; oc++)
-            for (int ic = 0; ic < IC; ic++)
-                for (int kh = 0; kh < KH; kh++)
-                    for (int kw = 0; kw < KW; kw++)
-                        dst[weight_conv_int8(OC, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
-                            W[(((size_t)oc * IC + ic) * KH + kh) * KW + kw];
+        ROCKET_CONV_WT_SCATTER(int8_t, 32, dst, W, OC, IC, KH, KW);
     }
     rocket_bo_fini(fd, wt_bo);
 
@@ -1245,16 +1218,12 @@ static int conv2d_int8_batch_tiles(int fd, rocket_conv_ctx *ctx,
     int ret = -1;
     rocket_bo *guard = &ctx->guard, *in_bo = &ctx->in, *wt_bo = &ctx->wt,
               *rc_bo = &ctx->rc,    *out_bo = &ctx->out;
-    if (conv_bo_ensure(fd, guard, 4096) ||
-        conv_bo_ensure(fd, in_bo,  in_tot)  ||
-        conv_bo_ensure(fd, wt_bo,  wt_tot)  ||
-        conv_bo_ensure(fd, rc_bo,  (size_t)tn * CONV_RC_STRIDE * sizeof(uint64_t)) ||
-        conv_bo_ensure(fd, out_bo, out_tot)) {
+    if (rocket_bo_ensure32(fd, guard, 4096) < 0 ||
+        rocket_bo_ensure32(fd, in_bo,  in_tot) < 0  ||
+        rocket_bo_ensure32(fd, wt_bo,  wt_tot) < 0  ||
+        rocket_bo_ensure32(fd, rc_bo,  (size_t)tn * CONV_RC_STRIDE * sizeof(uint64_t)) < 0 ||
+        rocket_bo_ensure32(fd, out_bo, out_tot) < 0) {
         ROCKET_LOGE("conv int8 batch: BO alloc failed\n"); goto out;
-    }
-    if (((in_bo->dma_address + in_bo->size) | (wt_bo->dma_address + wt_bo->size) |
-         (out_bo->dma_address + out_bo->size) | (rc_bo->dma_address + rc_bo->size)) >> 32) {
-        ROCKET_LOGE("conv int8 batch: a BO dma_address exceeds 32 bits\n"); goto out;
     }
     scratch = malloc(rocket_submit_scratch_size((uint32_t)tn));
     if (!scratch) { ROCKET_LOGE("conv int8 batch: scratch alloc failed\n"); goto out; }
@@ -1294,12 +1263,7 @@ static int conv2d_int8_batch_tiles(int fd, rocket_conv_ctx *ctx,
         const i8tile *tl = &tiles[t0 + k];
         const int8_t *Wslice = Wuse + (size_t)tl->oc0 * IC * KH * KW;
         int8_t *dst = (int8_t *)wt_bo->ptr + off_wt[k];
-        for (int oc = 0; oc < tl->OCn; oc++)
-            for (int ic = 0; ic < IC; ic++)
-                for (int kh = 0; kh < KH; kh++)
-                    for (int kw = 0; kw < KW; kw++)
-                        dst[weight_conv_int8(tl->OCn, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
-                            Wslice[(((size_t)oc * IC + ic) * KH + kh) * KW + kw];
+        ROCKET_CONV_WT_SCATTER(int8_t, 32, dst, Wslice, tl->OCn, IC, KH, KW);
     }
     rocket_bo_fini(fd, wt_bo);
 
@@ -1729,19 +1693,13 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
     uint64_t regs[256] = {0};
     int rc = -1;
 
-    if (conv_bo_ensure(fd, guard, 4096) ||
-        conv_bo_ensure(fd, in_bo,  in_elems  * sizeof(int8_t)  + CBUF_BANK) ||
-        conv_bo_ensure(fd, wt_bo,  wt_elems  * sizeof(int8_t)  + CBUF_BANK) ||
-        conv_bo_ensure(fd, rc_bo,  256 * sizeof(uint64_t))                  ||
-        conv_bo_ensure(fd, bs_bo,  (size_t)Cpad * sizeof(int32_t) + CBUF_BANK) ||
-        conv_bo_ensure(fd, out_bo, out_elems * sizeof(int8_t)  + CBUF_BANK)) {
+    if (rocket_bo_ensure32(fd, guard, 4096) < 0 ||
+        rocket_bo_ensure32(fd, in_bo,  in_elems  * sizeof(int8_t)  + CBUF_BANK) < 0 ||
+        rocket_bo_ensure32(fd, wt_bo,  wt_elems  * sizeof(int8_t)  + CBUF_BANK) < 0 ||
+        rocket_bo_ensure32(fd, rc_bo,  256 * sizeof(uint64_t)) < 0                  ||
+        rocket_bo_ensure32(fd, bs_bo,  (size_t)Cpad * sizeof(int32_t) + CBUF_BANK) < 0 ||
+        rocket_bo_ensure32(fd, out_bo, out_elems * sizeof(int8_t)  + CBUF_BANK) < 0) {
         ROCKET_LOGE("rocket_conv2d_dw_int8: BO alloc failed\n");
-        goto out;
-    }
-    if (((in_bo->dma_address + in_bo->size) | (wt_bo->dma_address + wt_bo->size) |
-         (out_bo->dma_address + out_bo->size) | (rc_bo->dma_address + rc_bo->size) |
-         (bs_bo->dma_address + bs_bo->size)) >> 32) {
-        ROCKET_LOGE("rocket_conv2d_dw_int8: a BO dma_address exceeds 32 bits\n");
         goto out;
     }
 

@@ -40,11 +40,11 @@ void rocket_geglu_ref_fp16(const _Float16 *gate, const _Float16 *up,
 int rocket_geglu_fp16(int fd, const _Float16 *gate, const _Float16 *up,
                       int kind, _Float16 *prod, int n)
 {
-    if (n <= 0) return -1;
+    if (n <= 0) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_geglu_ref_fp16(gate, up, kind, prod, n); return 0; }
 
     _Float16 *act_g = malloc((size_t)n * sizeof(_Float16));
-    if (!act_g) return -2;
+    if (!act_g) return ROCKET_E_NOMEM;
     int r = rocket_activation_fp16(fd, kind, gate, act_g, n);   /* act(gate) on the NPU */
     if (r == 0) r = rocket_ew_mul_fp16(fd, act_g, up, prod, n); /* ⊙ up on the NPU      */
     free(act_g);
@@ -59,10 +59,22 @@ void rocket_ffn_ref_fp16(int M, int H, int I,
                          const _Float16 *x, const _Float16 *Wg, const _Float16 *Wu,
                          const _Float16 *Wd, int kind, _Float16 *out)
 {
-    /* fp64 oracle: gate/up = x·W^T, prod = act(gate)⊙up, out = prod·Wd^T */
+    /* fp64 oracle: gate/up = x·W^T, prod = act(gate)⊙up, out = prod·Wd^T
+     *
+     * ONE allocation for the whole call, not one per row: this is the oracle, but it is
+     * also the fd < 0 host fallback, so it runs in production. It was unchecked and
+     * O(M) allocations for a buffer whose size does not depend on m. The signature is
+     * void, so an allocation failure has nowhere to go but a zeroed output and a loud
+     * log — better than the NULL dereference it used to be. */
+    double *prod = malloc((size_t)I * sizeof(double));
+    if (!prod) {
+        ROCKET_LOGE("rocket_ffn_ref_fp16: no memory for the %d-wide intermediate; "
+                    "returning a ZEROED output\n", I);
+        memset(out, 0, (size_t)M * H * sizeof(_Float16));
+        return;
+    }
     for (int m = 0; m < M; m++) {
         const _Float16 *xr = x + (size_t)m * H;
-        double *prod = malloc((size_t)I * sizeof(double));
         for (int i = 0; i < I; i++) {
             const _Float16 *wg = Wg + (size_t)i * H, *wu = Wu + (size_t)i * H;
             double g = 0, u = 0;
@@ -77,23 +89,23 @@ void rocket_ffn_ref_fp16(int M, int H, int I,
             for (int i = 0; i < I; i++) acc += prod[i] * (double)wd[i];
             orow[h] = (_Float16)acc;
         }
-        free(prod);
     }
+    free(prod);
 }
 
 int rocket_ffn_fp16(int fd, int M, int H, int I,
                     const _Float16 *x, const _Float16 *Wg, const _Float16 *Wu,
                     const _Float16 *Wd, int kind, _Float16 *out)
 {
-    if (M < 1 || H < 1 || I < 1) return -1;
+    if (M < 1 || H < 1 || I < 1) return ROCKET_E_SHAPE;
     /* The geglu element count M*I is passed as int below; reject a product that
      * would truncate (the buffers are sized in size_t, so the truncation would
      * under-process the op, not over-read). */
-    if ((size_t)M * I > INT_MAX) return -1;
+    if ((size_t)M * I > INT_MAX) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_ffn_ref_fp16(M, H, I, x, Wg, Wu, Wd, kind, out); return 0; }
 
     const int NT = 3;                       /* fan the projections across the 3 NPU cores */
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *gate = malloc((size_t)M * I * sizeof(_Float16));
     _Float16 *up   = malloc((size_t)M * I * sizeof(_Float16));
     _Float16 *prod = malloc((size_t)M * I * sizeof(_Float16));
@@ -121,8 +133,8 @@ int rocket_ffn_fp16_fused(int fd, int M, int H, int I,
                           const _Float16 *x, const _Float16 *Wg, const _Float16 *Wu,
                           const _Float16 *Wd, int kind, _Float16 *out)
 {
-    if (M < 1 || H < 1 || I < 1) return -1;
-    if ((size_t)M * I > INT_MAX) return -1;
+    if (M < 1 || H < 1 || I < 1) return ROCKET_E_SHAPE;
+    if ((size_t)M * I > INT_MAX) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_ffn_ref_fp16(M, H, I, x, Wg, Wu, Wd, kind, out); return 0; }
 
     /* Shared cross-op tile: Nt(gate/up) == Kt(down), a multiple of 32, so the gate/up
@@ -229,10 +241,10 @@ static int mlp_host_handoff(int fd, int M, int Din, int Dff, int Dout,
                             const _Float16 *x, const _Float16 *W1, const _Float16 *b1,
                             const _Float16 *W2, int kind, _Float16 *out)
 {
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *f1  = malloc((size_t)M * Dff * sizeof(_Float16));
     _Float16 *act = malloc((size_t)M * Dff * sizeof(_Float16));
-    if (!f1 || !act) { free(f1); free(act); return -2; }
+    if (!f1 || !act) { free(f1); free(act); return ROCKET_E_NOMEM; }
 
     if (fd < 0) {
         /* fp16-rounded host reference */
@@ -269,8 +281,8 @@ int rocket_mlp_fp16_fused(int fd, int M, int Din, int Dff, int Dout,
                           const _Float16 *x, const _Float16 *W1, const _Float16 *b1,
                           const _Float16 *W2, int kind, _Float16 *out)
 {
-    if (M < 1 || Din < 1 || Dff < 1 || Dout < 1) return -1;
-    if ((size_t)M * Dff > INT_MAX) return -1;
+    if (M < 1 || Din < 1 || Dff < 1 || Dout < 1) return ROCKET_E_SHAPE;
+    if ((size_t)M * Dff > INT_MAX) return ROCKET_E_SHAPE;
     if (fd < 0) return mlp_host_handoff(fd, M, Din, Dff, Dout, x, W1, b1, W2, kind, out);
 
     const int T = 256;   /* shared tile: Nt(fc1) == Kt(fc2), a multiple of 32 */

@@ -29,6 +29,7 @@
 #ifndef ROCKET_SCRATCH_H
 #define ROCKET_SCRATCH_H
 
+#include <assert.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,9 @@
 typedef struct {
     void  *base;
     size_t cap;
+#ifndef NDEBUG
+    int    open_frames;    /* debug only — see the one-frame rule below */
+#endif
 } rocket_scratch_pool;
 
 /* One open scratch frame: a bump cursor over either a borrowed pool or an owned block. */
@@ -47,6 +51,9 @@ typedef struct {
     size_t         cap;    /* usable bytes                                       */
     size_t         off;    /* bump cursor                                        */
     int            owned;  /* 1 => free(base) on close; 0 => borrowed from a pool */
+#ifndef NDEBUG
+    rocket_scratch_pool *pool;   /* debug only — whose counter to decrement       */
+#endif
 } rocket_arena;
 
 static inline size_t rocket_arena_align_up(size_t x, size_t a)
@@ -62,6 +69,21 @@ static inline int rocket_arena_open(rocket_arena *a, rocket_scratch_pool *pool, 
 {
     a->off = 0;
     if (need == 0) need = 1;
+#ifndef NDEBUG
+    a->pool = pool;
+    /* THE ONE MISUSE THAT CANNOT BE FOUND BY READING. A pool is a single high-water
+     * block, not a stack: a second frame opened on a live one reallocs underneath the
+     * first frame's carved pointers, and everything that follows reads plausible
+     * garbage out of freed memory. The header states the rule; this is what enforces
+     * it. Costs a counter in a debug build and nothing at all in a release one. */
+    if (pool) {
+        assert(pool->open_frames == 0 &&
+               "rocket_arena: a second frame opened on a live pool — the realloc "
+               "would alias the first frame's buffers. Use a call-local (NULL) frame "
+               "for nested scratch.");
+        pool->open_frames++;
+    }
+#endif
     if (pool) {
         if (pool->cap < need) {
             void *p = realloc(pool->base, need);
@@ -107,6 +129,10 @@ static inline size_t rocket_arena_reserve(const size_t *sizes, int n)
  * every error path, including ones taken before the frame was opened. */
 static inline void rocket_arena_close(rocket_arena *a)
 {
+#ifndef NDEBUG
+    if (a->pool && a->pool->open_frames > 0) a->pool->open_frames--;
+    a->pool = NULL;
+#endif
     if (a->owned) free(a->base);
     a->base = NULL;
     a->cap  = 0;

@@ -105,6 +105,32 @@ int  rocket_num_big_cores(void);
  * On success bo->ptr is a valid CPU pointer and bo->dma_address is the VA to
  * program into CNA_FEATURE_DATA_ADDR / DPU_DST_BASE_ADD / decompress_addr0. */
 int  rocket_bo_alloc(int fd, size_t size, rocket_bo *bo);
+
+/* rocket_bo_alloc, plus the check every regcmd-programmed BO owes the hardware: the
+ * address fields are 32 BITS WIDE, so a BO whose last byte leaves the low 4 GB encodes
+ * an address the datapath reads wrapped — a full, correctly sized, entirely wrong
+ * surface. A per-fd IOVA window is 4 GB and a resident-weight workload can walk right
+ * up to it, so this is reachable rather than theoretical.
+ *
+ * Folding the check into the allocation is the point: it was previously written out at
+ * each call site as `((a + sza) | (b + szb) | ...) >> 32`, present fourteen times in the
+ * RK3588 matmul and absent from the RK3576 entries entirely — which allocate twenty-eight
+ * BOs between them and program every one of those addresses into a 32-bit field.
+ *
+ * Frees the BO and returns ROCKET_E_DEVICE if it lands high (an address constraint, not
+ * a shortage of memory) and ROCKET_E_NOMEM if the allocation itself failed. Either way
+ * the BO is left freed, so a caller that can retry gets a clean slate rather than a BO
+ * it must not use. */
+int  rocket_bo_alloc32(int fd, size_t size, rocket_bo *bo);
+
+/* Grow `bo` to at least `need` bytes, keeping it inside the 32-bit IOVA window.
+ *
+ * Returns 1 if it REALLOCATED, 0 if the existing BO already fit, <0 on failure (the BO
+ * is left freed). The distinction is the whole contract: a caller that relies on zeroed
+ * padding has to re-zero after a realloc and must not after a reuse. There were two of
+ * these with OPPOSITE conventions -- one returned 0 for both cases -- so neither could
+ * be substituted for the other without reading both. */
+int  rocket_bo_ensure32(int fd, rocket_bo *bo, size_t need);
 void rocket_bo_free(int fd, rocket_bo *bo);
 
 /* Cache management around CPU access. rocket BOs are cached, so you MUST

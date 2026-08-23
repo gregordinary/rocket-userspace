@@ -17,21 +17,13 @@
 #include <string.h>
 #include <math.h>
 
+#include "rocket_npu.h"    /* ROCKET_E_* — this library's error codes */
 #include "rocket_normvision.h"
 #include "rocket_norm.h"        /* rocket_scale_rows_fp16 (per-row broadcast multiply)   */
 #include "rocket_reduce.h"      /* rocket_reduce_feature_fp16 (the group/row contraction) */
 #include "rocket_activation.h"  /* rocket_ew_mul_fp16 / rocket_ew_add_fp16               */
+#include "rocket_norm_internal.h" /* rocket_square_prescale_k (the fp16-square guard)     */  /* rocket_ew_mul_fp16 / rocket_ew_add_fp16               */
 
-/* fp16-square overflow guard, shared with RMSNorm/LayerNorm: pick k so (|x|max * 2^-k)^2
- * stays well under fp16 max (~65504). 223^2 ~ 49729 < 65504, so the threshold is 223; the
- * recovered mean-square is (reduced sum of the prescaled squares) * 4^k. k==0 (the common
- * case) means x is used directly with no copy. */
-static int square_prescale_k(const _Float16 *x, size_t n)
-{
-    float amax = 0.f;
-    for (size_t i = 0; i < n; i++) { float a = fabsf((float)x[i]); if (a > amax) amax = a; }
-    return (amax > 223.f) ? (int)ceilf(log2f(amax / 223.f)) : 0;
-}
 
 /* ============================================================================
  * SECTION — BatchNorm (inference)
@@ -60,12 +52,12 @@ int rocket_batchnorm_fp16(int fd, int N, int C, int P, const _Float16 *x,
                           const _Float16 *mean, const _Float16 *var,
                           float eps, _Float16 *out)
 {
-    if (N < 1 || C < 1 || P < 1 || !x || !mean || !var || !out) return -1;
+    if (N < 1 || C < 1 || P < 1 || !x || !mean || !var || !out) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_batchnorm_ref_fp16(N, C, P, x, gamma, beta, mean, var, eps, out);
                   return 0; }
 
     const size_t total = (size_t)N * C * P;
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *A = malloc(total * sizeof(_Float16));   /* per-channel scale, broadcast */
     _Float16 *B = malloc(total * sizeof(_Float16));   /* per-channel bias,  broadcast */
     _Float16 *tmp = malloc(total * sizeof(_Float16));
@@ -131,7 +123,7 @@ int rocket_groupnorm_fp16(int fd, int N, int C, int G, int P, const _Float16 *x,
                           const _Float16 *gamma, const _Float16 *beta,
                           float eps, _Float16 *out)
 {
-    if (N < 1 || C < 1 || P < 1 || G < 1 || (C % G) != 0 || !x || !out) return -1;
+    if (N < 1 || C < 1 || P < 1 || G < 1 || (C % G) != 0 || !x || !out) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_groupnorm_ref_fp16(N, C, G, P, x, gamma, beta, eps, out); return 0; }
 
     const int Cg = C / G;
@@ -139,12 +131,12 @@ int rocket_groupnorm_fp16(int fd, int N, int C, int G, int P, const _Float16 *x,
     const int Pg = Cg * P;              /* elements reduced per group row      */
     const size_t total = (size_t)N * C * P;
 
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *xs_buf = NULL, *sq = NULL, *stack = NULL, *A = NULL, *B = NULL, *tmp = NULL;
     float *csum = NULL, *meanv = NULL, *rinv = NULL;
 
     /* fp16-square overflow prescale for the x^2 branch (the mean(x) branch uses x directly) */
-    int k = square_prescale_k(x, total);
+    int k = rocket_square_prescale_k(x, total);
     const float p = ldexpf(1.f, -k);
     const _Float16 *xs = x;
     if (k > 0) {
@@ -249,15 +241,15 @@ void rocket_l2norm_ref_fp16(int M, int H, const _Float16 *x, float eps, _Float16
 
 int rocket_l2norm_fp16(int fd, int M, int H, const _Float16 *x, float eps, _Float16 *out)
 {
-    if (M < 1 || H < 1 || !x || !out) return -1;
+    if (M < 1 || H < 1 || !x || !out) return ROCKET_E_SHAPE;
     if (fd < 0) { rocket_l2norm_ref_fp16(M, H, x, eps, out); return 0; }
 
     const size_t MH = (size_t)M * H;
-    int rc = -2;
+    int rc = ROCKET_E_NOMEM;
     _Float16 *xs_buf = NULL, *sq = NULL;
     float *ss = NULL, *r = NULL;
 
-    int k = square_prescale_k(x, MH);
+    int k = rocket_square_prescale_k(x, MH);
     const float p = ldexpf(1.f, -k);
     const _Float16 *xs = x;
     if (k > 0) {

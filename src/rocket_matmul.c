@@ -37,6 +37,7 @@
 #include "rocket_hw_profile.h"   /* machine parameters (cbuf_banks / max_tile / dtype mask) */
 #include "npu_matmul.h"
 #include "rocket_matmul.h"
+#include "rocket_cube.h"           /* NPU tile-layout index math + the blocked cube moves */
 #include "rocket_matmul_internal.h"
 #include "rocket_chain.h"        /* contiguous self-chaining regcmd layout (shared) */
 #include "rocket_log.h"     // centralized log channel
@@ -108,8 +109,48 @@ static void mm_prof_add_pack_kind(double ms, char kind) {
 }
 /* Attribute pack time done OUTSIDE mm_compute (e.g. the prepacked path's single
  * shared A-pack) to the aggregate, so the summary stays honest. */
+_Float16 *mm_csub(mm_bos *b, size_t elems)
+{
+    if (b->csub_cap < elems) {
+        free(b->csub);
+        b->csub = malloc(elems * sizeof(_Float16));
+        b->csub_cap = b->csub ? elems : 0;
+    }
+    return b->csub;
+}
+
 void mm_prof_add_pack(double ms)   { mm_prof_add_pack_kind(ms, 'A'); }
 void mm_prof_add_pack_b(double ms) { mm_prof_add_pack_kind(ms, 'B'); }
+
+int mm_prof_on(void) { return mm_profile(); }
+
+/* The non-pack buckets, for a path with its own compute core (the resident int8 route
+ * is one: it does not go through mm_compute*, so without this it reported nothing at
+ * all — and it is the route an LLM's prefill actually takes). */
+void mm_prof_add_phase(char phase, double ms)
+{
+    if (!mm_profile()) return;
+    pthread_mutex_lock(&g_prof_mu);
+    mm_prof_arm_locked();
+    switch (phase) {
+    case 'g': g_prof.gen    += ms; break;
+    case 's': g_prof.sync   += ms; break;
+    case 'u': g_prof.submit += ms; break;
+    case 'w': g_prof.wait   += ms; break;
+    case 'r': g_prof.read   += ms; break;
+    default: break;
+    }
+    pthread_mutex_unlock(&g_prof_mu);
+}
+
+void mm_prof_add_call(void)
+{
+    if (!mm_profile()) return;
+    pthread_mutex_lock(&g_prof_mu);
+    mm_prof_arm_locked();
+    g_prof.calls++;
+    pthread_mutex_unlock(&g_prof_mu);
+}
 
 /* int8-path profiler — a SEPARATE accumulator from g_prof. In a hybrid
  * int8 run, over-budget weights fall back to the fp16 streaming path (which feeds
@@ -267,19 +308,15 @@ static int reuse_mode_for(int nMt, int nNt) {
 } while (0)
 
 /* CBUF bank SIZE stays a compile-time constant pointed at the single npu_hw.h source
- * (the banks_for_*() helpers want a constant). The bank COUNT and the Mt/Nt cap are
- * read from the active hardware profile (rocket_hw_current(): cbuf_banks / max_tile),
- * so those chip-specific values live in ONE place rather than as bare 12 / 256 literals
- * duplicated per planner (the "edit one, miss the others" mis-tile trap). Each planner
- * below pulls them into `const int CBUF_BANKS` / `MAX_TILE` locals. */
+ * (mm_banks() wants a constant). The bank COUNT and the Mt/Nt cap are read from the
+ * active hardware profile (rocket_hw_current(): cbuf_banks / max_tile), so those
+ * chip-specific values live in ONE place rather than as bare 12 / 256 literals — which
+ * is also why there is one tiling policy (mm_plan_geom) rather than one per dtype. */
 #define CBUF_BANK   NPU_CBUF_BANK_SIZE
 #define BATCH       64           /* tiles (tasks) per NPU job                      */
 #define RC_STRIDE   128          /* u64 words reserved per task in the regcmd BO   */
 
 static int rup(int x, int a) { return ((x + a - 1) / a) * a; }
-static int banks_for(int rows, int Kt) {
-    return ((long)rows * Kt * 2 + CBUF_BANK - 1) / CBUF_BANK;
-}
 
 /* ── Batched (chained) submit — the dispatch-floor lever ───────────────────────
  * A tiled matmul submits one HW kick (one submit + one completion IRQ + one
@@ -491,68 +528,227 @@ static inline void wt_scatter_tile(_Float16 *restrict slot, const _Float16 *rest
  * below that overflow edge, so it only rejects pathological/adversarial inputs. */
 #define ROCKET_MM_DIM_MAX (1 << 24)
 
-/* ############################################################################
- * PART 2 — Tiling / planning and the pack-scatter phases (weights, input, bias)
- * ##########################################################################*/
+/* ── One tiling policy, parameterised by the datatype's geometry ────────────────
+ *
+ * Every dtype plans the same way: start Mt/Nt at the hardware tile cap, maximise Kt
+ * to fill the CBUF, then shrink Nt and Mt until the pair of operand tiles fits. What
+ * separates fp16 from int8 from tf32 is six numbers, not six algorithms — the bytes
+ * an element occupies, the N and K granularities the generator requires, the largest
+ * Kt it will encode, and how many CBUF banks the datapath withholds from the tiling
+ * budget. Writing the policy once is what makes a dimension guard (or the next tiling
+ * lever) apply to every dtype instead of to whichever copy got the attention.
+ *
+ * `bank_slack` is the one field that is a hardware fact rather than a layout fact:
+ * gen_matmul_int8 sets data_bank = fd_banks+1 to dodge the int8 feature-DMA tail-row
+ * resonance, so an int8 plan must leave that bank free. */
+enum {
+    MM_GEOM_ASYM_NT = 1u << 0,   /* the asymmetric-Nt heuristic applies (see asym_on) */
+    MM_GEOM_PICK_NT = 1u << 1,   /* start Nt at the smallest tile that still reaches the
+                                  * fewest tiles the cap allows, not at the cap itself  */
+    MM_GEOM_GROUPED = 1u << 2,   /* Kt is pinned by a quant group, so a `group` argument
+                                  * is REQUIRED — see mm_plan_geom                      */
+};
 
-int rocket_matmul_plan(int M, int K, int N, int *pMt, int *pKt, int *pNt)
+struct mm_geom {
+    const char *name;      /* dtype name, for a refusal's diagnostic                   */
+    int  ebytes_num;       /* bytes per element = ebytes_num / ebytes_den (int4 = 1/2) */
+    int  ebytes_den;
+    int  nalign;           /* Nt granularity, and the N divisibility the HW requires   */
+    int  kalign;           /* Kt granularity, and the K divisibility the HW requires   */
+    int  kt_ceil;          /* largest Kt the generator will encode                     */
+    int  bank_slack;       /* CBUF banks withheld from the tiling budget               */
+    unsigned flags;
+};
+
+static const struct mm_geom mm_geom_fp16 = {
+    "fp16", 2, 1, 16, 32, 16384, 0, MM_GEOM_ASYM_NT };
+static const struct mm_geom mm_geom_int8 = {
+    /* Deliberately NOT MM_GEOM_PICK_NT, unlike the group-wise twin. This plan's Kt is
+     * unconstrained (it starts at K and shrinks to fit the CBUF), so a smaller Nt frees
+     * CBUF banks and lets Kt GROW — at the resident MoE shape it would move Kt 640 -> 768
+     * and re-tile K on a shipped, HW-validated path, for a padding win this plan does not
+     * need (the dense W8A8 path holds one weight per tensor, not thousands of experts).
+     * The group-wise plan has no such coupling: its Kt can never exceed the quant group.
+     * Applying it here is a real lever for dense-int8 model fit, but it is its own change,
+     * with its own gate run — int8 CBUF edges are where the feature-DMA resonance lived. */
+    "int8", 1, 1, 32, 32, 16384, 1, 0 };
+static const struct mm_geom mm_geom_int8_gw = {
+    "int8 group-wise", 1, 1, 32, 32, 16384, 1, MM_GEOM_PICK_NT | MM_GEOM_GROUPED };
+static const struct mm_geom mm_geom_int4 = {
+    "int4", 1, 2, 64, 32, 16384, 0, 0 };
+static const struct mm_geom mm_geom_int16 = {
+    /* bf16 shares this: identical 2-byte-in / 4-byte-out geometry and alignment. */
+    "int16", 2, 1, 16, 32, 16384, 0, 0 };
+static const struct mm_geom mm_geom_tf32 = {
+    /* 4 B/elem halves the Kt ceiling: weight_bytes_per_kernel = Kt*4 must stay <= 32768
+     * (gen_matmul_tf32 refuses above that), so Kt <= 8192. K-group is 16, not 32. */
+    "tf32", 4, 1, 16, 16, 8192, 0, 0 };
+
+/* CBUF banks a `rows` x Kt operand tile of this dtype occupies. */
+static int mm_banks(const struct mm_geom *g, int rows, int Kt)
+{
+    long bytes = (long)rows * Kt * g->ebytes_num / g->ebytes_den;
+    return (int)((bytes + CBUF_BANK - 1) / CBUF_BANK);
+}
+
+/* Do the input and weight tiles fit the CBUF together? */
+static int mm_fits(const struct mm_geom *g, int Mt, int Nt, int Kt, int budget)
+{
+    return mm_banks(g, Mt, Kt) + mm_banks(g, Nt, Kt) <= budget;
+}
+
+/* The largest Kt that fits alongside (Mt, Nt). Maximising Kt is the lever that matters:
+ * the conv accumulates over K natively in one pass, so a bigger Kt means fewer K-passes
+ * and proportionally less readback. Floors at kalign — the caller shrinks Nt/Mt if even
+ * that does not fit. */
+static int mm_max_kt(const struct mm_geom *g, int Mt, int Nt, int K, int budget)
+{
+    const int ka = g->kalign;
+    int Kt = (K < g->kt_ceil) ? K : g->kt_ceil;
+    Kt = (Kt / ka) * ka;
+    if (Kt < ka) Kt = ka;
+    while (Kt > ka && !mm_fits(g, Mt, Nt, Kt, budget)) Kt -= ka;
+    return Kt;
+}
+
+/* The starting N-tile when MM_GEOM_PICK_NT is set: the SMALLEST tile that still reaches
+ * the fewest tiles the hardware's tile cap allows.
+ *
+ * max_tile fixes the tile COUNT — nNt = ceil(N/max_tile) is the fewest possible, and that
+ * count is what sets the task count and the dispatch. But ANY Nt >= ceil(N/nNt) reaches that
+ * same count, so defaulting Nt to max_tile buys nothing and leaves the tail tile mostly
+ * empty. Take the smallest such Nt instead: same tiles, same tasks, same real DMA — but the
+ * ALLOCATED columns drop from nNt*max_tile to nNt*Nt, and for a RESIDENT weight those columns
+ * are memory held for the process lifetime.
+ *
+ * At the resident-MoE operating point that is not a rounding error. A resident weight's N is
+ * split across the worker fds, so each worker plans on a SLICE: gpt-oss's N=2880 over 5
+ * workers gives a 576-wide slice, which at Nt=256 stores 3*256 = 768 columns to hold 576 — a
+ * 33% padding tax on every resident expert, when residency is the entire product of the
+ * native-quant expert route. At Nt=192 the same 3 tiles store exactly 576.
+ *
+ * Rounding UP to the N-alignment is load-bearing: rounding DOWN can drop the tile below
+ * ceil(N/nNt) and cost an EXTRA tile — a real dispatch cost, to save nothing.
+ *
+ * Callers may still shrink Nt afterwards to fit the CBUF; that stays correct (it only costs
+ * tiles), it just may no longer divide N evenly. */
+static int mm_pick_nt(int N, int max_tile, int na)
+{
+    int Nt;
+    if (N <= max_tile) {
+        Nt = N;
+    } else {
+        const int nNt = (N + max_tile - 1) / max_tile;   /* fewest tiles max_tile allows */
+        Nt = (N + nNt - 1) / nNt;                        /* smallest tile reaching them   */
+    }
+    Nt = (Nt + na - 1) / na * na;                        /* N-align — UP, see above       */
+    if (Nt > max_tile) Nt = (max_tile / na) * na;
+    if (Nt < na)       Nt = na;
+    return Nt;
+}
+
+/*
+ * The planner every dtype entry point calls. Returns the job (tile) count, or
+ * ROCKET_E_SHAPE for a dimension this geometry cannot express.
+ *
+ * MM_GEOM_GROUPED selects the group-wise K search: a K-tile may never straddle a quant
+ * group, so Kt is the largest DIVISOR of `group` that fits rather than the largest
+ * multiple of kalign, and ROCKET_MM_KT is ignored (Kt is pinned by the group). Which
+ * search runs is a property of the GEOMETRY, not of the argument: a grouped geometry
+ * refuses a missing group rather than quietly planning dense (the plans differ, and a
+ * dense plan straddles the groups the caller is about to scale by), and a dense one
+ * refuses a group it would ignore.
+ *
+ * The dimension guard is here rather than in each entry point on purpose: with M == 0,
+ * `0 % 4` passes the alignment check, Mt floors at 0 (Nt and Kt both floor at their
+ * alignment, M is the one dimension with no floor), and the tile count divides by it.
+ */
+static int mm_plan_geom(const struct mm_geom *g, int M, int K, int N, int group,
+                        int *pMt, int *pKt, int *pNt)
 {
     /* Machine parameters from the active hardware profile (chip-agnostic by
      * construction; RK3588 today), pulled into locals for the tiling math below. */
     const struct rocket_hw_profile *hw = rocket_hw_current();
-    const int MAX_TILE = hw->max_tile, CBUF_BANKS = hw->cbuf_banks;
+    const int MAX_TILE = hw->max_tile;
+    const int budget   = hw->cbuf_banks - g->bank_slack;
+    const int na = g->nalign, ka = g->kalign;
+
     /* Reject non-positive / absurd dimensions before the int tile-count arithmetic. */
     if (M <= 0 || K <= 0 || N <= 0 ||
         M > ROCKET_MM_DIM_MAX || K > ROCKET_MM_DIM_MAX || N > ROCKET_MM_DIM_MAX)
         return ROCKET_E_SHAPE;
     /* M%4==0 only. M==1 (a height-1 GEMV) mis-computes on the HW height-1 conv
-     * geometry, so this path rejects it; the cosine-sim correctness matrix gates
-     * this. The one-shot rocket_matmul_fp16 pads M==1->4 before planning, so it never
-     * asks the plan for M==1; every other caller gets -1 rather than a wrong result.
-     * Single-vector callers: pad M to 4. */
-    if (K % 32 || N % 16 || M % 4 != 0)
+     * geometry, so every path rejects it; the one-shot entries pad M==1->4 before
+     * planning, so they never ask for M==1. Every other caller gets a refusal rather
+     * than a wrong result. Single-vector callers: pad M to 4. */
+    if (K % ka || N % na || M % 4 != 0)
+        return ROCKET_E_SHAPE;
+    const int grouped = (g->flags & MM_GEOM_GROUPED) != 0;
+    /* `group < ka` short-circuits before `K % group`, so group == 0 never divides. */
+    if (grouped ? (group < ka || group % ka || K % group) : (group != 0))
         return ROCKET_E_SHAPE;
 
     int Mt = (M < MAX_TILE) ? M : MAX_TILE;
-    int Nt = (N < MAX_TILE) ? N : MAX_TILE;
-
-    /* Mt/Nt overrides are applied FIRST so Kt is then maximized for the chosen
-     * tile. Shrinking Mt/Nt lets Kt grow to fill the CBUF (12 banks * 32KB), which
-     * is the lever that matters: the conv accumulates over K natively in one pass,
-     * so a bigger Kt means fewer K-passes (nKt) and proportionally less readback. */
-    const char *e;
-    if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }
-    if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= 16) { Nt = (v/16)*16; if (Nt > N) Nt = N; } }
-
-    /* maximize Kt to fill the CBUF for the final Mt,Nt */
-    int Kt = (K < 16384) ? K : 16384;
-    Kt = (Kt / 32) * 32; if (Kt < 32) Kt = 32;
-    while (Kt > 32 && banks_for(Mt, Kt) + banks_for(Nt, Kt) > CBUF_BANKS) Kt -= 32;
-
-    /* Asymmetric-Nt heuristic (opt-in): when N AND K both tile, halving the FULL Nt frees
-     * CBUF so Kt grows (the symmetric fit caps it), and the asymmetric Mt>Nt tile runs the
-     * datapath more efficiently. Only fires on the symmetric default (no Nt override, Nt
-     * still at the cap, N>cap) and only when the symmetric plan actually K-tiles (else a
-     * bigger Kt is moot and the extra N-tiles are pure loss). Re-maximizes Kt for the halved
-     * Nt. See asym_on(). The explicit MM_KT override below still wins if set. */
-    if (asym_on() && !getenv("ROCKET_MM_NT") && Nt == MAX_TILE && N > MAX_TILE &&
-        MAX_TILE / 2 >= 16 && (K + Kt - 1) / Kt > 1) {
-        Nt = MAX_TILE / 2;
-        Kt = (K < 16384) ? K : 16384;
-        Kt = (Kt / 32) * 32; if (Kt < 32) Kt = 32;
-        while (Kt > 32 && banks_for(Mt, Kt) + banks_for(Nt, Kt) > CBUF_BANKS) Kt -= 32;
+    int Nt;
+    if (g->flags & MM_GEOM_PICK_NT) {
+        Nt = mm_pick_nt(N, MAX_TILE, na);
+    } else {
+        Nt = (N < MAX_TILE) ? N : MAX_TILE;
+        Nt = (Nt / na) * na;
+        if (Nt < na) Nt = na;
     }
 
-    /* if even Kt=32 won't fit alongside the tile, shrink Nt then Mt */
-    while (banks_for(Mt, Kt) + banks_for(Nt, Kt) > CBUF_BANKS && Nt > 16) Nt -= 16;
-    while (banks_for(Mt, Kt) + banks_for(Nt, Kt) > CBUF_BANKS && Mt > 4)  Mt -= 4;
+    /* Mt/Nt overrides are applied FIRST so Kt is then maximised for the chosen tile. */
+    const char *e;
+    if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }
+    if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= na) { Nt = (v/na)*na; if (Nt > N) Nt = N; } }
 
-    /* explicit Kt override (clamped to K and to what fits the CBUF) */
-    if ((e = getenv("ROCKET_MM_KT"))) {
-        int v = atoi(e);
-        if (v >= 32) {
-            Kt = (v/32)*32; if (Kt > (K/32)*32) Kt = (K/32)*32;
-            while (Kt > 32 && banks_for(Mt, Kt) + banks_for(Nt, Kt) > CBUF_BANKS) Kt -= 32;
+    int Kt;
+    if (grouped) {
+        /* Group-wise: Kt must divide the quant group, so walk the group's divisors down
+         * from the group itself and take the first that fits. */
+        Kt = 0;
+        for (;;) {
+            for (int d = group; d >= ka; d -= ka) {
+                if (group % d) continue;             /* a K-tile must never straddle a group */
+                if (mm_fits(g, Mt, Nt, d, budget)) { Kt = d; break; }
+            }
+            if (Kt) break;
+            /* Not even a kalign-wide K-tile fits at this tile size. Unreachable on RK3588
+             * (Mt,Nt <= 256 costs 2 banks at Kt=32, against a budget of 11); defensive
+             * against a future profile with a large max_tile or a small CBUF. */
+            if      (Nt > na) Nt -= na;
+            else if (Mt > 4)  Mt -= 4;
+            else return ROCKET_E_SHAPE;
+        }
+    } else {
+        Kt = mm_max_kt(g, Mt, Nt, K, budget);
+
+        /* Asymmetric-Nt heuristic (opt-in): when N AND K both tile, halving the FULL Nt frees
+         * CBUF so Kt grows (the symmetric fit caps it), and the asymmetric Mt>Nt tile runs the
+         * datapath more efficiently. Only fires on the symmetric default (no Nt override, Nt
+         * still at the cap, N>cap) and only when the symmetric plan actually K-tiles (else a
+         * bigger Kt is moot and the extra N-tiles are pure loss). Re-maximises Kt for the
+         * halved Nt. The explicit MM_KT override below still wins if set. */
+        if ((g->flags & MM_GEOM_ASYM_NT) && asym_on() && !getenv("ROCKET_MM_NT") &&
+            Nt == MAX_TILE && N > MAX_TILE && MAX_TILE / 2 >= na && (K + Kt - 1) / Kt > 1) {
+            Nt = MAX_TILE / 2;
+            Kt = mm_max_kt(g, Mt, Nt, K, budget);
+        }
+
+        /* if even Kt=kalign won't fit alongside the tile, shrink Nt then Mt */
+        while (!mm_fits(g, Mt, Nt, Kt, budget) && Nt > na) Nt -= na;
+        while (!mm_fits(g, Mt, Nt, Kt, budget) && Mt > 4)  Mt -= 4;
+
+        /* explicit Kt override (clamped to K, to the generator's ceiling, and to the CBUF) */
+        if ((e = getenv("ROCKET_MM_KT"))) {
+            int v = atoi(e);
+            if (v >= ka) {
+                Kt = (v / ka) * ka;
+                if (Kt > (K / ka) * ka) Kt = (K / ka) * ka;
+                if (Kt > g->kt_ceil)    Kt = g->kt_ceil;
+                while (Kt > ka && !mm_fits(g, Mt, Nt, Kt, budget)) Kt -= ka;
+            }
         }
     }
 
@@ -560,11 +756,21 @@ int rocket_matmul_plan(int M, int K, int N, int *pMt, int *pKt, int *pNt)
     if (pKt) *pKt = Kt;
     if (pNt) *pNt = Nt;
 
-    int nm = (M + Mt - 1) / Mt, nn = (N + Nt - 1) / Nt, nk = (K + Kt - 1) / Kt;
+    int nm = (M + Mt - 1) / Mt, nn = (N + Nt - 1) / Nt;
+    int nk = grouped ? K / Kt : (K + Kt - 1) / Kt; /* group-wise: Kt | group | K exactly */
     /* M4: reject shapes whose int tile-count product would overflow before the
      * size_t BO math (and the `total = nMt*nNt*nKt` in the compute loops below). */
     if ((int64_t)nm * nn * nk > INT32_MAX) return ROCKET_E_SHAPE;
     return nm * nn * nk;
+}
+
+/* ############################################################################
+ * PART 2 — Tiling / planning and the pack-scatter phases (weights, input, bias)
+ * ##########################################################################*/
+
+int rocket_matmul_plan(int M, int K, int N, int *pMt, int *pKt, int *pNt)
+{
+    return mm_plan_geom(&mm_geom_fp16, M, K, N, 0, pMt, pKt, pNt);
 }
 
 /* ---- reusable phases (shared with rocket_prepacked.c) ---- */
@@ -574,14 +780,7 @@ int mm_plan_init(mm_plan *pl, int M, int K, int N)
     int Mt, Kt, Nt;
     if (rocket_matmul_plan(M, K, N, &Mt, &Kt, &Nt) < 0)
         return -1;
-    pl->M = M; pl->K = K; pl->N = N;
-    pl->Mt = Mt; pl->Kt = Kt; pl->Nt = Nt;
-    pl->nMt = (M + Mt - 1) / Mt;
-    pl->nNt = (N + Nt - 1) / Nt;
-    pl->nKt = (K + Kt - 1) / Kt;
-    pl->in_slot  = (size_t)rup(Mt, 4)  * rup(Kt, 32);
-    pl->wt_slot  = (size_t)rup(Nt, 16) * rup(Kt, 32);
-    pl->out_slot = (size_t)rup(Mt, 4)  * rup(Nt, 16);
+    mm_plan_derive(pl, M, K, N, Mt, Kt, Nt);
     return 0;
 }
 
@@ -609,10 +808,10 @@ static int matmul_plan_pin(int M, int K, int N, int pin_Nt, int pin_Kt,
     } else {
         Kt = (K < 16384) ? K : 16384;
         Kt = (Kt / 32) * 32; if (Kt < 32) Kt = 32;
-        while (Kt > 32 && banks_for(Mt, Kt) + banks_for(Nt, Kt) > CBUF_BANKS) Kt -= 32;
+        Kt = mm_max_kt(&mm_geom_fp16, Mt, Nt, K, CBUF_BANKS);
     }
     /* shrink the FREE dims (never a pinned one) until the tile fits the CBUF */
-    while (banks_for(Mt, Kt) + banks_for(Nt, Kt) > CBUF_BANKS) {
+    while (!mm_fits(&mm_geom_fp16, Mt, Nt, Kt, CBUF_BANKS)) {
         if (!pin_Nt && Nt > 16)      Nt -= 16;
         else if (Mt > 4)             Mt -= 4;
         else if (!pin_Kt && Kt > 32) Kt -= 32;
@@ -633,14 +832,7 @@ int mm_plan_init_pin(mm_plan *pl, int M, int K, int N, int pin_Nt, int pin_Kt)
     int Mt, Kt, Nt;
     if (matmul_plan_pin(M, K, N, pin_Nt, pin_Kt, &Mt, &Kt, &Nt) < 0)
         return -1;
-    pl->M = M; pl->K = K; pl->N = N;
-    pl->Mt = Mt; pl->Kt = Kt; pl->Nt = Nt;
-    pl->nMt = (M + Mt - 1) / Mt;
-    pl->nNt = (N + Nt - 1) / Nt;
-    pl->nKt = (K + Kt - 1) / Kt;
-    pl->in_slot  = (size_t)rup(Mt, 4)  * rup(Kt, 32);
-    pl->wt_slot  = (size_t)rup(Nt, 16) * rup(Kt, 32);
-    pl->out_slot = (size_t)rup(Mt, 4)  * rup(Nt, 16);
+    mm_plan_derive(pl, M, K, N, Mt, Kt, Nt);
     return 0;
 }
 
@@ -810,6 +1002,7 @@ void mm_bos_free(int fd, mm_bos *b)
     free(b->bni);    b->bni    = NULL;
     free(b->boff);   b->boff   = NULL;
     free(b->acc);    b->acc    = NULL;  b->acc_cap = 0;
+    free(b->csub);   b->csub   = NULL;  b->csub_cap = 0;
     free(b->submit_dt); b->submit_dt = NULL;
     /* pipe scratch */
     rocket_bo_free(fd, &b->regcmd2);
@@ -2052,17 +2245,6 @@ struct rocket_mm_batch {
     int     last_M, last_K, last_N, last_nbatch;
 };
 
-/* Grow a BO to at least `need` bytes (free + realloc), re-checking the 32-bit IOVA
- * ceiling. Returns 1 if (re)allocated (the caller re-zeroes if it relies on zeroed
- * padding), 0 if the existing BO already fits, <0 on failure (BO left freed). */
-static int mm_bo_ensure(int fd, rocket_bo *bo, size_t need)
-{
-    if (bo->handle && bo->size >= need) return 0;
-    rocket_bo_free(fd, bo);
-    if (rocket_bo_alloc(fd, need, bo) != 0) return ROCKET_E_NOMEM;
-    if ((bo->dma_address + bo->size) >> 32) { rocket_bo_free(fd, bo); return ROCKET_E_DEVICE; }
-    return 1;
-}
 
 rocket_mm_batch *rocket_mm_batch_create(int fd)
 {
@@ -2134,9 +2316,9 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
 
     /* Grow the resident BOs to this shape (no-op when it already fits). out_all never
      * needs zeroing (the NPU writes it, only its live region is read back). */
-    int gi = mm_bo_ensure(fd, &b->in_all,  in_sz);
-    int gw = mm_bo_ensure(fd, &b->wt_all,  wt_sz);
-    int go = mm_bo_ensure(fd, &b->out_all, out_sz);
+    int gi = rocket_bo_ensure32(fd, &b->in_all,  in_sz);
+    int gw = rocket_bo_ensure32(fd, &b->wt_all,  wt_sz);
+    int go = rocket_bo_ensure32(fd, &b->out_all, out_sz);
     if (gi < 0 || gw < 0 || go < 0) {
         ROCKET_LOGE("rocket_matmul: batch BO alloc failed (in=%zuMB wt=%zuMB out=%zuMB n=%d)\n",
                 in_sz >> 20, wt_sz >> 20, out_sz >> 20, nbatch);
@@ -2316,124 +2498,219 @@ int rocket_matmul_fp16_batch(int fd, int M, int K, int N, int nbatch,
 /* ============================================================================
  * int8 x int8 -> int32 tiled matmul.
  *
- * Self-contained sibling of the fp16 path above — deliberately NOT a dtype
- * parameterization of mm_*, so the tuned fp16 path stays byte-for-byte unchanged
- * (zero regression risk). To be DRY'd up when the int8 streaming/prepacked path
- * is wired for the backend. Deltas vs fp16: in/wt BOs are 1 B (int8), out BO is
- * 4 B (int32); banks_for is x1 not x2 (so Kt ~2x); input cube C2=16, weight
- * k-group 32 (weight_int8), int32-output cube C2=4; gen_matmul_int8; K-partials
- * summed on the host in int64. A/B are pre-quantized, C is the raw int32 result.
+ * Shares the fp16 path's tiling policy (mm_geom_int8) and forks only where the
+ * datapath does: in/wt BOs are 1 B (int8) and the out BO 4 B (int32); the bank cost
+ * is x1 not x2, so Kt runs ~2x wider; input cube C2=16, weight k-group 32
+ * (weight_int8), int32-output cube C2=4; gen_matmul_int8; K-partials summed on the
+ * host in int64. A/B are pre-quantized, C is the raw int32 result.
  * ==========================================================================*/
 
-/* CBUF banks for `rows` x Kt int8 (1 B/elem) — the x1 vs fp16's x2 is what lets
- * Kt grow ~2x, cutting K-passes (nKt) and readback. */
-static int banks_for_i8(int rows, int Kt) {
-    return ((long)rows * Kt + CBUF_BANK - 1) / CBUF_BANK;
+
+
+/* ============================================================================
+ * GROUP-WISE int8 matmul: C_f[M,N] = sum_g a_scale[m,g]*b_scale[n,g] * (int32
+ * partial of K-group g), accumulated in fp32.
+ *
+ * The int8 sibling of rocket_matmul_int4_groupwise, and the primitive a natively
+ * quantized weight needs. Such a weight (a GGUF MXFP4 / Q8_0 / Q4_K block) carries
+ * one scale per K-block, and the NPU cannot apply a K-blocked scale on-chip: at the
+ * output stage K is fully contracted, so nothing in the DPU is indexed by a K-block,
+ * for any dtype. But the integer partials ALREADY leave the chip at every K-tile
+ * boundary — on-device integer K-accum is HW-dead (see rocket_matmul_int8 above) —
+ * so the block scale is free at a boundary that is already being paid for. Keep each
+ * K-tile inside one quant group, multiply its int32 partial by that group's scale,
+ * accumulate in fp32 on the host. The NPU-side work is identical to
+ * rocket_matmul_int8; the only delta is `float += scale * int32` on readback instead
+ * of `int64 += int32`.
+ *
+ * A, B are PRE-QUANTIZED int8 (row-major); a_scale is [M*nG] and b_scale is [N*nG]
+ * (row-major, nG = K/group); Cf[M,N] is overwritten. Alignment is rocket_matmul_int8's
+ * minus the M==1 pad: K%32, N%32, M%4 — a padded M==1 would need a padded a_scale
+ * too, so single vectors are padded to M=4 caller-side (as the resident paths require).
+ *
+ * There is NO saturation bound here. The int4 twin needs `49*group < 32767` because
+ * its NPU output is int16; int8's is int32, and a K-tile partial is bounded by
+ * |group * 127 * 127| = 16129*group — well inside int32 for any group the CBUF can
+ * hold (Kt <= 640 on RK3588). That headroom is exactly why int8, not int4, is the
+ * dtype for a GGUF-quantized weight.
+ * ==========================================================================*/
+
+/* Group-wise int8 tiling (pure). Kt is constrained to lie inside one quant group,
+ * which the free-Kt search in rocket_matmul_plan_int8 cannot express, so the CBUF is
+ * re-fitted here around that constraint.
+ *
+ * Kt need only DIVIDE the group, not equal it: each K-tile must lie wholly inside one
+ * group so its partial can take that group's single scale, but it does not have to BE
+ * the group. So readback (~ M*N*nKt, and these paths are readback-bound) is set by the
+ * CBUF's Kt cap, and `group` only upper-bounds it. Take the largest divisor that fits.
+ *
+ * Do NOT do what rocket_matmul_int4_groupwise does — overwrite the planner's Kt with
+ * `group` and re-check nothing. int4 gets away with that only because its int16
+ * saturation bound already caps group at 668 AND its nibble packing halves the bytes.
+ * int8 has neither (the int32 accumulator is the whole point), so an un-rechecked wide
+ * group would silently overflow the CBUF. */
+int rocket_matmul_plan_int8_gw(int M, int K, int N, int group,
+                               int *pMt, int *pKt, int *pNt)
+{
+    return mm_plan_geom(&mm_geom_int8_gw, M, K, N, group, pMt, pKt, pNt);
 }
 
-/* The starting N-tile for an int8 plan: the SMALLEST tile that still reaches the fewest
- * tiles the hardware's tile cap allows.
- *
- * max_tile fixes the tile COUNT — nNt = ceil(N/max_tile) is the fewest possible, and that
- * count is what sets the task count and the dispatch. But ANY Nt >= ceil(N/nNt) reaches that
- * same count, so defaulting Nt to max_tile buys nothing and leaves the tail tile mostly
- * empty. Take the smallest such Nt instead: same tiles, same tasks, same real DMA — but the
- * ALLOCATED columns drop from nNt*max_tile to nNt*Nt, and for a RESIDENT weight those columns
- * are memory held for the process lifetime.
- *
- * At the resident-MoE operating point that is not a rounding error. A resident weight's N is
- * split across the worker fds, so each worker plans on a SLICE: gpt-oss's N=2880 over 5
- * workers gives a 576-wide slice, which at Nt=256 stores 3*256 = 768 columns to hold 576 — a
- * 33% padding tax on every resident expert, when residency is the entire product of the
- * native-quant expert route. At Nt=192 the same 3 tiles store exactly 576.
- *
- * Rounding UP to the 32-column int8 N-alignment is load-bearing: rounding DOWN can drop the
- * tile below ceil(N/nNt) and cost an EXTRA tile — a real dispatch cost, to save nothing.
- *
- * Callers may still shrink Nt afterwards to fit the CBUF; that stays correct (it only costs
- * tiles), it just may no longer divide N evenly.
- */
-static int i8_pick_nt(int N, int max_tile) {
-    int Nt;
-    if (N <= max_tile) {
-        Nt = N;
-    } else {
-        const int nNt = (N + max_tile - 1) / max_tile;   /* fewest tiles max_tile allows */
-        Nt = (N + nNt - 1) / nNt;                        /* smallest tile reaching them   */
+int rocket_matmul_int8_groupwise(int fd, int M, int K, int N,
+                                 const int8_t *A, const int8_t *B,
+                                 const float *a_scale, const float *b_scale,
+                                 float *Cf, int group)
+{
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
+        return ROCKET_E_UNSUPPORTED;
+    int Mt, Kt, Nt;
+    if (rocket_matmul_plan_int8_gw(M, K, N, group, &Mt, &Kt, &Nt) < 0) {
+        ROCKET_LOGE("rocket_matmul_int8_groupwise: unsupported shape M=%d K=%d N=%d "
+                "group=%d (need K%%32, N%%32, M%%4, group%%32, group|K)\n", M, K, N, group);
+        return ROCKET_E_SHAPE;
     }
-    Nt = (Nt + 31) / 32 * 32;                            /* int8 N-align — UP, see above  */
-    if (Nt > max_tile) Nt = (max_tile / 32) * 32;
-    if (Nt < 32)       Nt = 32;
-    return Nt;
-}
+    int nG = K / group;                                        /* quant groups along K */
+    int nMt = (M + Mt - 1) / Mt, nNt = (N + Nt - 1) / Nt, nKt = K / Kt;
+    int kt_per_group = group / Kt;                             /* K-tiles inside one group */
+    size_t in_slot  = (size_t)rup(Mt, 4)  * rup(Kt, 32);       /* int8 elems  */
+    size_t wt_slot  = (size_t)rup(Nt, 32) * rup(Kt, 32);       /* int8 elems  */
+    size_t out_slot = (size_t)rup(Mt, 4)  * rup(Nt, 16);       /* int32 elems */
 
-/* int8 NPU layout index math (cf. feat_idx/wt_idx). Input feature cube C2=16,
- * weight k-group 32 (== weight_int8()), int32-output cube C2=4. */
-static inline size_t feat_idx_i8(int H, int ch, int h) {   /* input, C2=16 */
-    return ((size_t)(ch - 1) / 16) * (size_t)H * 16 + 16 * (size_t)(h - 1) + (ch - 1) % 16;
-}
-static inline size_t wt_idx_i8(int C, int k, int c) {      /* weight, k-group 32 */
-    return (size_t)((c - 1) / 32) * 32 * 32 + (size_t)((k - 1) / 32) * 32 * C
-         + (size_t)((c - 1) % 32) + (size_t)((k - 1) % 32) * 32;
-}
-static inline size_t out_idx_i8(int H, int ch, int h) {    /* output, C2=4 */
-    return ((size_t)(ch - 1) / 4) * (size_t)H * 4 + 4 * (size_t)(h - 1) + (ch - 1) % 4;
+    /* ---- allocate BOs (int8 in/wt @1B, int32 out @4B) — geometry identical to
+     * rocket_matmul_int8, which is what makes this a drop-in scale-on-readback. ---- */
+    rocket_bo guard = {0}, regcmd = {0}, in_all = {0}, wt_all = {0}, out_all = {0};
+    size_t in_sz  = (size_t)nMt * nKt * in_slot  + CBUF_BANK;
+    size_t wt_sz  = (size_t)nNt * nKt * wt_slot  + CBUF_BANK;
+    size_t rc_sz  = (size_t)BATCH * RC_STRIDE * sizeof(uint64_t);
+    size_t out_sz = (size_t)BATCH * out_slot * sizeof(int32_t) + CBUF_BANK;
+
+    int ret = 0;
+    ret |= rocket_bo_alloc(fd, 4096, &guard);                  /* push allocs off IOVA 0 */
+    ret |= rocket_bo_alloc(fd, rc_sz,  &regcmd);
+    ret |= rocket_bo_alloc(fd, in_sz,  &in_all);
+    ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
+    ret |= rocket_bo_alloc(fd, out_sz, &out_all);
+    if (ret) { ROCKET_LOGE("rocket_matmul_int8_groupwise: BO alloc failed\n"); ret = -1; goto free_bos; }
+    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
+         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
+        ROCKET_LOGE("rocket_matmul_int8_groupwise: a BO dma_address exceeds 32 bits\n");
+        ret = -1; goto free_bos;
+    }
+
+    /* ---- pack weights B[N,K] -> (N/32,K/32,32,32) int8 tile layout ---- */
+    if (rocket_bo_prep(fd, &wt_all, 1, 0) != 0) { ret = -1; goto free_bos; }
+    memset(wt_all.ptr, 0, wt_all.size);
+    for (int ni = 0; ni < nNt; ni++) {
+        int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
+        for (int ki = 0; ki < nKt; ki++) {
+            int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
+            int8_t *slot = (int8_t *)wt_all.ptr + (size_t)(ni * nKt + ki) * wt_slot;
+            MM_WT_SCATTER(int8_t, int8_t, 32, 32, wt_idx_i8,
+                          slot, B, K, n0, k0, Ntile, Ktile, MM_ID);
+        }
+    }
+    rocket_bo_fini(fd, &wt_all);
+
+    /* ---- pack input A[M,K] -> (M,K) int8 feature cube (C2=16) ---- */
+    if (rocket_bo_prep(fd, &in_all, 1, 0) != 0) { ret = -1; goto free_bos; }
+    memset(in_all.ptr, 0, in_all.size);
+    for (int mi = 0; mi < nMt; mi++) {
+        int m0 = mi * Mt, Mtile = (M - m0 < Mt) ? (M - m0) : Mt;
+        for (int ki = 0; ki < nKt; ki++) {
+            int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
+            int8_t *slot = (int8_t *)in_all.ptr + (size_t)(mi * nKt + ki) * in_slot;
+            MM_CUBE_SCATTER(int8_t, int8_t, 16, feat_idx_i8,
+                            slot, A, K, m0, k0, Mtile, Ktile, MM_ID);
+        }
+    }
+    rocket_bo_fini(fd, &in_all);
+
+    /* ---- batched tile compute: host fp32 K-accumulation with per-group scales ---- */
+    rocket_task_desc *tasks = malloc(BATCH * sizeof(*tasks));
+    uint64_t npu_regs[256] = {0};
+    int *bm0 = malloc(BATCH * sizeof(int)), *bn0 = malloc(BATCH * sizeof(int));
+    int *bMtile = malloc(BATCH * sizeof(int)), *bNtile = malloc(BATCH * sizeof(int));
+    int *bg = malloc(BATCH * sizeof(int));
+    size_t *boff = malloc(BATCH * sizeof(size_t));
+    if (!tasks || !bm0 || !bn0 || !bMtile || !bNtile || !bg || !boff) { ret = -1; goto free_host; }
+    memset(Cf, 0, (size_t)M * N * sizeof(float));
+
+    int total = nMt * nNt * nKt, done_tiles = 0, nb = 0;
+    for (int mi = 0; mi < nMt; mi++) {
+        int m0 = mi * Mt, Mtile = (M - m0 < Mt) ? (M - m0) : Mt;
+        for (int ni = 0; ni < nNt; ni++) {
+            int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
+            for (int ki = 0; ki < nKt; ki++) {
+                int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
+
+                if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
+
+                size_t out_off = (size_t)nb * out_slot;
+                matmul_params_t p = {
+                    .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
+                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot),
+                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot),
+                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(int32_t)),
+                    .tasks = npu_regs,
+                };
+                if ((ret = gen_matmul_int8(&p)) != 0) {
+                    ROCKET_LOGE("rocket_matmul_int8_groupwise: gen failed (%d)\n", ret); goto free_host;
+                }
+                if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
+                memcpy((uint64_t *)regcmd.ptr + (size_t)nb * RC_STRIDE, npu_regs,
+                       (size_t)p.task_count * sizeof(uint64_t));
+                tasks[nb].regcmd = (uint32_t)(regcmd.dma_address + (size_t)nb * RC_STRIDE * sizeof(uint64_t));
+                tasks[nb].regcmd_count = p.task_count;
+                bm0[nb] = m0; bn0[nb] = n0; bMtile[nb] = Mtile; bNtile[nb] = Ntile;
+                bg[nb] = ki / kt_per_group;    /* Kt | group, so the tile lies in ONE group */
+                boff[nb] = out_off;
+                nb++; done_tiles++;
+
+                if (nb == BATCH || done_tiles == total) {
+                    rocket_bo_fini(fd, &regcmd);
+                    rocket_bo_prep(fd, &out_all, 1, 0);
+                    rocket_bo_fini(fd, &out_all);
+
+                    uint32_t in_h[]  = { in_all.handle, wt_all.handle, regcmd.handle };
+                    uint32_t out_h[] = { out_all.handle };
+                    if ((ret = rocket_submit_tasks(fd, tasks, nb, in_h, 3, out_h, 1)) != 0) goto free_host;
+                    if ((ret = rocket_bo_prep(fd, &out_all, 0, rocket_wait_ns())) != 0) {
+                        ROCKET_LOGE("rocket_matmul_int8_groupwise: WAIT TIMEOUT (%d) M=%d K=%d N=%d "
+                                "batch=%d tiles=%d/%d\n", ret, M, K, N, nb, done_tiles, total);
+                        goto free_host;
+                    }
+
+                    int32_t *ob = (int32_t *)out_all.ptr;
+                    for (int j = 0; j < nb; j++) {
+                        int32_t *slot = ob + boff[j];
+                        int g = bg[j];
+#define MM_ACC_(h_, nn_, v_) do {                                            \
+    int mrow_ = bm0[j] + (h_) - 1, ncol_ = bn0[j] + (nn_) - 1;               \
+    Cf[(size_t)mrow_ * N + ncol_] += a_scale[(size_t)mrow_ * nG + g] *       \
+        b_scale[(size_t)ncol_ * nG + g] * (float)(v_);                       \
+} while (0)
+                        MM_CUBE_GATHER(int32_t, 4, out_idx_i8, slot,
+                                       bMtile[j], bNtile[j], MM_ACC_);
+#undef MM_ACC_
+                    }
+                    rocket_bo_fini(fd, &out_all);
+                    nb = 0;
+                }
+            }
+        }
+    }
+
+free_host:
+    free(tasks); free(bm0); free(bn0); free(bMtile); free(bNtile); free(bg); free(boff);
+free_bos:
+    rocket_bo_free(fd, &guard);
+    rocket_bo_free(fd, &regcmd); rocket_bo_free(fd, &in_all);
+    rocket_bo_free(fd, &wt_all); rocket_bo_free(fd, &out_all);
+    return ret;
 }
 
 int rocket_matmul_plan_int8(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 {
-    /* Machine parameters from the active hardware profile (see rocket_matmul_plan). */
-    const struct rocket_hw_profile *hw = rocket_hw_current();
-    const int MAX_TILE = hw->max_tile, CBUF_BANKS = hw->cbuf_banks;
-    /* M%4==0 only — M==1 (height-1 GEMV) is broken on HW (the cosine-sim correctness matrix); the
-     * one-shot rocket_matmul_int8 pads M==1->4 before planning, non-padding
-     * callers (resident/int16_exact pre-check) get an honest -1. */
-    if (K % 32 || N % 32 || M % 4 != 0)
-        return ROCKET_E_SHAPE;
-
-    int Mt = (M < MAX_TILE) ? M : MAX_TILE;
-    /* Deliberately NOT i8_pick_nt here, unlike the group-wise twin below. This planner's Kt
-     * is unconstrained (it starts at K and shrinks to fit the CBUF), so a smaller Nt frees
-     * CBUF banks and lets Kt GROW — at the resident MoE shape it would move Kt 640 -> 768 and
-     * re-tile K on a shipped, HW-validated path, for a padding win this plan does not need
-     * (the dense W8A8 path holds one weight per tensor, not thousands of experts). The
-     * group-wise planner has no such coupling: its Kt can never exceed the quant group.
-     * Applying it here is a real lever for dense-int8 model fit, but it is its own change,
-     * with its own gate run — int8 CBUF edges are where the feature-DMA resonance lived. */
-    int Nt = (N < MAX_TILE) ? N : MAX_TILE;
-    Nt = (Nt / 32) * 32; if (Nt < 32) Nt = 32;   /* int8 N-align is 32 */
-
-    const char *e;
-    if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }
-    if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= 32) { Nt = (v/32)*32; if (Nt > N) Nt = N; } }
-
-    /* Reserve ONE feature slack bank: gen_matmul_int8 sets data_bank = fd_banks+1
-     * to dodge the int8 feature-DMA tail-row resonance, so the planner must keep
-     * feature+weight within BANKS-1 (the +1th bank is the feature's slack). */
-    const int I8_BUDGET = CBUF_BANKS - 1;
-    int Kt = (K < 16384) ? K : 16384;
-    Kt = (Kt / 32) * 32; if (Kt < 32) Kt = 32;
-    while (Kt > 32 && banks_for_i8(Mt, Kt) + banks_for_i8(Nt, Kt) > I8_BUDGET) Kt -= 32;
-    while (banks_for_i8(Mt, Kt) + banks_for_i8(Nt, Kt) > I8_BUDGET && Nt > 32) Nt -= 32;
-    while (banks_for_i8(Mt, Kt) + banks_for_i8(Nt, Kt) > I8_BUDGET && Mt > 4)  Mt -= 4;
-
-    if ((e = getenv("ROCKET_MM_KT"))) {
-        int v = atoi(e);
-        if (v >= 32) {
-            Kt = (v/32)*32; if (Kt > (K/32)*32) Kt = (K/32)*32;
-            while (Kt > 32 && banks_for_i8(Mt, Kt) + banks_for_i8(Nt, Kt) > I8_BUDGET) Kt -= 32;
-        }
-    }
-
-    if (pMt) *pMt = Mt;
-    if (pKt) *pKt = Kt;
-    if (pNt) *pNt = Nt;
-
-    int nm = (M + Mt - 1) / Mt, nn = (N + Nt - 1) / Nt, nk = (K + Kt - 1) / Kt;
-    /* M4: reject shapes whose int tile-count product would overflow before the
-     * size_t BO math (and the `total = nMt*nNt*nKt` in the compute loops below). */
-    if ((int64_t)nm * nn * nk > INT32_MAX) return ROCKET_E_SHAPE;
-    return nm * nn * nk;
+    return mm_plan_geom(&mm_geom_int8, M, K, N, 0, pMt, pKt, pNt);
 }
 
 int rocket_matmul_int8(int fd, int M, int K, int N,
@@ -2495,9 +2772,8 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             int8_t *slot = (int8_t *)wt_all.ptr + (size_t)(ni * nKt + ki) * wt_slot;
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[wt_idx_i8(Ktile, kk, c)] = B[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)];
+            MM_WT_SCATTER(int8_t, int8_t, 32, 32, wt_idx_i8,
+                          slot, B, K, n0, k0, Ntile, Ktile, MM_ID);
         }
     }
     rocket_bo_fini(fd, &wt_all);
@@ -2512,9 +2788,8 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             int8_t *slot = (int8_t *)in_all.ptr + (size_t)(mi * nKt + ki) * in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[feat_idx_i8(Mtile, c, h)] = A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)];
+            MM_CUBE_SCATTER(int8_t, int8_t, 16, feat_idx_i8,
+                            slot, A, K, m0, k0, Mtile, Ktile, MM_ID);
         }
     }
     rocket_bo_fini(fd, &in_all);
@@ -2594,10 +2869,11 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
                     int32_t *ob = (int32_t *)out_all.ptr;
                     for (int j = 0; j < nb; j++) {
                         int32_t *slot = ob + boff[j];
-                        for (int h = 1; h <= bMtile[j]; h++)
-                            for (int nn = 1; nn <= bNtile[j]; nn++)
-                                acc[(size_t)(bm0[j] + h - 1) * N + (bn0[j] + nn - 1)] +=
-                                    (int64_t)slot[out_idx_i8(bMtile[j], nn, h)];
+#define MM_ACC_(h_, nn_, v_) \
+    (acc[(size_t)(bm0[j] + (h_) - 1) * N + (bn0[j] + (nn_) - 1)] += (int64_t)(v_))
+                        MM_CUBE_GATHER(int32_t, 4, out_idx_i8, slot,
+                                       bMtile[j], bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     rocket_bo_fini(fd, &out_all);
                     t_read += now_ms() - tsx;
@@ -2627,250 +2903,6 @@ free_bos:
 }
 
 /* ============================================================================
- * GROUP-WISE int8 matmul: C_f[M,N] = sum_g a_scale[m,g]*b_scale[n,g] * (int32
- * partial of K-group g), accumulated in fp32.
- *
- * The int8 sibling of rocket_matmul_int4_groupwise, and the primitive a natively
- * quantized weight needs. Such a weight (a GGUF MXFP4 / Q8_0 / Q4_K block) carries
- * one scale per K-block, and the NPU cannot apply a K-blocked scale on-chip: at the
- * output stage K is fully contracted, so nothing in the DPU is indexed by a K-block,
- * for any dtype. But the integer partials ALREADY leave the chip at every K-tile
- * boundary — on-device integer K-accum is HW-dead (see rocket_matmul_int8 above) —
- * so the block scale is free at a boundary that is already being paid for. Keep each
- * K-tile inside one quant group, multiply its int32 partial by that group's scale,
- * accumulate in fp32 on the host. The NPU-side work is identical to
- * rocket_matmul_int8; the only delta is `float += scale * int32` on readback instead
- * of `int64 += int32`.
- *
- * A, B are PRE-QUANTIZED int8 (row-major); a_scale is [M*nG] and b_scale is [N*nG]
- * (row-major, nG = K/group); Cf[M,N] is overwritten. Alignment is rocket_matmul_int8's
- * minus the M==1 pad: K%32, N%32, M%4 — a padded M==1 would need a padded a_scale
- * too, so single vectors are padded to M=4 caller-side (as the resident paths require).
- *
- * There is NO saturation bound here. The int4 twin needs `49*group < 32767` because
- * its NPU output is int16; int8's is int32, and a K-tile partial is bounded by
- * |group * 127 * 127| = 16129*group — well inside int32 for any group the CBUF can
- * hold (Kt <= 640 on RK3588). That headroom is exactly why int8, not int4, is the
- * dtype for a GGUF-quantized weight.
- * ==========================================================================*/
-
-/* Group-wise int8 tiling (pure). Kt is constrained to lie inside one quant group,
- * which the free-Kt search in rocket_matmul_plan_int8 cannot express, so the CBUF is
- * re-fitted here around that constraint.
- *
- * Kt need only DIVIDE the group, not equal it: each K-tile must lie wholly inside one
- * group so its partial can take that group's single scale, but it does not have to BE
- * the group. So readback (~ M*N*nKt, and these paths are readback-bound) is set by the
- * CBUF's Kt cap, and `group` only upper-bounds it. Take the largest divisor that fits.
- *
- * Do NOT do what rocket_matmul_int4_groupwise does — overwrite the planner's Kt with
- * `group` and re-check nothing. int4 gets away with that only because its int16
- * saturation bound already caps group at 668 AND its nibble packing halves the bytes.
- * int8 has neither (the int32 accumulator is the whole point), so an un-rechecked wide
- * group would silently overflow the CBUF. */
-int rocket_matmul_plan_int8_gw(int M, int K, int N, int group,
-                               int *pMt, int *pKt, int *pNt)
-{
-    const struct rocket_hw_profile *hw = rocket_hw_current();
-    const int MAX_TILE = hw->max_tile, CBUF_BANKS = hw->cbuf_banks;
-    if (K % 32 || N % 32 || M % 4 != 0) return ROCKET_E_SHAPE;
-    if (group < 32 || group % 32 || K % group) return ROCKET_E_SHAPE;
-
-    /* Reserve ONE feature slack bank, exactly as rocket_matmul_plan_int8 does:
-     * gen_matmul_int8 sets data_bank = fd_banks+1 to dodge the int8 feature-DMA
-     * tail-row resonance, so feature+weight must stay within BANKS-1. */
-    const int I8_BUDGET = CBUF_BANKS - 1;
-
-    int Mt = (M < MAX_TILE) ? M : MAX_TILE;
-    int Nt = i8_pick_nt(N, MAX_TILE);
-
-    const char *e;
-    if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }
-    if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= 32) { Nt = (v/32)*32; if (Nt > N) Nt = N; } }
-    /* ROCKET_MM_KT is deliberately NOT honored: Kt is pinned by the quant group. */
-
-    int Kt = 0;
-    for (;;) {
-        for (int d = group; d >= 32; d -= 32) {
-            if (group % d) continue;             /* a K-tile must never straddle a group */
-            if (banks_for_i8(Mt, d) + banks_for_i8(Nt, d) <= I8_BUDGET) { Kt = d; break; }
-        }
-        if (Kt) break;
-        /* Not even a 32-wide K-tile fits at this tile size. Unreachable on RK3588
-         * (Mt,Nt <= 256 costs 2 banks at Kt=32, against a budget of 11); defensive
-         * against a future profile with a large max_tile or a small CBUF. */
-        if      (Nt > 32) Nt -= 32;
-        else if (Mt > 4)  Mt -= 4;
-        else return ROCKET_E_SHAPE;
-    }
-
-    if (pMt) *pMt = Mt;
-    if (pKt) *pKt = Kt;
-    if (pNt) *pNt = Nt;
-
-    int nm = (M + Mt - 1) / Mt, nn = (N + Nt - 1) / Nt, nk = K / Kt;   /* Kt | group | K */
-    if ((int64_t)nm * nn * nk > INT32_MAX) return ROCKET_E_SHAPE;
-    return nm * nn * nk;
-}
-
-int rocket_matmul_int8_groupwise(int fd, int M, int K, int N,
-                                 const int8_t *A, const int8_t *B,
-                                 const float *a_scale, const float *b_scale,
-                                 float *Cf, int group)
-{
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
-        return ROCKET_E_UNSUPPORTED;
-    int Mt, Kt, Nt;
-    if (rocket_matmul_plan_int8_gw(M, K, N, group, &Mt, &Kt, &Nt) < 0) {
-        ROCKET_LOGE("rocket_matmul_int8_groupwise: unsupported shape M=%d K=%d N=%d "
-                "group=%d (need K%%32, N%%32, M%%4, group%%32, group|K)\n", M, K, N, group);
-        return ROCKET_E_SHAPE;
-    }
-    int nG = K / group;                                        /* quant groups along K */
-    int nMt = (M + Mt - 1) / Mt, nNt = (N + Nt - 1) / Nt, nKt = K / Kt;
-    int kt_per_group = group / Kt;                             /* K-tiles inside one group */
-    size_t in_slot  = (size_t)rup(Mt, 4)  * rup(Kt, 32);       /* int8 elems  */
-    size_t wt_slot  = (size_t)rup(Nt, 32) * rup(Kt, 32);       /* int8 elems  */
-    size_t out_slot = (size_t)rup(Mt, 4)  * rup(Nt, 16);       /* int32 elems */
-
-    /* ---- allocate BOs (int8 in/wt @1B, int32 out @4B) — geometry identical to
-     * rocket_matmul_int8, which is what makes this a drop-in scale-on-readback. ---- */
-    rocket_bo guard = {0}, regcmd = {0}, in_all = {0}, wt_all = {0}, out_all = {0};
-    size_t in_sz  = (size_t)nMt * nKt * in_slot  + CBUF_BANK;
-    size_t wt_sz  = (size_t)nNt * nKt * wt_slot  + CBUF_BANK;
-    size_t rc_sz  = (size_t)BATCH * RC_STRIDE * sizeof(uint64_t);
-    size_t out_sz = (size_t)BATCH * out_slot * sizeof(int32_t) + CBUF_BANK;
-
-    int ret = 0;
-    ret |= rocket_bo_alloc(fd, 4096, &guard);                  /* push allocs off IOVA 0 */
-    ret |= rocket_bo_alloc(fd, rc_sz,  &regcmd);
-    ret |= rocket_bo_alloc(fd, in_sz,  &in_all);
-    ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
-    ret |= rocket_bo_alloc(fd, out_sz, &out_all);
-    if (ret) { ROCKET_LOGE("rocket_matmul_int8_groupwise: BO alloc failed\n"); ret = -1; goto free_bos; }
-    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
-         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul_int8_groupwise: a BO dma_address exceeds 32 bits\n");
-        ret = -1; goto free_bos;
-    }
-
-    /* ---- pack weights B[N,K] -> (N/32,K/32,32,32) int8 tile layout ---- */
-    if (rocket_bo_prep(fd, &wt_all, 1, 0) != 0) { ret = -1; goto free_bos; }
-    memset(wt_all.ptr, 0, wt_all.size);
-    for (int ni = 0; ni < nNt; ni++) {
-        int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
-        for (int ki = 0; ki < nKt; ki++) {
-            int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
-            int8_t *slot = (int8_t *)wt_all.ptr + (size_t)(ni * nKt + ki) * wt_slot;
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[wt_idx_i8(Ktile, kk, c)] = B[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)];
-        }
-    }
-    rocket_bo_fini(fd, &wt_all);
-
-    /* ---- pack input A[M,K] -> (M,K) int8 feature cube (C2=16) ---- */
-    if (rocket_bo_prep(fd, &in_all, 1, 0) != 0) { ret = -1; goto free_bos; }
-    memset(in_all.ptr, 0, in_all.size);
-    for (int mi = 0; mi < nMt; mi++) {
-        int m0 = mi * Mt, Mtile = (M - m0 < Mt) ? (M - m0) : Mt;
-        for (int ki = 0; ki < nKt; ki++) {
-            int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
-            int8_t *slot = (int8_t *)in_all.ptr + (size_t)(mi * nKt + ki) * in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[feat_idx_i8(Mtile, c, h)] = A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)];
-        }
-    }
-    rocket_bo_fini(fd, &in_all);
-
-    /* ---- batched tile compute: host fp32 K-accumulation with per-group scales ---- */
-    rocket_task_desc *tasks = malloc(BATCH * sizeof(*tasks));
-    uint64_t npu_regs[256] = {0};
-    int *bm0 = malloc(BATCH * sizeof(int)), *bn0 = malloc(BATCH * sizeof(int));
-    int *bMtile = malloc(BATCH * sizeof(int)), *bNtile = malloc(BATCH * sizeof(int));
-    int *bg = malloc(BATCH * sizeof(int));
-    size_t *boff = malloc(BATCH * sizeof(size_t));
-    if (!tasks || !bm0 || !bn0 || !bMtile || !bNtile || !bg || !boff) { ret = -1; goto free_host; }
-    memset(Cf, 0, (size_t)M * N * sizeof(float));
-
-    int total = nMt * nNt * nKt, done_tiles = 0, nb = 0;
-    for (int mi = 0; mi < nMt; mi++) {
-        int m0 = mi * Mt, Mtile = (M - m0 < Mt) ? (M - m0) : Mt;
-        for (int ni = 0; ni < nNt; ni++) {
-            int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
-            for (int ki = 0; ki < nKt; ki++) {
-                int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
-
-                if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
-
-                size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
-                    .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot),
-                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot),
-                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(int32_t)),
-                    .tasks = npu_regs,
-                };
-                if ((ret = gen_matmul_int8(&p)) != 0) {
-                    ROCKET_LOGE("rocket_matmul_int8_groupwise: gen failed (%d)\n", ret); goto free_host;
-                }
-                if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
-                memcpy((uint64_t *)regcmd.ptr + (size_t)nb * RC_STRIDE, npu_regs,
-                       (size_t)p.task_count * sizeof(uint64_t));
-                tasks[nb].regcmd = (uint32_t)(regcmd.dma_address + (size_t)nb * RC_STRIDE * sizeof(uint64_t));
-                tasks[nb].regcmd_count = p.task_count;
-                bm0[nb] = m0; bn0[nb] = n0; bMtile[nb] = Mtile; bNtile[nb] = Ntile;
-                bg[nb] = ki / kt_per_group;    /* Kt | group, so the tile lies in ONE group */
-                boff[nb] = out_off;
-                nb++; done_tiles++;
-
-                if (nb == BATCH || done_tiles == total) {
-                    rocket_bo_fini(fd, &regcmd);
-                    rocket_bo_prep(fd, &out_all, 1, 0);
-                    rocket_bo_fini(fd, &out_all);
-
-                    uint32_t in_h[]  = { in_all.handle, wt_all.handle, regcmd.handle };
-                    uint32_t out_h[] = { out_all.handle };
-                    if ((ret = rocket_submit_tasks(fd, tasks, nb, in_h, 3, out_h, 1)) != 0) goto free_host;
-                    if ((ret = rocket_bo_prep(fd, &out_all, 0, rocket_wait_ns())) != 0) {
-                        ROCKET_LOGE("rocket_matmul_int8_groupwise: WAIT TIMEOUT (%d) M=%d K=%d N=%d "
-                                "batch=%d tiles=%d/%d\n", ret, M, K, N, nb, done_tiles, total);
-                        goto free_host;
-                    }
-
-                    int32_t *ob = (int32_t *)out_all.ptr;
-                    for (int j = 0; j < nb; j++) {
-                        int32_t *slot = ob + boff[j];
-                        int g = bg[j];
-                        for (int h = 1; h <= bMtile[j]; h++) {
-                            int mrow = bm0[j] + h - 1;
-                            float as = a_scale[(size_t)mrow * nG + g];
-                            for (int nn = 1; nn <= bNtile[j]; nn++) {
-                                int ncol = bn0[j] + nn - 1;
-                                Cf[(size_t)mrow * N + ncol] +=
-                                    as * b_scale[(size_t)ncol * nG + g] *
-                                    (float)slot[out_idx_i8(bMtile[j], nn, h)];
-                            }
-                        }
-                    }
-                    rocket_bo_fini(fd, &out_all);
-                    nb = 0;
-                }
-            }
-        }
-    }
-
-free_host:
-    free(tasks); free(bm0); free(bn0); free(bMtile); free(bNtile); free(bg); free(boff);
-free_bos:
-    rocket_bo_free(fd, &guard);
-    rocket_bo_free(fd, &regcmd); rocket_bo_free(fd, &in_all);
-    rocket_bo_free(fd, &wt_all); rocket_bo_free(fd, &out_all);
-    return ret;
-}
-
-/* ============================================================================
  * int4 x int4 -> int16 tiled matmul.
  *
  * Self-contained sibling of the int8 path above (same zero-regression stance).
@@ -2888,71 +2920,9 @@ free_bos:
  * int4 is ~2x int8's (half the bytes), so many shapes are single-pass (nKt=1).
  * ==========================================================================*/
 
-/* CBUF banks for `rows` x Kt int4 (0.5 B/elem) — half int8's bytes, so Kt ~2x. */
-static int banks_for_i4(int rows, int Kt) {
-    long bytes = (long)rows * Kt / 2;
-    return (bytes + CBUF_BANK - 1) / CBUF_BANK;
-}
-
-/* int4 NPU layout index math (NIBBLE indices for in/wt; int16 elems for out). */
-static inline size_t feat_idx_i4(int H, int ch, int h) {   /* input nibble, C2=32 */
-    return ((size_t)(ch - 1) / 32) * (size_t)H * 32 + 32 * (size_t)(h - 1) + (ch - 1) % 32;
-}
-static inline size_t wt_idx_i4(int C, int k, int c) {      /* weight nibble, (N/64,K/32,64,32) */
-    size_t nKgrp   = (size_t)((C + 31) / 32);
-    size_t Ngrp    = (size_t)(k - 1) / 64, Nwithin = (size_t)(k - 1) % 64;
-    size_t Kgrp    = (size_t)(c - 1) / 32, Kwithin = (size_t)(c - 1) % 32;
-    return Ngrp * nKgrp * 64 * 32 + Kgrp * 64 * 32 + Nwithin * 32 + Kwithin;
-}
-static inline size_t out_idx_i4(int H, int ch, int h) {    /* output int16 elem, C2=8 */
-    return ((size_t)(ch - 1) / 8) * (size_t)H * 8 + 8 * (size_t)(h - 1) + (ch - 1) % 8;
-}
-/* set nibble `idx` (byte idx/2; even=low, odd=high) in a packed buffer. */
-static inline void put_nib(uint8_t *buf, size_t idx, int8_t v) {
-    uint8_t nib = (uint8_t)(v & 0xF);
-    if (idx & 1) buf[idx >> 1] = (uint8_t)((buf[idx >> 1] & 0x0F) | (nib << 4));
-    else         buf[idx >> 1] = (uint8_t)((buf[idx >> 1] & 0xF0) | nib);
-}
-
 int rocket_matmul_plan_int4(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 {
-    /* Machine parameters from the active hardware profile (see rocket_matmul_plan). */
-    const struct rocket_hw_profile *hw = rocket_hw_current();
-    const int MAX_TILE = hw->max_tile, CBUF_BANKS = hw->cbuf_banks;
-    if (K % 32 || N % 64 || M % 4 != 0)   /* int4 N-align is 64; M%4 (M==1 padded in one-shot) */
-        return ROCKET_E_SHAPE;
-
-    int Mt = (M < MAX_TILE) ? M : MAX_TILE;
-    int Nt = (N < MAX_TILE) ? N : MAX_TILE;
-    Nt = (Nt / 64) * 64; if (Nt < 64) Nt = 64;         /* int4 N-align 64 */
-
-    const char *e;
-    if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }
-    if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= 64) { Nt = (v/64)*64; if (Nt > N) Nt = N; } }
-
-    int Kt = (K < 16384) ? K : 16384;
-    Kt = (Kt / 32) * 32; if (Kt < 32) Kt = 32;
-    while (Kt > 32 && banks_for_i4(Mt, Kt) + banks_for_i4(Nt, Kt) > CBUF_BANKS) Kt -= 32;
-    while (banks_for_i4(Mt, Kt) + banks_for_i4(Nt, Kt) > CBUF_BANKS && Nt > 64) Nt -= 64;
-    while (banks_for_i4(Mt, Kt) + banks_for_i4(Nt, Kt) > CBUF_BANKS && Mt > 4)  Mt -= 4;
-
-    if ((e = getenv("ROCKET_MM_KT"))) {
-        int v = atoi(e);
-        if (v >= 32) {
-            Kt = (v/32)*32; if (Kt > (K/32)*32) Kt = (K/32)*32;
-            while (Kt > 32 && banks_for_i4(Mt, Kt) + banks_for_i4(Nt, Kt) > CBUF_BANKS) Kt -= 32;
-        }
-    }
-
-    if (pMt) *pMt = Mt;
-    if (pKt) *pKt = Kt;
-    if (pNt) *pNt = Nt;
-
-    int nm = (M + Mt - 1) / Mt, nn = (N + Nt - 1) / Nt, nk = (K + Kt - 1) / Kt;
-    /* M4: reject shapes whose int tile-count product would overflow before the
-     * size_t BO math (and the `total = nMt*nNt*nKt` in the compute loops below). */
-    if ((int64_t)nm * nn * nk > INT32_MAX) return ROCKET_E_SHAPE;
-    return nm * nn * nk;
+    return mm_plan_geom(&mm_geom_int4, M, K, N, 0, pMt, pKt, pNt);
 }
 
 int rocket_matmul_int4_ex(int fd, int M, int K, int N,
@@ -3005,9 +2975,7 @@ int rocket_matmul_int4_ex(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             uint8_t *slot = (uint8_t *)wt_all.ptr + (size_t)(ni * nKt + ki) * (wt_slot / 2);
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    put_nib(slot, wt_idx_i4(Ktile, kk, c), B[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)]);
+            i4_wt_scatter(slot, B, (size_t)K, n0, k0, Ntile, Ktile);
         }
     }
     rocket_bo_fini(fd, &wt_all);
@@ -3020,9 +2988,7 @@ int rocket_matmul_int4_ex(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             uint8_t *slot = (uint8_t *)in_all.ptr + (size_t)(mi * nKt + ki) * (in_slot / 2);
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    put_nib(slot, feat_idx_i4(Mtile, c, h), A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)]);
+            i4_feat_scatter(slot, A, (size_t)K, m0, k0, Mtile, Ktile);
         }
     }
     rocket_bo_fini(fd, &in_all);
@@ -3082,10 +3048,11 @@ int rocket_matmul_int4_ex(int fd, int M, int K, int N,
                     int16_t *ob = (int16_t *)out_all.ptr;
                     for (int j = 0; j < nb; j++) {
                         int16_t *slot = ob + boff[j];
-                        for (int h = 1; h <= bMtile[j]; h++)
-                            for (int nn = 1; nn <= bNtile[j]; nn++)
-                                acc[(size_t)(bm0[j] + h - 1) * N + (bn0[j] + nn - 1)] +=
-                                    (int64_t)slot[out_idx_i4(bMtile[j], nn, h)];
+#define MM_ACC_(h_, nn_, v_) \
+    (acc[(size_t)(bm0[j] + (h_) - 1) * N + (bn0[j] + (nn_) - 1)] += (int64_t)(v_))
+                        MM_CUBE_GATHER(int16_t, 8, out_idx_i4, slot,
+                                       bMtile[j], bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     rocket_bo_fini(fd, &out_all);
                     nb = 0;
@@ -3180,9 +3147,7 @@ int rocket_matmul_int4_groupwise(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             uint8_t *slot = (uint8_t *)wt_all.ptr + (size_t)(ni * nKt + ki) * (wt_slot / 2);
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    put_nib(slot, wt_idx_i4(Ktile, kk, c), B[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)]);
+            i4_wt_scatter(slot, B, (size_t)K, n0, k0, Ntile, Ktile);
         }
     }
     rocket_bo_fini(fd, &wt_all);
@@ -3195,9 +3160,7 @@ int rocket_matmul_int4_groupwise(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             uint8_t *slot = (uint8_t *)in_all.ptr + (size_t)(mi * nKt + ki) * (in_slot / 2);
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    put_nib(slot, feat_idx_i4(Mtile, c, h), A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)]);
+            i4_feat_scatter(slot, A, (size_t)K, m0, k0, Mtile, Ktile);
         }
     }
     rocket_bo_fini(fd, &in_all);
@@ -3254,16 +3217,14 @@ int rocket_matmul_int4_groupwise(int fd, int M, int K, int N,
                     for (int j = 0; j < nb; j++) {
                         int16_t *slot = ob + boff[j];
                         int g = bki[j];
-                        for (int h = 1; h <= bMtile[j]; h++) {
-                            int mrow = bm0[j] + h - 1;
-                            float as = a_scale[(size_t)mrow * nG + g];
-                            for (int nn = 1; nn <= bNtile[j]; nn++) {
-                                int ncol = bn0[j] + nn - 1;
-                                Cf[(size_t)mrow * N + ncol] +=
-                                    as * b_scale[(size_t)ncol * nG + g] *
-                                    (float)slot[out_idx_i4(bMtile[j], nn, h)];
-                            }
-                        }
+#define MM_ACC_(h_, nn_, v_) do {                                            \
+    int mrow_ = bm0[j] + (h_) - 1, ncol_ = bn0[j] + (nn_) - 1;               \
+    Cf[(size_t)mrow_ * N + ncol_] += a_scale[(size_t)mrow_ * nG + g] *       \
+        b_scale[(size_t)ncol_ * nG + g] * (float)(v_);                       \
+} while (0)
+                        MM_CUBE_GATHER(int16_t, 8, out_idx_i4, slot,
+                                       bMtile[j], bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     rocket_bo_fini(fd, &out_all);
                     nb = 0;
@@ -3286,7 +3247,7 @@ free_bos:
  *
  * int16 = fp16's INPUT geometry (in/wt are 2 B whole elements; feature cube C2=8;
  * weight layout (N/16,K/32,16,32) [weight_int16 == weight_fp16, N-group 16];
- * banks_for_i16 is x2, 2 B/elem) with a 4 B output cube (C2=4, == int8). The bf16
+ * 2 B/elem, so the bank cost matches fp16's) with a 4 B output cube (C2=4, == int8). The bf16
  * and tf32 tiled paths below reuse this plan and these index helpers — they share
  * the 2-byte input geometry and the C2=4 output de-tile, differing only in dtype.
  *
@@ -3299,63 +3260,10 @@ free_bos:
  * <=16-bit operand DMA, exactly like int8).
  * ==========================================================================*/
 
-/* CBUF banks for `rows` x Kt int16 (2 B/elem) — same as fp16's banks_for. */
-static int banks_for_i16(int rows, int Kt) {
-    return ((long)rows * Kt * 2 + CBUF_BANK - 1) / CBUF_BANK;
-}
-
-/* int16 NPU layout index math. Feature cube C2=8 (== fp16); weight (N/16,K/32,
- * 16,32) (== weight_fp16); int32-output cube C2=4 (== int8). */
-static inline size_t feat_idx_i16(int H, int ch, int h) {   /* input, C2=8 */
-    return ((size_t)(ch - 1) / 8) * (size_t)H * 8 + 8 * (size_t)(h - 1) + (ch - 1) % 8;
-}
-static inline size_t wt_idx_i16(int C, int k, int c) {      /* weight, (N/16,K/32,16,32) */
-    return (size_t)((c - 1) / 32) * 32 * 16 + (size_t)((k - 1) / 16) * 16 * C
-         + (size_t)((c - 1) % 32) + (size_t)((k - 1) % 16) * 32;
-}
-static inline size_t out_idx_i16(int H, int ch, int h) {    /* output int32 elem, C2=4 */
-    return ((size_t)(ch - 1) / 4) * (size_t)H * 4 + 4 * (size_t)(h - 1) + (ch - 1) % 4;
-}
 
 int rocket_matmul_plan_int16(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 {
-    /* Machine parameters from the active hardware profile (see rocket_matmul_plan). */
-    const struct rocket_hw_profile *hw = rocket_hw_current();
-    const int MAX_TILE = hw->max_tile, CBUF_BANKS = hw->cbuf_banks;
-    if (K % 32 || N % 16 || M % 4 != 0)   /* int16/bf16 N-align 16; M%4 (M==1 padded in one-shot) */
-        return ROCKET_E_SHAPE;
-
-    int Mt = (M < MAX_TILE) ? M : MAX_TILE;
-    int Nt = (N < MAX_TILE) ? N : MAX_TILE;
-    Nt = (Nt / 16) * 16; if (Nt < 16) Nt = 16;         /* int16 N-align 16 */
-
-    const char *e;
-    if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }
-    if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= 16) { Nt = (v/16)*16; if (Nt > N) Nt = N; } }
-
-    int Kt = (K < 16384) ? K : 16384;
-    Kt = (Kt / 32) * 32; if (Kt < 32) Kt = 32;
-    while (Kt > 32 && banks_for_i16(Mt, Kt) + banks_for_i16(Nt, Kt) > CBUF_BANKS) Kt -= 32;
-    while (banks_for_i16(Mt, Kt) + banks_for_i16(Nt, Kt) > CBUF_BANKS && Nt > 16) Nt -= 16;
-    while (banks_for_i16(Mt, Kt) + banks_for_i16(Nt, Kt) > CBUF_BANKS && Mt > 4)  Mt -= 4;
-
-    if ((e = getenv("ROCKET_MM_KT"))) {
-        int v = atoi(e);
-        if (v >= 32) {
-            Kt = (v/32)*32; if (Kt > (K/32)*32) Kt = (K/32)*32;
-            while (Kt > 32 && banks_for_i16(Mt, Kt) + banks_for_i16(Nt, Kt) > CBUF_BANKS) Kt -= 32;
-        }
-    }
-
-    if (pMt) *pMt = Mt;
-    if (pKt) *pKt = Kt;
-    if (pNt) *pNt = Nt;
-
-    int nm = (M + Mt - 1) / Mt, nn = (N + Nt - 1) / Nt, nk = (K + Kt - 1) / Kt;
-    /* M4: reject shapes whose int tile-count product would overflow before the
-     * size_t BO math (and the `total = nMt*nNt*nKt` in the compute loops below). */
-    if ((int64_t)nm * nn * nk > INT32_MAX) return ROCKET_E_SHAPE;
-    return nm * nn * nk;
+    return mm_plan_geom(&mm_geom_int16, M, K, N, 0, pMt, pKt, pNt);
 }
 
 /* ---- bit-exact int16 x int16 -> int64 via int8 byte-decomposition -------------
@@ -3424,8 +3332,8 @@ done:
  * bf16 x bf16 -> fp32 tiled matmul.
  *
  * bf16 shares the int16 NPU GEOMETRY exactly (2-byte input, feature cube C2=8,
- * weight (N/16,K/32,16,32), 4-byte output cube C2=4), so it reuses banks_for_i16 /
- * feat_idx_i16 / wt_idx_i16 / out_idx_i16 and rocket_matmul_plan_int16. Unlike
+ * weight (N/16,K/32,16,32), 4-byte output cube C2=4), so it reuses feat_idx_i16 /
+ * wt_idx_i16 / out_idx_i16 and rocket_matmul_plan_int16. Unlike
  * int16 it has a working native output. It differs only in DTYPE: the output is
  * fp32 (not int32), the K-partials are summed on the HOST in double, and there is
  * NO saturation — fp32 output is the bf16 MAC's natural fp32 accumulation,
@@ -3441,9 +3349,6 @@ done:
 
 /* fp32 -> bf16 by truncation (high 16 bits). Matches matmul_bf16_rocket's
  * reference; the NPU then does exact bf16 products + fp32 accumulate. */
-static inline uint16_t f32_to_bf16(float f) {
-    uint32_t b; memcpy(&b, &f, sizeof b); return (uint16_t)(b >> 16);
-}
 
 int rocket_matmul_plan_bf16(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 {
@@ -3496,9 +3401,8 @@ int rocket_matmul_bf16(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             uint16_t *slot = (uint16_t *)wt_all.ptr + (size_t)(ni * nKt + ki) * wt_slot;
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[wt_idx_i16(Ktile, kk, c)] = f32_to_bf16(B[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)]);
+            MM_WT_SCATTER(uint16_t, float, 32, 16, wt_idx_i16,
+                          slot, B, K, n0, k0, Ntile, Ktile, f32_to_bf16);
         }
     }
     rocket_bo_fini(fd, &wt_all);
@@ -3511,9 +3415,8 @@ int rocket_matmul_bf16(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             uint16_t *slot = (uint16_t *)in_all.ptr + (size_t)(mi * nKt + ki) * in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[feat_idx_i16(Mtile, c, h)] = f32_to_bf16(A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)]);
+            MM_CUBE_SCATTER(uint16_t, float, 8, feat_idx_i16,
+                            slot, A, K, m0, k0, Mtile, Ktile, f32_to_bf16);
         }
     }
     rocket_bo_fini(fd, &in_all);
@@ -3573,10 +3476,11 @@ int rocket_matmul_bf16(int fd, int M, int K, int N,
                     float *ob = (float *)out_all.ptr;
                     for (int j = 0; j < nb; j++) {
                         float *slot = ob + boff[j];
-                        for (int h = 1; h <= bMtile[j]; h++)
-                            for (int nn = 1; nn <= bNtile[j]; nn++)
-                                acc[(size_t)(bm0[j] + h - 1) * N + (bn0[j] + nn - 1)] +=
-                                    (double)slot[out_idx_i16(bMtile[j], nn, h)];
+#define MM_ACC_(h_, nn_, v_) \
+    (acc[(size_t)(bm0[j] + (h_) - 1) * N + (bn0[j] + (nn_) - 1)] += (double)(v_))
+                        MM_CUBE_GATHER(float, 4, out_idx_i16, slot,
+                                       bMtile[j], bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     rocket_bo_fini(fd, &out_all);
                     nb = 0;
@@ -3735,10 +3639,11 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
                     float *ob = (float *)out_all.ptr;
                     for (int j = 0; j < nb; j++) {
                         float *slot = ob + boff[j];
-                        for (int h = 1; h <= bMtile[j]; h++)
-                            for (int nn = 1; nn <= bNtile[j]; nn++)
-                                acc[(size_t)(bm0[j] + h - 1) * N + (bn0[j] + nn - 1)] +=
-                                    (double)slot[out_idx_i16(bMtile[j], nn, h)];
+#define MM_ACC_(h_, nn_, v_) \
+    (acc[(size_t)(bm0[j] + (h_) - 1) * N + (bn0[j] + (nn_) - 1)] += (double)(v_))
+                        MM_CUBE_GATHER(float, 4, out_idx_i16, slot,
+                                       bMtile[j], bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     rocket_bo_fini(fd, &out_all);
                     nb = 0;
@@ -3778,63 +3683,10 @@ free_bos:
  * at full speed) — completeness, not a workload. No in-model backend; bf16 wins.
  * ==========================================================================*/
 
-/* CBUF banks for `rows` x Kt tf32 (4 B/elem — x2 vs bf16's 2 B). */
-static int banks_for_tf32(int rows, int Kt) {
-    return ((long)rows * Kt * 4 + CBUF_BANK - 1) / CBUF_BANK;
-}
-
-/* tf32 NPU layout index math. Feature cube C2=4 (4-byte atom); weight
- * (N/16,K/16,16,16) (== weight_tf32). The fp32 output reuses out_idx_i16 (cube
- * C2=4) — identical to the int16/bf16 fp32-out writer. */
-static inline size_t feat_idx_tf32(int H, int ch, int h) {   /* input, C2=4 */
-    return ((size_t)(ch - 1) / 4) * (size_t)H * 4 + 4 * (size_t)(h - 1) + (ch - 1) % 4;
-}
-static inline size_t wt_idx_tf32(int C, int k, int c) {      /* weight, (N/16,K/16,16,16) */
-    return (size_t)((c - 1) / 16) * 16 * 16 + (size_t)((k - 1) / 16) * 16 * C
-         + (size_t)((c - 1) % 16) + (size_t)((k - 1) % 16) * 16;
-}
 
 int rocket_matmul_plan_tf32(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 {
-    /* Machine parameters from the active hardware profile (see rocket_matmul_plan). */
-    const struct rocket_hw_profile *hw = rocket_hw_current();
-    const int MAX_TILE = hw->max_tile, CBUF_BANKS = hw->cbuf_banks;
-    if (K % 16 || N % 16 || M % 4 != 0)   /* tf32: K/N-group 16; M%4 (M==1 padded in one-shot) */
-        return ROCKET_E_SHAPE;
-
-    int Mt = (M < MAX_TILE) ? M : MAX_TILE;
-    int Nt = (N < MAX_TILE) ? N : MAX_TILE;
-    Nt = (Nt / 16) * 16; if (Nt < 16) Nt = 16;
-
-    const char *e;
-    if ((e = getenv("ROCKET_MM_MT"))) { int v = atoi(e); if (v >= 4)  { Mt = (v/4)*4;   if (Mt > M) Mt = M; } }
-    if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= 16) { Nt = (v/16)*16; if (Nt > N) Nt = N; } }
-
-    /* 4-byte halves the Kt ceiling: weight_bytes_per_kernel = Kt*4 must be <= 32768
-     * (gen_matmul_tf32 returns -2 above that), so Kt <= 8192. K-group is 16. */
-    int Kt = (K < 8192) ? K : 8192;
-    Kt = (Kt / 16) * 16; if (Kt < 16) Kt = 16;
-    while (Kt > 16 && banks_for_tf32(Mt, Kt) + banks_for_tf32(Nt, Kt) > CBUF_BANKS) Kt -= 16;
-    while (banks_for_tf32(Mt, Kt) + banks_for_tf32(Nt, Kt) > CBUF_BANKS && Nt > 16) Nt -= 16;
-    while (banks_for_tf32(Mt, Kt) + banks_for_tf32(Nt, Kt) > CBUF_BANKS && Mt > 4)  Mt -= 4;
-
-    if ((e = getenv("ROCKET_MM_KT"))) {
-        int v = atoi(e);
-        if (v >= 16) {
-            Kt = (v/16)*16; if (Kt > (K/16)*16) Kt = (K/16)*16; if (Kt > 8192) Kt = 8192;
-            while (Kt > 16 && banks_for_tf32(Mt, Kt) + banks_for_tf32(Nt, Kt) > CBUF_BANKS) Kt -= 16;
-        }
-    }
-
-    if (pMt) *pMt = Mt;
-    if (pKt) *pKt = Kt;
-    if (pNt) *pNt = Nt;
-
-    int nm = (M + Mt - 1) / Mt, nn = (N + Nt - 1) / Nt, nk = (K + Kt - 1) / Kt;
-    /* M4: reject shapes whose int tile-count product would overflow before the
-     * size_t BO math (and the `total = nMt*nNt*nKt` in the compute loops below). */
-    if ((int64_t)nm * nn * nk > INT32_MAX) return ROCKET_E_SHAPE;
-    return nm * nn * nk;
+    return mm_plan_geom(&mm_geom_tf32, M, K, N, 0, pMt, pKt, pNt);
 }
 
 int rocket_matmul_tf32(int fd, int M, int K, int N,
@@ -3882,9 +3734,8 @@ int rocket_matmul_tf32(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             float *slot = (float *)wt_all.ptr + (size_t)(ni * nKt + ki) * wt_slot;
-            for (int kk = 1; kk <= Ntile; kk++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[wt_idx_tf32(Ktile, kk, c)] = B[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)];
+            MM_WT_SCATTER(float, float, 16, 16, wt_idx_tf32,
+                          slot, B, K, n0, k0, Ntile, Ktile, MM_ID);
         }
     }
     rocket_bo_fini(fd, &wt_all);
@@ -3897,9 +3748,8 @@ int rocket_matmul_tf32(int fd, int M, int K, int N,
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             float *slot = (float *)in_all.ptr + (size_t)(mi * nKt + ki) * in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[feat_idx_tf32(Mtile, c, h)] = A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)];
+            MM_CUBE_SCATTER(float, float, 4, feat_idx_tf32,
+                            slot, A, K, m0, k0, Mtile, Ktile, MM_ID);
         }
     }
     rocket_bo_fini(fd, &in_all);
@@ -3959,10 +3809,11 @@ int rocket_matmul_tf32(int fd, int M, int K, int N,
                     float *ob = (float *)out_all.ptr;
                     for (int j = 0; j < nb; j++) {
                         float *slot = ob + boff[j];
-                        for (int h = 1; h <= bMtile[j]; h++)
-                            for (int nn = 1; nn <= bNtile[j]; nn++)
-                                acc[(size_t)(bm0[j] + h - 1) * N + (bn0[j] + nn - 1)] +=
-                                    (double)slot[out_idx_i16(bMtile[j], nn, h)];
+#define MM_ACC_(h_, nn_, v_) \
+    (acc[(size_t)(bm0[j] + (h_) - 1) * N + (bn0[j] + (nn_) - 1)] += (double)(v_))
+                        MM_CUBE_GATHER(float, 4, out_idx_i16, slot,
+                                       bMtile[j], bNtile[j], MM_ACC_);
+#undef MM_ACC_
                     }
                     rocket_bo_fini(fd, &out_all);
                     nb = 0;

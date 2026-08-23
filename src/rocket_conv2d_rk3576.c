@@ -559,6 +559,19 @@ static int r76_submit_ops(int fd, struct r76_conv_bos *b, const uint64_t *ops,
                     entry, ne, (unsigned)R76_MAX_CHAIN_TASKS);
         return ROCKET_E_SHAPE;
     }
+    /* A chained stream and a leading LUT table load do not compose here, and the failure
+     * is silent: r76_chain_stream fills td[0 .. ne-1], the LUT descriptor then overwrites
+     * td[0] -- row task 0 -- and the submit carries `ne` tasks rather than lead+ne, so one
+     * row is lost and the chain's forward links point at slots the PC never reaches. The
+     * caller upstream (r76_w_prepare) forces batch=0 whenever a LUT is present, which is
+     * why this is unreachable today. Say it HERE too: this is the shared submit helper for
+     * every RK3576 conv path, and an invariant held only at a distant call site is one
+     * refactor from being an entirely plausible wrong surface. */
+    if (chained && lead) {
+        ROCKET_LOGE("%s: a chained row stream cannot carry a leading LUT table load "
+                    "(the chain layout has no slot for it) -- submit unchained\n", entry);
+        return ROCKET_E_UNSUPPORTED;
+    }
 
     for (attempt = 0; attempt < attempts; attempt++) {
         int srv;
@@ -1582,7 +1595,10 @@ static int r76_w_prepare(const char *entry, int fd, const rocket_conv2d_desc *d,
         if (h->max_tasks > R76_MAX_CHAIN_TASKS) {
             ROCKET_LOGE("%s: %u row tasks exceeds the %u one job lays out\n",
                         entry, h->max_tasks, (unsigned)R76_MAX_CHAIN_TASKS);
-            free(h);
+            /* r76_w_free, not free: equivalent HERE because nothing on the handle is
+             * owned yet, but every other exit from this function uses the destructor
+             * and the ownership boundary is not visible from the call site. */
+            r76_w_free(h);
             return ROCKET_E_SHAPE;
         }
         /* The chain rewrite links programs inside ONE BO, and the table load is a
@@ -1837,12 +1853,12 @@ static int r76_wtile_pack(const char *entry, r76_w *h, unsigned t, const int8_t 
     int rc = ROCKET_OK;
     double pt0 = R76_PT(*prof);
 
-    if (rocket_bo_alloc(h->fd, w_bytes, &s->w) < 0 ||
-        rocket_bo_alloc(h->fd, coeff_bytes, &s->coeff) < 0)
+    if (rocket_bo_alloc32(h->fd, w_bytes, &s->w) < 0 ||
+        rocket_bo_alloc32(h->fd, coeff_bytes, &s->coeff) < 0)
         return ROCKET_E_NOMEM;
     /* The surface, unless this handle writes into a caller's buffer instead — then it owns
      * none and allocating one here would be a megabyte per layer of nothing. */
-    if (!h->out_ext.ptr && rocket_bo_alloc(h->fd, surf_bytes, &s->out) < 0)
+    if (!h->out_ext.ptr && rocket_bo_alloc32(h->fd, surf_bytes, &s->out) < 0)
         return ROCKET_E_NOMEM;
     /* THE TAIL A DIRECT CONSUMER WALKS, filled once. See r76_surf_bytes(). */
     s->tail_zp = 0;
@@ -2053,7 +2069,7 @@ static int r76_feature_pack(r76_w *h, const int8_t *in)
         const int8_t *sp[4];
         unsigned c;
         if (!h->in.ptr) {
-            if (rocket_bo_alloc(h->fd, h->in_bytes, &h->in) < 0) return ROCKET_E_NOMEM;
+            if (rocket_bo_alloc32(h->fd, h->in_bytes, &h->in) < 0) return ROCKET_E_NOMEM;
             /* Only on the allocation, and for two reasons. A WIDENED one-channel image's
              * second lane is zero samples against zero weights. And an EXTENDED one's
              * columns outside the caller's plane are the input zero point on every live
@@ -2107,7 +2123,7 @@ static int r76_feature_pack(r76_w *h, const int8_t *in)
         return ROCKET_OK;
     }
     if (!h->in.ptr) {
-        if (rocket_bo_alloc(h->fd, h->in_bytes, &h->in) < 0) return ROCKET_E_NOMEM;
+        if (rocket_bo_alloc32(h->fd, h->in_bytes, &h->in) < 0) return ROCKET_E_NOMEM;
         rocket_bo_prep(h->fd, &h->in, 1, 0);
         /* Only on the allocation. The channels past `ic` are the cube's padding and nothing
          * writes them again, while every live channel is fully overwritten below — so a
@@ -2181,7 +2197,7 @@ static int r76_int8_exec(const char *entry, r76_w *h, const int8_t *W,
      * (rkt_chain_words), which rounds an odd program length up by one, and the
      * multi-descriptor layout uses the same slot. */
     if (!h->rc.ptr &&
-        rocket_bo_alloc(h->fd, (size_t)(h->multi ? h->max_tasks : 1u) *
+        rocket_bo_alloc32(h->fd, (size_t)(h->multi ? h->max_tasks : 1u) *
                         R76_TASK_SLOT_WORDS * sizeof(uint64_t), &h->rc) < 0)
         return ROCKET_E_NOMEM;
 
@@ -2195,7 +2211,7 @@ static int r76_int8_exec(const char *entry, r76_w *h, const int8_t *W,
 
         if (!lops) return ROCKET_E_NOMEM;
         h->lut_scratch = (uint32_t)((prog + 63u) & ~(size_t)63u);
-        if (rocket_bo_alloc(h->fd, h->lut_scratch + 64u, &h->lut_bo) < 0) {
+        if (rocket_bo_alloc32(h->fd, h->lut_scratch + 64u, &h->lut_bo) < 0) {
             free(lops);
             return ROCKET_E_NOMEM;
         }
@@ -3422,7 +3438,7 @@ int rocket_rk3576_cube_alloc(int fd, unsigned c, unsigned h, unsigned w,
 
     if (!out || !c || !h || !w) return ROCKET_E_SHAPE;
     memset(out, 0, sizeof *out);
-    if (rocket_bo_alloc(fd, (size_t)groups * h * w * C2, &out->bo) < 0) {
+    if (rocket_bo_alloc32(fd, (size_t)groups * h * w * C2, &out->bo) < 0) {
         ROCKET_LOGE("%s: %u channel(s) of a %ux%u plane could not be allocated\n",
                     entry, c, w, h);
         return ROCKET_E_NOMEM;
@@ -3528,7 +3544,7 @@ int rocket_conv2d_int8_cube_out_at_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
                             h->surf_elems * C2;
             size_t surf_bytes = r76_surf_bytes(h, h->tile[0].ocreg);
             h->tile[0].tail_zp = 0;
-            if (rocket_bo_alloc(h->fd, surf_bytes, &h->tile[0].out) < 0) {
+            if (rocket_bo_alloc32(h->fd, surf_bytes, &h->tile[0].out) < 0) {
                 ROCKET_LOGE("%s: this handle's own output surface could not be allocated "
                             "again\n", entry);
                 return ROCKET_E_NOMEM;
@@ -4245,7 +4261,7 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
      * always a convolution: a pool may only be interior. */
     if (!nd[0].conv->cube_in && !nd[0].conv->in.ptr) {
         r76_w *h0 = nd[0].conv;
-        if (rocket_bo_alloc(fd, h0->in_bytes, &h0->in) < 0) {
+        if (rocket_bo_alloc32(fd, h0->in_bytes, &h0->in) < 0) {
             ROCKET_LOGE("%s: the first layer's feature cube could not be allocated\n",
                         entry);
             return NULL;
@@ -4398,7 +4414,7 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
         }
     }
 
-    if (rocket_bo_alloc(fd, (size_t)words * sizeof(uint64_t), &c->rc) < 0) goto fail;
+    if (rocket_bo_alloc32(fd, (size_t)words * sizeof(uint64_t), &c->rc) < 0) goto fail;
 
     /* Lay the whole stream out and link it, across layer boundaries as well as inside them.
      * The last program's forward link is cleared: the hardware halts there on TASK_NUMBER,
@@ -5237,11 +5253,11 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
         rc = ROCKET_E_UNSUPPORTED; goto done;
     }
 
-    if (rocket_bo_alloc(fd, in_bytes, &b.in) < 0 ||
-        rocket_bo_alloc(fd, w_bytes, &b.w) < 0 ||
-        rocket_bo_alloc(fd, coeff_bytes, &b.coeff) < 0 ||
-        rocket_bo_alloc(fd, surf, &b.out) < 0 ||
-        rocket_bo_alloc(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
+    if (rocket_bo_alloc32(fd, in_bytes, &b.in) < 0 ||
+        rocket_bo_alloc32(fd, w_bytes, &b.w) < 0 ||
+        rocket_bo_alloc32(fd, coeff_bytes, &b.coeff) < 0 ||
+        rocket_bo_alloc32(fd, surf, &b.out) < 0 ||
+        rocket_bo_alloc32(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
         rc = ROCKET_E_NOMEM; goto done;
     }
 
@@ -5455,11 +5471,11 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
         rc = ROCKET_E_UNSUPPORTED; goto done;
     }
 
-    if (rocket_bo_alloc(fd, in_bytes, &b.in) < 0 ||
-        rocket_bo_alloc(fd, w_bytes, &b.w) < 0 ||
-        rocket_bo_alloc(fd, coeff_bytes, &b.coeff) < 0 ||
-        rocket_bo_alloc(fd, surf, &b.out) < 0 ||
-        rocket_bo_alloc(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
+    if (rocket_bo_alloc32(fd, in_bytes, &b.in) < 0 ||
+        rocket_bo_alloc32(fd, w_bytes, &b.w) < 0 ||
+        rocket_bo_alloc32(fd, coeff_bytes, &b.coeff) < 0 ||
+        rocket_bo_alloc32(fd, surf, &b.out) < 0 ||
+        rocket_bo_alloc32(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
         rc = ROCKET_E_NOMEM; goto done;
     }
 

@@ -29,16 +29,16 @@
 
 int rocket_reduce_factor_axis(int n, int *f, int cap)
 {
-    if (n < 1) return -1;
+    if (n < 1) return ROCKET_E_SHAPE;
     int c = 0;
     while (n > 16) {
         int d = 0;
         for (int x = 16; x >= 2; x--) if (n % x == 0) { d = x; break; }
-        if (d == 0) return -1;                 /* prime factor > 16: not 16-smooth */
-        if (c >= cap) return -1;
+        if (d == 0) return ROCKET_E_SHAPE;                 /* prime factor > 16: not 16-smooth */
+        if (c >= cap) return ROCKET_E_SHAPE;
         f[c++] = d; n /= d;
     }
-    if (n >= 2) { if (c >= cap) return -1; f[c++] = n; }
+    if (n >= 2) { if (c >= cap) return ROCKET_E_SHAPE; f[c++] = n; }
     /* Sort ASCENDING (smallest kernel first). This keeps the running quotient large for
      * as long as possible: after pass i it equals the product of the remaining (larger)
      * factors, hence >= the largest factor. For any axis > 16 the largest factor is >= 4,
@@ -52,9 +52,9 @@ int rocket_reduce_factor_axis(int n, int *f, int cap)
 
 int rocket_global_avgpool_plan(int C, int H, int W)
 {
-    if (C < 1 || H < 1 || W < 1) return -1;
-    if (H > ROCKET_REDUCE_MAX_DIM || W > ROCKET_REDUCE_MAX_DIM) return -2;
-    if ((unsigned)(C - 1) >> 13) return -3;    /* PPU CUBE_*_CHANNEL is 13-bit (value-1) */
+    if (C < 1 || H < 1 || W < 1) return ROCKET_E_SHAPE;
+    if (H > ROCKET_REDUCE_MAX_DIM || W > ROCKET_REDUCE_MAX_DIM) return ROCKET_E_NOMEM;
+    if ((unsigned)(C - 1) >> 13) return ROCKET_E_UNSUPPORTED;    /* PPU CUBE_*_CHANNEL is 13-bit (value-1) */
     int fh[REDUCE_MAX_PASS], fw[REDUCE_MAX_PASS];
     int nh = rocket_reduce_factor_axis(H, fh, REDUCE_MAX_PASS);
     int nw = rocket_reduce_factor_axis(W, fw, REDUCE_MAX_PASS);
@@ -185,7 +185,17 @@ int rocket_global_avgpool_fp16(int fd, int C, int H, int W,
             ROCKET_LOGE("rocket_global_avgpool: submit pass %d failed (%d)\n", i, ret);
             goto out;
         }
-        /* wait for this pass to land before it feeds the next (RAW chain) */
+        /* Wait for this pass to land before it feeds the next (RAW chain).
+         *
+         * DELIBERATELY UNPAIRED, and this is the one place in the library where a prep
+         * has no matching fini. PREP_BO(read) both waits and syncs `dst` for the CPU;
+         * next iteration the same BO goes back to the device as `src` with no FINI_BO
+         * between. That is safe ONLY because nothing on the CPU writes it in between —
+         * there are no dirty lines for a for-device sync to flush. The moment anything
+         * touches dst->ptr inside this loop (a debug dump, a host-side epilogue) the
+         * reasoning is void and the bracket has to be closed. It is left open rather
+         * than paired because closing it costs a second full-BO cache walk per pass to
+         * flush nothing; the wait itself already pays one. */
         if ((ret = rocket_bo_prep(fd, dst, 0, 2000000000ULL)) != 0) {
             ROCKET_LOGE("rocket_global_avgpool: wait pass %d (%d)\n", i, ret);
             goto out;
@@ -392,7 +402,7 @@ void rocket_reduce_feature_ref_fp16(int M, int H,
 int rocket_reduce_feature_fp16(int fd, int M, int H,
                                const _Float16 *in, float *out, int mean)
 {
-    if (M < 1 || H < 1) return -1;
+    if (M < 1 || H < 1) return ROCKET_E_SHAPE;
 
     /* No device: exact host reduction (always correct). */
     if (fd < 0) { rocket_reduce_feature_ref_fp16(M, H, in, out, mean); return 0; }
@@ -407,7 +417,7 @@ int rocket_reduce_feature_fp16(int fd, int M, int H,
     /* ones weight [N, Kpad]: 1 over the real H columns, 0 over the K-pad. */
     _Float16 *ones = malloc((size_t)N * Kpad * sizeof(_Float16));
     float    *C    = malloc((size_t)Mpad * N * sizeof(float));
-    if (!ones || !C) { free(ones); free(C); return -2; }
+    if (!ones || !C) { free(ones); free(C); return ROCKET_E_NOMEM; }
     for (int r = 0; r < N; r++) {
         _Float16 *row = ones + (size_t)r * Kpad;
         for (int k = 0; k < H;    k++) row[k] = (_Float16)1.0f;
@@ -420,7 +430,7 @@ int rocket_reduce_feature_fp16(int fd, int M, int H,
     _Float16 *Apad = NULL;
     if (Kpad != H || Mpad != M) {
         Apad = calloc((size_t)Mpad * Kpad, sizeof(_Float16));
-        if (!Apad) { free(ones); free(C); return -2; }
+        if (!Apad) { free(ones); free(C); return ROCKET_E_NOMEM; }
         for (int m = 0; m < M; m++)
             memcpy(Apad + (size_t)m * Kpad, in + (size_t)m * H, (size_t)H * sizeof(_Float16));
         A = Apad;
@@ -466,7 +476,7 @@ void rocket_cumsum_ref_fp16(int M, int N, const _Float16 *in, _Float16 *out,
 int rocket_cumsum_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *out,
                        int exclusive, int reverse)
 {
-    if (M < 1 || N < 1) return -1;
+    if (M < 1 || N < 1) return ROCKET_E_SHAPE;
 
     /* No device: exact host scan (always correct). */
     if (fd < 0) { rocket_cumsum_ref_fp16(M, N, in, out, exclusive, reverse); return 0; }
@@ -480,7 +490,7 @@ int rocket_cumsum_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *out,
 
     _Float16 *L = calloc((size_t)Npad * Kpad, sizeof(_Float16));   /* zero pad rows + cols */
     float    *C = malloc((size_t)Mpad * Npad * sizeof(float));
-    if (!L || !C) { free(L); free(C); return -2; }
+    if (!L || !C) { free(L); free(C); return ROCKET_E_NOMEM; }
 
     /* Triangular ones: L[n][k] = 1 iff input column k is in prefix n (the requested variant).
      * Only the real [N,N] block is set; k>=N (K-pad) and n>=N (unused output cols) stay 0. */
@@ -499,7 +509,7 @@ int rocket_cumsum_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *out,
     _Float16 *Apad = NULL;
     if (Kpad != N || Mpad != M) {
         Apad = calloc((size_t)Mpad * Kpad, sizeof(_Float16));
-        if (!Apad) { free(L); free(C); return -2; }
+        if (!Apad) { free(L); free(C); return ROCKET_E_NOMEM; }
         for (int m = 0; m < M; m++)
             memcpy(Apad + (size_t)m * Kpad, in + (size_t)m * N, (size_t)N * sizeof(_Float16));
         A = Apad;

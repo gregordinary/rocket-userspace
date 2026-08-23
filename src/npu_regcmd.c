@@ -2018,6 +2018,26 @@ int gen_matmul_tf32(matmul_params_t *params)
    return 0;
 }
 
+/* ── The per-call getenv in the generators below is DELIBERATE ───────────────────
+ *
+ * These generators read ninety-odd ROCKET_* knobs and run once per output tile, which
+ * looks exactly like a hot-path getenv to hoist into a resolved-once cache. It is not,
+ * and both halves of that are measured:
+ *
+ *   THE COST IS NOT THERE. On the RK1 at M=512 K=3840 N=4096 the whole `gen` bucket
+ *   ROCKET_MM_PROFILE reports is 2-5 ms against a ~800 ms wall -- under 0.6%, of which
+ *   the environ scans are a fraction again.
+ *
+ *   AND CACHING BREAKS THE SWEEPS. The knobs are not static debug flags: the RE tests
+ *   drive them with setenv() BETWEEN calls in one process, which is how a single run
+ *   sweeps a register field. ew_mul_rocket sets ROCKET_EW_CFG per operation to select
+ *   add/sub/mul, and matmul_int8_dequant_rocket walks ROCKET_INT8_DEQ_* across cells.
+ *   A cache keyed on first read makes every later cell repeat the first one -- and the
+ *   surface it returns is full, correctly sized and wrong, which is the failure mode
+ *   this whole codebase is built to refuse. Caching them was tried; those two gates
+ *   caught it. [HW sweep, RK1, 2026-08-22]
+ */
+
 /* ============================================================================
  * SECTION — Tiled-layout index and weight-packing helpers
  * ==========================================================================*/
@@ -2704,7 +2724,6 @@ static int gen_conv2d_fill(conv_params_t *params, int depthwise)
     *   ROCKET_CONV_DW_OCPAD (pad OC Mesa-style: align(max(OC,32),32); *2 if OC<=32;
     *   align 64 — de-scatter still reads the real OC at the front). */
    if (depthwise) {
-     const char *e;
      dpu_desc.size_e_2 = 3; dpu_desc.size_e_1 = 3; dpu_desc.size_e_0 = 3;  /* HIGH */
      dpu_desc.od_bypass = 0;                                              /* HIGH */
      dpu_desc.surf_add *= 2;                                              /* HIGH */

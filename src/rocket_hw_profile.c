@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "rocket_sysfs.h"   /* the one enumeration of the bound NPU cores */
 #include "rocket_hw_profile.h"
 #include "rocket_log.h"
 
@@ -178,20 +179,15 @@ static int read_dt_strings(const char *path, char *buf, size_t len)
  * device rocket registers has no of_node of its own. */
 static int read_bound_device_compatible(char *buf, size_t len)
 {
-    static const char *dir = "/sys/bus/platform/drivers/rocket";
-    DIR *d = opendir(dir);
-    if (!d) return -1;
-    int rc = -1;
-    for (struct dirent *e; (e = readdir(d)) != NULL; ) {
-        if (e->d_name[0] == '.' || !strcmp(e->d_name, "bind") ||
-            !strcmp(e->d_name, "unbind") || !strcmp(e->d_name, "uevent") ||
-            !strcmp(e->d_name, "module")) continue;
+    char names[ROCKET_SYSFS_MAX_DEVS][ROCKET_SYSFS_NAME_MAX];
+    int n = rocket_sysfs_bound_devices(names, ROCKET_SYSFS_MAX_DEVS);
+    for (int i = 0; i < n; i++) {
         char path[512];
-        snprintf(path, sizeof(path), "%s/%s/of_node/compatible", dir, e->d_name);
-        if (read_dt_strings(path, buf, len) == 0) { rc = 0; break; }
+        snprintf(path, sizeof(path), "/sys/bus/platform/drivers/rocket/%.*s/of_node/compatible",
+                 ROCKET_SYSFS_NAME_MAX - 1, names[i]);
+        if (read_dt_strings(path, buf, len) == 0) return 0;
     }
-    closedir(d);
-    return rc;
+    return -1;
 }
 
 static const struct rocket_hw_profile *rocket_hw_detect(void)

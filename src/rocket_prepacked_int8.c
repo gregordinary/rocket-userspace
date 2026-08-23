@@ -11,10 +11,11 @@
  * proved for fp16 (~9% of per-matmul wall), now on the int8 path whose
  * 11GB whole-model footprint fits across the 5 worker fds' 4GB IOVA windows.
  *
- * DELIBERATELY self-contained (it reimplements the int8 tiled host-accum compute
- * here) rather than threading int8 through rocket_prepacked.c's fp16 rkw_run, so
- * the tuned fp16 path stays byte-for-byte unchanged — the same zero-regression
- * stance the one-shot int8 path took in rocket_matmul.c. The compute mirrors
+ * The COMPUTE core is int8's own (it is not fp16's rkw_run wearing a cast: the operand
+ * types, the BO geometry and the accumulator all differ, and int8 cannot use the NPU-side
+ * K-accum ping-pong at all — the DPU EW operand DMA is <=16-bit). Everything AROUND it
+ * — the pool shape, the slot cache, the fence deadline, the column split and the
+ * spawn/join — is rocket_fanout.h's, shared with fp16/int4/bf16. The compute mirrors
  * rocket_matmul_int8's host-int64 K-accum branch (int8 NPU K-accum is HW-dead:
  * the DPU EW operand DMA is <=16-bit, so int32 partials can't accumulate on-chip;
  * they are summed on the host in int64, which is integer-EXACT -> bit-identical
@@ -64,49 +65,21 @@
 #include "rocket_hw_profile.h"
 #include "npu_matmul.h"
 #include "rocket_matmul.h"
+#include "rocket_cube.h"                /* the NPU cube index math + blocked moves */
+#include "rocket_matmul_internal.h"  /* the ROCKET_MM_PROFILE buckets */
 #include "rocket_affinity.h"
+#include "rocket_fanout.h"
 #include "rocket_log.h"     // centralized log channel
 #include "rocket_chain.h"   // contiguous self-chaining regcmd layout (batched submit)
 
-#define RKI_MAX_WORKERS 8
-#define RKI_MAX_SLOTS   32
-#define I8_BATCH        64    /* tiles (tasks) per NPU job — matches rocket_matmul.c */
-#define I8_RC_STRIDE    128   /* u64 words reserved per task in the regcmd BO        */
-#define I8_CBUF_BANK    32768 /* tail pad so a tile's DMA never runs off the BO end  */
+#define RKI_MAX_WORKERS ROCKET_FANOUT_MAX_WORKERS
+#define I8_BATCH        ROCKET_FANOUT_BATCH
+#define I8_RC_STRIDE    ROCKET_FANOUT_RC_STRIDE
+#define I8_CBUF_BANK    NPU_CBUF_BANK_SIZE /* tail pad so a tile's DMA never runs off the BO end */
 
 /* ============================================================================
  * SECTION — int8 tile-layout index math and small helpers
  * ==========================================================================*/
-
-/* Round x up to a multiple of a, in size_t (these feed slot/BO allocation sizes;
- * computing in int would truncate before the widen at the call site). */
-static size_t i8_rup(int x, int a) { return (((size_t)x + a - 1) / a) * a; }
-
-/* Output-fence wait deadline (ns). Mirrors rocket_matmul.c's rocket_wait_ns. */
-static long i8_wait_ns(void) {
-    static _Atomic long ns = -1;
-    if (ns < 0) {
-        const char *e = getenv("ROCKET_WAIT_MS");
-        long ms = e ? atol(e) : 8000;
-        if (ms < 1) ms = 8000;
-        ns = ms * 1000000L;
-    }
-    return ns;
-}
-
-/* int8 NPU tile-layout index math — IDENTICAL to rocket_matmul.c's static
- * inlines (input feature cube C2=16, weight k-group 32, int32-output cube C2=4).
- * 1-based indices, matching weight_int8(). Kept in sync by the bit-exact test. */
-static inline size_t i8_feat_idx(int H, int ch, int h) {   /* input, C2=16 */
-    return ((size_t)(ch - 1) / 16) * (size_t)H * 16 + 16 * (size_t)(h - 1) + (ch - 1) % 16;
-}
-static inline size_t i8_wt_idx(int C, int k, int c) {      /* weight, k-group 32 */
-    return (size_t)((c - 1) / 32) * 32 * 32 + (size_t)((k - 1) / 32) * 32 * C
-         + (size_t)((c - 1) % 32) + (size_t)((k - 1) % 32) * 32;
-}
-static inline size_t i8_out_idx(int H, int ch, int h) {    /* output, C2=4 */
-    return ((size_t)(ch - 1) / 4) * (size_t)H * 4 + 4 * (size_t)(h - 1) + (ch - 1) % 4;
-}
 
 /* One worker's N-slice: its column range, resolved int8 tiling plan, slot sizes,
  * and its shared per-shape scratch BOs + host-accum arrays. */
@@ -135,20 +108,24 @@ typedef struct {
     rki_worker w[RKI_MAX_WORKERS];
 } rki_scratch;
 
-/* Per-NAME resident int8 weight: just the scattered per-worker int8 wt BOs + a
- * borrowed pointer to the shared per-shape scratch. group == 0 is per-channel. */
+/* Per-NAME resident int8 weight: the scattered per-worker int8 wt BOs plus the layout
+ * that fixed where their bytes went. group == 0 is per-channel.
+ *
+ * A SIGNATURE, not a pointer to the scratch it was packed against: the slot cache
+ * recycles its least recently used shape, so a weight that held such a pointer would
+ * be one unrelated shape away from dereferencing freed memory. The determinants are
+ * M-independent, which is also what lets a weight packed at one M compute at another. */
 struct rocket_i8_weights {
     int M, K, N, nt, group;
     rocket_bo   wt[RKI_MAX_WORKERS];
-    rki_scratch *sc;
+    rocket_wsig sig[RKI_MAX_WORKERS];
 };
 
 struct rocket_i8_ctx {
     int nthreads;
     const struct rocket_hw_profile *hw; /* active machine-parameter profile (the multi-chip profile seam) */
     int fd[RKI_MAX_WORKERS];
-    rki_scratch *scache[RKI_MAX_SLOTS];
-    int nscache;
+    rocket_slot_cache scache;
 };
 
 /* ============================================================================
@@ -160,8 +137,7 @@ struct rocket_i8_ctx {
  * of 32 when N%32==0. */
 static int rki_nstep(int N, int nthreads)
 {
-    int s = ((N + nthreads - 1) / nthreads + 31) / 32 * 32;
-    return s < 32 ? 32 : s;
+    return rocket_fanout_nstep(N, nthreads, 32);
 }
 
 rocket_i8_ctx *rocket_i8_ctx_create(int nthreads)
@@ -205,10 +181,23 @@ static void rki_scratch_free(rocket_i8_ctx *ctx, rki_scratch *sc)
     free(sc);
 }
 
+static rki_scratch *rki_scratch_alloc(rocket_i8_ctx *ctx, int M, int K, int N, int group);
+
+/* How the shared slot cache builds and releases one of our per-shape scratches. */
+static void *rki_slot_alloc(void *owner, const rocket_shape_key *k)
+{
+    return rki_scratch_alloc((rocket_i8_ctx *)owner, k->M, k->K, k->N, k->group);
+}
+static void rki_slot_release(void *owner, void *slot)
+{
+    rki_scratch_free((rocket_i8_ctx *)owner, (rki_scratch *)slot);
+}
+static const rocket_slot_ops rki_slot_ops = { rki_slot_alloc, rki_slot_release };
+
 void rocket_i8_ctx_free(rocket_i8_ctx *ctx)
 {
     if (!ctx) return;
-    for (int i = 0; i < ctx->nscache; i++) rki_scratch_free(ctx, ctx->scache[i]);
+    rocket_slot_cache_clear(&ctx->scache, ctx, &rki_slot_ops);
     for (int t = 0; t < ctx->nthreads; t++)
         if (ctx->fd[t] >= 0) rocket_close(ctx->fd[t]);
     free(ctx);
@@ -250,9 +239,9 @@ static int rki_worker_alloc(int fd, rki_worker *w, int M, int tileM, int K, int 
     w->nMt = (M + w->Mt - 1) / w->Mt;
     w->nNt = (nsub + w->Nt - 1) / w->Nt;
     w->nKt = (K + w->Kt - 1) / w->Kt;
-    w->in_slot  = (size_t)i8_rup(w->Mt, 4)  * i8_rup(w->Kt, 32);   /* int8  */
-    w->wt_slot  = (size_t)i8_rup(w->Nt, 32) * i8_rup(w->Kt, 32);   /* int8  */
-    w->out_slot = (size_t)i8_rup(w->Mt, 4)  * i8_rup(w->Nt, 16);   /* int32 */
+    w->in_slot  = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Kt, 32);   /* int8  */
+    w->wt_slot  = (size_t)rocket_rup_sz(w->Nt, 32) * rocket_rup_sz(w->Kt, 32);   /* int8  */
+    w->out_slot = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Nt, 16);   /* int32 */
 
     size_t in_sz  = (size_t)w->nMt * w->nKt * w->in_slot + I8_CBUF_BANK;
     size_t rc_sz  = (size_t)I8_BATCH * I8_RC_STRIDE * sizeof(uint64_t);
@@ -317,17 +306,22 @@ fail:
     return NULL;
 }
 
+/* Find (or build + cache) the per-shape scratch. NULL only on an alloc failure: a full
+ * cache recycles its least recently used shape rather than refusing. `group` is part of
+ * the key because the two modes tile K differently and cannot share a slot. */
 static rki_scratch *rki_ctx_scratch(rocket_i8_ctx *ctx, int M, int K, int N, int group)
 {
-    for (int i = 0; i < ctx->nscache; i++)
-        if (ctx->scache[i]->M == M && ctx->scache[i]->K == K &&
-            ctx->scache[i]->N == N && ctx->scache[i]->group == group)
-            return ctx->scache[i];
-    if (ctx->nscache >= RKI_MAX_SLOTS) return NULL;
-    rki_scratch *sc = rki_scratch_alloc(ctx, M, K, N, group);
-    if (!sc) return NULL;
-    ctx->scache[ctx->nscache++] = sc;
-    return sc;
+    const rocket_shape_key k = { M, K, N, group };
+    return rocket_slot_get(&ctx->scache, ctx, &k, &rki_slot_ops);
+}
+
+/* This scratch's per-worker weight layout, as a signature a resident weight can hold.
+ * wt_bytes is exactly what rki_scatter_weights allocates for that worker's weight BO. */
+static rocket_wsig rki_wsig(const rki_scratch *sc, int t)
+{
+    const rki_worker *w = &sc->w[t];
+    return (rocket_wsig){ w->n0, w->nsub, w->Kt, w->Nt, w->nKt, w->nNt, w->wt_slot,
+                          (size_t)w->nNt * w->nKt * w->wt_slot + I8_CBUF_BANK };
 }
 
 /* True iff a weight scattered for the `packed` scratch's per-worker tile layout is valid
@@ -335,15 +329,14 @@ static rki_scratch *rki_ctx_scratch(rocket_i8_ctx *ctx, int M, int K, int N, int
  * on the N-split + Nt/Kt/nNt/nKt/wt_slot; canonical tiling makes these M-independent, so
  * this holds for every M — but check defensively (e.g. a ROCKET_MM_* env override between
  * pack and compute) so a genuine mismatch returns -2 instead of miscomputing. */
-static int rki_weight_fits(const rki_scratch *packed, const rki_scratch *sc)
+static int rki_weight_fits(const rocket_i8_weights *w, const rki_scratch *sc)
 {
-    if (!packed || !sc) return 0;
-    if (packed->K != sc->K || packed->N != sc->N ||
-        packed->group != sc->group || packed->nt != sc->nt) return 0;
+    if (!w || !sc) return 0;
+    if (w->K != sc->K || w->N != sc->N || w->group != sc->group || w->nt != sc->nt)
+        return 0;
     for (int t = 0; t < sc->nt; t++) {
-        const rki_worker *a = &packed->w[t], *b = &sc->w[t];
-        if (a->n0  != b->n0  || a->nsub != b->nsub || a->Nt != b->Nt || a->Kt != b->Kt ||
-            a->nNt != b->nNt || a->nKt  != b->nKt  || a->wt_slot != b->wt_slot) return 0;
+        const rocket_wsig now = rki_wsig(sc, t);
+        if (!rocket_wsig_eq(&w->sig[t], &now)) return 0;
     }
     return 1;
 }
@@ -385,9 +378,8 @@ static int rki_scatter_weights(const char *who, rocket_i8_ctx *ctx, rki_scratch 
             for (int ki = 0; ki < ww->nKt; ki++) {
                 int k0 = ki * ww->Kt, Ktile = (K - k0 < ww->Kt) ? (K - k0) : ww->Kt;
                 int8_t *restrict slot = (int8_t *)w->wt[t].ptr + (size_t)(ni * ww->nKt + ki) * ww->wt_slot;
-                for (int kk = 1; kk <= Ntile; kk++)
-                    for (int c = 1; c <= Ktile; c++)
-                        slot[i8_wt_idx(Ktile, kk, c)] = Bslice[(size_t)(n0 + kk - 1) * K + (k0 + c - 1)];
+                MM_WT_SCATTER(int8_t, int8_t, 32, 32, wt_idx_i8,
+                              slot, Bslice, K, n0, k0, Ntile, Ktile, MM_ID);
             }
         }
         rocket_bo_fini(ctx->fd[t], &w->wt[t]);
@@ -424,7 +416,8 @@ rocket_i8_weights *rocket_i8_weights_pack(rocket_i8_ctx *ctx, int M, int K, int 
 
     rocket_i8_weights *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
-    w->M = M; w->K = K; w->N = N; w->nt = sc->nt; w->group = 0; w->sc = sc;
+    w->M = M; w->K = K; w->N = N; w->nt = sc->nt; w->group = 0;
+    for (int t = 0; t < sc->nt; t++) w->sig[t] = rki_wsig(sc, t);
     if (rki_scatter_weights("rocket_i8_weights_pack", ctx, sc, w, B, K) < 0) { free(w); return NULL; }
     return w;
 }
@@ -451,7 +444,8 @@ rocket_i8_weights *rocket_i8_weights_pack_gw(rocket_i8_ctx *ctx, int M, int K, i
 
     rocket_i8_weights *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
-    w->M = M; w->K = K; w->N = N; w->nt = sc->nt; w->group = group; w->sc = sc;
+    w->M = M; w->K = K; w->N = N; w->nt = sc->nt; w->group = group;
+    for (int t = 0; t < sc->nt; t++) w->sig[t] = rki_wsig(sc, t);
     if (rki_scatter_weights("rocket_i8_weights_pack_gw", ctx, sc, w, B, K) < 0) { free(w); return NULL; }
     return w;
 }
@@ -493,10 +487,24 @@ typedef struct {
     int core_base;           /* big-core rotation base inherited from the caller thread */
 } rki_arg;
 
+/* Monotonic ms. Only called behind mm_prof_on(), so an unprofiled run pays nothing. */
+static double rki_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
 static void *rki_thread(void *a)
 {
     rki_arg *t = (rki_arg *)a;
     rocket_pin_worker_based(t->idx, t->core_base);
+    /* ROCKET_MM_PROFILE buckets. This path runs its own compute core rather than
+     * mm_compute*, so until these it reported nothing at all — on the route an LLM's
+     * prefill actually takes. `prof` is read once: a mid-call change cannot leave a
+     * bucket half-timed. */
+    const int prof = mm_prof_on();
+    double t0 = 0, t_packA = 0, t_gen = 0, t_sync = 0, t_submit = 0, t_wait = 0, t_read = 0;
     rki_worker *w = t->ww;
     int fd = t->fd;
     int M = t->M, K = t->K, N = t->N;
@@ -510,6 +518,7 @@ static void *rki_thread(void *a)
     /* ---- pack input A[M,K] -> (M,K) int8 feature cube (C2=16) into in_all.
      * A is N-independent, so every worker scatters the full A into its own
      * scratch (cheap int8 scatter; the shared-A optimization is a later lever). */
+    if (prof) t0 = rki_now_ms();
     if (rocket_bo_prep(fd, &w->in_all, 1, 0) != 0) { t->ret = -1; return NULL; }  /* sync failed (logged) */
     memset(w->in_all.ptr, 0, w->in_all.size);
     for (int mi = 0; mi < nMt; mi++) {
@@ -517,14 +526,14 @@ static void *rki_thread(void *a)
         for (int ki = 0; ki < nKt; ki++) {
             int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
             int8_t *restrict slot = (int8_t *)w->in_all.ptr + (size_t)(mi * nKt + ki) * w->in_slot;
-            for (int h = 1; h <= Mtile; h++)
-                for (int c = 1; c <= Ktile; c++)
-                    slot[i8_feat_idx(Mtile, c, h)] = t->A[(size_t)(m0 + h - 1) * K + (k0 + c - 1)];
+            MM_CUBE_SCATTER(int8_t, int8_t, 16, feat_idx_i8,
+                            slot, t->A, K, m0, k0, Mtile, Ktile, MM_ID);
         }
     }
     /* Flush the packed input to the device before it is read by the NPU. An
      * un-propagated sync failure would let a tile run on stale/un-synced data. */
     if ((t->ret = rocket_bo_fini(fd, &w->in_all)) != 0) return NULL;
+    if (prof) t_packA = rki_now_ms() - t0;
 
     /* ---- batched tile compute: host K-accumulation (int8 NPU K-accum is HW-dead).
      * Accumulate over this worker's N-slice into acc[M, nsub] (per-channel: int64,
@@ -564,6 +573,7 @@ static void *rki_thread(void *a)
                 if (nb == 0 && (t->ret = rocket_bo_prep(fd, &w->regcmd, 1, 0)) != 0) return NULL;
 
                 size_t out_off = (size_t)nb * w->out_slot;
+                double tg0 = prof ? rki_now_ms() : 0;
                 matmul_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
                     .input_dma   = (uint32_t)(w->in_all.dma_address + (size_t)(mi*nKt+ki) * w->in_slot),
@@ -582,6 +592,7 @@ static void *rki_thread(void *a)
                 }
                 rkt_chain_pack(chained, &w->regcmd, tasks, nb, npu_regs,
                                p.task_count, I8_RC_STRIDE);
+                if (prof) t_gen += rki_now_ms() - tg0;
                 w->bm0[nb] = m0; w->bn0[nb] = n0; w->bMtile[nb] = Mtile; w->bNtile[nb] = Ntile;
                 w->boff[nb] = out_off;
                 /* Kt divides the group, so this K-tile lies wholly inside ONE group —
@@ -595,49 +606,55 @@ static void *rki_thread(void *a)
                      * staging-sync failures (un-synced regcmd / a not-yet-
                      * invalidated output BO would silently corrupt the result). */
                     rkt_chain_seal(chained, &w->regcmd, nb, tasks[0].regcmd_count);
+                    if (prof) t0 = rki_now_ms();
                     if ((t->ret = rocket_bo_fini(fd, &w->regcmd))   != 0) return NULL;
                     if ((t->ret = rocket_bo_prep(fd, &w->out_all, 1, 0)) != 0) return NULL;
                     if ((t->ret = rocket_bo_fini(fd, &w->out_all))  != 0) return NULL;
+                    if (prof) t_sync += rki_now_ms() - t0;
 
                     uint32_t in_h[]  = { w->in_all.handle, t->wt->handle, w->regcmd.handle };
                     uint32_t out_h[] = { w->out_all.handle };
                     /* Resident submit scratch (w->submit_dt), no per-job calloc/free; batched=0
                      * keeps the gapped per-task layout (integer chaining is HW-blocked here). */
+                    if (prof) t0 = rki_now_ms();
                     if ((t->ret = rocket_submit_tasks_pre(fd, w->submit_dt, tasks, nb,
                                                           in_h, 3, out_h, 1, 0)) != 0)
                         return NULL;
+                    if (prof) { t_submit += rki_now_ms() - t0; t0 = rki_now_ms(); }
 
-                    if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, i8_wait_ns())) != 0) {
+                    if ((t->ret = rocket_bo_prep(fd, &w->out_all, 0, rocket_fanout_wait_ns())) != 0) {
                         ROCKET_LOGE("rocket_matmul_int8_prepacked: WAIT TIMEOUT (%d) "
                                 "M=%d K=%d N=%d slice=%d batch=%d tiles=%d/%d\n",
                                 t->ret, M, K, nsub, w->n0, nb, done_tiles, total);
                         return NULL;
                     }
 
+                    if (prof) { t_wait += rki_now_ms() - t0; t0 = rki_now_ms(); }
                     int32_t *restrict ob = (int32_t *)w->out_all.ptr;
                     for (int j = 0; j < nb; j++) {
                         int32_t *restrict slot = ob + w->boff[j];
                         if (gw) {
                             int g = w->bg[j];                    /* this tile's K-group */
-                            for (int h = 1; h <= w->bMtile[j]; h++) {
-                                int mrow = w->bm0[j] + h - 1;
-                                float as = t->a_scale[(size_t)mrow * nG + g];
-                                for (int nn = 1; nn <= w->bNtile[j]; nn++) {
-                                    int ncol_loc = w->bn0[j] + nn - 1;   /* within this N-slice */
-                                    int ncol     = w->n0 + ncol_loc;     /* global (b_scale)    */
-                                    facc[(size_t)mrow * nsub + ncol_loc] +=
-                                        as * t->b_scale[(size_t)ncol * nG + g] *
-                                        (float)slot[i8_out_idx(w->bMtile[j], nn, h)];
-                                }
-                            }
+#define MM_ACC_(h_, nn_, v_) do {                                                  \
+    size_t mrow_ = (size_t)(w->bm0[j] + (h_) - 1);                                 \
+    int ncol_loc_ = w->bn0[j] + (nn_) - 1;   /* within this worker's N-slice */    \
+    int ncol_ = w->n0 + ncol_loc_;           /* global N index (b_scale)     */    \
+    facc[mrow_ * nsub + ncol_loc_] += t->a_scale[mrow_ * nG + g] *                 \
+        t->b_scale[(size_t)ncol_ * nG + g] * (float)(v_);                          \
+} while (0)
+                            MM_CUBE_GATHER(int32_t, 4, out_idx_i8, slot,
+                                           w->bMtile[j], w->bNtile[j], MM_ACC_);
+#undef MM_ACC_
                         } else {
-                            for (int h = 1; h <= w->bMtile[j]; h++)
-                                for (int nn = 1; nn <= w->bNtile[j]; nn++)
-                                    acc[(size_t)(w->bm0[j] + h - 1) * nsub + (w->bn0[j] + nn - 1)] +=
-                                        (int64_t)slot[i8_out_idx(w->bMtile[j], nn, h)];
+#define MM_ACC_(h_, nn_, v_) \
+    (acc[(size_t)(w->bm0[j] + (h_) - 1) * nsub + (w->bn0[j] + (nn_) - 1)] += (int64_t)(v_))
+                            MM_CUBE_GATHER(int32_t, 4, out_idx_i8, slot,
+                                           w->bMtile[j], w->bNtile[j], MM_ACC_);
+#undef MM_ACC_
                         }
                     }
                     if ((t->ret = rocket_bo_fini(fd, &w->out_all)) != 0) return NULL;
+                    if (prof) t_read += rki_now_ms() - t0;
                     nb = 0;
                 }
             }
@@ -645,12 +662,23 @@ static void *rki_thread(void *a)
     }
 
     /* scatter this worker's column slice into the full output. */
+    if (prof) t0 = rki_now_ms();
     for (int m = 0; m < M; m++)
         for (int n = 0; n < nsub; n++) {
             if (gw) t->Cf[(size_t)m * N + (w->n0 + n)] = facc[(size_t)m * nsub + n];
             else    t->C [(size_t)m * N + (w->n0 + n)] = (int32_t)acc[(size_t)m * nsub + n];
         }
 
+    if (prof) {
+        t_read += rki_now_ms() - t0;      /* the de-scatter is part of the readback */
+        mm_prof_add_pack(t_packA);
+        mm_prof_add_phase('g', t_gen);
+        mm_prof_add_phase('s', t_sync);
+        mm_prof_add_phase('u', t_submit);
+        mm_prof_add_phase('w', t_wait);
+        mm_prof_add_phase('r', t_read);
+        mm_prof_add_call();
+    }
     return NULL;
 }
 
@@ -686,7 +714,7 @@ static int rki_resolve(rocket_i8_ctx *ctx, const char *who, int M, int K, int N,
     }
     rki_scratch *sc = rki_ctx_scratch(ctx, M, K, N, w->group);
     if (!sc) return -1;
-    if (!rki_weight_fits(w->sc, sc)) {
+    if (!rki_weight_fits(w, sc)) {
         ROCKET_LOGE("%s: weight tiling (packed M=%d) incompatible with M=%d — "
                 "re-pack needed\n", who, w->M, M);
         return -2;
@@ -700,9 +728,7 @@ static int rki_resolve(rocket_i8_ctx *ctx, const char *who, int M, int K, int N,
 static int rki_run(rocket_i8_ctx *ctx, rki_scratch *sc, rocket_i8_weights *w,
                    const rki_arg *proto)
 {
-    pthread_t th[RKI_MAX_WORKERS];
-    rki_arg   args[RKI_MAX_WORKERS];
-    int joinable[RKI_MAX_WORKERS] = {0};
+    rki_arg args[RKI_MAX_WORKERS];
     int base = rocket_affinity_get_base();      /* spread in-process pools across the cluster */
 
     for (int t = 0; t < sc->nt; t++) {
@@ -713,27 +739,19 @@ static int rki_run(rocket_i8_ctx *ctx, rki_scratch *sc, rocket_i8_weights *w,
         args[t].idx = t;
         args[t].ret = 0;
         args[t].core_base = base;
-        if (pthread_create(&th[t], NULL, rki_thread, &args[t]) == 0)
-            joinable[t] = 1;
-        /* else: run inline AFTER the spawn loop (see rocket_matmul_fp16_mt) so a create
-         * failure doesn't serialize the remaining workers behind its ~8s NPU wait. */
     }
-
-    for (int t = 0; t < sc->nt; t++)
-        if (!joinable[t]) rki_thread(&args[t]);
+    rocket_fanout_run(sc->nt, args, sizeof args[0], rki_thread);
 
     int ret = 0;
-    for (int t = 0; t < sc->nt; t++) {
-        if (joinable[t]) pthread_join(th[t], NULL);
+    for (int t = 0; t < sc->nt; t++)
         if (args[t].ret) ret = args[t].ret;
-    }
     return ret;
 }
 
 int rocket_matmul_int8_prepacked(rocket_i8_ctx *ctx, int M, int K, int N,
                                  const int8_t *A, int32_t *C, rocket_i8_weights *w)
 {
-    if (!ctx || !w || !w->sc || !A || !C) return -1;
+    if (!ctx || !w || !A || !C) return -1;
     if (w->group != 0) {
         ROCKET_LOGE("rocket_matmul_int8_prepacked: weight is group-wise (group=%d) — "
                 "use rocket_matmul_int8_prepacked_gw\n", w->group);
@@ -751,7 +769,7 @@ int rocket_matmul_int8_prepacked_gw(rocket_i8_ctx *ctx, int M, int K, int N,
                                     const int8_t *A, const float *a_scale,
                                     const float *b_scale, float *Cf, rocket_i8_weights *w)
 {
-    if (!ctx || !w || !w->sc || !A || !a_scale || !b_scale || !Cf) return -1;
+    if (!ctx || !w || !A || !a_scale || !b_scale || !Cf) return -1;
     if (w->group <= 0) {
         ROCKET_LOGE("rocket_matmul_int8_prepacked_gw: weight is per-channel — "
                 "use rocket_matmul_int8_prepacked\n");
