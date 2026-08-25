@@ -30,6 +30,10 @@
 #include "rocket_resize.h"
 
 static int g_fail = 0;
+/* Cases that actually reached the driver and were compared against the reference.
+ * A per-case planner refusal just returns, so without this a run in which EVERY shape
+ * was refused would print N "skip" lines and exit PASS over zero evidence. */
+static int g_checked = 0;
 
 /* one upsample case: NPU (or CPU ref when fd<0) vs the independent reference */
 static void run_case(int fd, int mode, int C, int IH, int IW, int sy, int sx)
@@ -51,6 +55,7 @@ static void run_case(int fd, int mode, int C, int IH, int IW, int sy, int sx)
     int r = mode ? rocket_upsample_bilinear_fp16(fd, in, out, C, IH, IW, sy, sx)
                  : rocket_upsample_nearest_fp16 (fd, in, out, C, IH, IW, sy, sx);
     if (r) { printf("  %s C=%d %dx%d x%d,%d: call=%d FAIL\n", name,C,IH,IW,sy,sx,r); g_fail=1; goto done; }
+    g_checked++;
 
     if (mode) rocket_upsample_bilinear_ref_fp16(in, ref, C, IH, IW, sy, sx);
     else      rocket_upsample_nearest_ref_fp16 (in, ref, C, IH, IW, sy, sx);
@@ -134,6 +139,11 @@ int main(int argc, char **argv)
     }
 
     if (fd >= 0) rocket_close(fd);
+    if (g_checked == 0) {
+        printf("no shape reached a numeric check — every case was refused or "
+               "skipped; this gate proved nothing\n");
+        g_fail = 1;
+    }
     printf("==== %s ====\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : (fd < 0 ? 2 : 0);
 }

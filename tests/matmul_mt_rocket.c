@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include <time.h>
 
@@ -40,8 +41,18 @@ int main(int argc, char **argv)
     _Float16 *B = malloc((size_t)N*K*sizeof(_Float16));
     _Float16 *C = malloc((size_t)M*N*sizeof(_Float16));
     float *ref  = malloc((size_t)M*N*sizeof(float));
-    for (size_t i=0;i<(size_t)M*K;i++) A[i]=(_Float16)(((i*7)%13-6)*0.05f);
-    for (size_t i=0;i<(size_t)N*K;i++) B[i]=(_Float16)(((i*5)%11-5)*0.05f);
+    /* NON-PERIODIC inputs, deliberately. This gate used to fill A with period 13 along
+     * k and B with period 11 along the flat index, which makes B[n,:] repeat every 11
+     * COLUMNS at these K — so a whole-tile or whole-slice mixup between workers copies
+     * bytes that already matched and the gate saw nothing. It missed a live one: CBUF
+     * operand reuse crossing a job boundary, which corrupts a 128-column tile with
+     * plausible values. Vary the data along both axes and the same mixup is loud. */
+    { uint32_t st = 0x9e3779b9u;
+      #define MT_NEXT() (st = st*1664525u + 1013904223u, (float)((st>>8)&0xffff)/65535.f)
+      for (size_t i=0;i<(size_t)M*K;i++) A[i]=(_Float16)((MT_NEXT()*2.f-1.f)*0.35f);
+      for (size_t i=0;i<(size_t)N*K;i++) B[i]=(_Float16)((MT_NEXT()*2.f-1.f)*0.35f);
+      #undef MT_NEXT
+    }
 
     /* CPU reference — ALL M rows. Tile-boundary / tail-row corruption (the bug class
      * the multicore fan-out is most likely to hit) lives in the LAST rows, so a
@@ -79,6 +90,27 @@ int main(int argc, char **argv)
                T, dt, gflop/(dt/1000.0), base/dt, max_abs, max_rel, nbad,
                t_fail?"FAIL":"PASS");
     }
+    /* DETERMINISM at the widest fan-out. The reference check above is a one-shot, and
+     * the failure this gate exists to catch is intermittent — a job interleaving
+     * between two of a batch's tiles, which happens on some runs and not others. Same
+     * inputs, same tiling, same order must give the same bytes; a run-to-run move is a
+     * race whatever the value looks like. Repeats are cheap next to the CPU reference. */
+    {
+        const int T = 3, REPS = 6;
+        _Float16 *first = malloc((size_t)M*N*sizeof(_Float16));
+        int moved = 0;
+        for (int r = 0; r < REPS && first; r++) {
+            for (size_t i=0;i<(size_t)M*N;i++) C[i]=(_Float16)-99.0f;
+            if (rocket_matmul_fp16_mt(M,K,N,A,B,C,T)) { fprintf(stderr,"rep %d failed\n",r); fails++; break; }
+            if (r == 0) memcpy(first, C, (size_t)M*N*sizeof(_Float16));
+            else if (memcmp(first, C, (size_t)M*N*sizeof(_Float16)) != 0) moved++;
+        }
+        printf("T=%d determinism over %d runs: %d moved -> %s\n", T, REPS, moved,
+               moved ? "FAIL" : "PASS");
+        if (moved) fails++;
+        free(first);
+    }
+
     free(A); free(B); free(C); free(ref);
     return fails ? 1 : 0;
 }

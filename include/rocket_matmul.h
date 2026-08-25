@@ -689,8 +689,11 @@ int rocket_matmul_fp16_stream_fused(rocket_stream *s, int M, int K,
  * int8 weight B[N,K] is scattered into resident per-worker NPU BOs ONCE and
  * reused across forward passes, so each matmul only packs A (the int8 weight
  * scatter — "packB" — is the per-call cost this removes, as for fp16). N is
- * fanned across worker fds (each fd has its own 4GB IOVA window;
- * int8's ~11GB whole-model footprint fits across 5 fds with room to spare).
+ * fanned across worker fds (on mainline `rocket` each fd has its own 4GB IOVA window;
+ * int8's ~11GB whole-model footprint fits across 5 fds with room to spare). That sizing
+ * argument is mainline-only: the vendor `rknpu` driver shares ONE domain across the whole
+ * process and fragments it over a board's uptime, so fanning across fds buys no address
+ * space there and a large contiguous request can be refused while smaller ones fit.
  *
  *   ctx = rocket_i8_ctx_create(nthreads);            // persistent worker fds
  *   w   = rocket_i8_weights_pack(ctx, M, K, N, qB);  // scatter int8 B once

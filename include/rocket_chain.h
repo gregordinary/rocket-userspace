@@ -44,10 +44,16 @@ size_t rkt_chain_words(uint32_t regcmd_count);
  * regcmd BO `rcbo` and fill its task descriptor `tasks[nb]`. When `chained`, lay
  * it contiguously at rkt_chain_words(count) stride and link its trailer to the
  * next task (next address + next stream length); otherwise use the caller's
- * `gapped_stride`-word slot. Mixed-length batches must pass chained=0. */
-void rkt_chain_pack(int chained, rocket_bo *rcbo, rocket_task_desc *tasks,
-                    int nb, const uint64_t *src, uint32_t count,
-                    size_t gapped_stride);
+ * `gapped_stride`-word slot. Mixed-length batches must pass chained=0.
+ *
+ * Returns 0, or -1 if the slot does not fit the BO, its address does not fit the
+ * regcmd's 32-bit address field, or the trailer shape is not the one the chain
+ * claims — in which case the caller must NOT submit the batch. Same contract as
+ * rkt_chain_pack_at: a failure here means the chain link was not written and the
+ * job would run task 0 and stall into a fence timeout. */
+int rkt_chain_pack(int chained, rocket_bo *rcbo, rocket_task_desc *tasks,
+                   int nb, const uint64_t *src, uint32_t count,
+                   size_t gapped_stride);
 
 /* THE SAME LINK, AT AN EXPLICIT OFFSET, for a chain whose programs are NOT all the same
  * length. rkt_chain_pack above derives task nb's slot from nb and this task's own count,
@@ -78,5 +84,26 @@ int rkt_chain_pack_at(rocket_bo *rcbo, rocket_task_desc *tasks, int idx,
  * the PC prefetch past the batch). No-op when not chained or for a single task.
  * `count` is the uniform per-task op count (== tasks[0].regcmd_count). */
 void rkt_chain_seal(int chained, rocket_bo *rcbo, int nb, uint32_t count);
+
+/* Read back what was actually packed and check the chain is self-consistent: for
+ * every task, that its trailer's PC_BASE_ADDRESS points at the NEXT task's regcmd
+ * address and its PC_REGISTER_AMOUNTS encodes the NEXT task's word count, and that
+ * the last task's forward link is cleared.
+ *
+ * This exists because rkt_chain_pack_at takes `next_count` as a parameter and
+ * cannot check it: the caller asserts how long the next program is, and the header
+ * says getting it wrong makes the chain fetch a short segment as a long one, with
+ * nothing to fault on. Here the answer is available — the next program is really in
+ * the BO — so the assertion becomes checkable. The uniform-length rkt_chain_pack
+ * path derives both fields from one count and cannot get them inconsistent, so for
+ * it this is a cheap tautology; the heterogeneous path is what it is for.
+ *
+ * CHAINED batches only: a gapped batch has no forward links to check, and every
+ * task would read as one whose link was never written. `tasks[0..n)` must be the
+ * descriptors the pack calls filled, in chain order. Returns 0, or -1 with a
+ * diagnostic naming the first task whose link disagrees — the caller must not
+ * submit. Reads the regcmd BO, so call it after packing (and after
+ * rkt_chain_seal) and before submit. */
+int rkt_chain_verify(const rocket_bo *rcbo, const rocket_task_desc *tasks, int n);
 
 #endif /* ROCKET_CHAIN_H */

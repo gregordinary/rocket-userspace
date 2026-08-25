@@ -54,6 +54,12 @@ typedef struct {
     uint64_t mmap_offset;  /* offset arg for mmap() on the accel fd           */
     size_t   size;
     void    *ptr;          /* CPU mapping (NULL until rocket_bo_map)          */
+    /* Memory-object address. The mainline `rocket` driver keys every BO ioctl on the
+     * GEM handle and leaves this 0; the vendor `rknpu` driver keys MEM_DESTROY and
+     * MEM_SYNC on the object address instead, so a provider for it has nowhere else to
+     * carry the value. Inert on any provider that does not need it — never read by the
+     * core, never patched into a register. */
+    uint64_t obj_addr;
 } rocket_bo;
 
 /* ============================================================================
@@ -109,8 +115,15 @@ int  rocket_bo_alloc(int fd, size_t size, rocket_bo *bo);
 /* rocket_bo_alloc, plus the check every regcmd-programmed BO owes the hardware: the
  * address fields are 32 BITS WIDE, so a BO whose last byte leaves the low 4 GB encodes
  * an address the datapath reads wrapped — a full, correctly sized, entirely wrong
- * surface. A per-fd IOVA window is 4 GB and a resident-weight workload can walk right
- * up to it, so this is reachable rather than theoretical.
+ * surface. A per-fd IOVA window is 4 GB on the mainline `rocket` driver and a
+ * resident-weight workload can walk right up to it, so this is reachable rather than
+ * theoretical. The window is a property of the DRIVER, not of the silicon: the vendor
+ * `rknpu` BSP driver has ONE domain shared process-wide, and it fragments over a board's
+ * uptime: freshly booted it serves ~3.9 GB at every size like mainline, but after a day of
+ * use the same board served 35 BOs of 16 MiB, ONE of 128 MiB and none of 192 MiB.
+ * So there a second fd adds no address space, a second process competes for the same
+ * budget, and a large contiguous request can be refused while smaller ones still fit.
+ * Treat a NOMEM on a large BO as transient there: retry smaller before giving up.
  *
  * Folding the check into the allocation is the point: it was previously written out at
  * each call site as `((a + sza) | (b + szb) | ...) >> 32`, present fourteen times in the
@@ -178,11 +191,36 @@ int  rocket_bo_ranges_supported(void);
  * ROCKET_BATCH_SUBMIT env var alone. */
 int  rocket_batched_submit_supported(void);
 
+/* 1 if the chained layout is this uAPI's NATIVE multi-program mode, so it is what a
+ * multi-task submit should use unless the caller says otherwise; 0 if chaining is an
+ * extension the caller has to ask for. This picks ROCKET_BATCH_SUBMIT's DEFAULT — the
+ * env var still forces either way — and it is a separate question from
+ * rocket_batched_submit_supported(), which says whether chaining works at all.
+ *
+ * Mainline is 0: the stock kernel runs a job's tasks one per IRQ and the chained
+ * layout needs both a patch and a module param, so it stays opt-in there. The vendor
+ * rknpu path is 1: its job programs only the first task's address, so a multi-program
+ * job can ONLY be a chain — and the chain is also the only shape that keeps a batch to
+ * one job, which is what CBUF reuse needs (see rocket_submit_batch_atomic). Measured on
+ * that provider at 512x3840x4096 fp16, three warm rounds: chained 36.8-39.3 ms against
+ * 68-77 ms unchained, and 26.1-27.7 ms with the driver's own core scheduler on top,
+ * versus 23.5-24.4 ms for the same shape on mainline.
+ *
+ * Probed once and cached. */
+int  rocket_batched_submit_native(void);
+
 /* 1 if the running kernel honors DRM_ROCKET_JOB_PPU_DONE (retire a pooling job on
  * the PPU's own completion); 0 otherwise. Probed once and cached. Callers MUST gate
  * on this: the submit ioctl REJECTS a flag word it does not recognise, so an older
  * kernel fails the submit rather than ignoring the bit. */
 int  rocket_ppu_done_supported(void);
+
+/* Is ROCKET_JOB_NO_DPU_DONE safe to set on the running kernel? The version number alone
+ * cannot answer it: the two SoCs' drivers number their interfaces independently and the
+ * flag sets behind a given minor diverge (RK3576 gains this bit at 1.2, the RK3588 series
+ * does not carry it at any version), while the submit ioctl rejects any flag word it does
+ * not recognise. Ungated, the bit turns one hint into -EINVAL on every submit. */
+int  rocket_no_dpu_done_supported(void);
 
 /* 1 if the running kernel arms a BATCHED job's completion wait on the task counter,
  * so the wait starts once the whole kick has retired (RK3576, interface 1.4); 0
@@ -191,6 +229,26 @@ int  rocket_ppu_done_supported(void);
  * stream can retire with programs still to run — the chain length a caller may build
  * is capped there and is the part's own here. */
 int  rocket_batch_completion_tracked(void);
+
+/* 1 if the tasks of ONE submit call run as ONE uninterrupted job — no other job,
+ * from this fd or any other context, is scheduled between them; 0 if the provider
+ * decomposes a multi-task submit into independent jobs.
+ *
+ * This is the contract CBUF OPERAND REUSE stands on. A tile with the CNA
+ * WEIGHT_REUSE / DATA_REUSE bit set reads its operand out of CBUF instead of
+ * re-fetching it, which is only sound while the previous tile's operand is still
+ * there — i.e. while nothing else has run on that core. A caller that sets those
+ * bits must have EITHER a chained (single-kick) layout OR this reporting 1.
+ *
+ * The failure when it does not hold is silent: a full, correctly sized, entirely
+ * plausible output surface whose value moves between runs, because the CBUF held
+ * whatever the interleaving job left. Measured on the vendor rknpu provider, where
+ * an unchained multi-task submit is n ioctls and therefore n jobs: 29 of 120 runs
+ * of one 128x1024x1024 fp16 matmul corrupt with reuse on, 0 of 120 with it off and
+ * 0 of 80 chained. Periodic inputs hide it, so a gate must vary its data.
+ *
+ * Probed once and cached. */
+int  rocket_submit_batch_atomic(void);
 
 /* Spin-poll the completion fence for up to `us` microseconds before a blocking
  * wait falls asleep (overrides the ROCKET_BUSY_POLL env, which sets the default;

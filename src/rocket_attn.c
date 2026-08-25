@@ -698,9 +698,26 @@ static int fa_heads_range(int fd, int n_tokens, int n_kv, int head_dim, int dv,
         const long per_head = (long)Tp * Kn;
         int Gmax = per_head > 0 ? (int)(fa_chain_elems() / per_head) : (h1 - h0);
         if (Gmax > (h1 - h0)) Gmax = h1 - h0;
-        if (Gmax > 1)
-            return fa_heads_range_batched(fd, n_tokens, n_kv, head_dim, n_head, n_kv_heads,
-                                          scale, softcap, Q, K, V, mask, out, s, h0, h1, host_sm, Gmax);
+        /* A group of G heads asks the batched matmul for ONE score BO of G*Tp*Kn
+         * elements, and a driver whose IOVA space is a single long-lived shared domain
+         * can refuse a large contiguous request while smaller ones still fit. That is a
+         * transient resource refusal, not an unsupported shape, so halve the group and
+         * retry rather than returning a hard ROCKET_E_NOMEM that costs the caller the
+         * whole offload. Measured on the vendor rknpu driver, whose fragmented domain
+         * serves one 128 MB BO and no 192 MB one after a day of uptime; on mainline
+         * rocket, where each fd gets a fresh 4 GB window, the first attempt always wins
+         * and this loop costs nothing. Retry, never skip: the heads a failed group left
+         * unwritten are rewritten from h0, because every group writes only its own
+         * output slices. */
+        for (; Gmax > 1; Gmax /= 2) {
+            int rc = fa_heads_range_batched(fd, n_tokens, n_kv, head_dim, n_head, n_kv_heads,
+                                            scale, softcap, Q, K, V, mask, out, s, h0, h1,
+                                            host_sm, Gmax);
+            if (rc != ROCKET_E_NOMEM && rc != ROCKET_E_DEVICE) return rc;
+            ROCKET_LOGW("rocket_flash_attn: a chained group of %d heads was refused (%d); "
+                        "retrying at %d\n", Gmax, rc, Gmax / 2);
+        }
+        /* Gmax==1 chains nothing, so fall through to the per-head path. */
     }
 
     for (int h = h0; h < h1; h++) {

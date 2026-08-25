@@ -522,14 +522,16 @@ static int r76_batch_on(void)
  * chain's own even-word stride with each trailer rewritten to point the PC at the next,
  * and the last task's forward link cleared. The kernel then programs TASK_NUMBER = ne so
  * the PC streams all of them from one kick and raises one completion. */
-static void r76_chain_stream(struct r76_conv_bos *b, rocket_task_desc *td,
-                             const uint64_t *ops, uint32_t task_ops, unsigned ne)
+static int r76_chain_stream(struct r76_conv_bos *b, rocket_task_desc *td,
+                            const uint64_t *ops, uint32_t task_ops, unsigned ne)
 {
     unsigned t;
     for (t = 0; t < ne; t++)
-        rkt_chain_pack(1, &b->rc, td, (int)t,
-                       ops + (size_t)t * RK3576_CONV_TASK_OPS, task_ops, 0);
+        if (rkt_chain_pack(1, &b->rc, td, (int)t,
+                           ops + (size_t)t * RK3576_CONV_TASK_OPS, task_ops, 0) != 0)
+            return -1;
     rkt_chain_seal(1, &b->rc, (int)ne, task_ops);
+    return rkt_chain_verify(&b->rc, td, (int)ne);
 }
 
 /* Submit one tile's row tasks and satisfy ourselves that each wrote. `ops` holds `ne`
@@ -578,7 +580,11 @@ static int r76_submit_ops(int fd, struct r76_conv_bos *b, const uint64_t *ops,
 
         rocket_bo_prep(fd, &b->rc, 1, 0);
         if (chained) {
-            r76_chain_stream(b, td, ops, task_ops, ne);
+            if (r76_chain_stream(b, td, ops, task_ops, ne) != 0) {
+                ROCKET_LOGE("%s: the chained row stream could not be laid out\n", entry);
+                rocket_bo_fini(fd, &b->rc);
+                return ROCKET_E_SHAPE;
+            }
         } else if (ne > 1u || lead) {
             /* Every program at its own slot, described as its own drm task. One PC
              * program per descriptor is the part's rule either way; what chaining adds
@@ -4436,6 +4442,14 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
             }
         }
     }
+    /* Inside the CPU-owned bracket, so the read sees what was just written. Every
+     * next_count above came from the caller's parallel cnt[] array rather than from
+     * the program really at off[k+1]; this is where those two are compared. */
+    if (rkt_chain_verify(&c->rc, c->td, (int)c->ntask) != 0) {
+        ROCKET_LOGE("%s: the packed chain does not describe itself\n", entry);
+        rocket_bo_fini(fd, &c->rc);
+        goto fail;
+    }
     rocket_bo_fini(fd, &c->rc);
 
     /* EACH BO ONCE, ACROSS BOTH LISTS. The driver locks every BO of a job through
@@ -5345,7 +5359,8 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
                             + (size_t)rows[r].output_off;
             e.span        = (size_t)rows[r].oh * ow * C2F * sizeof(_Float16);
             rc = r76_submit_task(fd, &b, &p, ops, in_h, 4u, out_h, &e, stamp,
-                             ROCKET_JOB_NO_DPU_DONE, entry);
+                             rocket_no_dpu_done_supported()
+                                 ? ROCKET_JOB_NO_DPU_DONE : 0u, entry);
             if (rc != ROCKET_OK) goto done;
         }
     }
@@ -5554,7 +5569,8 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
         e.span        = e.group_bytes;
         t0 = prof.on ? r76_now_us() : 0;
         rc = r76_submit_task(fd, &b, &p, ops, in_h, 4u, out_h, &e, stamp,
-                             ROCKET_JOB_NO_DPU_DONE, entry);
+                             rocket_no_dpu_done_supported()
+                                 ? ROCKET_JOB_NO_DPU_DONE : 0u, entry);
         if (prof.on) prof.submit_us += r76_now_us() - t0;
         if (rc != ROCKET_OK) goto done;
 

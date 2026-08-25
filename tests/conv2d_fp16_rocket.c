@@ -127,6 +127,11 @@ static int cube_self_check(const rocket_conv2d_desc *d,
     return max_abs == 0.0 ? 0 : 1;
 }
 
+/* Cases that actually reached the driver and were compared against the reference.
+ * A per-case planner refusal returns 0, so without this a run in which EVERY shape
+ * was refused would print N "skipping" lines and exit PASS over zero evidence. */
+static int g_checked = 0;
+
 static int run_shape(int fd, const rocket_conv2d_desc *d)
 {
     int OH = rocket_conv2d_oh(d), OW = rocket_conv2d_ow(d);
@@ -180,6 +185,7 @@ static int run_shape(int fd, const rocket_conv2d_desc *d)
         if (r == -5) { printf("  %s: depthwise gated (ROCKET_CONV_DW_NATIVE) — SKIP\n", tag); }
         else if (r) { printf("  %s: rocket_conv2d_fp16 = %d (FAIL)\n", tag, r); fail = 1; }
         else {
+            g_checked++;
             rocket_conv2d_ref_fp16(d, in, W, ref);
             double max_abs = 0; int bad = 0;
             for (size_t i = 0; i < out_n; i++) {
@@ -243,6 +249,11 @@ int main(int argc, char **argv)
     }
 
     if (fd >= 0) rocket_close(fd);
+    if (g_checked == 0) {
+        printf("no shape reached a numeric check — every case was refused or "
+               "skipped; this gate proved nothing\n");
+        fail = 1;
+    }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

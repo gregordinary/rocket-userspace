@@ -1289,7 +1289,9 @@ static int conv2d_int8_batch_tiles(int fd, rocket_conv_ctx *ctx,
             ROCKET_LOGE("conv int8 batch: regcmd overflow (%u > %d)\n", p.task_count, CONV_RC_STRIDE);
             ret = -1; goto out;
         }
-        rkt_chain_pack(0, rc_bo, tasks, k, regs, p.task_count, CONV_RC_STRIDE);
+        if (rkt_chain_pack(0, rc_bo, tasks, k, regs, p.task_count, CONV_RC_STRIDE) != 0) {
+            ret = -1; goto out;
+        }
     }
     rocket_bo_fini(fd, rc_bo);
 

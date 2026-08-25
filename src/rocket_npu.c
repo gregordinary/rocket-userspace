@@ -32,6 +32,7 @@
 #include "rocket_npu.h"
 #include "rocket_log.h"
 #include "rocket_sysfs.h"        /* the one enumeration of the bound NPU cores */
+#include "rocket_busy_poll.h"    /* the shared completion-wait spin budget    */
 #include "rocket_rk3576_internal.h"   /* rocket_rk3576_bo_pool_drain, called from rocket_close */            // centralized log channel
 #include "rocket_hw_profile.h"     // chip detection (warn on unprofiled silicon)
 
@@ -284,6 +285,13 @@ int rocket_batched_submit_supported(void)
  * job's last program raises. The version is the only signal, and it is enough: 1.3 is
  * the version in which the flag appears.
  *
+ * DELIBERATELY VERSION-ONLY — do NOT add an SoC gate here by analogy with
+ * rocket_no_dpu_done_supported() below. Bit 2 and version 1.3 mean the same thing on
+ * both parts, which is the entire payoff for the RK3588 series skipping 1.2 rather than
+ * reusing bit 1, and it is what lets the two parts share one header. An SoC gate here
+ * would silently cost the RK3588 the shorter completion the moment a caller sets it.
+ * The flag BELOW needs the SoC because its bit is genuinely absent on one part.
+ *
  * Returns 1 if it is safe to set, 0 otherwise.
  */
 int rocket_ppu_done_supported(void)
@@ -294,6 +302,41 @@ int rocket_ppu_done_supported(void)
         return c;
 
     c = rocket_iface_minor() >= 3;
+    atomic_store(&cached, c);
+    return c;
+}
+
+/*
+ * Does the running kernel honor DRM_ROCKET_JOB_NO_DPU_DONE?
+ *
+ * THE VERSION NUMBER ALONE CANNOT ANSWER THIS, and that is the whole reason this probe
+ * exists separately from the one above. The two SoCs' drivers number their interfaces
+ * independently, and the flag sets behind a given minor DIVERGE:
+ *
+ *      RK3576   1.1 BATCHED   1.2 +NO_DPU_DONE   1.3 +PPU_DONE   1.4 ... 1.6
+ *      RK3588   1.1 BATCHED                      1.3 +PPU_DONE
+ *
+ * The RK3588 series skips both the bit and the version, so its 1.3 carries PPU_DONE and
+ * NOT NO_DPU_DONE, while the RK3576's 1.3 carries both. A probe keyed on `minor >= 2`
+ * alone would therefore set the bit on an RK3588 1.3 kernel, whose submit ioctl rejects
+ * any flag word it does not recognise — so EVERY submit fails with -EINVAL, not just the
+ * ones that wanted the hint. Gate it on the SoC first, then on that SoC's version.
+ *
+ * Advisory in MEANING (a wrong completion class costs the settle period, not
+ * correctness) is not the same as safe to SEND; see rocket_ppu_done_supported() above,
+ * which makes the same point about the same ioctl.
+ *
+ * Returns 1 if it is safe to set, 0 otherwise.
+ */
+int rocket_no_dpu_done_supported(void)
+{
+    static _Atomic int cached = -1;
+    int c = atomic_load(&cached);
+    if (c >= 0)
+        return c;
+
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+    c = (hw && strcmp(hw->name, "rk3576") == 0 && rocket_iface_minor() >= 2) ? 1 : 0;
     atomic_store(&cached, c);
     return c;
 }
@@ -332,6 +375,27 @@ int rocket_batch_completion_tracked(void)
     atomic_store(&cached, c);
     return c;
 }
+
+/* CHAINING IS AN EXTENSION HERE, NOT THE NATIVE MODE.
+ *
+ * The stock driver runs a job's tasks one per IRQ; the contiguous self-linked layout
+ * needs the batched-submit patch AND its module param. So it stays opt-in
+ * (ROCKET_BATCH_SUBMIT=1) even where rocket_batched_submit_supported() says the kernel
+ * would honor it — a caller that mixes regcmd lengths in one job must be able to leave
+ * it alone, and the gapped per-task layout is the one every gate has always run. */
+int rocket_batched_submit_native(void) { return 0; }
+
+/* ONE SUBMIT IS ONE JOB.
+ *
+ * The mainline driver holds core->in_flight_job across the whole task sequence:
+ * rocket_job_handle_irq() programs the next task of the SAME job and only signals
+ * the done fence once next_task_idx reaches task_count, so the scheduler cannot put
+ * another entity's job on that core in between. CBUF operand reuse therefore holds
+ * across a batch here without the caller doing anything, chained or not.
+ *
+ * Structural, not versioned — there is nothing to probe, and no kernel in this
+ * driver's history has decomposed a job. */
+int rocket_submit_batch_atomic(void) { return 1; }
 
 /* RANGED CACHE MAINTENANCE (interface 1.5).
  *
@@ -469,50 +533,6 @@ int rocket_bo_fini_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
  * ROCKET_RK3576_ALLOW_MULTI_FD=1 lifts the refusal, for the probes that provoke the
  * corruption on purpose and for anyone who has serialized submits themselves.
  */
-int rocket_sysfs_bound_devices(char names[][ROCKET_SYSFS_NAME_MAX], int max)
-{
-    static const char *dir = "/sys/bus/platform/drivers/rocket";
-    DIR *d = opendir(dir);
-    struct dirent *e;
-    int n = 0;
-
-    if (!d) return 0;
-    while ((e = readdir(d)) && n < max) {
-        char path[512];
-        struct stat st;
-        if (e->d_name[0] == '.') continue;
-        /* The directory also holds bind/unbind/uevent and a `module` link; a bound
-         * device is whatever carries a power/ subdirectory. */
-        if (snprintf(path, sizeof path, "%s/%s/power", dir, e->d_name) >= (int)sizeof path)
-            continue;
-        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-        if (names) {
-            /* Truncate rather than skip: a name this long is not a device we can use
-             * either way, and a truncated one simply fails to open. */
-            snprintf(names[n], ROCKET_SYSFS_NAME_MAX, "%.*s",
-                     ROCKET_SYSFS_NAME_MAX - 1, e->d_name);
-        }
-        n++;
-    }
-    closedir(d);
-    return n;
-}
-
-int rocket_sysfs_bound_core_count(void)
-{
-    /* Cached: the bind set does not change under a running process that is using the
-     * device, and the RK3576 fd guard asks on every open. _Atomic because that guard
-     * can be reached from several threads at once; the probe is idempotent, so a race
-     * costs a second enumeration and nothing else. */
-    static _Atomic int cached = -1;
-    int c = atomic_load_explicit(&cached, memory_order_relaxed);
-    if (c < 0) {
-        c = rocket_sysfs_bound_devices(NULL, ROCKET_SYSFS_MAX_DEVS);
-        atomic_store_explicit(&cached, c, memory_order_relaxed);
-    }
-    return c;
-}
-
 static int rocket_bound_core_count(void) { return rocket_sysfs_bound_core_count(); }
 
 /* fds this library currently has open, so the guard fires on the SECOND one. */
@@ -637,7 +657,7 @@ int rocket_bo_alloc32(int fd, size_t size, rocket_bo *bo)
         return rc;
     /* The LAST byte is what has to be encodable, not the first: a BO based just under
      * 4 GB whose tail crosses it programs an address the hardware reads as wrapped. */
-    if (((bo->dma_address + size) >> 32) != 0) {
+    if (size != 0 && ((bo->dma_address + size - 1) >> 32) != 0) {
         ROCKET_LOGE("rocket_bo_alloc32(%zu): IOVA 0x%llx..0x%llx leaves the low 4 GB the "
                     "regcmd's 32-bit address fields can encode\n", size,
                     (unsigned long long)bo->dma_address,
@@ -690,24 +710,9 @@ void rocket_bo_free(int fd, rocket_bo *bo)
  * every poll, so it pays only when that output is SMALL. It does NOT skip the
  * kernel IRQ — the mainline `rocket` fence is still IRQ-signalled — so it
  * removes the waiter-side wakeup, not the interrupt itself (that needs a
- * kernel-side poll, a patches/rocket item). Resolved once from the env, with a
- * programmatic override for in-process A/B (see rocket_busy_poll_set_us). */
-static _Atomic long g_busy_poll_us = -1;   /* -1 = unresolved; resolve lazily from env (also set by rocket_busy_poll_set_us) */
-
-void rocket_busy_poll_set_us(long us)
-{
-    g_busy_poll_us = us < 0 ? 0 : us;
-}
-
-static long rkt_busy_poll_us(void)
-{
-    if (g_busy_poll_us < 0) {
-        const char *e = getenv("ROCKET_BUSY_POLL");
-        long v = (e && *e) ? strtol(e, NULL, 10) : 0;
-        g_busy_poll_us = v < 0 ? 0 : v;
-    }
-    return g_busy_poll_us;
-}
+ * kernel-side poll, a patches/rocket item). The budget itself is host-side and
+ * shared across providers — see rocket_busy_poll.h; what is specific to this
+ * provider is the probe below. */
 
 /* Non-blocking completion probe: PREP_BO with a zero (=poll) deadline. Returns
  * 0 if the job's writes to this BO have landed (the BO is now CPU-synced),
@@ -917,7 +922,9 @@ int rocket_submit_tasks(int fd,
  * is only valid when the caller has laid the tasks' regcmds out contiguously and
  * self-chained (rocket_chain.c) AND rocket_batched_submit_supported() is true — a
  * chained layout run down the stock per-task path stalls, so that bit does not degrade
- * gracefully on an older kernel. ROCKET_JOB_NO_DPU_DONE is advisory and always safe. */
+ * gracefully on an older kernel. ROCKET_JOB_NO_DPU_DONE is advisory in MEANING but is NOT
+ * always safe to SEND — the ioctl rejects an unrecognised flag word, and the SoCs number
+ * their interfaces independently, so gate it with rocket_no_dpu_done_supported(). */
 int rocket_submit_tasks_flags(int fd,
                               const rocket_task_desc *tasks, uint32_t n_tasks,
                               const uint32_t *in_handles,  uint32_t n_in,

@@ -225,8 +225,12 @@ int rocket_pool_fp16(int fd, const rocket_pool_desc *d, const _Float16 *in, _Flo
 
     {
         rocket_bo *const ins[] = { &in_bo };
-        ret = rocket_op_submit_one(fd, "rocket_pool_fp16", &rc_bo, regs, p.task_count,
-                                   ins, 1, &out_bo);
+        /* This program is a POOL: it finishes on the PPU, not the DPU. Naming the
+         * block costs the mainline driver's grace period nothing to skip and is what
+         * lets a driver that waits for the named block retire the job at all. */
+        ret = rocket_op_submit_one_flags(fd, "rocket_pool_fp16", &rc_bo, regs,
+                                         p.task_count, ins, 1, &out_bo,
+                                         rocket_ppu_done_supported() ? ROCKET_JOB_PPU_DONE : 0u);
     }
     if (ret) goto out;
     {

@@ -39,6 +39,7 @@
 #include "rocket_matmul.h"
 #include "rocket_cube.h"           /* NPU tile-layout index math + the blocked cube moves */
 #include "rocket_matmul_internal.h"
+#include "rocket_op.h"   /* rocket_op_iova_overflow — one 32-bit IOVA rule */
 #include "rocket_chain.h"        /* contiguous self-chaining regcmd layout (shared) */
 #include "rocket_log.h"     // centralized log channel
 
@@ -278,14 +279,30 @@ static int reuse_debug(void) {
     if (v < 0) v = getenv("ROCKET_REUSE_DEBUG") != NULL;
     return v;
 }
-static int reuse_mode_for(int nMt, int nNt) {
+/* Reuse's PRECONDITION, separate from its policy: a tile that reads its operand out
+ * of CBUF is only right while the previous tile's operand is still there, which needs
+ * the whole batch to run as ONE job. A chained batch is one kick and satisfies it by
+ * construction; an unchained one satisfies it only where the provider runs a
+ * multi-task submit as one job. Where neither holds — the vendor rknpu provider, whose
+ * unchained submit is one ioctl per task and therefore one JOB per task — any other
+ * job on that core lands between two of our tiles and the reuse bit reads its CBUF.
+ * The result is a full, correctly sized, plausible surface whose value moves between
+ * runs; it is not an error and nothing refuses. So the bit goes off. */
+static int reuse_ok(int chained) {
+    static _Atomic int one_job = -1;       /* cached like the other knobs */
+    int v = one_job;
+    if (v < 0) { v = rocket_submit_batch_atomic() ? 1 : 0; one_job = v; }
+    return chained || v;
+}
+static int reuse_mode_for(int nMt, int nNt, int chained) {
     int p = reuse_policy();
     int m = (p != -1) ? p                  /* off or forced */
                       : (nNt >= nMt) ? 2 : 1;   /* AUTO: deeper consecutive run wins */
+    if (m && !reuse_ok(chained)) m = 0;    /* the batch is not one job — see reuse_ok */
     if (reuse_debug())
-        ROCKET_LOGI("reuse: %s mode=%d (%s) nMt=%d nNt=%d\n",
+        ROCKET_LOGI("reuse: %s mode=%d (%s) nMt=%d nNt=%d chained=%d\n",
                     p == -1 ? "AUTO" : "forced", m,
-                    m == 0 ? "off" : m == 2 ? "DATA" : "WEIGHT", nMt, nNt);
+                    m == 0 ? "off" : m == 2 ? "DATA" : "WEIGHT", nMt, nNt, chained);
     return m;
 }
 
@@ -351,9 +368,9 @@ static int rup(int x, int a) { return ((x + a - 1) / a) * a; }
  * the matmul's gapped slot stride (RC_STRIDE) so the call sites below are
  * unchanged. */
 static inline int  mm_batch_chained(void) { return rkt_chain_enabled(); }
-static inline void mm_pack_regcmd(int chained, rocket_bo *rcbo, rocket_task_desc *tasks,
-                                  int nb, const uint64_t *src, uint32_t count) {
-    rkt_chain_pack(chained, rcbo, tasks, nb, src, count, (size_t)RC_STRIDE);
+static inline int mm_pack_regcmd(int chained, rocket_bo *rcbo, rocket_task_desc *tasks,
+                                 int nb, const uint64_t *src, uint32_t count) {
+    return rkt_chain_pack(chained, rcbo, tasks, nb, src, count, (size_t)RC_STRIDE);
 }
 static inline void mm_seal_chain(int chained, rocket_bo *rcbo, int nb, uint32_t count) {
     rkt_chain_seal(chained, rcbo, nb, count);
@@ -882,11 +899,12 @@ int mm_bos_alloc(int fd, const mm_plan *pl, mm_bos *b)
         mm_bos_free(fd, b);
         return -1;
     }
-    if (((b->in_all.dma_address + in_sz) | (b->wt_all.dma_address + wt_sz) |
-         (b->out_all.dma_address + out_sz) | (b->regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul: a BO dma_address exceeds 32 bits\n");
-        mm_bos_free(fd, b);
-        return -1;
+    {
+        rocket_bo *const chk[] = { &b->in_all, &b->wt_all, &b->out_all, &b->regcmd };
+        if (rocket_op_iova_overflow("rocket_matmul", chk, 4)) {
+            mm_bos_free(fd, b);
+            return -1;
+        }
     }
 
     /* Capability flags fixed at alloc time from env; the compute dispatcher branches
@@ -910,10 +928,10 @@ int mm_bos_alloc(int fd, const mm_plan *pl, mm_bos *b)
          * (pre-right-size behavior) to A/B the sync win or fall back on a regression. */
         if (getenv("ROCKET_KACC_BATCHOUT")) ktiles = BATCH;
         size_t outk_sz = (size_t)ktiles * pl->out_slot * sizeof(_Float16) + CBUF_BANK;
+        rocket_bo *const chk[] = { &b->okacc0, &b->pong };
         if (rocket_bo_alloc(fd, outk_sz, &b->okacc0) ||
-            (b->okacc0.dma_address + outk_sz) >> 32 ||
             rocket_bo_alloc(fd, outk_sz, &b->pong) ||
-            (b->pong.dma_address + outk_sz) >> 32) {
+            rocket_op_iova_overflow("rocket_matmul (KACC)", chk, 2)) {
             ROCKET_LOGE("rocket_matmul: KACC output BO alloc failed\n");
             mm_bos_free(fd, b);
             return -1;
@@ -925,9 +943,10 @@ int mm_bos_alloc(int fd, const mm_plan *pl, mm_bos *b)
      * overwritten per batch; out2 is fully written by the NPU and only its live
      * tiles are read back). */
     if (b->has_pipe) {
+        rocket_bo *const chk[] = { &b->regcmd2, &b->out2 };
         if (rocket_bo_alloc(fd, rc_sz,  &b->regcmd2) ||
             rocket_bo_alloc(fd, out_sz, &b->out2) ||
-            ((b->regcmd2.dma_address + rc_sz) | (b->out2.dma_address + out_sz)) >> 32) {
+            rocket_op_iova_overflow("rocket_matmul (PIPE)", chk, 2)) {
             ROCKET_LOGE("rocket_matmul: PIPE BO alloc failed\n");
             mm_bos_free(fd, b);
             return -1;
@@ -1225,7 +1244,8 @@ int mm_compute(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
                     ROCKET_LOGE("rocket_matmul: gen failed (%d)\n", ret); goto done;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto done; }
-                mm_pack_regcmd(batch_chained, &b->regcmd, tasks, nb, npu_regs, p.task_count);
+                if (mm_pack_regcmd(batch_chained, &b->regcmd, tasks, nb, npu_regs,
+                                   p.task_count) != 0) { ret = -1; goto done; }
                 bm0[nb] = m0; bn0[nb] = n0; bMtile[nb] = Mtile; bNtile[nb] = Ntile;
                 boff[nb] = out_off;
                 t_gen += now_ms() - ts;
@@ -1737,7 +1757,7 @@ int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
      * unaffected — tile gi maps to the same (mi,ni) across all ki for either decode.
      * reuse_mode_for() picks the deeper run per shape (AUTO default); an explicit
      * ROCKET_REUSE forces one mode. */
-    int rmode = reuse_mode_for(nMt, nNt);
+    int rmode = reuse_mode_for(nMt, nNt, batch_chained);
 
     /* ── Cross-ki chaining (ROCKET_KACC_CHAIN=1) ──────────────────────────────
      * Replace the nKt fenced submits of one tile-group with a SINGLE self-chained
@@ -1767,6 +1787,7 @@ int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
     int chain_engage = (nKt > 1 && nKt <= BATCH) &&
                        (chain_mode == 2 || (chain_mode == 1 && nKt * 3 <= BATCH));
     if (chain_engage) {
+        rmode = reuse_mode_for(nMt, nNt, 1);       /* this path always kicks once */
         int gcap = BATCH / nKt;                    /* tiles/group: nKt*gcap <= BATCH */
         if (gcap > nTiles) gcap = nTiles;
         for (int base = 0; base < nTiles; base += gcap) {
@@ -1807,7 +1828,10 @@ int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
                         ROCKET_LOGE("rocket_matmul(kacc-chain): gen failed (%d)\n", ret); goto done;
                     }
                     if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto done; }
-                    rkt_chain_pack(1, &b->regcmd, tasks, nt, npu_regs, p.task_count, (size_t)RC_STRIDE);
+                    if (rkt_chain_pack(1, &b->regcmd, tasks, nt, npu_regs,
+                                       p.task_count, (size_t)RC_STRIDE) != 0) {
+                        ret = -1; goto done;
+                    }
                     if (ki == 0) { bmi[gi] = mi; bni[gi] = ni; }   /* (mi,ni) per tile, ki-invariant */
                     nt++;
                 }
@@ -1901,7 +1925,8 @@ int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
                  * self-chained (one kick). fp16 KACC accumulates via fp16 eltwise-add
                  * across ki-JOBS (separate fenced submits), not the int32 CACC, so
                  * chaining the independent tiles WITHIN a ki-job is accumulation-safe. */
-                mm_pack_regcmd(batch_chained, &b->regcmd, tasks, gi, npu_regs, p.task_count);
+                if (mm_pack_regcmd(batch_chained, &b->regcmd, tasks, gi, npu_regs,
+                                   p.task_count) != 0) { ret = -1; goto done; }
                 bmi[gi] = mi; bni[gi] = ni;
             }
             mm_seal_chain(batch_chained, &b->regcmd, g, tasks[0].regcmd_count);
@@ -2002,7 +2027,12 @@ int mm_compute_kacc_cube(int fd, const mm_plan *pl, mm_bos *b, rocket_bo *cube, 
     if (nKt > 1) {
         size_t need = (size_t)nTiles * out_slot * sizeof(_Float16) + CBUF_BANK;
         if (rocket_bo_alloc(fd, need, &pong_local) < 0) return -1;
-        if ((pong_local.dma_address + need) >> 32) { rocket_bo_free(fd, &pong_local); return -1; }
+        {
+            rocket_bo *const chk[] = { &pong_local };
+            if (rocket_op_iova_overflow("rocket_matmul (kacc pong)", chk, 1)) {
+                rocket_bo_free(fd, &pong_local); return -1;
+            }
+        }
         bufs[finidx ^ 1] = &pong_local;
     } else {
         bufs[finidx ^ 1] = cube;   /* unused (accumulate is always 0 at nKt==1) */
@@ -2034,7 +2064,10 @@ int mm_compute_kacc_cube(int fd, const mm_plan *pl, mm_bos *b, rocket_bo *cube, 
             int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
             size_t out_off = (size_t)gi * out_slot;       /* == (mi*nNt+ni)*out_slot */
             int dims_ok = (Mtile == p_Mt && Ntile == p_Nt);
-            int dreuse  = (gi > 0 && dims_ok && mi == p_mi);   /* consecutive ni share (mi,ki) input */
+            /* The (mi,ni) DECODE above is the mandatory part, not the CBUF bit: the bit
+             * only says "skip the re-fetch", and input_dma is programmed either way. So
+             * it drops out where the batch is not one job without moving an output. */
+            int dreuse  = (gi > 0 && dims_ok && mi == p_mi && reuse_ok(batch_chained));
             matmul_params_t p = {
                 .m = Mtile, .k = Ktile, .n = Ntile,
                 .input_dma  = (uint32_t)(b->in_all.dma_address +
@@ -2052,7 +2085,8 @@ int mm_compute_kacc_cube(int fd, const mm_plan *pl, mm_bos *b, rocket_bo *cube, 
                 ROCKET_LOGE("rocket_matmul(kacc_cube): gen failed (%d)\n", ret); goto done;
             }
             if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto done; }
-            mm_pack_regcmd(batch_chained, &b->regcmd, tasks, gi, npu_regs, p.task_count);
+            if (mm_pack_regcmd(batch_chained, &b->regcmd, tasks, gi, npu_regs,
+                               p.task_count) != 0) { ret = -1; goto done; }
             bmi[gi] = mi; bni[gi] = ni;
         }
         mm_seal_chain(batch_chained, &b->regcmd, g, tasks[0].regcmd_count);
@@ -2179,7 +2213,7 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
     } else if (reuse_policy() != 0) {
         /* Reached only with KACC off + ROCKET_REUSE forced (AUTO implies KACC implies
          * has_pong above), so reuse_mode_for resolves to that forced 1/2 here. */
-        ret = mm_compute_reuse(fd, &pl, &b, C, 0.0, reuse_mode_for(pl.nMt, pl.nNt));
+        ret = mm_compute_reuse(fd, &pl, &b, C, 0.0, reuse_mode_for(pl.nMt, pl.nNt, 0));
     } else if (b.has_pipe) {
         ret = mm_compute_pipe(fd, &pl, &b, C, 0.0);   /* pipelined overlap */
     } else {
@@ -2254,9 +2288,10 @@ rocket_mm_batch *rocket_mm_batch_create(int fd)
     b->last_M = b->last_K = b->last_N = b->last_nbatch = -1;
 
     size_t rc_sz = (size_t)BATCH * RC_STRIDE * sizeof(uint64_t);
+    rocket_bo *const chk[] = { &b->regcmd };
     if (rocket_bo_alloc(fd, 4096, &b->guard) != 0 ||           /* push allocs off IOVA 0 */
         rocket_bo_alloc(fd, rc_sz, &b->regcmd) != 0 ||
-        (b->regcmd.dma_address + b->regcmd.size) >> 32) {
+        rocket_op_iova_overflow("rocket_mm_batch_create", chk, 1)) {
         rocket_mm_batch_free(b);
         return NULL;
     }
@@ -2410,7 +2445,8 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
                         ROCKET_LOGE("rocket_matmul: batch gen failed (%d)\n", ret); goto fail;
                     }
                     if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = ROCKET_E_DEVICE; goto fail; }
-                    mm_pack_regcmd(batch_chained, &b->regcmd, tasks, nb, npu_regs, p.task_count);
+                    if (mm_pack_regcmd(batch_chained, &b->regcmd, tasks, nb, npu_regs,
+                                       p.task_count) != 0) { ret = ROCKET_E_DEVICE; goto fail; }
                     bit_[nb] = it; bm0[nb] = m0; bn0[nb] = n0;
                     bMtile[nb] = Mtile; bNtile[nb] = Ntile; boff[nb] = out_off;
                     t_gen += now_ms() - ts;
@@ -2590,10 +2626,9 @@ int rocket_matmul_int8_groupwise(int fd, int M, int K, int N,
     ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
     ret |= rocket_bo_alloc(fd, out_sz, &out_all);
     if (ret) { ROCKET_LOGE("rocket_matmul_int8_groupwise: BO alloc failed\n"); ret = -1; goto free_bos; }
-    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
-         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul_int8_groupwise: a BO dma_address exceeds 32 bits\n");
-        ret = -1; goto free_bos;
+    {
+        rocket_bo *const chk[] = { &in_all, &wt_all, &out_all, &regcmd };
+        if (rocket_op_iova_overflow("rocket_matmul_int8_groupwise", chk, 4)) { ret = -1; goto free_bos; }
     }
 
     /* ---- pack weights B[N,K] -> (N/32,K/32,32,32) int8 tile layout ---- */
@@ -2757,10 +2792,9 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
     ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
     ret |= rocket_bo_alloc(fd, out_sz, &out_all);
     if (ret) { ROCKET_LOGE("rocket_matmul_int8: BO alloc failed\n"); ret = -1; goto free_bos; }
-    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
-         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul_int8: a BO dma_address exceeds 32 bits\n");
-        ret = -1; goto free_bos;
+    {
+        rocket_bo *const chk[] = { &in_all, &wt_all, &out_all, &regcmd };
+        if (rocket_op_iova_overflow("rocket_matmul_int8", chk, 4)) { ret = -1; goto free_bos; }
     }
 
     /* ---- pack weights B[N,K] -> (N/32,K/32,32,32) int8 tile layout ---- */
@@ -2961,10 +2995,9 @@ int rocket_matmul_int4_ex(int fd, int M, int K, int N,
     ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
     ret |= rocket_bo_alloc(fd, out_sz, &out_all);
     if (ret) { ROCKET_LOGE("rocket_matmul_int4: BO alloc failed\n"); ret = -1; goto free_bos; }
-    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
-         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul_int4: a BO dma_address exceeds 32 bits\n");
-        ret = -1; goto free_bos;
+    {
+        rocket_bo *const chk[] = { &in_all, &wt_all, &out_all, &regcmd };
+        if (rocket_op_iova_overflow("rocket_matmul_int4", chk, 4)) { ret = -1; goto free_bos; }
     }
 
     /* ---- pack weights B[N,K] -> (N/64,K/32,64,32) int4 nibble layout ---- */
@@ -3133,10 +3166,9 @@ int rocket_matmul_int4_groupwise(int fd, int M, int K, int N,
     ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
     ret |= rocket_bo_alloc(fd, out_sz, &out_all);
     if (ret) { ROCKET_LOGE("rocket_matmul_int4_groupwise: BO alloc failed\n"); ret = -1; goto free_bos; }
-    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
-         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul_int4_groupwise: a BO dma_address exceeds 32 bits\n");
-        ret = -1; goto free_bos;
+    {
+        rocket_bo *const chk[] = { &in_all, &wt_all, &out_all, &regcmd };
+        if (rocket_op_iova_overflow("rocket_matmul_int4_groupwise", chk, 4)) { ret = -1; goto free_bos; }
     }
 
     /* ---- pack weights B[N,K] -> (N/64,K/32,64,32) int4 nibble layout ---- */
@@ -3387,10 +3419,9 @@ int rocket_matmul_bf16(int fd, int M, int K, int N,
     ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
     ret |= rocket_bo_alloc(fd, out_sz, &out_all);
     if (ret) { ROCKET_LOGE("rocket_matmul_bf16: BO alloc failed\n"); ret = -1; goto free_bos; }
-    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
-         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul_bf16: a BO dma_address exceeds 32 bits\n");
-        ret = -1; goto free_bos;
+    {
+        rocket_bo *const chk[] = { &in_all, &wt_all, &out_all, &regcmd };
+        if (rocket_op_iova_overflow("rocket_matmul_bf16", chk, 4)) { ret = -1; goto free_bos; }
     }
 
     /* ---- pack weights B[N,K] -> (N/16,K/32,16,32) bf16 tile layout (truncate) ---- */
@@ -3552,10 +3583,9 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
     ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
     ret |= rocket_bo_alloc(fd, out_sz, &out_all);
     if (ret) { ROCKET_LOGE("rocket_matmul_fp16_f32out: BO alloc failed\n"); ret = -1; goto free_bos; }
-    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
-         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul_fp16_f32out: a BO dma_address exceeds 32 bits\n");
-        ret = -1; goto free_bos;
+    {
+        rocket_bo *const chk[] = { &in_all, &wt_all, &out_all, &regcmd };
+        if (rocket_op_iova_overflow("rocket_matmul_fp16_f32out", chk, 4)) { ret = -1; goto free_bos; }
     }
 
     /* ---- pack weights B[N,K] -> fp16 (N/16,K/32,16,32) tile layout (no truncation) ---- */
@@ -3720,10 +3750,9 @@ int rocket_matmul_tf32(int fd, int M, int K, int N,
     ret |= rocket_bo_alloc(fd, wt_sz,  &wt_all);
     ret |= rocket_bo_alloc(fd, out_sz, &out_all);
     if (ret) { ROCKET_LOGE("rocket_matmul_tf32: BO alloc failed\n"); ret = -1; goto free_bos; }
-    if (((in_all.dma_address + in_sz) | (wt_all.dma_address + wt_sz) |
-         (out_all.dma_address + out_sz) | (regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("rocket_matmul_tf32: a BO dma_address exceeds 32 bits\n");
-        ret = -1; goto free_bos;
+    {
+        rocket_bo *const chk[] = { &in_all, &wt_all, &out_all, &regcmd };
+        if (rocket_op_iova_overflow("rocket_matmul_tf32", chk, 4)) { ret = -1; goto free_bos; }
     }
 
     /* ---- pack weights B[N,K] -> (N/16,K/16,16,16) fp32 tile layout (RAW, no trunc) ---- */

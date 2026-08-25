@@ -58,6 +58,10 @@ static void lower_desc(const rocket_conv_transpose2d_desc *d, rocket_conv2d_desc
     *IHd = core_h + ly + ty;
     *IWd = core_w + lx + tx;
 
+    /* Zero first: the fields this lowering does not set — `oh`/`ow` and the RK3576
+     * encoding flags — carry the contract "zero means derive it", so a caller-supplied
+     * struct must start zeroed. Both call sites declare `fwd` on the stack. */
+    memset(fwd, 0, sizeof *fwd);
     fwd->ic = d->ic; fwd->ih = *IHd; fwd->iw = *IWd;
     fwd->oc = d->oc; fwd->kh = d->kh; fwd->kw = d->kw;
     fwd->stride_y = 1; fwd->stride_x = 1;

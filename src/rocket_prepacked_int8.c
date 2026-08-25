@@ -69,6 +69,7 @@
 #include "rocket_matmul_internal.h"  /* the ROCKET_MM_PROFILE buckets */
 #include "rocket_affinity.h"
 #include "rocket_fanout.h"
+#include "rocket_op.h"   /* rocket_op_iova_overflow — one 32-bit IOVA rule */
 #include "rocket_log.h"     // centralized log channel
 #include "rocket_chain.h"   // contiguous self-chaining regcmd layout (batched submit)
 
@@ -203,13 +204,6 @@ void rocket_i8_ctx_free(rocket_i8_ctx *ctx)
     free(ctx);
 }
 
-/* True if BO [addr, addr+size) escapes the low-4GB IOVA window the regcmd's
- * 32-bit address fields can encode. */
-static int i8_iova_overflow(const rocket_bo *bo, size_t size)
-{
-    return ((bo->dma_address + size) >> 32) != 0;
-}
-
 /* Allocate one worker's N-slice plan + shared scratch BOs (NOT the weight BO).
  * group == 0 per-channel, > 0 group-wise (see the file header). */
 static int rki_worker_alloc(int fd, rki_worker *w, int M, int tileM, int K, int nsub,
@@ -253,10 +247,9 @@ static int rki_worker_alloc(int fd, rki_worker *w, int M, int tileM, int K, int 
     ret |= rocket_bo_alloc(fd, in_sz,  &w->in_all);
     ret |= rocket_bo_alloc(fd, out_sz, &w->out_all);
     if (ret) { ROCKET_LOGE("rki_worker_alloc: scratch BO alloc failed\n"); goto fail; }
-    if (i8_iova_overflow(&w->in_all, in_sz) || i8_iova_overflow(&w->out_all, out_sz) ||
-        i8_iova_overflow(&w->regcmd, rc_sz)) {
-        ROCKET_LOGE("rki_worker_alloc: scratch BO dma_address exceeds 32 bits\n");
-        goto fail;
+    {
+        rocket_bo *const chk[] = { &w->in_all, &w->out_all, &w->regcmd };
+        if (rocket_op_iova_overflow("rki_worker_alloc", chk, 3)) goto fail;
     }
 
     w->tasks  = malloc(I8_BATCH * sizeof(*w->tasks));
@@ -360,10 +353,12 @@ static int rki_scatter_weights(const char *who, rocket_i8_ctx *ctx, rki_scratch 
             ROCKET_LOGE("%s: wt BO alloc failed (worker %d, %zuMB)\n", who, t, wt_sz >> 20);
             goto fail;
         }
-        if (i8_iova_overflow(&w->wt[t], wt_sz)) {
-            ROCKET_LOGE("%s: wt BO dma_address exceeds 32 bits (worker %d)\n", who, t);
-            rocket_bo_free(ctx->fd[t], &w->wt[t]);
-            goto fail;
+        {
+            rocket_bo *const chk[] = { &w->wt[t] };
+            if (rocket_op_iova_overflow(who, chk, 1)) {
+                rocket_bo_free(ctx->fd[t], &w->wt[t]);
+                goto fail;
+            }
         }
 
         /* B's column-slice [n0, n0+nsub): local n into the slice maps to global row
@@ -590,8 +585,10 @@ static void *rki_thread(void *a)
                             "(task_count %u > %d words)\n", p.task_count, I8_RC_STRIDE);
                     t->ret = -1; return NULL;
                 }
-                rkt_chain_pack(chained, &w->regcmd, tasks, nb, npu_regs,
-                               p.task_count, I8_RC_STRIDE);
+                if (rkt_chain_pack(chained, &w->regcmd, tasks, nb, npu_regs,
+                                   p.task_count, I8_RC_STRIDE) != 0) {
+                    t->ret = -1; return NULL;
+                }
                 if (prof) t_gen += rki_now_ms() - tg0;
                 w->bm0[nb] = m0; w->bn0[nb] = n0; w->bMtile[nb] = Mtile; w->bNtile[nb] = Ntile;
                 w->boff[nb] = out_off;

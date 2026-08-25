@@ -91,6 +91,11 @@ static int cube_self_check(const rocket_pool_desc *d, const _Float16 *in)
     return max_abs == 0.0 ? 0 : 1;
 }
 
+/* Cases that actually reached the driver and were compared against the reference.
+ * A per-case planner refusal returns 0, so without this a run in which EVERY shape
+ * was refused would print N "skipping" lines and exit PASS over zero evidence. */
+static int g_checked = 0;
+
 static int run_shape(int fd, const rocket_pool_desc *d)
 {
     int OH = rocket_pool_oh(d), OW = rocket_pool_ow(d);
@@ -129,6 +134,7 @@ static int run_shape(int fd, const rocket_pool_desc *d)
         int r = rocket_pool_fp16(fd, d, in, out);
         if (r) { printf("  %s: rocket_pool_fp16 = %d (FAIL)\n", tag, r); fail = 1; }
         else {
+            g_checked++;
             rocket_pool_ref_fp16(d, in, ref);
             /* MAX is exact; AVG within tolerance (fp16(65536/k) recip + fp16 rounding). */
             double tol = (d->method == POOL_METHOD_MAX) ? 0.0 : 0.06;
@@ -188,6 +194,11 @@ int main(int argc, char **argv)
         }
     }
     if (fd >= 0) rocket_close(fd);
+    if (g_checked == 0) {
+        printf("no shape reached a numeric check — every case was refused or "
+               "skipped; this gate proved nothing\n");
+        fail = 1;
+    }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

@@ -67,6 +67,42 @@ src/
 tests/                         standalone tests + benchmarks (see below)
 ```
 
+## The submit seam (`rocket_npu.h`)
+
+Every kernel interaction goes through one set of C symbols, and that set has more than one
+implementation: `src/rocket_npu.c` for the mainline `rocket` DRM-accel driver (the default,
+`-DROCKETNPU_PROVIDER=builtin`), and an external provider for a vendor BSP driver
+(`-DROCKETNPU_PROVIDER=external -DROCKETNPU_PROVIDER_LIB=...`). Selection is at link time
+rather than through a vtable: the seam is a set of C symbols already, one build targets one
+driver, and an indirect call on every BO operation would buy nothing.
+
+**The seam is exactly the externally-visible `rocket_*` functions defined in
+`src/rocket_npu.c`, and a conforming provider defines exactly that set** — nothing missing, and
+no `rocket_*` name of its own that the library already defines above the seam.
+
+`rocket_npu.h` is where they are declared, but the header is not the definition of the seam:
+it also declares host-side entry points that stay in the core whatever the driver is
+(`rocket_affinity_*`, `rocket_pin_worker`, `rocket_num_big_cores`, `rocket_busy_poll_set_us`).
+Do not enumerate the seam by reading the header, and do not enumerate it by hand — the list
+grows, and a hand-kept copy goes stale silently:
+
+```sh
+tools/provider-seam.sh                          # print the seam
+tools/provider-seam.sh path/to/provider.a       # check a provider (.a / .o / .so / .c)
+```
+
+Groups, as they stand: device open and close; BO allocation and the 32-bit-IOVA variants; cache
+maintenance including the ranged form and its capability query; submit in its matmul, task,
+pre-arranged and job forms plus the scratch-size query; the capability probes; and the submit
+counters.
+
+**Why this is checked rather than trusted.** A provider *defines* these symbols rather than
+calling them, so when the seam grows the provider still compiles clean. `librocketnpu.a` is a
+static archive, which is allowed to carry unresolved symbols, so the library still builds too.
+The break surfaces only in whoever links the two together, as an undefined reference in every
+executable at once. Configure runs the check for an external provider that names a file, and
+fails with the missing symbols listed before an object is compiled.
+
 ## Public matmul API (`rocket_matmul.h`)
 
 | function | what it is |

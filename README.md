@@ -43,7 +43,9 @@ The complete function reference — every entry point, per dtype and op — is i
   node `/dev/accel/accel0` present. Confirm with `ls /dev/accel/accel0` and `lsmod | grep rocket`
   (the module is named `rocket`).
 - The `drm/rocket_accel.h` uAPI header (ships in `/usr/include/drm` on a kernel with `rocket`); CMake
-  checks for it at configure time.
+  checks for it at configure time. Needed only by the built-in submit provider — a BSP-kernel board
+  has no mainline `rocket` uAPI and supplies its own provider instead, see
+  [Submit provider](#submit-provider).
 - libdrm and pthreads. No ML-framework dependency.
 - Privilege to open the accel node — run as a user in the node's group, or with `sudo -E` (the `-E`
   preserves the `ROCKET_*` env knobs that plain `sudo` strips).
@@ -266,6 +268,45 @@ doubling as a CTest correctness gate; the full catalog is in [API.md](API.md#tes
 
 The full `ROCKET_*` reference (flash-attention chaining, tiling overrides, batched submit) and the
 diagnostic log channel are in [API.md](API.md#runtime-knobs).
+
+### Submit provider
+
+Every kernel interaction the library makes goes through one set of C symbols — the **submit
+seam**: device open and close, buffer allocation and cache maintenance, submit, and the
+capability and counter queries. Everything above it is shaped by the silicon rather than by the
+driver and compiles unchanged whichever kernel is underneath.
+
+The seam has two implementations, selected at link time:
+
+| `-DROCKETNPU_PROVIDER=` | drives | needs |
+|---|---|---|
+| `builtin` (default) | the mainline `rocket` DRM-accel driver, `/dev/accel/accel0` | `drm/rocket_accel.h` |
+| `external` | whatever you link, via `-DROCKETNPU_PROVIDER_LIB=` | nothing from mainline |
+
+`external` is how the library runs on a BSP kernel, where the NPU is an `rknpu` node rather than
+an `accel/rocket` one. It is also the only configuration that builds at all on such a board,
+since the built-in provider needs a uAPI header the BSP kernel does not ship.
+
+```sh
+cmake -S . -B build -DROCKETNPU_PROVIDER=external \
+      -DROCKETNPU_PROVIDER_LIB=/path/to/libyour-provider.a
+```
+
+**The seam is exactly the externally-visible `rocket_*` functions defined in
+`src/rocket_npu.c`, and a provider must define all of them.** `tools/provider-seam.sh` prints
+that list, and checks a provider against it:
+
+```sh
+tools/provider-seam.sh                          # the symbols a provider owes
+tools/provider-seam.sh path/to/provider.a       # or a .o, a .so, or the .c source
+```
+
+Configure runs the same check whenever the provider is external and names a file, and stops
+with the missing symbols listed. That matters because the failure is otherwise late and
+misleading: a provider *defines* these symbols rather than calling them, so a seam that grows
+breaks nothing when the provider is compiled, and `librocketnpu.a` is a static archive that
+links happily with the symbol unresolved. Without the check the first sign is every executable
+in the tree failing at the end of the build.
 
 ## The rocket NPU stack
 

@@ -55,6 +55,21 @@ int rocket_op_submit_one(int fd, const char *who,
                          rocket_bo *rc, const uint64_t *regs, uint32_t count,
                          rocket_bo *const *in, int n_in, rocket_bo *out);
 
+/* rocket_op_submit_one with a ROCKET_JOB_* bitmask.
+ *
+ * The one flag a single-program op has any use for is ROCKET_JOB_PPU_DONE, which says
+ * this program finishes on the PPU rather than the DPU. A pool enables no DPU stage at
+ * all — PC_OPERATION_ENABLE is a per-block bitmap and a pool sets 0x60 against a
+ * convolution's 0x1d — so the completion the driver waits on by default can never set.
+ * What that costs depends on the driver: the mainline one settles out its grace period
+ * and retires anyway, so the flag is a latency saving there; a driver that waits for
+ * the named block instead never retires at all without it. Gate on
+ * rocket_ppu_done_supported(). */
+int rocket_op_submit_one_flags(int fd, const char *who,
+                               rocket_bo *rc, const uint64_t *regs, uint32_t count,
+                               rocket_bo *const *in, int n_in, rocket_bo *out,
+                               uint32_t job_flags);
+
 /* Does any of these BOs' last byte leave the low 4 GB the regcmd's 32-bit address fields
  * can encode? Logs and returns non-zero if so. NULL entries and unallocated BOs are
  * skipped, so a caller can pass its whole set. */

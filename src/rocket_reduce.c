@@ -19,6 +19,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_reduce.h"
+#include "rocket_op.h"   /* rocket_op_iova_overflow — one 32-bit IOVA rule */
 #include "rocket_matmul.h" /* rocket_matmul_fp16_f32out (the feature-axis ones-matmul reduce) */
 #include "npu_pool.h"     /* gen_pool_fp16, pool_params_t, ppu_recip_kernel_fp16, POOL_METHOD_AVG */
 #include "npu_matmul.h"   /* feature_data (NC1HWC2 cube index) */
@@ -122,9 +123,9 @@ int rocket_global_avgpool_fp16(int fd, int C, int H, int W,
         rocket_bo_alloc(fd, sizeof(regs), &rc_bo)) {
         ROCKET_LOGE("rocket_global_avgpool: BO alloc failed\n"); goto out;
     }
-    if (((A.dma_address + A.size) | (B.dma_address + B.size) |
-         (rc_bo.dma_address + rc_bo.size)) >> 32) {
-        ROCKET_LOGE("rocket_global_avgpool: a BO dma_address exceeds 32 bits\n"); goto out;
+    {
+        rocket_bo *const chk[] = { &A, &B, &rc_bo };
+        if (rocket_op_iova_overflow("rocket_global_avgpool", chk, 3)) goto out;
     }
 
     /* scatter input feature [C][H][W] -> NC1HWC2 cube in A */
@@ -181,7 +182,12 @@ int rocket_global_avgpool_fp16(int fd, int C, int H, int W,
                                   .regcmd_count = p.task_count };
         uint32_t in_h[]  = { src->handle, rc_bo.handle };
         uint32_t out_h[] = { dst->handle };
-        if ((ret = rocket_submit_tasks(fd, &task, 1, in_h, 2, out_h, 1)) != 0) {
+        /* This program is a POOL: it finishes on the PPU, not the DPU. Naming the
+         * block costs the mainline driver's grace period nothing to skip and is what
+         * lets a driver that waits for the named block retire the job at all. */
+        if ((ret = rocket_submit_tasks_flags(fd, &task, 1, in_h, 2, out_h, 1,
+                                             rocket_ppu_done_supported()
+                                                 ? ROCKET_JOB_PPU_DONE : 0u)) != 0) {
             ROCKET_LOGE("rocket_global_avgpool: submit pass %d failed (%d)\n", i, ret);
             goto out;
         }
@@ -281,9 +287,9 @@ static int run_global_extrema_pool(int fd, int C, int H, int W, int method,
         rocket_bo_alloc(fd, sizeof(regs), &rc_bo)) {
         ROCKET_LOGE("rocket_global_extrema_pool: BO alloc failed\n"); goto out;
     }
-    if (((A.dma_address + A.size) | (B.dma_address + B.size) |
-         (rc_bo.dma_address + rc_bo.size)) >> 32) {
-        ROCKET_LOGE("rocket_global_extrema_pool: a BO dma_address exceeds 32 bits\n"); goto out;
+    {
+        rocket_bo *const chk[] = { &A, &B, &rc_bo };
+        if (rocket_op_iova_overflow("rocket_global_extrema_pool", chk, 3)) goto out;
     }
 
     /* scatter input feature [C][H][W] -> NC1HWC2 cube in A */
@@ -336,7 +342,12 @@ static int run_global_extrema_pool(int fd, int C, int H, int W, int method,
                                   .regcmd_count = p.task_count };
         uint32_t in_h[]  = { src->handle, rc_bo.handle };
         uint32_t out_h[] = { dst->handle };
-        if ((ret = rocket_submit_tasks(fd, &task, 1, in_h, 2, out_h, 1)) != 0) {
+        /* This program is a POOL: it finishes on the PPU, not the DPU. Naming the
+         * block costs the mainline driver's grace period nothing to skip and is what
+         * lets a driver that waits for the named block retire the job at all. */
+        if ((ret = rocket_submit_tasks_flags(fd, &task, 1, in_h, 2, out_h, 1,
+                                             rocket_ppu_done_supported()
+                                                 ? ROCKET_JOB_PPU_DONE : 0u)) != 0) {
             ROCKET_LOGE("rocket_global_extrema_pool: submit pass %d failed (%d)\n", i, ret);
             goto out;
         }

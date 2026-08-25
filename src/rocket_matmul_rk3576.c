@@ -2156,7 +2156,8 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                  * blind settle. Naming the class lets it use the shorter one. */
                 if (rocket_submit_matmul_flags(fd, &b.rc, q.task_count, in_h, 4,
                                                out_h, 1,
-                                               ROCKET_JOB_NO_DPU_DONE) != 0) {
+                                               rocket_no_dpu_done_supported()
+                                                   ? ROCKET_JOB_NO_DPU_DONE : 0u) != 0) {
                     rc = ROCKET_E_DEVICE; goto done;
                 }
                 if (rocket_bo_prep(fd, &b.out, 0, 2000000000ull) < 0) {

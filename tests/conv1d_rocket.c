@@ -22,6 +22,10 @@
 #include "rocket_conv.h"
 
 static int g_fail = 0;
+/* Cases that actually reached the driver and were compared against the reference.
+ * A per-case planner refusal returns 0, so without this a run in which EVERY shape
+ * was refused would print N "skipping" lines and exit PASS over zero evidence. */
+static int g_checked = 0;
 
 static void fill(_Float16 *v, size_t n, float amp, uint32_t seed)
 {
@@ -57,6 +61,7 @@ static int test_conv1d(int fd, int ic, int it, int oc, int kw, int stride, int p
     int fail = 0;
     if (rc) { printf("  %s: call=%d -> FAIL\n", tag, rc); fail = 1; }
     else {
+        g_checked++;
         /* Two-metric: bit-exact for small reductions; a tiny fp16-accumulation tolerance for
          * the large IC*KW reductions (the CNA's fp32-accum ORDER differs from the host loop, so
          * a 1-ULP fp16 store difference is expected and benign — same regime as the conv2d HW
@@ -91,6 +96,11 @@ int main(void)
     g_fail |= test_conv1d(fd, 16, 600, 32,  3, 1, 1);  /* wide OT (past one CBUF tile) */
 
     rocket_close(fd);
+    if (g_checked == 0) {
+        printf("no shape reached a numeric check — every case was refused or "
+               "skipped; this gate proved nothing\n");
+        g_fail = 1;
+    }
     printf("==== %s ====\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

@@ -44,6 +44,7 @@
 #include "rocket_cube.h"       /* the NPU cube index math + blocked moves */
 #include "rocket_fanout.h"
 #include "rocket_log.h"
+#include "rocket_op.h"   /* rocket_op_iova_overflow — one 32-bit IOVA rule */
 
 #define BFS_MAX_WORKERS ROCKET_FANOUT_MAX_WORKERS
 #define BFS_BATCH       ROCKET_FANOUT_BATCH
@@ -113,9 +114,9 @@ static int bfs_bos_alloc(int fd, const bfs_plan *pl, bfs_bos *b)
     ret |= rocket_bo_alloc(fd, wt_sz,  &b->wt_all);
     ret |= rocket_bo_alloc(fd, out_sz, &b->out_all);
     if (ret) { ROCKET_LOGE("bf16_stream: BO alloc failed\n"); goto fail; }
-    if (((b->in_all.dma_address + in_sz) | (b->wt_all.dma_address + wt_sz) |
-         (b->out_all.dma_address + out_sz) | (b->regcmd.dma_address + rc_sz)) >> 32) {
-        ROCKET_LOGE("bf16_stream: a BO dma_address exceeds 32 bits\n"); ret = -1; goto fail;
+    {
+        rocket_bo *const chk[] = { &b->in_all, &b->wt_all, &b->out_all, &b->regcmd };
+        if (rocket_op_iova_overflow("bf16_stream", chk, 4)) { ret = -1; goto fail; }
     }
 
     /* Prezero the input/weight BOs ONCE so the per-call pack writes only live tile

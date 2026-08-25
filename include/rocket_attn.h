@@ -100,9 +100,11 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
  * the FA-NPU-vs-CPU prefill crossover from ~6K down to ~2K (parity <=1K); hence default-on.
  * The mask + softmax sit between the two batched jobs, so it is compatible with the
  * host-softmax default. Numerically identical to the per-head path (ROCKET_FA_CHAIN_ELEMS
- * bounds the head group by score-matrix size, default 4M elems; ROCKET_FA_CHAIN=0 forces
+ * bounds the head group by score-matrix size, default 32M elems; ROCKET_FA_CHAIN=0 forces
  * the per-head path). Applies to the _mt and _ctx paths (per worker) and the nthreads==1 /
- * single-fd path (the whole range).
+ * single-fd path (the whole range). The group size is an upper bound, not a promise: a driver
+ * that refuses the group's single score buffer gets the group halved and retried, down to the
+ * per-head path, so the result is unchanged and only the submit count moves.
  *
  * ROCKET_FA_TILE_KV (long context) selects the online/tiled path: instead of one QK matmul
  * over the full key axis (materializing the [n_tokens,n_kv] score matrix host-side for the

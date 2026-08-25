@@ -164,6 +164,11 @@ static int cube_self_check(const rocket_conv2d_desc *d, const int8_t *in, const 
     return max_abs == 0 ? 0 : 1;
 }
 
+/* Cases that actually reached the driver and were compared against the reference.
+ * A per-case skip returns 0, so without this a run in which EVERY shape was
+ * refused would print N "skipping" lines and exit PASS over zero evidence. */
+static int g_checked = 0;
+
 /* Run ONE int8 conv as a single NPU job (must fit one CBUF pass). Direct: OC is
  * zero-padded up to 32 (the weight oc-group); the first OC output channels are read
  * back. Depthwise: OC==IC, channel group G. got[OC*OH*OW] receives the int32 output.
@@ -330,6 +335,7 @@ static int run_tiled_runtime(int fd, const rocket_conv2d_desc *d)
     int fail = 0;
     if (r != 0) { printf("  rocket_conv2d_int8 = %d -> FAIL\n", r); fail = 1; }
     else {
+        g_checked++;
         ref_conv_int8(d, in, W, ref);
         int64_t max_abs = 0; int bad = 0;
         for (size_t i = 0; i < out_n; i++) {
@@ -399,6 +405,7 @@ static int run_shape(int fd, const rocket_conv2d_desc *d)
         memset(got, 0, out_n * sizeof(int32_t));
         int r = run_hw_single_job(fd, d, in, W, got);
         if (r == 0) {
+            g_checked++;
             ref_conv_int8(d, in, W, ref);
             int64_t max_abs = 0; int bad = 0;
             for (size_t i = 0; i < out_n; i++) {
@@ -474,6 +481,11 @@ int main(int argc, char **argv)
     }
 
     if (fd >= 0) rocket_close(fd);
+    if (g_checked == 0) {
+        printf("no shape reached a numeric check — every case was refused or "
+               "skipped; this gate proved nothing\n");
+        fail = 1;
+    }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

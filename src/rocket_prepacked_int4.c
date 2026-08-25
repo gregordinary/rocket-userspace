@@ -32,6 +32,7 @@
 #include "rocket_cube.h"       /* the NPU cube index math + blocked moves */
 #include "rocket_affinity.h"
 #include "rocket_fanout.h"
+#include "rocket_op.h"   /* rocket_op_iova_overflow — one 32-bit IOVA rule */
 #include "rocket_log.h"     // centralized log channel
 #include "rocket_chain.h"   // contiguous self-chaining regcmd layout (batched submit)
 
@@ -138,8 +139,6 @@ void rocket_i4_ctx_free(rocket_i4_ctx *ctx) {
     free(ctx);
 }
 
-static int i4_iova_of(const rocket_bo *bo, size_t size) { return ((bo->dma_address + size) >> 32) != 0; }
-
 static int rk4_worker_alloc(int fd, rk4_worker *w, int M, int tileM, int K, int nsub, int n0, int group) {
     w->n0 = n0; w->nsub = nsub;
     /* Plan the tiling at the CANONICAL tileM (= MAX_TILE), not the actual row count M,
@@ -176,8 +175,9 @@ static int rk4_worker_alloc(int fd, rk4_worker *w, int M, int tileM, int K, int 
     ret |= rocket_bo_alloc(fd, in_sz,  &w->in_all);
     ret |= rocket_bo_alloc(fd, out_sz, &w->out_all);
     if (ret) { ROCKET_LOGE("rk4_worker_alloc: scratch BO alloc failed\n"); goto fail; }
-    if (i4_iova_of(&w->in_all, in_sz) || i4_iova_of(&w->out_all, out_sz) || i4_iova_of(&w->regcmd, rc_sz)) {
-        ROCKET_LOGE("rk4_worker_alloc: scratch BO dma_address exceeds 32 bits\n"); goto fail;
+    {
+        rocket_bo *const chk[] = { &w->in_all, &w->out_all, &w->regcmd };
+        if (rocket_op_iova_overflow("rk4_worker_alloc", chk, 3)) goto fail;
     }
     w->tasks  = malloc(I4_BATCH * sizeof(*w->tasks));
     w->submit_dt = malloc(rocket_submit_scratch_size(I4_BATCH));  /* reused every submit; no per-job calloc */
@@ -274,7 +274,9 @@ static int rk4_scatter_weights(rocket_i4_ctx *ctx, rk4_scratch *sc, rocket_i4_we
     for (; t < sc->nt; t++) {
         rk4_worker *ww = &sc->w[t];
         size_t wt_sz = (size_t)ww->nNt * ww->nKt * (ww->wt_slot / 2) + I4_CBUF_BANK;
-        if (rocket_bo_alloc(ctx->fd[t], wt_sz, &w->wt[t]) != 0 || i4_iova_of(&w->wt[t], wt_sz)) {
+        rocket_bo *const chk[] = { &w->wt[t] };
+        if (rocket_bo_alloc(ctx->fd[t], wt_sz, &w->wt[t]) != 0 ||
+            rocket_op_iova_overflow("rocket_i4_weights_pack", chk, 1)) {
             ROCKET_LOGE("rocket_i4_weights_pack: wt BO alloc/IOVA failed (worker %d, %zuMB)\n", t, wt_sz >> 20);
             if (w->wt[t].handle) rocket_bo_free(ctx->fd[t], &w->wt[t]);
             goto fail;
@@ -431,8 +433,10 @@ static void *rk4_thread(void *a) {
                             "(task_count %u > %d words)\n", p.task_count, I4_RC_STRIDE);
                     t->ret = -1; return NULL;
                 }
-                rkt_chain_pack(chained, &w->regcmd, tasks, nb, npu_regs,
-                               p.task_count, I4_RC_STRIDE);
+                if (rkt_chain_pack(chained, &w->regcmd, tasks, nb, npu_regs,
+                                   p.task_count, I4_RC_STRIDE) != 0) {
+                    t->ret = -1; return NULL;
+                }
                 w->bm0[nb] = m0; w->bn0[nb] = n0; w->bMtile[nb] = Mtile; w->bNtile[nb] = Ntile; w->boff[nb] = out_off;
                 nb++; done_tiles++;
                 if (nb == I4_BATCH || done_tiles == total) {
@@ -578,8 +582,10 @@ static void *rk4_thread_gw(void *a) {
                             "(task_count %u > %d words)\n", p.task_count, I4_RC_STRIDE);
                     t->ret = -1; return NULL;
                 }
-                rkt_chain_pack(chained, &w->regcmd, tasks, nb, npu_regs,
-                               p.task_count, I4_RC_STRIDE);
+                if (rkt_chain_pack(chained, &w->regcmd, tasks, nb, npu_regs,
+                                   p.task_count, I4_RC_STRIDE) != 0) {
+                    t->ret = -1; return NULL;
+                }
                 w->bm0[nb] = m0; w->bn0[nb] = n0; w->bMtile[nb] = Mtile; w->bNtile[nb] = Ntile;
                 w->bki[nb] = ki; w->boff[nb] = out_off;
                 nb++; done_tiles++;

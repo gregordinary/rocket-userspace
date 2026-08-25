@@ -11,10 +11,10 @@ int rocket_op_iova_overflow(const char *who, rocket_bo *const *bos, int n)
     for (int i = 0; i < n; i++) {
         const rocket_bo *b = bos[i];
         if (!b || !b->handle) continue;
-        if (((b->dma_address + b->size) >> 32) != 0) {
+        if (b->size != 0 && ((b->dma_address + b->size - 1) >> 32) != 0) {
             ROCKET_LOGE("%s: a BO's last byte (0x%llx) leaves the low 4 GB the regcmd's "
                         "32-bit address fields can encode\n", who,
-                        (unsigned long long)(b->dma_address + b->size));
+                        (unsigned long long)(b->dma_address + b->size - 1));
             return 1;
         }
     }
@@ -24,6 +24,14 @@ int rocket_op_iova_overflow(const char *who, rocket_bo *const *bos, int n)
 int rocket_op_submit_one(int fd, const char *who,
                          rocket_bo *rc, const uint64_t *regs, uint32_t count,
                          rocket_bo *const *in, int n_in, rocket_bo *out)
+{
+    return rocket_op_submit_one_flags(fd, who, rc, regs, count, in, n_in, out, 0u);
+}
+
+int rocket_op_submit_one_flags(int fd, const char *who,
+                               rocket_bo *rc, const uint64_t *regs, uint32_t count,
+                               rocket_bo *const *in, int n_in, rocket_bo *out,
+                               uint32_t job_flags)
 {
     int ret;
 
@@ -48,7 +56,8 @@ int rocket_op_submit_one(int fd, const char *who,
     in_h[nh++] = rc->handle;                    /* the regcmd is always the last input */
     uint32_t out_h[] = { out->handle };
 
-    if ((ret = rocket_submit_tasks(fd, &task, 1, in_h, nh, out_h, 1)) != 0) {
+    if ((ret = rocket_submit_tasks_flags(fd, &task, 1, in_h, nh, out_h, 1,
+                                        job_flags)) != 0) {
         ROCKET_LOGE("%s: submit failed (%d)\n", who, ret);
         return ret;
     }

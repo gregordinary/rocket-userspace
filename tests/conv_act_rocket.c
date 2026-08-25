@@ -67,6 +67,11 @@ static int regcmd_smoke(const rocket_conv2d_desc *d)
     return ok ? 0 : 1;
 }
 
+/* Cases that actually reached the driver and were compared against the reference.
+ * A per-case skip returns 0, so without this a run in which EVERY shape was
+ * refused would print N "skipping" lines and exit PASS over zero evidence. */
+static int g_checked = 0;
+
 static int run_shape(int fd, const rocket_conv2d_desc *d, int tiled)
 {
     const int OH = rocket_conv2d_oh(d), OW = rocket_conv2d_ow(d), N = d->oc*OH*OW;
@@ -96,6 +101,7 @@ static int run_shape(int fd, const rocket_conv2d_desc *d, int tiled)
         memset(got,0,(size_t)N*2);
         int r = rocket_conv2d_act_fp16(fd, d, kind, in, W, got);       /* fused, one job */
         if (r) { printf("  %-4s: rocket_conv2d_act_fp16=%d FAIL\n", rocket_activation_name(kind), r); fail=1; continue; }
+        g_checked++;
         /* standalone reference: NPU conv readback, then the flying single-pass LUT */
         memset(s1,0,(size_t)N*2); memset(fly,0,(size_t)N*2);
         int rc = rocket_conv2d_fp16(fd, d, in, W, s1);
@@ -178,6 +184,11 @@ int main(void)
     printf("\n");
 
     if (fd >= 0) rocket_close(fd); else { printf("==== SKIP (no NPU) ====\n"); return 2; }
+    if (g_checked == 0) {
+        printf("no shape reached a numeric check — every case was refused or "
+               "skipped; this gate proved nothing\n");
+        fail = 1;
+    }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

@@ -17,30 +17,89 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(DRM REQUIRED libdrm)        # <libdrm/drm.h>
 find_package(Threads REQUIRED)                # rocket_matmul_mt.c
+
+# --- which submit provider is compiled in -------------------------------------
+#
+# The submit seam is include/rocket_npu.h: device open/close, BO alloc/free, cache
+# maintenance, submit, and the capability + counter queries. `builtin` compiles
+# src/rocket_npu.c, the shim over the mainline `rocket` DRM-accel driver, and is what
+# every consumer gets by default. `external` omits it, leaving those symbols for a
+# provider the consumer links alongside this library -- the rknpu-submit provider for
+# the vendor BSP driver, or a host-memory mock for off-device gates.
+#
+# Selection is at LINK time rather than through a vtable: the seam is a set of C
+# symbols already, one build targets one driver, and an indirect call on every BO
+# operation would buy nothing here. Everything ABOVE the seam is silicon-shaped and
+# identical either way.
+set(ROCKETNPU_PROVIDER "builtin" CACHE STRING
+    "Submit provider: builtin (mainline rocket DRM-accel) or external (linked separately)")
+set_property(CACHE ROCKETNPU_PROVIDER PROPERTY STRINGS builtin external)
+if(NOT ROCKETNPU_PROVIDER MATCHES "^(builtin|external)$")
+    message(FATAL_ERROR "ROCKETNPU_PROVIDER must be 'builtin' or 'external', got '${ROCKETNPU_PROVIDER}'")
+endif()
+# A CMake target or a plain library path. Carried as an INTERFACE dependency of
+# rocketnpu, so tests and frontends pick it up with no per-target change.
+set(ROCKETNPU_PROVIDER_LIB "" CACHE STRING
+    "Provider library every consumer links alongside rocketnpu (external provider only)")
+message(STATUS "rocketnpu: submit provider = ${ROCKETNPU_PROVIDER}")
+
+# An external provider must define the whole seam, and a missing symbol is not a compile
+# error anywhere near it: src/rocket_npu.c is compiled only for the builtin provider, so a
+# symbol added there and called from above the seam is an undefined reference in EVERY
+# external build. librocketnpu.a is a static archive and links anyway, which is why the
+# first sign of it is dozens of executables failing at the very end of the build.
+#
+# Check it here instead, before an object is compiled, and name the symbols. Only possible
+# when the provider is a file this can read -- ROCKETNPU_PROVIDER_LIB is also allowed to be
+# a CMake target, whose archive does not exist yet at configure time.
+if(ROCKETNPU_PROVIDER STREQUAL "external" AND EXISTS "${ROCKETNPU_PROVIDER_LIB}")
+    execute_process(
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tools/provider-seam.sh" "${ROCKETNPU_PROVIDER_LIB}"
+        RESULT_VARIABLE _seam_rc OUTPUT_VARIABLE _seam_out ERROR_VARIABLE _seam_err)
+    if(_seam_rc EQUAL 1)
+        message(FATAL_ERROR
+            "the external provider does not implement librocketnpu's submit seam.\n"
+            "${_seam_err}${_seam_out}"
+            "Update the provider, or run tools/provider-seam.sh with no arguments to list "
+            "the seam it has to define.")
+    elseif(NOT _seam_rc EQUAL 0)
+        message(STATUS "rocketnpu: seam check skipped (${_seam_err})")
+    else()
+        message(STATUS "rocketnpu: provider implements the submit seam")
+    endif()
+endif()
 
 # libdrm only provides <libdrm/drm.h>; the actual build dependency is the mainline
 # rocket DRM-accel uAPI header <drm/rocket_accel.h> (the DRM_IOCTL_ROCKET_* / struct
 # drm_rocket_* definitions), which ships as include/uapi/drm/rocket_accel.h and is
 # usually installed to /usr/include/drm/rocket_accel.h. Check it at configure time so a
 # missing uAPI header is a clear message, not a confusing mid-compile error.
-include(CheckIncludeFile)
-set(CMAKE_REQUIRED_INCLUDES ${DRM_INCLUDE_DIRS})
-check_include_file("drm/rocket_accel.h" HAVE_DRM_ROCKET_ACCEL_H)
-unset(CMAKE_REQUIRED_INCLUDES)
-if(NOT HAVE_DRM_ROCKET_ACCEL_H)
-    message(FATAL_ERROR
-        "drm/rocket_accel.h not found. Install the mainline rocket DRM-accel uAPI header "
-        "(usually /usr/include/drm/rocket_accel.h, from include/uapi/drm/rocket_accel.h in "
-        "the kernel source) before building rocket-userspace.")
+#
+# Only the builtin provider includes that header. A BSP-kernel box has no mainline
+# rocket uAPI at all, so demanding it there would stop the library configuring for a
+# provider that does not want it.
+if(ROCKETNPU_PROVIDER STREQUAL "builtin")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(DRM REQUIRED libdrm)    # <libdrm/drm.h>
+    include(CheckIncludeFile)
+    set(CMAKE_REQUIRED_INCLUDES ${DRM_INCLUDE_DIRS})
+    check_include_file("drm/rocket_accel.h" HAVE_DRM_ROCKET_ACCEL_H)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    if(NOT HAVE_DRM_ROCKET_ACCEL_H)
+        message(FATAL_ERROR
+            "drm/rocket_accel.h not found. Install the mainline rocket DRM-accel uAPI header "
+            "(usually /usr/include/drm/rocket_accel.h, from include/uapi/drm/rocket_accel.h in "
+            "the kernel source) before building rocket-userspace, or configure with "
+            "-DROCKETNPU_PROVIDER=external to supply a provider of your own.")
+    endif()
 endif()
 
 # --- the library: shim + validated fp16 generator + tiled + multicore matmul ---
 set(ROCKETNPU_SOURCES
     src/rocket_log.c          # centralized log channel (levels + host-settable callback)
-    src/rocket_npu.c          # DRM-accel shim over /dev/accel/accel0
+    src/rocket_sysfs.c        # the one enumeration of the bound NPU cores (core side of the seam)
+    src/rocket_busy_poll.c    # the completion-wait spin budget (core side of the seam)
     src/rocket_hw_profile.c   # the chip machine-parameter profile (RK3588 today)
     src/npu_regcmd.c     # regcmd generators (fp16/int8/int4/int16/bf16/tf32)
     src/npu_regcmd_rk3576.c   # RK3576 int8 conv regcmd (its own geometry-register encoding)
@@ -74,6 +133,12 @@ set(ROCKETNPU_SOURCES
     src/rocket_prepacked_int4.c # resident int4 (W4A4) weight path
     src/rocket_affinity.c)    # pin pack/readback workers to the big (A76) cores
 
+# The submit provider itself. `external` leaves the seam's symbols undefined in this
+# library; the consumer links a provider that defines them.
+if(ROCKETNPU_PROVIDER STREQUAL "builtin")
+    list(APPEND ROCKETNPU_SOURCES src/rocket_npu.c)   # DRM-accel shim over /dev/accel/accel0
+endif()
+
 # Optimization flags for the hot library (pack/scatter/readback/CPU-K-accum).
 # Defaults to -O2. Override per-build to benchmark or to
 # adopt a faster target, e.g.:
@@ -99,6 +164,26 @@ target_include_directories(rocketnpu
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
            $<INSTALL_INTERFACE:include/rocketnpu>)
 target_link_libraries(rocketnpu PUBLIC Threads::Threads m PRIVATE ${DRM_LIBRARIES})
+# With an external provider the seam's symbols are undefined in this archive. Carrying
+# the provider as an INTERFACE dependency here is what makes every consumer — the test
+# executables, rocketgraph, the frontends — link it without a per-target change.
+#
+# The two archives reference each other, so the link needs a RESCAN: the provider
+# defines the seam this library calls, and calls back into rocket_hw_current() to
+# resolve the chip profile at open. Whichever archive a one-pass linker sees first has
+# its unresolved references dropped, so the group is not optional — without it the
+# error is an undefined rocket_hw_current at every consumer's link.
+#
+# The archive is named through the NAMESPACED alias, not the bare target. This
+# property is exported verbatim, and the genex is evaluated in the consumer's
+# project, where the plain name `rocketnpu` does not exist - a find_package()
+# consumer of an INSTALLED external-provider package then fails at generate with
+# `No target "rocketnpu"`. The imported `rocketnpu::rocketnpu` is defined in both
+# trees, so the alias form is the one that works from a build tree and an install.
+if(ROCKETNPU_PROVIDER STREQUAL "external" AND ROCKETNPU_PROVIDER_LIB)
+    target_link_libraries(rocketnpu INTERFACE
+        -Wl,--start-group ${ROCKETNPU_PROVIDER_LIB} $<TARGET_FILE:rocketnpu::rocketnpu> -Wl,--end-group)
+endif()
 
 # --- the RK3576 graph planner: a component, NOT part of the library ---------------
 #
@@ -277,9 +362,6 @@ if(ROCKETNPU_BUILD_TESTS)
             multicore_threads      # N fds/threads -> parallel cores
             ctx_pool_throughput    # multi-instance context-pool throughput sweep (detection)
             moe_gw_bench           # resident group-wise int8 at the MoE expert shape (hand-run, not a gate)
-            uapi_selftest_rocket   # rocket uAPI conformance gate (BO/deadline/IOVA contracts)
-            uapi_submit_errpath_rocket # rocket uAPI GATE: a rejected submit returns an errno, it does not oops
-            uapi_bo_ranges_rocket  # rocket uAPI GATE: the ranged cache-maintenance ioctls accept and refuse correctly
             uapi_bo_lifetime_rocket # rocket uAPI GATE: a BO referenced by an in-flight job survives its file's close
             prep_signal_robust_rocket # PREP_BO wait: EINTR-retry + UINT64_MAX-deadline saturation gate
             submit_overhead_rocket # per-job dispatch floor (us/submit) A/B probe for IOMMU keep-attach
@@ -290,6 +372,7 @@ if(ROCKETNPU_BUILD_TESTS)
             dump_regcmd            # host-only: diff the matmul regcmd accumulate=0 vs 1 (no HW)
             dump_dw_regcmd         # host-only: emit depthwise-conv regcmd for the Mesa decoder
             chain_layout_rocket    # host-only GATE: batched-submit contiguous layout + trailer link (no HW)
+            chain_verify_gate      # host-only GATE: rkt_chain_verify catches a wrong next_count (no HW)
             matmul_plan_gate       # host-only GATE: the shared matmul tiling policy's invariants (no HW)
             regcmd_rk3576_gate     # host-only GATE: RK3576 conv regcmd vs the vendor capture (no HW)
             rk3576_first_light     # RK3576 board: does the RK3576 emitter make the NPU compute?
@@ -303,7 +386,6 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_mm_corr         # RK3576 board: does an arbitrary matmul shape lose surface, and how often?
             rk3576_mm_requant      # RK3576 board GATE: the matmul entry's requant vs the host models of it
             rk3576_w8a8_route      # RK3576 board GATE: the W8A8 two-pass calibration route, composed on the part
-            rk3576_prep_floor      # RK3576 board: what a PREP_BO/FINI_BO bracket costs, floor vs bytes
             rk3576_fc_vendor       # RK3576 board: submit a vendor capture VERBATIM — does it write?
             rk3576_cost_table      # RK3576 board: what the library entries cost, against a CPU reference
             rk3576_stem_cost       # RK3576 board: is a conv's execution its MACs or its feature DMA?
@@ -342,7 +424,6 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_conv_sym        # RK3576 board: the symmetry audit on the CNA — non-square strides, and a rung fitted at kh == kw
             rk3576_rowplan         # RK3576 host: the row window the planner chooses for one layer, and what it stages
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
-            uapi_regcmd_fault_rocket # probe, NOT a gate: a client-requested NPU DMA fault (faults the NPU on purpose)
             hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure
             membench               # DRAM bandwidth + NPU readback de-tile microbench
             fabench)               # flash-attention QK/AV submit-chaining A/B (ROCKET_FA_CHAIN 0 vs 1)
@@ -350,6 +431,25 @@ if(ROCKETNPU_BUILD_TESTS)
         target_link_libraries(${t} PRIVATE rocketnpu)
         target_compile_options(${t} PRIVATE -Wall -Wextra)
     endforeach()
+    # Gates ON the mainline rocket uAPI rather than on the library: each includes
+    # <drm/rocket_accel.h> and drives DRM_IOCTL_ROCKET_* itself, so what it asserts is a
+    # contract of THAT driver and it cannot be built, let alone run, against another
+    # provider. Excluded from an external-provider build rather than made to skip — a
+    # test that cannot compile is not a test that skipped.
+    if(ROCKETNPU_PROVIDER STREQUAL "builtin")
+        foreach(t
+                uapi_selftest_rocket   # rocket uAPI conformance gate (BO/deadline/IOVA contracts)
+                uapi_submit_errpath_rocket # rocket uAPI GATE: a rejected submit returns an errno, it does not oops
+                uapi_bo_ranges_rocket  # rocket uAPI GATE: the ranged cache-maintenance ioctls accept and refuse correctly
+                rk3576_prep_floor      # RK3576 board: what a PREP_BO/FINI_BO bracket costs, floor vs bytes
+                uapi_regcmd_fault_rocket) # probe, NOT a gate: a client-requested NPU DMA fault (faults the NPU on purpose)
+            add_executable(${t} tests/${t}.c)
+            target_link_libraries(${t} PRIVATE rocketnpu)
+            target_include_directories(${t} PRIVATE ${DRM_INCLUDE_DIRS})
+            target_compile_options(${t} PRIVATE -Wall -Wextra)
+        endforeach()
+    endif()
+
     # the network gate is the graph planner's first caller: it owns the tensors and the
     # weights, graph/ owns which of them stay in cube layout and which runs are one kick
     if(TARGET rk3576_net_gate)
@@ -420,6 +520,7 @@ if(ROCKETNPU_BUILD_TESTS)
     set_tests_properties(bytes_moved_rocket PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME conv2d_fp16_rocket COMMAND conv2d_fp16_rocket)
     add_test(NAME chain_layout_rocket COMMAND chain_layout_rocket)  # host-only; no NPU, never skips
+    add_test(NAME chain_verify_gate COMMAND chain_verify_gate)      # host-only; no NPU, never skips
     add_test(NAME matmul_plan_gate COMMAND matmul_plan_gate)        # host-only; no NPU, skips off-RK3588
     set_tests_properties(matmul_plan_gate PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME scratch_cache_gate COMMAND scratch_cache_gate)
@@ -607,6 +708,9 @@ if(ROCKETNPU_BUILD_TESTS)
         mixed_chain_coexist_rocket
         PROPERTIES SKIP_RETURN_CODE 2)
 
+    # The mainline-uAPI gates only exist in a builtin-provider build (see the foreach
+    # above); registering them otherwise would name targets that were never created.
+    if(ROCKETNPU_PROVIDER STREQUAL "builtin")
     # uAPI conformance gate: runtime-verifies the drm_rocket_* contracts the
     # shim depends on (BO/regcmd-IOVA window, PREP_BO absolute-deadline semantics).
     # The cross-kernel canary — a kernel that drifts fails here, not deep in matmul.
@@ -621,6 +725,7 @@ if(ROCKETNPU_BUILD_TESTS)
     set_tests_properties(uapi_submit_errpath_rocket PROPERTIES SKIP_RETURN_CODE 2)
     add_test(NAME uapi_bo_ranges_rocket COMMAND uapi_bo_ranges_rocket)
     set_tests_properties(uapi_bo_ranges_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    endif()
     # The per-context IOVA allocator is freed in rocket_postclose(), but a BO's IOVA
     # node is removed in its GEM free path — which the drm_sched free worker can run
     # after that close. Submitting and closing without waiting races the two on
