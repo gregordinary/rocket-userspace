@@ -44,6 +44,22 @@ set(ROCKETNPU_PROVIDER_LIB "" CACHE STRING
     "Provider library every consumer links alongside rocketnpu (external provider only)")
 message(STATUS "rocketnpu: submit provider = ${ROCKETNPU_PROVIDER}")
 
+# What rocket_driver_name() reports, for a device listing or a log line. The library can
+# name its own builtin driver and cannot name someone else's, so an external build says
+# only what is known unless its packager names it -- rknpu-submit's README passes
+# "vendor rknpu driver" here. A frontend prints this instead of a literal, so a BSP board
+# is never told the mainline path is live.
+set(ROCKETNPU_DRIVER_NAME "" CACHE STRING
+    "Kernel driver this build reaches, as a short human name (default: per provider)")
+if(NOT ROCKETNPU_DRIVER_NAME)
+    if(ROCKETNPU_PROVIDER STREQUAL "builtin")
+        set(ROCKETNPU_DRIVER_NAME "mainline rocket driver")
+    else()
+        set(ROCKETNPU_DRIVER_NAME "external submit provider")
+    endif()
+endif()
+message(STATUS "rocketnpu: driver name = ${ROCKETNPU_DRIVER_NAME}")
+
 # An external provider must define the whole seam, and a missing symbol is not a compile
 # error anywhere near it: src/rocket_npu.c is compiled only for the builtin provider, so a
 # symbol added there and called from above the seam is an undefined reference in EVERY
@@ -101,6 +117,7 @@ set(ROCKETNPU_SOURCES
     src/rocket_sysfs.c        # the one enumeration of the bound NPU cores (core side of the seam)
     src/rocket_busy_poll.c    # the completion-wait spin budget (core side of the seam)
     src/rocket_hw_profile.c   # the chip machine-parameter profile (RK3588 today)
+    src/rocket_driver_name.c  # the build's kernel-driver name (not seam: no provider defines it)
     src/npu_regcmd.c     # regcmd generators (fp16/int8/int4/int16/bf16/tf32)
     src/npu_regcmd_rk3576.c   # RK3576 int8 conv regcmd (its own geometry-register encoding)
     src/rocket_chain.c        # contiguous self-chaining regcmd layout (batched submit, shared)
@@ -157,6 +174,7 @@ target_include_directories(rocketnpu_obj
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     PRIVATE ${DRM_INCLUDE_DIRS})
 target_compile_options(rocketnpu_obj PRIVATE -O2 -Wall -Wextra ${DRM_CFLAGS_OTHER} ${ROCKETNPU_OPT_FLAGS})
+target_compile_definitions(rocketnpu_obj PRIVATE ROCKETNPU_DRIVER_NAME="${ROCKETNPU_DRIVER_NAME}")
 
 add_library(rocketnpu STATIC $<TARGET_OBJECTS:rocketnpu_obj>)
 add_library(rocketnpu::rocketnpu ALIAS rocketnpu)

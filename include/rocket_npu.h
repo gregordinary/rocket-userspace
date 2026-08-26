@@ -250,6 +250,20 @@ int  rocket_batch_completion_tracked(void);
  * Probed once and cached. */
 int  rocket_submit_batch_atomic(void);
 
+/* The kernel driver this build reaches, as a short human name for a device listing or
+ * a log line: "mainline rocket driver" for the builtin provider, and whatever an
+ * external provider's build named itself otherwise ("vendor rknpu driver" for
+ * rknpu-submit), falling back to "external submit provider" when nothing named it.
+ *
+ * Build-time, not probed: the provider is chosen at build time, so this asks no ioctl
+ * and is valid before any device is open. It is not part of the submit seam -- a
+ * provider defines nothing for it -- and -DROCKETNPU_DRIVER_NAME=... sets it.
+ *
+ * Print this rather than a literal. A frontend that hardcodes one driver's name tells
+ * every user of the other one that the wrong kernel path is live, on exactly the
+ * platform where knowing which is live matters most. */
+const char *rocket_driver_name(void);
+
 /* Spin-poll the completion fence for up to `us` microseconds before a blocking
  * wait falls asleep (overrides the ROCKET_BUSY_POLL env, which sets the default;
  * us<=0 disables). A single-stream latency lever for tiny submit-bound jobs with
