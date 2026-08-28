@@ -338,6 +338,9 @@ if(ROCKETNPU_BUILD_TESTS)
             conv1d_rocket          # Whisper conv1d front-end (height-1 conv2d lowering) bit-exact
             conv_transpose_rocket  # ConvTranspose2d: lowering self-check + HW oracle (vs scatter ref)
             deconv_mode_probe      # RK3588 board: is CNA_CONV_CON1 bit 16 (DECONV) a live hardware mode?
+            deconv_geometry_probe  # RK3588 board: WHERE the DECONV mode scatters, via an impulse response
+            deconv_arith_probe     # RK3588 board: does DECONV compute a real transposed conv (dense, vs oracle)?
+            deconv_pad_probe       # RK3588 board: does DECONV take a pad, and where does its result land?
             resize_rocket          # nearest/bilinear upsample (depthwise transpose) vs independent gather refs
             pool_fp16_rocket       # on-NPU MaxPool/AvgPool (PPU): cube self-check + HW oracle
             pool_int8_rocket       # on-NPU int8/uint8 MaxPool/AvgPool (PPU C2=16): cube self-check + HW oracle
@@ -369,6 +372,7 @@ if(ROCKETNPU_BUILD_TESTS)
             scratch_cache_gate     # GATE: the per-shape scratch cache recycles instead of refusing
             matmul_stream_vs_prepacked_rocket # per-call packB cost (stream vs resident)
             iova_ceiling_rocket    # NPU 32-bit IOVA window size + per-fd vs shared
+            iova_rcache_rocket     # does freeing a BO return its IOVA? (rcache withholding; hand-run, not a gate)
             prototype_shared_scratch_rocket # shared-scratch ownership prototype
             crossop_chain_rocket   # cross-op chaining: feed one matmul's output BO straight into the next's input
             replay_dump            # replay a dumped in-context failing matmul
