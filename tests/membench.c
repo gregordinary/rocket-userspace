@@ -3,8 +3,10 @@
 /*
  * membench.c — DRAM bandwidth + NPU readback de-tile microbench (no deps).
  *
- * Grounds the perf model from the walkthrough on THIS box, which exposes no DDR
- * PMU and has no tinymembench installed:
+ * Grounds the perf model from the walkthrough on THIS box, which has no tinymembench
+ * installed. (It is NOT the only route any more: the kernel exposes the DDR controller as
+ * a `perf` uncore PMU, `rockchip_ddr` -- see tests/ddr_pmu_cal.c. This still measures what
+ * that one cannot, which is where the time goes inside one process.)
  *   - achievable LPDDR bandwidth (memcpy / read / write);
  *   - the cost of mm_compute's readback de-tile: a feat_idx gather + fp16->fp32
  *     accumulate, long claimed ~0.69 GB/s = index-math-bound, NOT bandwidth-bound.

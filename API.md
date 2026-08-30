@@ -1,7 +1,7 @@
 # librocketnpu: API reference
 
 The complete function reference, test catalog, and runtime-knob list for `librocketnpu`. The
-[README](README.md) is the guide; this is the reference. Convention throughout:
+[README](README.md) is the guide, and this is the reference. Convention throughout:
 `C[M,N] = A[M,K] · B[N,K]ᵀ`, row-major.
 
 ## Library layout
@@ -69,19 +69,21 @@ tests/                         standalone tests + benchmarks (see below)
 
 ## The submit seam (`rocket_npu.h`)
 
-Every kernel interaction goes through one set of C symbols, and that set has more than one
-implementation: `src/rocket_npu.c` for the mainline `rocket` DRM-accel driver (the default,
-`-DROCKETNPU_PROVIDER=builtin`), and an external provider for a vendor BSP driver
-(`-DROCKETNPU_PROVIDER=external -DROCKETNPU_PROVIDER_LIB=...`). Selection is at link time
-rather than through a vtable: the seam is a set of C symbols already, one build targets one
-driver, and an indirect call on every BO operation would buy nothing.
+Every kernel interaction goes through one set of C symbols, and that set has two
+implementations. `src/rocket_npu.c` drives the mainline `rocket` DRM-accel driver, which is
+the default (`-DROCKETNPU_PROVIDER=builtin`). An external provider drives a vendor BSP driver
+(`-DROCKETNPU_PROVIDER=external -DROCKETNPU_PROVIDER_LIB=...`).
+
+Selection is at link time rather than through a vtable. The seam is a set of C symbols
+already, one build targets one driver, and an indirect call on every BO operation would buy
+nothing.
 
 **The seam is exactly the externally-visible `rocket_*` functions defined in
-`src/rocket_npu.c`, and a conforming provider defines exactly that set**: nothing missing, and
-no `rocket_*` name of its own that the library already defines above the seam.
+`src/rocket_npu.c`, and a conforming provider defines exactly that set.** Nothing is missing,
+and it adds no `rocket_*` name of its own that the library already defines.
 
-`rocket_npu.h` is where they are declared, but the header is not the definition of the seam:
-it also declares host-side entry points that stay in the core whatever the driver is
+`rocket_npu.h` is where they are declared, and the header is not the definition of the
+seam. It also declares host-side entry points that stay in the core whatever the driver is
 (`rocket_affinity_*`, `rocket_pin_worker`, `rocket_num_big_cores`, `rocket_busy_poll_set_us`).
 Do not enumerate the seam by reading the header, and do not enumerate it by hand. The list
 grows, and a hand-kept copy goes stale silently:
@@ -91,10 +93,14 @@ tools/provider-seam.sh                          # print the seam
 tools/provider-seam.sh path/to/provider.a       # check a provider (.a / .o / .so / .c)
 ```
 
-Groups, as they stand: device open and close; BO allocation and the 32-bit-IOVA variants; cache
-maintenance including the ranged form and its capability query; submit in its matmul, task,
-pre-arranged and job forms plus the scratch-size query; the capability probes; and the submit
-counters.
+Groups, as they stand:
+
+- Device open and close.
+- BO allocation, and the 32-bit-IOVA variants.
+- Cache maintenance, including the ranged form and its capability query.
+- Submit in its matmul, task, pre-arranged and job forms, plus the scratch-size query.
+- The capability probes.
+- The submit counters.
 
 **Why this is checked rather than trusted.** A provider *defines* these symbols rather than
 calling them, so when the seam grows the provider still compiles clean. `librocketnpu.a` is a
@@ -129,13 +135,21 @@ fails with the missing symbols listed before an object is compiled.
 | `rocket_matmul_int8_rk3576` / `rocket_matmul_plan_int8_rk3576` | **the RK3576's own int8 matmul**, and a different contract from `rocket_matmul_int8`: `C = sat8(round((A·Bᵀ + bias)·scale))`, an int8 surface through the DPU's requant rather than raw int32. That is why it is a separate entry and not a routing. Requires `K%32, N%32`; **M carries no constraint at all** on that part, so `M=1` is simply correct. N is tiled and is what buys throughput (a submit costs ~1.4 ms whatever it carries; `ROCKET_RK3576_MM_NT` overrides the tile). K past one task's contraction is split through the int32 entry below, with the requant done on the host |
 | `rocket_matmul_int8_rk3576_i32` | **the RK3576's int32-output matmul, and its K split**: `C = A·Bᵀ + bias` in raw int32, K split internally and the partials summed on the host, so K is bounded only by memory. Requires `K%32, N%32`. The DPU's 32-bit writer keeps the INT8 surface's byte budget whatever the element width is, so it delivers only the first eight output channels of every thirty-two; this entry programs four times the output channels and scatters the real ones into the delivered slots, which is correct and costs a quarter of the int8 path's MACs per submit. It also idles ~150 ms between its submits and once on the way out, because an int32 job leaves the next submit of ANY kind writing nothing until 50-100 ms have passed (`ROCKET_RK3576_MM_GAP_MS` overrides). Use it for the K a single task cannot contract, not as a default matmul |
 
-Alignment requirements differ by dtype (the native tile atoms): fp16 `K%32, N%16`;
-int8 `K%32, N%32`; int4 `K%32, N%64`; int16-exact follows int8 `K%32, N%32`; bf16
-`K%32, N%16` (== fp16); tf32 `K%16, N%16` (4-byte halves the K-group to 16); all
-require `M%4==0`. **`M==1` (single-vector GEMV) is broken on the hardware** at every
-dtype, because the conv feature-height-1 geometry mis-computes, so the one-shot entry points **pad M==1->4
-internally** and return row 0, while the pure planners and resident/streaming paths
-reject it (pad single vectors to 4 caller-side). The plan functions are pure (no
+Alignment requirements differ by dtype, following the native tile atoms:
+
+| dtype | Alignment |
+|---|---|
+| fp16 | `K%32, N%16` |
+| int8 | `K%32, N%32` |
+| int4 | `K%32, N%64` |
+| int16-exact | `K%32, N%32`, following int8 |
+| bf16 | `K%32, N%16`, the same as fp16 |
+| tf32 | `K%16, N%16`, where the 4-byte input halves the K-group to 16 |
+
+All require `M%4==0`. **`M==1` (single-vector GEMV) is broken on the hardware** at every
+dtype, because the conv feature-height-1 geometry mis-computes. The one-shot entry points
+therefore **pad M==1->4 internally** and return row 0. The pure planners and the resident and
+streaming paths reject it instead, so pad single vectors to 4 caller-side. The plan functions are pure (no
 hardware) and preview the tiling.
 
 Everything in that table except `rocket_matmul_int8_rk3576` emits the **RK3588**
@@ -147,8 +161,8 @@ on the RK3576 every M computes, including 1.
 ## Conv API (`rocket_conv.h`)
 
 Beyond the matmul, the library runs a general 2D convolution, the basis of the
-`tflite-rocket` detection delegate (a 1×1 pointwise conv is just the matmul; everything
-else is the conv path). HW-validated **bit-exact**.
+`tflite-rocket` detection delegate. A 1×1 pointwise conv is the matmul, and everything else
+is the conv path. HW-validated **bit-exact**.
 
 | function | what it is |
 |---|---|
@@ -167,20 +181,21 @@ Pure planners (`rocket_conv2d_plan` / `_oh` / `_ow` / `rocket_total_pad`, plus
 `rocket_conv_transpose2d_plan` / `_oh` / `_ow`) preview dims + the CBUF-fit gate without
 hardware. `rocket_conv2d_ref_int8` / `rocket_conv_transpose2d_ref_fp16` are golden oracles.
 
-Native **int8** `CONV_2D` runs end-to-end and is HW-validated: the regcmd +
+Native **int8** `CONV_2D` runs end-to-end and is HW-validated, both the regcmd and
 cube layers (`gen_conv2d_int8` / `gen_conv2d_dw_int8`) and the runtime wrappers
 (`rocket_conv2d_int8` / `rocket_conv2d_dw_int8`). **DIRECT** = int8xint8->int32 raw + host
-per-axis requant (the input zero-point correction folded into the bias; in `tflite-rocket`'s
-`rocket_out_nchw_to_nhwc_q_per_axis`): real int8 accumulate, bit-identical to CPU TFLite.
-**DEPTHWISE** = int8-OUT with on-chip requant (`conv_params_t.int8_out=1`: QD_EN + per-OC int32
-bias in the BS ALU + `OUT_CVT` requant); per-tensor, bit-exact vs Teflon (`tests/replay_dw_mesa.c`
+per-axis requant, with the input zero-point correction folded into the bias, in
+`tflite-rocket`'s `rocket_out_nchw_to_nhwc_q_per_axis`. That is a real int8 accumulate,
+bit-identical to CPU TFLite. **DEPTHWISE** = int8-OUT with on-chip requant
+(`conv_params_t.int8_out=1`: QD_EN + per-OC int32 bias in the BS ALU + `OUT_CVT` requant),
+per-tensor, bit-exact vs Teflon (`tests/replay_dw_mesa.c`
 for the regcmd, `tests/conv_dw_int8_runtime.c` for the runtime). The `tflite-rocket` delegate
 routes signed-int8 convs to these under `--option native_int8=1`.
 
 ## Activation API (`rocket_activation.h`)
 
-The first **on-NPU nonlinear activation** on this stack: a standalone DPU **LUT**
-pass (NVDLA SDP, no conv) that applies `f(x)` to a flat fp16 vector entirely on the
+The first **on-NPU nonlinear activation** on this stack. It is a standalone DPU **LUT**
+pass, NVDLA SDP with no conv, that applies `f(x)` to a flat fp16 vector entirely on the
 NPU.
 
 | function | what |
@@ -201,23 +216,28 @@ NPU.
 | `rocket_ew_mul_fp16(fd, a, b, out, n)` | fully-on-NPU elementwise fp16 multiply `out=a*b` (identity-conv main feed + `EW_OP_TYPE=1`; M-tiled). Bit-exact (`tests/ew_mul_rocket.c`). The building block of on-NPU HardSwish/SiLU |
 | `gen_lut_activation_fp16` (`npu_activation.h`) | low-level: the flying-mode DPU LUT regcmd (LE/LO hybrid tables, BN-mul index, OUT_CVT Q0.15->fp16). The same epilogue is fused into `gen_conv2d_task` (`lut_epilogue_t` / `npu_dpu_desc.lut_en`) for conv->activation |
 
-**Any `n`, and the max-width quirk.** A LUT op carries the vector as a cube of `cols = n/8` width
-positions, and `DPU_DATA_CUBE_WIDTH` is 13-bit, so one op caps at `n <= 65528`. `run_dpu_lut`
-**tiles** automatically, so every activation works at any `n` (a transformer's `[M,I]` cube is
-millions of elements). Riding the *exact* max width (`cols = 8191`) corrupts ~54 cube
-positions, so the tile cap stays **well under** the ceiling (32768), bit-clean. **GELU** runs the
-accurate **2-pass** `x·Φ(x)` (the single-pass GELU spikes ~128 in the flat negative tail, quirk 1,
-which also makes a *fused* single-pass matmul->GELU spike for wide FFN inputs; the 2-pass is the
-on-NPU GELU route).
+### Any `n`, and the max-width quirk
+
+A LUT op carries the vector as a cube of `cols = n/8` width positions, and
+`DPU_DATA_CUBE_WIDTH` is 13-bit, so one op caps at `n <= 65528`. `run_dpu_lut` **tiles**
+automatically, so every activation works at any `n`, and a transformer's `[M,I]` cube is
+millions of elements. Riding the *exact* max width (`cols = 8191`) corrupts ~54 cube
+positions, so the tile cap stays **well under** the ceiling (32768), bit-clean.
+
+**GELU** runs the accurate **2-pass** `x·Φ(x)`. The single-pass GELU spikes ~128 in the flat
+negative tail, quirk 1, which also makes a *fused* single-pass matmul->GELU spike for wide FFN
+inputs. The 2-pass is the on-NPU GELU route.
 
 A **fully-on-NPU** elementwise multiply (`rocket_ew_mul_fp16`) is **implemented and
 HW-validated bit-exact** (`tests/ew_mul_rocket.c`). rocket's DPU EW reads its 2nd operand
-only combined with a conv/CACC **main** feed (ERDMA+MRDMA `COMB_USE(5)`, the Teflon
-`add_tensor` RE), so `rocket_ew_mul_fp16` uses an **identity conv** as the main feed and
-sets the EW op to multiply (`EW_OP_TYPE=1`, `DPU_EW_CFG=0x108003C4`), the same machinery
-as the fp16 K-accum eltwise-add with one register field changed (`gen_matmul_fp16`'s new
-`ew_mul` flag). With it, **HardSwish/SiLU run fully on the NPU** (LUT gate + EW mul, no
-host arithmetic) under `ROCKET_ACT_NPU_MUL=1`; the host multiply stays the default since a
+only combined with a conv/CACC **main** feed. That is ERDMA+MRDMA `COMB_USE(5)`, the Teflon
+`add_tensor` RE.
+
+So `rocket_ew_mul_fp16` uses an **identity conv** as the main feed and sets the EW op to
+multiply (`EW_OP_TYPE=1`, `DPU_EW_CFG=0x108003C4`). That is the same machinery as the fp16
+K-accum eltwise-add with one register field changed, `gen_matmul_fp16`'s new `ew_mul` flag.
+With it, **HardSwish/SiLU run fully on the NPU** under `ROCKET_ACT_NPU_MUL=1`, as a LUT
+gate plus an EW mul with no host arithmetic. The host multiply stays the default, since a
 standalone EW-mul costs a second NPU round-trip (the perf path is fusing the mul into the
 producing conv). The flying-main `gen_ew_mul_fp16` (which reads 0, since there is no main feed)
 stays behind `ROCKET_ACT_EXPERIMENTAL=1`, disabled by default.
@@ -245,17 +265,20 @@ the substrate for fused FFN / encoder blocks. Each is a CTest gate vs an fp64 or
 | `rocket_encoder_block_fp16(fd, T, d, n_head, d_ff, x, ln1…, Wq…Wo…, ln2…, Wf1…Wf2…, eps, out)` | **one full Whisper/transformer encoder block** (pre-norm): `x += MHA(LN1(x)); x += MLP(LN2(x))`. **Fully on the NPU**: both LayerNorms, all attention matmuls + softmax, both residual adds, the two MLP projection matmuls, AND the MLP's GELU (the 2-pass `x·Φ(x)`: Φ-gate DPU LUT + DPU EW-mul). cos = 1.000000 vs an fp64 block oracle (`tests/encoder_block_rocket.c`) |
 | `rocket_siglip_encode(fd, m, pixels, out, hidden)` / `rocket_siglip_encode_ctx(c, …)` (`rocket_siglip.h`) | **the SigLIP-B/16 vision encoder end-to-end** (SmolVLM-256M front-end): patch-embed (im2col -> matmul) + position add + 12x `rocket_encoder_block_fp16` `(L=1024, d=768, 12 heads, d_ff=3072)` + post-LayerNorm. Weights mmap'd from a flat fp16 blob (`tools/siglip_extract.py`). Two paths: the simple per-call form and a **resident** form (`_ctx`: static GEMMs prepacked once + multicore). The resident path runs the 12 attention heads **across the worker fds** (`rocket_flash_attn_fp16_ctx`, unmasked MHA, since heads are independent, so one drm scheduling entity per fd dispatches head ranges across the NPU cores; head-chaining + resident scratch), **1.44-1.51x warm** vs the prior single-stream per-head loop (`ROCKET_SIGLIP_FA=0` reverts); the host GELU uses a **bit-exact fp16->fp16 LUT** (all 65536 fp16 outputs fit one 128 KB table, identical to the scalar `tanhf`), a further **1.22x** (`ROCKET_SIGLIP_GELU_SCALAR=1` reverts), for **1.78x warm combined**, cosine unchanged. **Per-layer cosine 0.999998 vs an fp32 reference** (`tests/siglip_rocket.c`) |
 
-These standalone are submit-bound (the host wins for an isolated norm); the value is
+These are submit-bound standalone, and the host wins for an isolated norm. The value is
 **compositional**: keeping the activation cube-resident between two NPU matmuls skips the
 de-tile->host->re-pack round-trip.
 
 ## Vision-normalization API (`rocket_normvision.h`)
 
-The **vision** normalization family, built on the SAME primitives as the transformer norms (the
-feature-axis reduce for the per-group mean/variance + the DPU elementwise path for the affine).
-The four ops differ only in **which axis is reduced** and **how the affine broadcasts**; all take
-channels-major NCHW-style buffers with `P = H*W` (the spatial count per channel, `P=1` for a pure
-`[N,C]` tensor). Each is a CTest gate (`tests/norm_vision_rocket.c`) vs an fp64 oracle.
+The **vision** normalization family, built on the SAME primitives as the transformer norms.
+Those are the feature-axis reduce for the per-group mean and variance, and the DPU elementwise
+path for the affine.
+
+The four ops differ only in **which axis is reduced** and **how the affine broadcasts**. All
+take channels-major NCHW-style buffers with `P = H*W`, the spatial count per channel, where
+`P=1` is a pure `[N,C]` tensor. Each is a CTest gate (`tests/norm_vision_rocket.c`) against an
+fp64 oracle.
 
 | function | what it is |
 |---|---|
@@ -285,19 +308,22 @@ native dtype (the per-dtype alignment atoms are listed in the matmul API above).
 | tf32 -> fp32 | native, validated | first 4-byte-input path; completeness rung (half-rate) |
 | int16 -> int32 | **no native output** | bit-exact via int8 byte-decomposition |
 
-**int16 is the only exception:** the int16 conv computes correctly but its DPU writer
-only emits a single int32 tile (broken iteration) or a full int16-saturating
-*transposed* buffer via `tp_org_en` (cracked, N<=32), never full-iteration int32. So
-full-precision int16 is done by int8 byte-decomposition (`rocket_matmul_int16_exact`).
+**int16 is the only exception.** The int16 conv computes correctly. Its DPU writer emits
+only a single int32 tile (broken iteration) or a full int16-saturating *transposed* buffer
+via `tp_org_en` (cracked, N<=32), never full-iteration int32. So full-precision int16 is done
+by int8 byte-decomposition (`rocket_matmul_int16_exact`).
 
-The two **float** rungs share the int16/fp16 fp32-out writer (host `double` K-accum, no
-saturation). **bf16** carries fp32's 8-bit exponent at fp16's 2-byte cost, so it needs
-no per-row activation scaling, and it ran Gemma-4-12B token-identical to fp16. **tf32** is
-the first 4-byte-input path (feature cube C2=4, weight `(N/16,K/16,16,16)`), and the K-group
-*halves* to 16 for a 4-byte element) and a genuine 10-bit-mantissa NVIDIA-style tf32
-(tracks a tf32-rounded reference to ~1e-7, the 10-bit gap from full fp32). tf32 is the
-lowest-value rung: "256×3 MAC/cycle" is half bf16's rate, and bf16 already gives fp32
-range at full speed, so it is a completeness deliverable, not a perf path.
+The two **float** rungs share the int16/fp16 fp32-out writer, with host `double` K-accum and
+no saturation.
+
+**bf16** carries fp32's 8-bit exponent at fp16's 2-byte cost, so it needs no per-row
+activation scaling, and it ran Gemma-4-12B token-identical to fp16.
+
+**tf32** is the first 4-byte-input path (feature cube C2=4, weight `(N/16,K/16,16,16)`), where
+the K-group *halves* to 16 for a 4-byte element. It is a genuine 10-bit-mantissa
+NVIDIA-style tf32. It tracks a tf32-rounded reference to ~1e-7, the 10-bit gap from full
+fp32. tf32 is the lowest-value rung: "256×3 MAC/cycle" is half bf16's rate, and bf16 already
+gives fp32 range at full speed. It is a completeness deliverable rather than a perf path.
 
 ## Tests
 
@@ -306,9 +332,9 @@ on the NPU. They double as the regression/bring-up checks.
 
 The correctness gates, including the bit-exact `int8`/`int4`/`int16`/`bf16`/`tf32`
 tiled-or-resident matmul paths and the int8 depthwise conv, are registered with CTest.
-Run `ctest` from the build directory after `cmake --build`; each gate exits with the
-CTest skip code when no NPU is present (or, for `conv_dw_int8_runtime`, when its
-host-packing fixtures are absent), so the suite is green off-device and fails only on a
+Run `ctest` from the build directory after `cmake --build`. Each gate exits with the CTest
+skip code when no NPU is present, or for `conv_dw_int8_runtime` when its host-packing
+fixtures are absent. So the suite is green off-device and fails only on a
 real on-device regression. Perf probes and RE sweeps are built but left unregistered.
 
 | test | purpose |
@@ -383,115 +409,152 @@ dtype-independent throughput ceiling.
 
 ## Runtime knobs
 
-The library reads a few `ROCKET_*` env vars (the `ggml-rocket` backend exposes more):
-`ROCKET_KACC` (fp16 NPU K-accum, **default on**; `=0` or `ROCKET_NO_KACC` opts out to
-the byte-exact host fp64-accum path), `ROCKET_REUSE` (0/1/2 CBUF reuse, defaulting to
-DATA_REUSE under KACC), `ROCKET_MM_MT/NT/KT` (tile overrides), `ROCKET_MM_ASYM` (asymmetric
-Mt>Nt tiling; see below), `ROCKET_N_THREADS`
-(worker count), `ROCKET_WAIT_MS` (fence deadline), `ROCKET_MM_PROFILE=1` (bucket
-breakdown), `ROCKET_FA_CHAIN` (default on; batches a flash-attention worker's per-head QK/AV
-submits through a resident batched-matmul context; `=0` forces the per-head path,
-`ROCKET_FA_CHAIN_ELEMS`, default **32M** score elems, bounds the chained head group, so a
-worker's head range stays batched up to ~20K context for the long-context win; raise it to
-chain at deeper context for more scratch), `ROCKET_FA_TILE_KV` (default off; opt-in
-online/tiled long-context flash attention; a memory escape hatch, slower than the materialized
-path on this dispatch-bound NPU, engages above `ROCKET_FA_TILE_MIN_KV`, default 8192). Note:
-`sudo` strips env, so use `sudo -E`.
+The library reads a few `ROCKET_*` env vars, and the `ggml-rocket` backend exposes more.
+`sudo` strips the environment, so use `sudo -E`.
 
-**Chip selection.** At device open the library resolves a hardware profile, the machine
-parameters (CBUF banks and bank size, tile caps, weight tile groups, the datatype menu, the
-worker default), from the NPU's device-tree `compatible`: the driver-bound per-core device
-under `/sys/bus/platform/drivers/rocket/`, else `/proc/device-tree/compatible`. Two profiles
-exist. `rk3588` is the fully validated target: every operation this library offers runs
-there. `rk3576` carries machine parameters measured on the part, but only its int8 **direct**
-`CONV_2D` has this chip's own geometry-register encoder; selecting it warns exactly which
-paths that leaves unserved.
+| Knob | Default | What it does |
+|---|---|---|
+| `ROCKET_KACC` | on | fp16 NPU K-accum. `=0`, or `ROCKET_NO_KACC`, opts out to the byte-exact host fp64-accum path |
+| `ROCKET_REUSE` | DATA_REUSE under KACC | CBUF reuse, 0/1/2 |
+| `ROCKET_MM_MT/NT/KT` | planned | Tile overrides |
+| `ROCKET_MM_ASYM` | on | Asymmetric Mt>Nt tiling. See below |
+| `ROCKET_N_THREADS` | profile | Worker count |
+| `ROCKET_WAIT_MS` | | Fence deadline |
+| `ROCKET_MM_PROFILE` | off | Bucket breakdown |
+| `ROCKET_FA_CHAIN` | on | Batches a flash-attention worker's per-head QK/AV submits through a resident batched-matmul context. `=0` forces the per-head path |
+| `ROCKET_FA_CHAIN_ELEMS` | 32M score elems | Bounds the chained head group, so a worker's head range stays batched up to ~20K context. Raise it to chain at deeper context, for more scratch |
+| `ROCKET_FA_TILE_KV` | off | Opt-in online and tiled long-context flash attention. A memory escape hatch, slower than the materialized path on this dispatch-bound NPU |
+| `ROCKET_FA_TILE_MIN_KV` | 8192 | Where `ROCKET_FA_TILE_KV` engages |
+
+### Chip selection
+
+At device open the library resolves a hardware profile from the NPU's device-tree
+`compatible`: the driver-bound per-core device under `/sys/bus/platform/drivers/rocket/`,
+else `/proc/device-tree/compatible`. A profile is the machine parameters, meaning CBUF banks
+and bank size, tile caps, weight tile groups, the datatype menu and the worker default.
+
+Two profiles exist. `rk3588` is the fully validated target, and every operation this library
+offers runs there. `rk3576` carries machine parameters measured on the part, and only its
+int8 **direct** `CONV_2D` has this chip's own geometry-register encoder. Selecting it warns
+exactly which paths that leaves unserved.
 
 That warning is load-bearing, because a profile selects machine parameters only. It does not
 switch the regcmd encoder, and the CNA/CORE/DPU geometry-register **encoding** is
-IP-revision-specific. An operation with no encoder for the running chip does not degrade: on
-RK3576 silicon an RK3588 program submits and the job completes with the output buffer
+IP-revision-specific. An operation with no encoder for the running chip does not degrade. On
+RK3576 silicon an RK3588 program submits, and the job completes with the output buffer
 untouched. A Rockchip NPU with no profile at all warns and runs with RK3588 parameters.
-`ROCKET_CHIP=<name>` forces a profile (a name with no profile warns and falls back).
+`ROCKET_CHIP=<name>` forces a profile, and a name with no profile warns and falls back.
 
-**CPU-affinity for multi-pool processes.** `ROCKET_CPU_AFFINITY` (a CPU list like `4-7`, or
-`off`) sets the per-process big-core SET the pack/readback workers pin to (auto-detected as the
-top-cpufreq cores otherwise). For running **several context pools concurrently in one process**
-(e.g. one detector instance per camera, each on its own thread), `rocket_affinity_set_base(int)`
-(`rocket_npu.h`) sets a per-thread rotation BASE so each pool's workers start at a distinct core
-(`big[(base+worker)%n_big]`) instead of every pool stacking on `big[0]`. Convention
-`rocket_affinity_set_base(pool_index * nthreads)` before the thread's `*_ctx_create`/matmul/conv
-calls. The base is thread-local and honoured by the **fp16/int8 matmul and conv-pool** worker
-paths (the pool-relevant ones) a thread spawns; it is a **scheduling hint only** (never changes
-numerics; default 0 = every pool's workers start at `big[0]`). The spread is deterministic (`ROCKET_DEBUG` logs each `worker N (base B) -> cpu C`);
-its throughput payoff is operating-point-dependent: at submit-bound matmul shapes an in-process
-pool is **NPU-wait-bound** (workers block on the fence, so the pool scales ~`n_core` even with
-every worker collided on one core), so the base is a deterministic-placement + contention-
-robustness lever rather than a large idle-box speedup (`tests/ctx_pool_throughput`).
+### CPU affinity for multi-pool processes
 
-`ROCKET_BATCH_SUBMIT=1` runs a tiled matmul's output tiles as **one HW kick**. The
-per-tile regcmds are laid contiguously and self-chain (each task's trailer links to the
-next), so the NPU streams through them and raises a single completion interrupt instead
-of one submit + IRQ per tile. It cuts the dispatch floor on jobs that decompose into
-independent tiles; bit-exact with the default per-task path. The same chaining backs
+`ROCKET_CPU_AFFINITY` takes a CPU list like `4-7`, or `off`. It sets the per-process
+big-core set the pack and readback workers pin to, auto-detected as the top-cpufreq cores
+otherwise.
+
+Several context pools can run concurrently in one process, such as one detector instance
+per camera, each on its own thread. For those, `rocket_affinity_set_base(int)`
+(`rocket_npu.h`) sets a per-thread rotation base. Each pool's workers then start at a distinct core,
+`big[(base+worker)%n_big]`, instead of every pool stacking on `big[0]`. The convention is
+`rocket_affinity_set_base(pool_index * nthreads)` before the thread's `*_ctx_create`, matmul
+and conv calls.
+
+The base is thread-local and honoured by the **fp16/int8 matmul and conv-pool** worker paths,
+the pool-relevant ones a thread spawns. It is a **scheduling hint only** and never changes
+numerics, and the default 0 starts every pool's workers at `big[0]`. The spread is
+deterministic, and `ROCKET_DEBUG` logs each `worker N (base B) -> cpu C`.
+
+Its throughput payoff is operating-point-dependent. At submit-bound matmul shapes an
+in-process pool is **NPU-wait-bound**, because workers block on the fence. The pool then
+scales ~`n_core` even with every worker collided on one core. The base is therefore a
+deterministic-placement and contention-robustness lever rather than a large idle-box speedup
+(`tests/ctx_pool_throughput`).
+
+### Batched submit and chaining
+
+`ROCKET_BATCH_SUBMIT=1` runs a tiled matmul's output tiles as **one HW kick**. The per-tile
+regcmds are laid contiguously and self-chain, each task's trailer linking to the next. The NPU
+streams through them and raises a single completion interrupt instead of one submit and IRQ
+per tile. It cuts the dispatch floor on jobs that decompose into independent tiles, and is
+bit-exact with the default per-task path. The same chaining backs
 `rocket_matmul_fp16_batch` (and so `ROCKET_FA_CHAIN`), where the contiguous self-chaining
 spans a batch of same-shape matmuls rather than one matmul's tiles.
 
-Chaining is a **joint layout contract with the kernel**: userspace self-chains the
-regcmds, the kernel sets `TASK_NUMBER = task_count`, so both halves must agree. A kernel
-that does not know `DRM_ROCKET_JOB_BATCHED` ignores the flag and runs a self-chained
-layout down the per-task path, which stalls or corrupts the job. `rocket_batched_submit_supported()`
-(`rocket_npu.h`; probed once, cached) reports whether the running kernel honors it, and
-the driver gates every chaining entry point on it: asking for `ROCKET_BATCH_SUBMIT=1` on a
-kernel without the `patches/rocket` batched-submit patch warns and runs the stock per-task
-path rather than producing garbage. Call it before self-chaining anything yourself.
+Chaining is a **joint layout contract with the kernel**. Userspace self-chains the regcmds
+and the kernel sets `TASK_NUMBER = task_count`, so both halves must agree. A kernel that does
+not know `DRM_ROCKET_JOB_BATCHED` ignores the flag and runs a self-chained layout down the
+per-task path, which stalls or corrupts the job.
+
+`rocket_batched_submit_supported()` (`rocket_npu.h`, probed once and cached) reports whether
+the running kernel honors it, and the driver gates every chaining entry point on it. Asking
+for `ROCKET_BATCH_SUBMIT=1` on a kernel without the `patches/rocket` batched-submit patch
+warns and runs the stock per-task path rather than producing garbage. Call it before
+self-chaining anything yourself.
 
 `ROCKET_KACC_CHAIN` (default off) extends that chaining **across the fp16 K-accumulation
-ki-steps**: instead of one fenced submit per K-tile, it chains a tile's whole nKt-step
-accumulation into one self-chained kick, where each `ki>0` task EW-adds the partial an earlier
-task in the *same kick* just wrote. The NPU honors that in-kick read-after-write, so it is
-**byte-exact** to the per-ki path (the gate forces it across nKt=2…43); fp16 only (integer
-chaining garbles, as above). It is **marginal and shape-gated**: collapsing the fences trims
-submit/sync, but the ki-steps are serially dependent, so a chained kick only pipelines the
-*independent* tiles within each ki-block, a net win only when `gcap = 64/nKt >= 3` (~5% at
-nKt~12-21), a wash-to-loss below that (`wait` +18% at nKt=40/gcap=1). So `=1` is **adaptive**:
-it engages only in that winning regime and otherwise falls back to per-ki (never regresses);
-`=2` forces chaining for any fitting nKt (the correctness gate's strict gcap=1 path). The
-common Gemma FFN-down (nKt=40) falls back, so the end-to-end LLM gain is ~nil. The knob is a
-narrow lever, not a default. `tests/matmul_kacc_chain_rocket.c` gates it; `matmul_kacc_chain_bench`
-A/Bs it.
+ki-steps**. Instead of one fenced submit per K-tile, it chains a tile's whole nKt-step
+accumulation into one self-chained kick. Each `ki>0` task EW-adds the partial that an earlier
+task in the *same kick* just wrote. The NPU honors that in-kick read-after-write, so
+it is **byte-exact** to the per-ki path, and the gate forces it across nKt=2…43. It is fp16
+only, because integer chaining garbles as above.
 
-`ROCKET_MM_ASYM` (**default on**; `=0` opts out) is a **tiling** lever, not a submit one. The planner
-caps Mt and Nt at 256 and maximizes Kt, which picks a **symmetric** Mt=Nt=256 tile (Kt=384). For a
-shape that tiles both N and K, **halving Nt to 128 (Mt stays 256) frees CBUF so Kt grows to 512**, and
-the asymmetric Mt>Nt tile runs the NPU datapath measurably faster: **+6-9% warm** on the square /
-large-K prefill matmuls (1024²/2048²×4096, Gemma FFN-down), ~wash on FFN-up. End-to-end warm pp2048
-through llama.cpp: **Qwen3.5-9B-F16 +9.5%, Gemma-4-12B-F16 +5.7%, Qwen3.5-9B-Q4_K +1.3%** (quant
-prefill is dequant-bound so the datapath win dilutes to ~noise): **win-or-wash on every shape/model
-tested, never a regression** [HW sweep]. The win is a `wait`-term (datapath) effect, not fewer fences
-(submit actually rises a little as nNt doubles; wait drops ~10% and dominates). It fires only when N is
-actually N-tiled (N>256, no `ROCKET_MM_NT` override) **and** the symmetric plan K-tiles (nKt>1), a
-bigger Kt is moot at nKt=1, so small-K / small-N shapes are an exact no-op. Bit-exact (tiling never
-changes the result; gated bit-exact under both settings by `matmul_correctness_matrix_asym` /
-`matmul_correctness_matrix_sym`). Composes with KACC.
+It is **marginal and shape-gated**. Collapsing the fences trims submit and sync, and the
+ki-steps are serially dependent, so a chained kick only pipelines the *independent* tiles
+within each ki-block. That is a net win only when `gcap = 64/nKt >= 3`, about 5% at nKt~12-21,
+and a wash to a loss below that (`wait` +18% at nKt=40/gcap=1).
 
-`ROCKET_CONV_BATCH=1` (default off) coalesces a tiled int8/uint8 DIRECT conv's per-tile submits
-into one multi-task job (`conv2d_int8_batch_tiles`), the **gapped** "lever 1" form, distinct from
-the chaining above: the kernel runs the tiles as separate HW kicks, so the int32 CACC clears per
-kick and **int8 stays bit-exact** (chaining is fp16-only), while the whole tile set pays one submit
-syscall + one fence + one IOMMU attach instead of one per tile. Each tile lands at a bank-aligned,
-zeroed slot of the batched BOs so its feature-DMA over-read reads zeros; bit-identical to the
-per-tile path across nt=1/2/4. It is **single-stream-neutral**: a
-tiled conv's wall is the host cube scatter/descatter, not the submit floor, and it pays only under
-multi-process contention on conv-tile-heavy work (several pool contexts sharing the submit/IOMMU
-path; +7.6% aggregate at P=4 on a conv-tile-heavy unit, ~0 on conv-tile-light MobileDet). Needs no
-kernel patch (gapped, not chained); the matmul path already batches its own tiles.
+So `=1` is **adaptive**: it engages only in that winning regime and otherwise falls back to
+per-ki, never regressing. `=2` forces chaining for any fitting nKt, which is the correctness
+gate's strict gcap=1 path. The common Gemma FFN-down (nKt=40) falls back, so the end-to-end
+LLM gain is ~nil. The knob is a narrow lever rather than a default.
+`tests/matmul_kacc_chain_rocket.c` gates it, and `matmul_kacc_chain_bench` A/Bs it.
+
+`ROCKET_MM_ASYM` (**default on**, `=0` opts out) is a **tiling** lever rather than a submit
+one. The planner caps Mt and Nt at 256 and maximizes Kt, which picks a **symmetric**
+Mt=Nt=256 tile (Kt=384). For a shape that tiles both N and K, **halving Nt to 128 frees CBUF
+so Kt grows to 512**, with Mt staying at 256.
+
+The asymmetric Mt>Nt tile runs the NPU datapath measurably faster. That is **+6-9% warm** on
+the square and large-K prefill matmuls (1024²/2048²×4096, Gemma FFN-down), and about a wash
+on FFN-up. End-to-end warm pp2048 through llama.cpp:
+
+| Model | Gain |
+|---|---|
+| Qwen3.5-9B-F16 | +9.5% |
+| Gemma-4-12B-F16 | +5.7% |
+| Qwen3.5-9B-Q4_K | +1.3% |
+
+Quant prefill is dequant-bound, so the datapath win dilutes to about noise there. It is
+**win-or-wash on every shape and model tested, never a regression** [HW sweep].
+
+The win is a `wait`-term datapath effect rather than fewer fences. Submit actually rises a
+little as nNt doubles, and wait drops ~10% and dominates. It fires only when N is actually
+N-tiled (N>256, no `ROCKET_MM_NT` override) **and** the symmetric plan K-tiles (nKt>1). A
+bigger Kt is moot at nKt=1, so small-K and small-N shapes are an exact no-op. Bit-exact,
+because tiling never changes the result, and gated bit-exact under both settings by
+`matmul_correctness_matrix_asym` and `matmul_correctness_matrix_sym`. Composes with KACC.
+
+`ROCKET_CONV_BATCH=1` (default off) coalesces a tiled int8/uint8 DIRECT conv's per-tile
+submits into one multi-task job (`conv2d_int8_batch_tiles`). This is the **gapped** "lever 1"
+form, and it is distinct from the chaining above. The kernel runs the tiles as separate HW
+kicks, so the int32 CACC clears per kick and **int8 stays bit-exact**, where chaining is
+fp16-only. The whole tile set pays one submit syscall, one fence and one IOMMU attach instead
+of one per tile.
+
+Each tile lands at a bank-aligned, zeroed slot of the batched BOs, so its feature-DMA
+over-read reads zeros. It is bit-identical to the per-tile path across nt=1/2/4.
+
+It is **single-stream-neutral**. A tiled conv's wall is the host cube scatter and de-scatter
+rather than the submit floor. So it pays only under multi-process contention on
+conv-tile-heavy work, where several pool contexts share the submit and IOMMU path. That is
++7.6% aggregate at P=4 on a conv-tile-heavy unit, and about 0 on conv-tile-light MobileDet.
+It needs no kernel patch, being gapped rather than chained, and the matmul path already
+batches its own tiles.
 
 ## Logging (`rocket_log.h`)
 
-Every diagnostic the library emits (errors, warnings, the `ROCKET_MM_PROFILE` breakdown,
-the `ROCKET_DEBUG` traces) flows through one channel so a host application can intercept,
-redirect, or silence it instead of having raw `stderr` writes pollute its own output.
+Every diagnostic the library emits flows through one channel: errors, warnings, the
+`ROCKET_MM_PROFILE` breakdown and the `ROCKET_DEBUG` traces. A host application can therefore
+intercept, redirect or silence it, instead of raw `stderr` writes polluting its own output.
 
 With no hook installed the default sink writes `ERROR`/`WARN`/`INFO` to `stderr` and drops
 `DEBUG` (errors always print, traces only under `ROCKET_DEBUG`). A host overrides this much like `ggml_log_set_callback`:
@@ -507,13 +570,14 @@ rocket_log_set_callback(my_sink, /*user_data=*/NULL);  /* NULL restores the stde
 rocket_log_set_level(ROCKET_LOG_WARN);                 /* or via the environment, below */
 ```
 
-The threshold is read once from the environment on first use: `ROCKET_LOG_LEVEL` =
-`error`|`warn`|`info`|`debug` (or `0`..`3`); `ROCKET_DEBUG` raises it
-to at least `debug`. The contract is set-callback-once-before-first-use (no internal locking).
+The threshold is read once from the environment on first use. `ROCKET_LOG_LEVEL` takes
+`error`, `warn`, `info` or `debug`, or `0`..`3`, and `ROCKET_DEBUG` raises it to at least
+`debug`. The contract is set-callback-once-before-first-use, with no internal locking.
 
 `ROCKET_LOG_STDERR` (set to any non-`0` value) additionally tees every emitted line to
 `stderr`, but only when a host callback is installed, so the default sink never
-double-prints. It is the escape hatch for a host that silences its own logger: `llama-bench`,
-for one, installs a no-op `ggml` callback unless `-v` is passed, which (because a host that
-adopts the channel forwards it into `ggml`) would otherwise swallow every rocket diagnostic,
-including one-shot decisions like the resident-weight budget that change the benchmarked number.
+double-prints. It is the escape hatch for a host that silences its own logger. `llama-bench`,
+for one, installs a no-op `ggml` callback unless `-v` is passed. A host that adopts the
+channel forwards it into `ggml`. That would otherwise swallow every rocket diagnostic,
+including one-shot decisions like the resident-weight budget that change the benchmarked
+number.

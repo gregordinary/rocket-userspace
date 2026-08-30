@@ -3,9 +3,9 @@
 /*
  * bytes_moved_rocket.c — ANALYTICAL DRAM-traffic model for a tiled matmul.
  *
- * The real RK3588 DDR/DMA byte counters are dead (reading the 0x2xxx page
- * hard-locks the SoC; the 0x80xx page is config-only). RKNN's "Total Memory R/W per frame"
- * is likewise *computed from the graph*, not read from HW. So this tool computes
+ * The NPU's own DMA byte counters are dead (reading the 0x2xxx page hard-locks the SoC;
+ * the 0x80xx page is config-only). RKNN's "Total Memory R/W per frame" is likewise
+ * *computed from the graph*, not read from HW. So this tool computes
  * the bytes each phase moves analytically from the shape + the real tiling
  * (rocket_matmul_plan, pure/no-HW) + the dtype + the reuse mode — a traffic metric
  * to drive the readback/dispatch-floor work with NO hardware counter.
@@ -14,6 +14,19 @@
  * ROCKET_MM_PROFILE timing line (pack / wait / read ms) to get achieved GB/s per
  * phase and see which phase is bandwidth-bound. It also makes the int8 readback
  * floor explicit: int32 partials, no on-NPU K-accum, so readback scales with nKt.
+ *
+ * WHERE IT IS MEASURED TO BE WRONG, and it is not wrong uniformly. Checked against the
+ * system-level `rockchip_ddr` DDR PMU (tests/ddr_pmu_cal.c calibrates that counter to 0.4%;
+ * tests/ddr_mm_bytes.c is the arm) at 512x3840x4096 fp16 on the RK3588:
+ *   - the data_reuse term is RIGHT: predicted +116.25 MB of reads with REUSE off, measured
+ *     +120.98 MiB, and nothing on the write column as predicted;
+ *   - the ABSOLUTE total is 3.57x low, and the miss is the HOST phases -- packB alone costs
+ *     the bus 249.34 MiB against the 30.00 MB counted here, because a scatter moves a whole
+ *     cache line per sub-line chunk and moves it in both directions;
+ *   - the KACC term is wrong on the read side: predicted +28 MB of writes and no reads,
+ *     measured +20.4 MiB write and +189.0 MiB read.
+ * So: good for a RATIO between two NPU-DMA configurations of one shape, a LOWER BOUND on
+ * absolute bus traffic, and not to be quoted as the cost of a host pack.
  *
  * Phase  -> ROCKET_MM_PROFILE bucket it feeds, and the formula:
  *   packB    (host weight scatter, "packB")  = N*K*ein                 (streaming: per call)

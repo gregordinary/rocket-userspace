@@ -448,6 +448,8 @@ if(ROCKETNPU_BUILD_TESTS)
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
             hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure
             membench               # DRAM bandwidth + NPU readback de-tile microbench
+            ddr_pmu_cal            # positive control for the rockchip_ddr DDR PMU: known bytes in, counted bytes out
+            ddr_mm_bytes           # the matmul arm the DDR PMU measures against bytes_moved_rocket
             fabench)               # flash-attention QK/AV submit-chaining A/B (ROCKET_FA_CHAIN 0 vs 1)
         add_executable(${t} tests/${t}.c)
         target_link_libraries(${t} PRIVATE rocketnpu)
