@@ -22,7 +22,7 @@
  * THE DEVICE HALF asks whether the part computes it. Each shape runs through the public
  * entry, rocket_matmul_fp16_rk3576(), and every output is compared EXACTLY against the
  * CPU. The golden shapes are one task each; a second table runs shapes the entry cuts
- * into 2 to 25 tasks along M, and each row prints how many tasks it submitted. The fills are GA-5.1's value sets, drawn without a period: A in 0.25 steps over
+ * into 2 to 25 tasks along M, and each row prints how many tasks it submitted. The fills are the first transcription run's value sets, drawn without a period: A in 0.25 steps over
  * [-1.5, 1.5] and B in 0.5 steps over [-1.5, 1.5]. Every product is a multiple of 1/8
  * and every partial sum stays under 2^15 of those units at K=2048, so fp32 holds each
  * one exactly and the order of accumulation cannot move the answer. A mismatch of any
@@ -30,7 +30,7 @@
  *
  * THE CONTROL is what says the comparison can fail. One shape runs the same program
  * with the weights packed row-major instead of in the part's layout, through a raw
- * submit, and must come back WRITTEN and WRONG. GA-5.1's DENSE control was wrong on 64
+ * submit, and must come back WRITTEN and WRONG. The first run's DENSE control was wrong on 64
  * of 64 outputs. A control that comes back exact fails the gate: the check could not
  * have seen a layout error.
  *
@@ -189,7 +189,7 @@ static int host_half(void)
     return fails;
 }
 
-/* GA-5.1's value sets. Seeds differ per tensor so A and B are unrelated. */
+/* The first transcription run's value sets. Seeds differ per tensor so A and B are unrelated. */
 static void fill(_Float16 *A, _Float16 *B, unsigned m, unsigned k, unsigned n)
 {
     for (size_t i = 0; i < (size_t)m * k; i++) A[i] = (_Float16)(tf_int(0xA1, i, -6, 6) * 0.25);
@@ -364,7 +364,7 @@ out:
     return fails != 0;
 }
 
-/* The same program with the weights row-major, B[n][k] at n*k + k: GA-5.1's DENSE. */
+/* The same program with the weights row-major, B[n][k] at n*k + k: the first run's DENSE. */
 static int run_control(int fd, unsigned m, unsigned k, unsigned n)
 {
     rocket_bo in = {0}, w = {0}, coef = {0}, out = {0}, rc = {0};

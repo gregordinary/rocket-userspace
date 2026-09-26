@@ -1,5 +1,5 @@
 /* The shapes tests/rk3576_mm_fp16_gate.c runs, as { m, k, n }, shared with the golden
- * generator tools/rk3576-mm-fp16-golden.c. The first six are GA-5.1's; the rest move
+ * generator tools/rk3576-mm-fp16-golden.c. The first six are the first transcription run's; the rest move
  * one axis each (M, then a K and an N that are not powers of two, then N), and the
  * next three were the corners of the first envelope. The last five are one task at the
  * bounds tests/rk3576_mm_fp16_envelope.c measured: the data window at K 1536 and at

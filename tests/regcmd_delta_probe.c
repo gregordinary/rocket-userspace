@@ -4,7 +4,7 @@
  * regcmd_delta_probe.c — can a task in a job carry only the registers that changed, on the
  * RK3588?
  *
- * A probe, not a gate (GATE_AUDIT_PLAN GA-5.5). regcmd_persist_rocket recorded "delta regcmd
+ * A probe, not a gate. regcmd_persist_rocket recorded "delta regcmd
  * is not usable": a 2-task job whose second task wrote only its addresses and the enable left
  * that output untouched, and passed only right after a full job. Two things about that probe
  * decide what it could see:

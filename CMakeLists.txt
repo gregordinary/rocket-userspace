@@ -316,7 +316,7 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_dtype_perf_rocket # fp16 vs int8 vs int4 resident throughput
             matmul_int8_tiled_rocket # tiled int8 (M/N tiles + host K-accum)
             mixed_chain_coexist_rocket # GATE: chained-fp16 + gapped-int8 in one process (per-job batched flag)
-            int8_chain_probe       # probe: does a chained batch of int8 matmul tasks compute? (GA-5.3)
+            int8_chain_probe       # probe: does a chained batch of int8 matmul tasks compute?
             matmul_int8_prepacked_rocket # resident int8 weights (bit-exact vs one-shot)
             matmul_int8_crossm_rocket # resident int8 weight reused across M, no re-pack (warmup-M serves prefill-M)
             matmul_int8_groupwise_rocket # group-wise int8 (per-K-group scales, fp32 K-accum) — the native-quant primitive
@@ -392,7 +392,7 @@ if(ROCKETNPU_BUILD_TESTS)
             submit_overhead_rocket # per-job dispatch floor (us/submit) A/B probe for IOMMU keep-attach
             x0_glitch_probe        # RE: does the x≈0 LE/LO mux glitch fire for a shifted table straddling 0?
             regcmd_persist_rocket  # the one-task-after delta arm (lands in an unwritten group); see regcmd_delta_probe
-            regcmd_delta_probe     # probe: a delta task in its own register group, three pointer modes (GA-5.5)
+            regcmd_delta_probe     # probe: a delta task in its own register group, three pointer modes
             # host-only regcmd dumpers + a standalone fp16 test + a DRAM microbench: tools, not CTest gates
             matmul_fp16_rocket     # standalone fp16 x fp16 single-task test (gen_matmul_fp16 path)
             dump_regcmd            # host-only: diff the matmul regcmd accumulate=0 vs 1 (no HW)

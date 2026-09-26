@@ -4018,8 +4018,8 @@ int64_t rocket_rk3576_ew_params(double gain,
  * One job, the whole of K. The fp16 convolution above contracts sixteen input channels
  * a task, and that bound is the program's rather than the part's: this program is
  * charsiu's (gahingwoo/charsiu 524e10a, charsiu_emit_job, no CHARSIU_* environment),
- * which contracts K 2048 exactly in one job on the H96 [HW sweep, GATE_AUDIT_PLAN
- * GA-5.1, 2026-09-24].
+ * which contracts K 2048 exactly in one job on the H96 [HW sweep,
+ * 2026-09-24].
  *
  * The table is that emitter's output at m=1 k=256 n=64, in its order. Every word the
  * shape moves was found by sweeping m over 1-32, k over 32-4096 and n over 16-1024 and
@@ -4339,7 +4339,7 @@ int gen_matmul_fp16_rk3576_unchecked(uint64_t *ops, unsigned m, unsigned k, unsi
 
 /* [n/16][k/32][n%16][k%32]: charsiu's CHARSIU_W16_GROUP, the int8 weight tiling with
  * two-byte elements, and the one layout of its three candidates that comes back exact
- * (GA-5.1: DENSE was wrong on 64 of 64 outputs). With k%32 and n%16 there are no edge
+ * (the dense row-major one was wrong on 64 of 64 outputs). With k%32 and n%16 there are no edge
  * tiles, so a row of 32 is contiguous at both ends. */
 int rocket_rk3576_mm_fp16_pack_weights(void *dst, size_t dst_bytes, const uint16_t *B,
                                        unsigned k, unsigned n)

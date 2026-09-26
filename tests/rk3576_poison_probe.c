@@ -70,7 +70,7 @@
  * Program kinds: int8fc fp16fc int8d fp16d i32 i32w dw mmf16
  *
  * `mmf16` is the matmul-form fp16 program (gen_matmul_fp16_rk3576), one job at M 1, K 256,
- * N 64 with an fp32 output: GA-5.1's repeat shape. It is not a convolution, so it carries
+ * N 64 with an fp32 output: the first transcription run's repeat shape. It is not a convolution, so it carries
  * no conv_params_t geometry and `scan`, `heal` and `xadd` do not apply to it; `pair`,
  * `chain` and `scope` do.
  *

@@ -3,7 +3,7 @@
 /*
  * int8_chain_probe.c — does a chained batch of int8 matmul tasks compute, on the RK3588?
  *
- * A probe, not a gate (GATE_AUDIT_PLAN GA-5.3). The record says a chained integer batch
+ * A probe, not a gate. The record says a chained integer batch
  * computes its first task exactly and every later one wrong, because the int32
  * accumulator (CACC) clears per hardware kick rather than per task, so task t lands on
  * task t-1's residual. Two things about that record are unexamined. Its oracle was
