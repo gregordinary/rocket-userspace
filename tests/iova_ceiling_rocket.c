@@ -20,6 +20,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 #include "rocket_npu.h"
@@ -58,9 +59,11 @@ int main(int argc, char **argv)
         if (full[f]) { nbo++; continue; }           /* skip a full fd, keep cycling */
 
         rocket_bo *bo = &bos[nbo];
-        if (rocket_bo_alloc(fd[f], chunk, bo) != 0) {
-            printf("fd[%d]: CREATE_BO FAILED after %zuMB held (%d BOs) -> kernel alloc ceiling\n",
-                   f, bytes[f] >> 20, held[f]);
+        int arc = rocket_bo_alloc(fd[f], chunk, bo);
+        if (arc != 0) {
+            /* the errno says WHICH ceiling: ENOSPC is the IOVA window, ENOMEM is memory */
+            printf("fd[%d]: CREATE_BO FAILED (%s) after %zuMB held (%d BOs) -> kernel alloc ceiling\n",
+                   f, strerror(arc < 0 ? -arc : arc), bytes[f] >> 20, held[f]);
             full[f] = 1;                            /* treat as full */
             bo->handle = 0;                         /* nothing to free */
             nbo++;

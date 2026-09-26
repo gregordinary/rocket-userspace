@@ -104,12 +104,18 @@ void rocket_pool_ref_int8(const rocket_pool_desc *d, const int8_t *in, int8_t *o
 
 /* int8/uint8 pooling on the PPU, ROUTED THROUGH THE fp16 PATH.
  *
- * NPU FACT (RE'd 2026-06-22): the RK3588 PPU has NO native int8 pooling precision. A
- * PPU job with PROC_PRECISION/IN_PRECISION=int8 (0) over a packed int8 C2=16 cube does
- * NOT pool in int8 — the HW reads the bytes as fp16 (garbage). HW-verified: PROC_PRECISION(2)=fp16
- * is required for EVERY pool (no int8 pool precision exists). So int8/uint8 pooling lifts the
- * feature into fp16 (every
- * int8/uint8 value is exact in fp16), runs the proven fp16 PPU job, and narrows back:
+ * The routing is a CHOICE, not a hardware bound. The PPU does have a native int8 pooling
+ * precision — `PPU_DATA_FORMAT[2:0]` = 0 with `PPU_RDMA_DATA_FORMAT[1:0]` = 1 over a
+ * packed int8 C2=16 cube pools MAX, MIN and AVG bit-exactly, given an INTEGER Q16
+ * `0x10000/k` reciprocal and the integer pad fill (-128 sign-extended, not fp16 -inf)
+ * [HW sweep, Turing RK1, 2026-09-20, tests/pool_int8_native_probe.c]. An earlier probe
+ * concluded otherwise because it programmed IN_PRECISION 0, which is the 4-bit storage
+ * width; that negative is withdrawn.
+ *
+ * This path stays fp16-routed because it is correct and because the native one is not a
+ * win on its own — what it would buy is the conversion either side, and a cube-resident
+ * int8 primitive for the fused-partition path. Every int8/uint8 value is exact in fp16,
+ * so lifting the feature, running the proven fp16 PPU job and narrowing back gives:
  *   - MAX is BIT-EXACT (fp16 max of exact values == int max; round-trip lossless).
  *   - AVG matches the fp16(65536/k) recip (within fp16/recip tolerance), then rounds.
  * For uint8 the feature is recentered by -128 (MAX is shift-invariant; an AVG of the

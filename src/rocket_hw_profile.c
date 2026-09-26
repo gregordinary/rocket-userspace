@@ -91,11 +91,12 @@ const struct rocket_hw_profile rocket_hw_rk3576 = {
     /* Matmul parameters, measured on this part against rocket_matmul_int8_rk3576.
      *
      * max_tile is the OUTPUT-CHANNEL tile, and here that is the whole of the tiling
-     * question. A submit costs about 1.4 ms whatever it carries, so throughput is MACs
-     * per submit; M*K is capped by the feature budget above and K by the resident
-     * weight slice, which leaves N as the only axis worth spending. Throughput rises
-     * almost linearly with it — 12 GOP/s at N=32 to about 1.0 TOP/s at N=2560 — up to
-     * a boundary past which the trailing output channels simply do not reach DDR: 2944
+     * question. M*K is capped by the feature budget above and K by the resident weight
+     * slice, which leaves N as the only axis worth spending. At that budget a submit's
+     * device time is about 0.12 ms at N=32 and 0.91 ms at N=2048, so the device's rate
+     * rises almost linearly with N, from about 140 GOP/s to about 1.2 TOP/s [HW sweep,
+     * rocket 1.6.0, 786 MHz, 2026-09-25]. It rises up to a boundary past which the
+     * trailing output channels simply do not reach DDR: 2944
      * channels computes and 3072 is intermittent, and independently a weight cube of
      * 6 MiB computes where 6.75 MiB does not. 2048 is the largest power of two
      * comfortably inside both, so the bound stays a guard rather than the operating

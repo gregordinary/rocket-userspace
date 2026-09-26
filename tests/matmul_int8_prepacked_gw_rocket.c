@@ -34,9 +34,11 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 #include "rocket_hw_profile.h"
 
-static int8_t rand_i8(void)    { return (int8_t)(rand() % 255 - 127); }
+/* the whole int8 range: a fill that stops at -127 cannot see a -128 mis-encoded */
+static int8_t rand_i8(void)    { return (int8_t)(rand() % 256 - 128); }
 static float  rand_scale(void) { return 0.5f + (rand() % 1000) / 1000.0f; }
 
 /* True iff every path plans Kt == group, which is what makes resident and one-shot
@@ -100,9 +102,11 @@ static int cmp_oneshot(const char *tag, const float *got, const float *ref, size
     for (size_t i = 0; i < n; i++) {
         double ad = fabs((double)got[i] - (double)ref[i]);
         if (ad > max_abs) max_abs = ad;
-        if (ad > tol && nbad < 6)
+        /* !(ad <= tol) and not (ad > tol): a NaN output, which is what an unwritten
+         * sentinel reads as, must count against the gate */
+        if (!(ad <= tol) && nbad < 6)
             printf("  [%s] [%zu] oneshot=%.6f resident=%.6f\n", tag, i, ref[i], got[i]);
-        if (ad > tol) nbad++;
+        if (!(ad <= tol)) nbad++;
     }
     printf("  [%s] vs one-shot: max_abs=%.6g nbad=%ld -> %s\n", tag, max_abs, nbad,
            nbad ? "FAIL" : (exact ? "PASS (bit-exact)" : "PASS (fp32-reassoc)"));
@@ -204,9 +208,15 @@ int main(int argc, char **argv)
     /* reuse w0 — guards against scratch aliasing across calls (the shared per-shape
      * scratch is reused by every weight; a stale accumulator would show up here) */
     ref_gw(M, K, N, group, A, B[0], as, bs[0], ref);
-    if (!oneshot(M, K, N, A, B[0], as, bs[0], Co, group)) {
-        memset(Cr, 0, Csz*sizeof(float));
-        if (!rocket_matmul_int8_prepacked_gw(ctx, M, K, N, A, as, bs[0], Cr, rw[0])) {
+    /* An error on either call is a failure: skipping the comparison would pass a reuse
+     * path that cannot run at all. */
+    if (oneshot(M, K, N, A, B[0], as, bs[0], Co, group)) {
+        printf("  [reuse-w0] the one-shot oracle failed -> FAIL\n"); fails++;
+    } else {
+    for (size_t i_ = 0; i_ < Csz; i_++) Cr[i_] = NAN;   /* a skipped write never compares equal */
+        if (rocket_matmul_int8_prepacked_gw(ctx, M, K, N, A, as, bs[0], Cr, rw[0])) {
+            printf("  [reuse-w0] the resident call failed -> FAIL\n"); fails++;
+        } else {
             if (cmp_oneshot("reuse-w0", Cr, Co, Csz, exact)) fails++;
             if (cmp_ref("reuse-w0", Cr, ref, Csz))           fails++;
         }

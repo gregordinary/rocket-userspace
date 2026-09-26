@@ -81,6 +81,7 @@
 #include "npu_dpu.h"
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
+#include "rocket_hw_profile.h"
 #include "rocket_log.h"
 
 #include <math.h>
@@ -1927,7 +1928,9 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     ops[i++] = NPUOP(OP_REG_DPU,
                      ((uint32_t)(dpu->fp32tofp16_en & 0x1) << 16) | dpu->out_cvt_scale,
                      R76_DPU_OUT_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, dpu->out_cvt_shift,  R76_DPU_OUT_CVT_SHIFT);
+    ops[i++] = NPUOP(OP_REG_DPU,
+                     npu_out_cvt_round_bit(dpu->out_cvt_round) | dpu->out_cvt_shift,
+                     R76_DPU_OUT_CVT_SHIFT);
     /* The channel-group jump: a full destination surface PLUS the rows of it this
      * task does not write. The writer walks the task's rows and then adds this to
      * reach the same rows of the next group, so a windowed task has to be told about
@@ -2156,6 +2159,25 @@ static void r76_dump_program(const uint64_t *ops, int n)
  * SECTION — descriptor fill
  * ==========================================================================*/
 
+/* THE RK3576 GEOMETRY-REGISTER ENCODING, REFUSED ON A PART THAT DOES NOT RUN IT.
+ *
+ * The mirror of rk3588_encoding_only() in npu_regcmd.c. The RK3588 re-packs the same
+ * block bases differently, so a program emitted here reaches it as a valid-looking job
+ * that the kernel's watchdog retires at 500 ms and resets the core for. That happened on
+ * every RK3588 ctest run: uapi_bo_lifetime_rocket built this program on every part and
+ * submitted it 64 times. So every entry point below refuses off the RK3576, and a
+ * host-only caller that wants the encoding off-chip sets ROCKET_CHIP=rk3576, as
+ * regcmd_rk3576_gate does. */
+static int rk3576_encoding_only(const char *gen)
+{
+    const struct rocket_hw_profile *hw = rocket_hw_current();
+    if (!strcmp(hw->name, "rk3576")) return 0;
+    ROCKET_LOGE("%s emits the RK3576 geometry-register encoding, which the %s does not "
+                "run: the job would hang until the kernel retired it. Set ROCKET_CHIP=rk3576 "
+                "to emit it off-chip for a host-only check\n", gen, hw->name);
+    return 1;
+}
+
 /* `dpu_proc` is the DPU's own PROC_PRECISION, which is the operand width every other
  * block also carries — except on the raw-int32 writer, where widening it alone doubles
  * the writer's byte budget without touching the arithmetic. See
@@ -2179,6 +2201,7 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
      * CNA program rather than the same one at a small channel count. */
     int argb = (IC <= R76_ARGB_LANES);
 
+    if (rk3576_encoding_only("gen_conv2d_rk3576")) return -1;
     if (argb && dw) {
         ROCKET_LOGE("rk3576 conv: the first-conv ARGB datapath has no depthwise form "
                     "(no capture, and the channel fold leaves nothing to be depthwise "
@@ -3450,6 +3473,7 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
     unsigned mode, dst_reg;
     int i = 0;
 
+    if (rk3576_encoding_only("gen_pool_rk3576")) return -1;
     if (!p || !ops) return -1;
     iw = p->iw; ih = p->ih; c = p->c;
     ow = p->ow; oh = p->oh;
@@ -3642,6 +3666,7 @@ int gen_lut_load_rk3576(lut_load_params_rk3576_t *p)
     unsigned e;
     int i = 0;
 
+    if (rk3576_encoding_only("gen_lut_load_rk3576")) return -1;
     if (!p || !ops || !p->lo || !p->hi) return -1;
 
     ops[i++] = NPUOP(OP_REG_DPU,      0xE, R76_DPU_S_POINTER);
@@ -3791,6 +3816,7 @@ int gen_ew_int8_rk3576(ew_params_rk3576_t *p)
     int mul;
     int i = 0;
 
+    if (rk3576_encoding_only("gen_ew_int8_rk3576")) return -1;
     if (!p || !ops) return -1;
     w = p->w; h = p->h; c = p->c;
     if (!w || !h || !c) return -1;
@@ -3854,7 +3880,8 @@ int gen_ew_int8_rk3576(ew_params_rk3576_t *p)
     ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->clamp_hi, R76_DPU_OUT_CLAMP_MAX);
     ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->out_offset, R76_DPU_OUT_CVT_OFFSET);
     ops[i++] = NPUOP(OP_REG_DPU, 0x00010000u | p->out_scale, R76_DPU_OUT_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, p->out_shift, R76_DPU_OUT_CVT_SHIFT);
+    ops[i++] = NPUOP(OP_REG_DPU, npu_out_cvt_round_bit(0) | p->out_shift,
+                     R76_DPU_OUT_CVT_SHIFT);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_SURFACE_ADD);
     ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40BC);
     ops[i++] = NPUOP(OP_REG_DPU, 0x04440000u, R76_DPU_CONST_40C0);
@@ -3983,4 +4010,381 @@ int64_t rocket_rk3576_ew_params(double gain,
         }
     }
     return best;
+}
+
+/* ============================================================================
+ * SECTION — the matmul-form fp16 program
+ *
+ * One job, the whole of K. The fp16 convolution above contracts sixteen input channels
+ * a task, and that bound is the program's rather than the part's: this program is
+ * charsiu's (gahingwoo/charsiu 524e10a, charsiu_emit_job, no CHARSIU_* environment),
+ * which contracts K 2048 exactly in one job on the H96 [HW sweep, GATE_AUDIT_PLAN
+ * GA-5.1, 2026-09-24].
+ *
+ * The table is that emitter's output at m=1 k=256 n=64, in its order. Every word the
+ * shape moves was found by sweeping m over 1-32, k over 32-4096 and n over 16-1024 and
+ * reading which words change; each closed form in r76_mmf16_word() reproduces all 441
+ * swept streams. The words it does not name are constant across the sweep.
+ *
+ * WHAT IS NOT DECODED, and why that is not a guess. The coefficient buffer carries
+ * charsiu's int8 records (a bias with a +128 lift, a 0x80 weight correction, a C of 16),
+ * and the fp32 result comes back exact with no 128 in it, so the lift at least is not
+ * added [inferred]. It is reproduced byte for byte anyway: which words the fp16 job
+ * reads is unmeasured, and a buffer the RDMA under-reads times the job out with every
+ * register correct (charsiu's round 147).
+ * ==========================================================================*/
+
+/* The block charsiu writes the five 0x28xx words through. npu_hw.h names no block at
+ * 0x0400; the words are all zero. */
+#define R76_OP_0401 0x0401
+
+static const struct { uint16_t op, reg; uint32_t val; } r76_mmf16_tab[RK3576_MM_FP16_OPS] = {
+    { OP_REG_CNA, 0x1004, 0x0000000e },
+    { OP_REG_CORE, 0x3004, 0x0000000e },
+    { OP_REG_CNA, 0x1038, 0x00000007 },
+    { OP_REG_DPU, 0x4004, 0x0000000e },
+    { OP_REG_DPU_RDMA, 0x5004, 0x0000000e },
+    { OP_REG_CNA, 0x100C, 0x20200120 },
+    { OP_REG_CNA, 0x1010, 0x00000fff },
+    { OP_REG_CNA, 0x1014, 0x00000009 },
+    { OP_REG_CNA, 0x1018, 0x40000404 },
+    { OP_REG_CNA, 0x101C, 0x00008000 }, /* shape */
+    { OP_REG_CNA, 0x1020, 0x00000200 }, /* shape */
+    { OP_REG_CNA, 0x1024, 0x0000003f }, /* shape */
+    { OP_REG_CNA, 0x1028, 0x000800ff }, /* shape */
+    { OP_REG_CNA, 0x102C, 0x00000000 }, /* shape */
+    { OP_REG_CNA, 0x1030, 0x02000000 }, /* shape */
+    { OP_REG_CNA, 0x1034, 0x00000000 }, /* shape */
+    { OP_REG_CNA, 0x1038, 0x00000007 },
+    { OP_REG_CNA, 0x103C, 0x00080000 }, /* shape */
+    { OP_REG_CNA, 0x1040, 0x10000000 },
+    { OP_REG_CNA, 0x1044, 0x00010008 }, /* shape */
+    { OP_REG_CNA, 0x1048, 0x0000000b },
+    { OP_REG_CNA, 0x104C, 0x00010001 },
+    { OP_REG_CNA, 0x1050, 0x00010001 },
+    { OP_REG_CNA, 0x1054, 0x00000000 },
+    { OP_REG_CNA, 0x1058, 0x00000000 },
+    { OP_REG_CNA, 0x105C, 0x00000000 },
+    { OP_REG_CNA, 0x1060, 0x00000000 },
+    { OP_REG_CNA, 0x1064, 0x00000000 },
+    { OP_REG_CNA, 0x1068, 0x00000000 },
+    { OP_REG_CNA, 0x106C, 0x00000000 },
+    { OP_REG_CNA, 0x1070, 0x00000000 },
+    { OP_REG_CNA, 0x1074, 0x00000000 },
+    { OP_REG_CNA, 0x1078, 0x00000000 }, /* shape */
+    { OP_REG_CNA, 0x107C, 0x000000ff }, /* shape */
+    { OP_REG_CNA, 0x1080, 0x00000000 },
+    { OP_REG_CNA, 0x1084, 0x00000000 },
+    { OP_REG_CNA, 0x1088, 0x11000000 }, /* address */
+    { OP_REG_CNA, 0x108C, 0x000f000f },
+    { OP_REG_CNA, 0x1090, 0x00000020 }, /* shape */
+    { OP_REG_CNA, 0x1094, 0x00000001 },
+    { OP_REG_CNA, 0x1098, 0x00000004 }, /* shape */
+    { OP_REG_CNA, 0x109C, 0x00000000 },
+    { OP_REG_CNA, 0x1100, 0x00000000 },
+    { OP_REG_CNA, 0x1104, 0x00000000 },
+    { OP_REG_CNA, 0x1110, 0x33000000 }, /* address */
+    { OP_REG_CNA, 0x1140, 0x00000000 },
+    { OP_REG_CNA, 0x1144, 0x00000000 },
+    { OP_REG_CNA, 0x118C, 0x00000000 },
+    { R76_OP_0401, 0x2810, 0x00000000 },
+    { R76_OP_0401, 0x2814, 0x00000000 },
+    { R76_OP_0401, 0x2818, 0x00000000 },
+    { R76_OP_0401, 0x281C, 0x00000000 },
+    { R76_OP_0401, 0x2820, 0x00000000 },
+    { OP_REG_CORE, 0x3018, 0x10000200 },
+    { OP_REG_CORE, 0x301C, 0x00000000 }, /* shape */
+    { OP_REG_CORE, 0x3020, 0x0000003f }, /* shape */
+    { OP_REG_CORE, 0x3024, 0x00000000 },
+    { OP_REG_DPU, 0x400C, 0x40000004 },
+    { OP_REG_DPU, 0x4010, 0xa0000002 },
+    { OP_REG_DPU, 0x4014, 0x00000000 },
+    { OP_REG_DPU, 0x4018, 0x22000000 }, /* address */
+    { OP_REG_DPU, 0x401C, 0x00000001 },
+    { OP_REG_DPU, 0x4020, 0x00000000 },
+    { OP_REG_DPU, 0x4024, 0x00000000 }, /* shape */
+    { OP_REG_DPU, 0x4028, 0x0000000f }, /* shape */
+    { OP_REG_DPU, 0x402C, 0x0000003f }, /* shape */
+    { OP_REG_DPU, 0x4030, 0x003f0310 }, /* shape */
+    { OP_REG_DPU, 0x4034, 0x00000000 }, /* shape */
+    { OP_REG_DPU, 0x4038, 0x00000053 },
+    { OP_REG_DPU, 0x403C, 0x00000000 },
+    { OP_REG_DPU, 0x4044, 0x00000002 },
+    { OP_REG_DPU, 0x4048, 0x80000000 },
+    { OP_REG_DPU, 0x404C, 0x7fffffff },
+    { OP_REG_DPU, 0x4050, 0x00023333 },
+    { OP_REG_DPU, 0x4058, 0x80000000 },
+    { OP_REG_DPU, 0x405C, 0x7fffffff },
+    { OP_REG_DPU, 0x4060, 0x00000903 },
+    { OP_REG_DPU, 0x406C, 0x80000000 },
+    { OP_REG_DPU, 0x4070, 0x7fffffff },
+    { OP_REG_DPU, 0x4074, 0x80000000 },
+    { OP_REG_DPU, 0x4078, 0x7fffffff },
+    { OP_REG_DPU, 0x407C, 0x010041c1 },
+    { OP_REG_DPU, 0x4080, 0x00000000 },
+    { OP_REG_DPU, 0x4084, 0x00000001 },
+    { OP_REG_DPU, 0x4088, 0x80000000 },
+    { OP_REG_DPU, 0x408C, 0x7fffffff },
+    { OP_REG_DPU, 0x4090, 0x00000000 },
+    { OP_REG_DPU, 0x4094, 0x00000000 },
+    { OP_REG_DPU, 0x409C, 0x00000000 },
+    { OP_REG_DPU, 0x40A4, 0x80000000 },
+    { OP_REG_DPU, 0x40A8, 0x7fffffff },
+    { OP_REG_DPU, 0x40AC, 0x00000000 },
+    { OP_REG_DPU, 0x40B0, 0x00000001 },
+    { OP_REG_DPU, 0x40B4, 0x00000000 },
+    { OP_REG_DPU, 0x40B8, 0x00000003 }, /* shape */
+    { OP_REG_DPU, 0x40BC, 0x00000000 },
+    { OP_REG_DPU, 0x40C0, 0x04440100 },
+    { OP_REG_DPU, 0x40C8, 0x00000000 },
+    { OP_REG_DPU, 0x40CC, 0x00000000 },
+    { OP_REG_DPU, 0x40D0, 0x0040ffff },
+    { OP_REG_DPU, 0x4100, 0x00000000 },
+    { OP_REG_DPU, 0x4104, 0x00000000 },
+    { OP_REG_DPU, 0x4108, 0x00000000 },
+    { OP_REG_DPU, 0x410C, 0x00000000 },
+    { OP_REG_DPU, 0x4110, 0x00000000 },
+    { OP_REG_DPU, 0x4114, 0x00000000 },
+    { OP_REG_DPU, 0x4118, 0x00000000 },
+    { OP_REG_DPU, 0x411C, 0x00000000 },
+    { OP_REG_DPU, 0x4120, 0x00000000 },
+    { OP_REG_DPU, 0x4130, 0x00000000 },
+    { OP_REG_DPU, 0x4140, 0x00000000 },
+    { OP_REG_DPU, 0x4144, 0x00000000 },
+    { OP_REG_DPU, 0x4148, 0x00000000 },
+    { OP_REG_DPU, 0x414C, 0x00000000 },
+    { OP_REG_DPU, 0x4150, 0x00000000 },
+    { OP_REG_DPU, 0x4154, 0x00000000 },
+    { OP_REG_DPU, 0x4160, 0x00000000 },
+    { OP_REG_DPU, 0x4170, 0x00000000 },
+    { OP_REG_DPU, 0x4174, 0x00000000 },
+    { OP_REG_DPU, 0x4184, 0x00000000 },
+    { OP_REG_DPU, 0x4188, 0x00000000 },
+    { OP_REG_DPU, 0x418C, 0x00000000 },
+    { OP_REG_DPU, 0x4190, 0x00000000 },
+    { OP_REG_DPU, 0x4194, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x500C, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x5010, 0x00000000 }, /* shape */
+    { OP_REG_DPU_RDMA, 0x5014, 0x0000003f }, /* shape */
+    { OP_REG_DPU_RDMA, 0x5018, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x501C, 0x00000710 },
+    { OP_REG_DPU_RDMA, 0x5020, 0x44000000 }, /* address */
+    { OP_REG_DPU_RDMA, 0x5024, 0x44000280 }, /* address */
+    { OP_REG_DPU_RDMA, 0x5028, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x502C, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x5030, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x5034, 0x00000041 },
+    { OP_REG_DPU_RDMA, 0x5038, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x5040, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x5044, 0x40000010 },
+    { OP_REG_DPU_RDMA, 0x5048, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x504C, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x5064, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x506C, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x5078, 0x00000000 },
+    { OP_REG_DPU_RDMA, 0x507C, 0x00000000 },
+    { OP_REG_CNA, 0x1008, 0x0000001d },
+    { OP_REG_CORE, 0x3008, 0x0000001d },
+    { OP_REG_DPU, 0x4008, 0x0000001d },
+    { OP_REG_DPU_RDMA, 0x5008, 0x0000001d },
+};
+
+/* ONE TASK'S ENVELOPE, and every bound in it was found on the part rather than read off
+ * the stream: tests/rk3576_mm_fp16_envelope.c ran the program as one task past its old
+ * gate at 49 shapes [HW sweep, H96 MAX M9, rocket 1.6.0, 2026-09-25].
+ *
+ *   - The input surface, K/32 CBUF entries a row, must fit the 4096-entry data window
+ *     that 0x1040 sets: (K/32)*M <= 4096 exactly, with M not rounded. 85x1536 (4080),
+ *     1365x96 (4095), 21x6144 and 512x256 are exact; 86x1536, 1366x96, 22x6144 and
+ *     1024x256 come back WRONG on every row, not short by the rows past the window, and
+ *     the same way twice. Nothing in the stream moves at the boundary: charsiu's own
+ *     emitter writes the same words there.
+ *   - K <= 6144: 6144 is exact and 6176 never reports completion, the int8 program's
+ *     boundary too.
+ *   - N <= 8192: 8192 is exact, and at 8960 the job wrote exactly the first 768 columns
+ *     and hung, which is 8959 mod 8192 + 1 [inferred: 0x1024's kernel count is 13 bits].
+ *   - Nothing else bounds it that the sweep reached: a 96 MiB weight at K 6144 N 8192,
+ *     M*N to 4096*2048 (0x40B8's closed form wraps there, as charsiu's does), exact.
+ *
+ * THE ENTRY'S ENVELOPE tiles M over tasks of at most the window's rows, so M is bounded
+ * by what the entry's gate runs, not by the window. */
+#define R76_MMF16_WINDOW 4096u
+#define R76_MMF16_MAX_K  6144u
+#define R76_MMF16_MIN_N  64u
+#define R76_MMF16_MAX_N  8192u
+#define R76_MMF16_MAX_M  2048u
+
+unsigned rocket_rk3576_mm_fp16_task_rows(unsigned k)
+{
+    if (k < 32 || k % 32 || k > R76_MMF16_MAX_K) return 0;
+    return R76_MMF16_WINDOW / (k / 32);
+}
+
+int rocket_rk3576_mm_fp16_task_ok(unsigned m, unsigned k, unsigned n)
+{
+    return m >= 1 && m <= rocket_rk3576_mm_fp16_task_rows(k) &&
+           n >= R76_MMF16_MIN_N && n <= R76_MMF16_MAX_N && n % 16 == 0;
+}
+
+int rocket_rk3576_mm_fp16_shape_ok(unsigned m, unsigned k, unsigned n)
+{
+    return m >= 1 && m <= R76_MMF16_MAX_M && rocket_rk3576_mm_fp16_task_ok(1, k, n);
+}
+
+/* charsiu's record table (8 channels a 64-byte group) and its fp16 scale table. The
+ * RDMA reads the second operand at their end, so 0x5024 = coef + 10n at n%8 == 0. */
+static size_t r76_mmf16_table_bytes(unsigned n) { return (size_t)((n + 7) / 8) * 64; }
+static size_t r76_mmf16_scale_bytes(unsigned n) { return (size_t)((n + 7) & ~7u) * 2; }
+
+size_t rocket_rk3576_mm_fp16_in_bytes(unsigned m, unsigned k)
+{
+    return (size_t)m * k * 2 + 4096;
+}
+
+size_t rocket_rk3576_mm_fp16_weight_bytes(unsigned k, unsigned n)
+{
+    return (size_t)k * n * 2;
+}
+
+size_t rocket_rk3576_mm_fp16_out_bytes(unsigned m, unsigned n)
+{
+    return (size_t)m * n * 4 + 4096;
+}
+
+/* charsiu_coef_bytes() at its default of 65536 float elements. The float region is far
+ * larger than anything written into it; charsiu sized it against RDMA reads that ran
+ * off a smaller buffer and faulted. */
+size_t rocket_rk3576_mm_fp16_coef_bytes(unsigned n)
+{
+    return r76_mmf16_table_bytes(n) + 65536u * 4u + 0x100u;
+}
+
+static uint32_t r76_mmf16_word(uint16_t reg, uint32_t val, unsigned m, unsigned k,
+                               unsigned n, uint32_t in_dma, uint32_t w_dma,
+                               uint32_t out_dma, uint32_t coef_dma)
+{
+    unsigned kd = k / 32;    /* CBUF entries a row: k/8 atoms, four to an entry */
+    switch (reg) {
+    case 0x101C: return (uint32_t)(k * n * 2);                 /* weight bytes        */
+    case 0x1020: return k * 2;                                 /* bytes per kernel    */
+    case 0x1024: return n - 1;
+    case 0x1028: return ((kd * m) << 16) | (k - 1);            /* input surface | k-1 */
+    case 0x102C: return m - 1;                                 /* rows on the height  */
+    case 0x1030: return (k * 2) << 16;
+    case 0x1034: return m - 1;
+    case 0x103C: return kd << 16;
+    case 0x1044: return 0x10000u | kd;
+    case 0x1078: return m - 1;
+    case 0x107C: return k - 1;
+    case 0x1088: return in_dma;
+    case 0x1090: return k / 8;                                 /* the row-major line  */
+    case 0x1098: return (m + 3) & ~3u;
+    case 0x1110: return w_dma;
+    case 0x301C: return (m - 1) << 16;
+    case 0x3020: return n - 1;
+    case 0x4018: return out_dma;
+    case 0x4024: return m - 1;
+    case 0x4028: return n / 4 - 1;
+    case 0x402C: return n - 1;
+    case 0x4030: return ((n - 1) << 16) | 0x310u;
+    case 0x4034: return (m - 1) << 16;
+    case 0x40B8: return (n / 4 + 3) - (m * n) / 4;             /* wraps, as charsiu's */
+    case 0x5010: return m - 1;
+    case 0x5014: return n - 1;
+    case 0x5020: return coef_dma;
+    case 0x5024: return coef_dma + (uint32_t)(r76_mmf16_table_bytes(n) +
+                                              r76_mmf16_scale_bytes(n));
+    default:     return val;
+    }
+}
+
+static int r76_mmf16_emit(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                          uint32_t in_dma, uint32_t weight_dma, uint32_t out_dma,
+                          uint32_t coef_dma)
+{
+    unsigned i;
+
+    for (i = 0; i < RK3576_MM_FP16_OPS; i++) {
+        uint32_t v = r76_mmf16_tab[i].val;
+        if (r76_mmf16_tab[i].op != R76_OP_0401)
+            v = r76_mmf16_word(r76_mmf16_tab[i].reg, v, m, k, n, in_dma, weight_dma,
+                               out_dma, coef_dma);
+        ops[i] = NPUOP(r76_mmf16_tab[i].op, v, r76_mmf16_tab[i].reg);
+    }
+    return RK3576_MM_FP16_OPS;
+}
+
+int gen_matmul_fp16_rk3576(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                           uint32_t in_dma, uint32_t weight_dma, uint32_t out_dma,
+                           uint32_t coef_dma)
+{
+    if (!ops) return -1;
+    if (!rocket_rk3576_mm_fp16_task_ok(m, k, n)) {
+        ROCKET_LOGE("rk3576 fp16 matmul: m=%u k=%u n=%u is outside one task's envelope "
+                    "(k 32-%u in steps of 32, n %u-%u in steps of 16, m*(k/32) <= %u)\n",
+                    m, k, n, R76_MMF16_MAX_K, R76_MMF16_MIN_N, R76_MMF16_MAX_N,
+                    R76_MMF16_WINDOW);
+        return -1;
+    }
+    return r76_mmf16_emit(ops, m, k, n, in_dma, weight_dma, out_dma, coef_dma);
+}
+
+int gen_matmul_fp16_rk3576_unchecked(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                                     uint32_t in_dma, uint32_t weight_dma,
+                                     uint32_t out_dma, uint32_t coef_dma)
+{
+    if (!ops || !m || k < 32 || k % 32 || n < 16 || n % 16) return -1;
+    return r76_mmf16_emit(ops, m, k, n, in_dma, weight_dma, out_dma, coef_dma);
+}
+
+/* [n/16][k/32][n%16][k%32]: charsiu's CHARSIU_W16_GROUP, the int8 weight tiling with
+ * two-byte elements, and the one layout of its three candidates that comes back exact
+ * (GA-5.1: DENSE was wrong on 64 of 64 outputs). With k%32 and n%16 there are no edge
+ * tiles, so a row of 32 is contiguous at both ends. */
+int rocket_rk3576_mm_fp16_pack_weights(void *dst, size_t dst_bytes, const uint16_t *B,
+                                       unsigned k, unsigned n)
+{
+    uint16_t *d = (uint16_t *)dst;
+    unsigned nn, kk;
+
+    if (!dst || !B || k % 32 || n % 16 || !k || !n) return -1;
+    if (dst_bytes < rocket_rk3576_mm_fp16_weight_bytes(k, n)) return -1;
+    for (nn = 0; nn < n; nn++)
+        for (kk = 0; kk < k; kk += 32)
+            memcpy(d + (size_t)(nn / 16) * 16 * k + (size_t)(kk / 32) * 32 * 16 +
+                       (size_t)(nn % 16) * 32,
+                   B + (size_t)nn * k + kk, 32 * sizeof(uint16_t));
+    return 0;
+}
+
+/* charsiu_build_coefs() for this job: zero bias and weight sums, zero points 0, every
+ * scale 1.0. Per 8-channel group of 64 bytes: eight int32 A of 128 (its lift,
+ * 128/mult rounded), eight int16 B of 0x80, eight int16 C of 16. Then one fp16 1.0 per
+ * channel padded to 8, then the int32 0x1004 its RDMA reads as the second operand, and
+ * zeros to the end. */
+int rocket_rk3576_mm_fp16_pack_coef(void *dst, size_t dst_bytes, unsigned n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    size_t tb = r76_mmf16_table_bytes(n), sb = r76_mmf16_scale_bytes(n);
+    unsigned oc;
+    uint32_t op2 = 0x1004;
+
+    if (!dst || !n || dst_bytes < rocket_rk3576_mm_fp16_coef_bytes(n)) return -1;
+    memset(d, 0, rocket_rk3576_mm_fp16_coef_bytes(n));
+    /* The padding channels past n carry the last real record, as charsiu's do; every
+     * record is the same here, so that is every channel of the last group. */
+    for (oc = 0; oc < ((n + 7) & ~7u); oc++) {
+        unsigned g = oc / 8, i = oc % 8;
+        int32_t a = 128;
+        int16_t b = 0x80, c = 16;
+        memcpy(d + g * 64 + i * 4, &a, 4);
+        memcpy(d + g * 64 + 32 + i * 2, &b, 2);
+        memcpy(d + g * 64 + 48 + i * 2, &c, 2);
+    }
+    for (oc = 0; oc < sb / 2; oc++) {
+        uint16_t one = 0x3C00;   /* fp16 1.0 */
+        memcpy(d + tb + oc * 2, &one, 2);
+    }
+    memcpy(d + tb + sb, &op2, 4);
+    return 0;
 }

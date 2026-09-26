@@ -404,7 +404,14 @@ static int run_one_pad(int fd, const char *name, unsigned ic, unsigned oc, unsig
     d.direct_datapath = direct;
     /* TFLite's SAME at an even plane and stride two: the odd row and column go at the END,
      * so the leading pad is zero and the extent is one larger than that pad derives. The
-     * CNA takes the pad its last window CONSUMES, so the extent is all it needs told. */
+     * CNA takes the pad its last window CONSUMES, so the extent is all it needs told.
+     * Every SAME cell whose derived extent falls short takes this form, whichever table it
+     * came from: left to the leading pad alone it runs, and is scored, as a pad-0 VALID
+     * cell under a SAME name. */
+    if (same && pad_override < 0 && !extent &&
+        (rocket_conv2d_ow(&d) != (int)((iw + stride - 1) / stride) ||
+         rocket_conv2d_oh(&d) != (int)((ih + stride - 1) / stride)))
+        extent = 1;
     if (extent) {
         d.oh = (int)((ih + stride - 1) / stride);
         d.ow = (int)((iw + stride - 1) / stride);
@@ -530,7 +537,9 @@ static int run_one_pad(int fd, const char *name, unsigned ic, unsigned oc, unsig
      * loop), so what this actually asks is whether HOLDING the operands across calls is
      * safe: the feature cube is filled without its zeroing memset from the second call on,
      * and each tile's output surface carries the previous call's result when the DPU starts
-     * writing. TWICE for that reason — a single prepacked call would not notice either.
+     * writing. So the passes ALTERNATE two inputs, each scored against its own transient
+     * answer: a pass that wrote nothing leaves the other input's result, which one input
+     * repeated three times would score as correct.
      *
      * ROCKET_LG_RESIDENT=1. Off by default so the shape table's own timings stay
      * comparable run to run. */
@@ -538,37 +547,67 @@ static int run_one_pad(int fd, const char *name, unsigned ic, unsigned oc, unsig
         /* ic<=4 without the flag is the packed-image conv; no handle packs that cube. */
         (dw || ic > 4 || direct)) {
         rocket_conv2d_int8_weights_rk3576 *h;
-        int8_t *out2 = calloc((size_t)oc * oh * ow, 1);
-        int pass;
+        const size_t on = (size_t)oc * oh * ow;
+        int8_t *out2 = calloc(on, 1), *in_b = calloc((size_t)ic * ih * iw, 1);
+        int8_t *out_b = calloc(on, 1);
+        int pass, trc;
 
         lg_resident_ab++;
 
-        if (!out2) { rc = 2; goto done; }
+        if (!out2 || !in_b || !out_b) { free(out2); free(in_b); free(out_b); rc = 2; goto done; }
+        /* The second input: varied on every axis, on a different period from the first. */
+        for (c = 0; c < ic; c++)
+            for (y = 0; y < ih; y++)
+                for (x = 0; x < iw; x++) {
+                    int v = ((int)((c * 11 + y * 5 + x * 17) % 59)) - 29 + in_zp;
+                    in_b[(((size_t)c * ih) + y) * iw + x] =
+                        (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+                }
+        trc = dw ? rocket_conv2d_dw_int8_rk3576(fd, &d, in_b, W, bias, 1.0f, 1.0f,
+                                                (float)divisor, in_zp, w_zp, out_zp, out_b)
+                 : rocket_conv2d_int8_rk3576(fd, &d, in_b, W, bias, 1.0f, 1.0f,
+                                             (float)divisor, in_zp, w_zp, out_zp, out_b);
+        if (trc != ROCKET_OK) {
+            printf("  %s: the transient call on the second input returned %d\n", name, trc);
+            free(out2); free(in_b); free(out_b); rc = 1; goto done;
+        }
+        if (!memcmp(out, out_b, on)) {
+            printf("  %s: the two inputs give the same output, so the resident A/B cannot "
+                   "see a stale surface\n", name);
+            free(out2); free(in_b); free(out_b); rc = 1; goto done;
+        }
         h = rocket_conv2d_int8_pack_rk3576(fd, &d, W, bias, 1.0f, 1.0f, NULL,
                                            (float)divisor, in_zp, w_zp, out_zp);
         if (!h) {
             printf("  %s: the transient call computed but pack refused\n", name);
-            free(out2); rc = 1; goto done;
+            free(out2); free(in_b); free(out_b); rc = 1; goto done;
         }
-        for (pass = 0; pass < 2 && !rc; pass++) {
+        for (pass = 0; pass < 3 && !rc; pass++) {
+            const int8_t *pin  = (pass & 1) ? in_b : in;
+            const int8_t *want = (pass & 1) ? out_b : out;
             int prc;
-            memset(out2, 0x5A, (size_t)oc * oh * ow);
-            prc = rocket_conv2d_int8_prepacked_rk3576(fd, h, in, out2);
+            memset(out2, 0x5A, on);
+            prc = rocket_conv2d_int8_prepacked_rk3576(fd, h, pin, out2);
             if (prc != ROCKET_OK) {
                 printf("  %s: prepacked pass %d returned %d\n", name, pass + 1, prc);
                 rc = 1;
-            } else if (memcmp(out, out2, (size_t)oc * oh * ow)) {
-                size_t n = (size_t)oc * oh * ow, j, bad = 0, first = 0;
-                for (j = 0; j < n; j++)
-                    if (out[j] != out2[j]) { if (!bad) first = j; bad++; }
-                printf("  %s: resident pass %d differs from transient on %zu of %zu "
-                       "elements, first at %zu (transient %d, resident %d)\n",
-                       name, pass + 1, bad, n, first, out[first], out2[first]);
+            } else if (memcmp(want, out2, on)) {
+                size_t j, bad = 0, first = 0, other = 0;
+                const int8_t *prev = (pass & 1) ? out : out_b;
+                for (j = 0; j < on; j++) {
+                    if (want[j] != out2[j]) { if (!bad) first = j; bad++; }
+                    if (out2[j] == prev[j] && prev[j] != want[j]) other++;
+                }
+                printf("  %s: resident pass %d (input %c) differs from transient on %zu of "
+                       "%zu elements, first at %zu (transient %d, resident %d); %zu hold "
+                       "the other input's answer\n",
+                       name, pass + 1, (pass & 1) ? 'B' : 'A', bad, on, first, want[first],
+                       out2[first], other);
                 rc = 1;
             }
         }
         rocket_conv2d_int8_weights_free_rk3576(fd, h);
-        free(out2);
+        free(out2); free(in_b); free(out_b);
     }
 
 #undef INP
@@ -1745,10 +1784,13 @@ int main(int argc, char **argv)
     if (wrong_refusal)
         printf("   (%d of those computed where the table says the part cannot)\n",
                wrong_refusal);
-    if (env_int("ROCKET_LG_RESIDENT", 0))
-        printf("   resident A/B: %d shape(s) also run through pack + 2 prepacked calls "
-               "and compared to the transient output element for element\n",
-               lg_resident_ab);
+    if (env_int("ROCKET_LG_RESIDENT", 0)) {
+        printf("   resident A/B: %d shape(s) also run through pack + 3 prepacked calls over "
+               "two alternating inputs, each compared to its own transient output element "
+               "for element\n", lg_resident_ab);
+        /* Asked for and never run is a gate that did not ask its question. */
+        if (!lg_resident_ab) { printf("   resident A/B: NO shape ran it -> FAIL\n"); failed++; }
+    }
     /* The count alone cannot be chased; the names can. Printed last so a captured
      * tail carries them, and with the drop-vs-arithmetic signature attached. */
     if (lg_nfailed) {

@@ -116,6 +116,7 @@ set(ROCKETNPU_SOURCES
     src/rocket_log.c          # centralized log channel (levels + host-settable callback)
     src/rocket_sysfs.c        # the one enumeration of the bound NPU cores (core side of the seam)
     src/rocket_busy_poll.c    # the completion-wait spin budget (core side of the seam)
+    src/rocket_fence_watch.c  # the fenced-wait counters (core side of the seam)
     src/rocket_hw_profile.c   # the chip machine-parameter profile (RK3588 today)
     src/rocket_driver_name.c  # the build's kernel-driver name (not seam: no provider defines it)
     src/npu_regcmd.c     # regcmd generators (fp16/int8/int4/int16/bf16/tf32)
@@ -315,6 +316,7 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_dtype_perf_rocket # fp16 vs int8 vs int4 resident throughput
             matmul_int8_tiled_rocket # tiled int8 (M/N tiles + host K-accum)
             mixed_chain_coexist_rocket # GATE: chained-fp16 + gapped-int8 in one process (per-job batched flag)
+            int8_chain_probe       # probe: does a chained batch of int8 matmul tasks compute? (GA-5.3)
             matmul_int8_prepacked_rocket # resident int8 weights (bit-exact vs one-shot)
             matmul_int8_crossm_rocket # resident int8 weight reused across M, no re-pack (warmup-M serves prefill-M)
             matmul_int8_groupwise_rocket # group-wise int8 (per-K-group scales, fp32 K-accum) — the native-quant primitive
@@ -341,6 +343,7 @@ if(ROCKETNPU_BUILD_TESTS)
             deconv_geometry_probe  # RK3588 board: WHERE the DECONV mode scatters, via an impulse response
             deconv_arith_probe     # RK3588 board: does DECONV compute a real transposed conv (dense, vs oracle)?
             deconv_pad_probe       # RK3588 board: does DECONV take a pad, and where does its result land?
+            deconv_extent_probe    # RK3588 board: does DECONV compute the WHOLE transposed conv given its extent?
             resize_rocket          # nearest/bilinear upsample (depthwise transpose) vs independent gather refs
             pool_fp16_rocket       # on-NPU MaxPool/AvgPool (PPU): cube self-check + HW oracle
             pool_int8_rocket       # on-NPU int8/uint8 MaxPool/AvgPool (PPU C2=16): cube self-check + HW oracle
@@ -360,8 +363,8 @@ if(ROCKETNPU_BUILD_TESTS)
             siglip_rocket          # full SigLIP-B/16 vision encoder vs fp32 HF oracle (per-layer cos-sim) + bench
             sam_rocket             # full SAM ViT-Det image encoder vs fp32 HF ref (per-layer cos-sim) + host-ref self-check + bench
             conv2d_int8_rocket     # native int8 CONV_2D: cube self-check + int32 single-job HW gate
-            replay_dw_mesa         # replay captured Teflon int8 DW BOs vs mesa-output (ground truth)
-            conv_dw_int8_runtime   # int8 DW int8-out RUNTIME (host packing) vs mesa-output
+            replay_dw_mesa         # our int8 DW register program over Teflon's captured BOs vs mesa-output
+            conv_dw_int8_runtime   # int8 DW int8-out RUNTIME vs TFLite's reference kernels + an exact host model
             matmul_correctness_matrix_rocket # cosine-sim layout/readback gate (realistic inputs)
             matmul_tiled_rocket    # tiled matmul + profiling/sweep knobs
             fc_data_bank_sweep_rocket # RE: CNA_CBUF_CON0 FC_DATA_BANK[10:8] sweep + large-K probe
@@ -388,7 +391,8 @@ if(ROCKETNPU_BUILD_TESTS)
             prep_signal_robust_rocket # PREP_BO wait: EINTR-retry + UINT64_MAX-deadline saturation gate
             submit_overhead_rocket # per-job dispatch floor (us/submit) A/B probe for IOMMU keep-attach
             x0_glitch_probe        # RE: does the x≈0 LE/LO mux glitch fire for a shifted table straddling 0?
-            regcmd_persist_rocket  # does register state persist across tasks in a job (delta regcmd)?
+            regcmd_persist_rocket  # the one-task-after delta arm (lands in an unwritten group); see regcmd_delta_probe
+            regcmd_delta_probe     # probe: a delta task in its own register group, three pointer modes (GA-5.5)
             # host-only regcmd dumpers + a standalone fp16 test + a DRAM microbench: tools, not CTest gates
             matmul_fp16_rocket     # standalone fp16 x fp16 single-task test (gen_matmul_fp16 path)
             dump_regcmd            # host-only: diff the matmul regcmd accumulate=0 vs 1 (no HW)
@@ -403,6 +407,11 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_fp16_sweep      # RK3576 board: settle the fp16 / asymmetric encodings against a CPU model
             rk3576_matmul_probe    # RK3576 board: the matmul-as-1x1-conv envelope (M axis, cost, precision)
             rk3576_matmul_gate     # RK3576 board GATE: the int8 matmul library entry vs a CPU model
+            rk3576_mm_fp16_gate    # RK3576 GATE: the matmul-form fp16 program vs charsiu (host) and a CPU reference (board)
+            rk3576_mm_fp16_cost    # RK3576 board: what the fp16 matmul costs per call, against the int8 entry
+            rk3576_mm_fp16_envelope # RK3576 board: where one task of the fp16 matmul program stops being exact
+            rk3576_mm_fp16_round   # RK3576 board: how the fp16 matmul rounds an fp32 sum that is not exact
+            rk3576_mm_bf16_probe   # RK3576 board: does the matmul form contract bf16 operands?
             rk3576_refusal_gate    # RK3576 board GATE: ops with no encoder refuse, not write nothing
             rk3576_submit_floor    # RK3576 board: the per-submit dispatch floor (us/submit) probe
             rk3576_mm_corr         # RK3576 board: does an arbitrary matmul shape lose surface, and how often?
@@ -446,6 +455,7 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_conv_sym        # RK3576 board: the symmetry audit on the CNA — non-square strides, and a rung fitted at kh == kw
             rk3576_rowplan         # RK3576 host: the row window the planner chooses for one layer, and what it stages
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
+            pool_int8_native_probe # board: does the PPU pool natively in int8? (the precision PAIR, as a map)
             hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure
             membench               # DRAM bandwidth + NPU readback de-tile microbench
             ddr_pmu_cal            # positive control for the rockchip_ddr DDR PMU: known bytes in, counted bytes out
@@ -483,9 +493,13 @@ if(ROCKETNPU_BUILD_TESTS)
     # the shared-scratch prototype + the cross-op chain probe drive the internal
     # tiled-matmul primitives directly; the LUT and elementwise probes run the library's
     # own wide-output poison guard (rocket_rk3576_power_idle) around their submits, both
-    # being DPU-only programs and so victims of it
+    # being DPU-only programs and so victims of it; the bf16 stream gate reads the fan-out's
+    # N split (rocket_fanout_nstep) to decide when its multicore paths must be bit-exact;
+    # the fp16 envelope probe power-cycles before its second run of a shape that was not exact
     foreach(t prototype_shared_scratch_rocket crossop_chain_rocket rk3576_cbuf_base
-              rk3576_lut_probe rk3576_add_probe rk3576_mm_requant rk3576_w8a8_route)
+              rk3576_lut_probe rk3576_add_probe rk3576_mm_requant rk3576_w8a8_route
+              pool_int8_native_probe deconv_extent_probe matmul_bf16_stream_rocket
+              replay_dump rk3576_mm_fp16_envelope rk3576_mm_bf16_probe)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
@@ -510,256 +524,277 @@ if(ROCKETNPU_BUILD_TESTS)
         endif()
     endforeach()
 
-    # Register the correctness gates with CTest (`ctest` after a build). The conv2d
-    # tests do real work even on x86 (cube-layout self-check) and additionally gate HW
-    # when an NPU is present; the matmul gates need an NPU and exit with their skip code
-    # when absent. The other built binaries are perf probes / sweeps run by hand, not
-    # gates, so they are intentionally left unregistered.
+    # Register the correctness gates with CTest (`ctest` after a build). The other built
+    # binaries are perf probes / sweeps run by hand, not gates, so they are intentionally
+    # left unregistered.
+    #
+    # EVERY TEST HOLDS ONE EXIT-CODE CONTRACT: 0 when a numeric check ran and passed, 2
+    # when the device (or the part the test needs) is absent, and 1 for everything else --
+    # a wrong answer, a declined path, a usage error. A declined path that exits 0 reads
+    # as PASS here, which is how a test once passed three registrations over no check.
     enable_testing()
-    add_test(NAME activation_lut_rocket COMMAND activation_lut_rocket)
-    set_tests_properties(activation_lut_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME leaky_relu_rocket COMMAND leaky_relu_rocket)
-    set_tests_properties(leaky_relu_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME recip_rsqrt_rocket COMMAND recip_rsqrt_rocket)
-    set_tests_properties(recip_rsqrt_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME lut_tanh_rocket COMMAND lut_tanh_rocket)
-    set_tests_properties(lut_tanh_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME exp_lut_rocket COMMAND exp_lut_rocket)
-    set_tests_properties(exp_lut_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME softplus_mish_rocket COMMAND softplus_mish_rocket)
-    set_tests_properties(softplus_mish_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME elu_rocket COMMAND elu_rocket)
-    set_tests_properties(elu_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME ew_minmax_rocket COMMAND ew_minmax_rocket)
-    set_tests_properties(ew_minmax_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME prelu_rocket COMMAND prelu_rocket)
-    set_tests_properties(prelu_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME ew_mul_rocket COMMAND ew_mul_rocket)
-    set_tests_properties(ew_mul_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME conv_act_rocket COMMAND conv_act_rocket)
-    set_tests_properties(conv_act_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME gelu_rocket COMMAND gelu_rocket)
-    set_tests_properties(gelu_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME bytes_moved_rocket COMMAND bytes_moved_rocket 512 3840 4096)
-    set_tests_properties(bytes_moved_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME conv2d_fp16_rocket COMMAND conv2d_fp16_rocket)
-    add_test(NAME chain_layout_rocket COMMAND chain_layout_rocket)  # host-only; no NPU, never skips
-    add_test(NAME chain_verify_gate COMMAND chain_verify_gate)      # host-only; no NPU, never skips
-    add_test(NAME matmul_plan_gate COMMAND matmul_plan_gate)        # host-only; no NPU, skips off-RK3588
-    set_tests_properties(matmul_plan_gate PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME scratch_cache_gate COMMAND scratch_cache_gate)
-    set_tests_properties(scratch_cache_gate PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME regcmd_rk3576_gate COMMAND regcmd_rk3576_gate)    # host-only; no NPU, never skips
-    # the RK3576 conv + matmul correctness gates. Both skip on any other chip (and with
-    # no NPU), so they are inert in an RK3588 ctest run. The conv gate runs `all` — every
-    # group including depthwise, which computes bit-exactly on this part.
-    add_test(NAME rk3576_conv_gate COMMAND rk3576_conv_gate all)
-    set_tests_properties(rk3576_conv_gate PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rk3576_conv_lib_gate COMMAND rk3576_conv_lib_gate)
-    set_tests_properties(rk3576_conv_lib_gate PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rk3576_argb_ic1 COMMAND rk3576_argb_ic1)
-    set_tests_properties(rk3576_argb_ic1 PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rk3576_matmul_gate COMMAND rk3576_matmul_gate)
-    set_tests_properties(rk3576_matmul_gate PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rk3576_perchannel_gate COMMAND rk3576_perchannel_gate)
-    set_tests_properties(rk3576_perchannel_gate PROPERTIES SKIP_RETURN_CODE 2)
+
+    # The kernel-log bracket. The `rocket` driver retires a job that runs 500 ms and
+    # signals its fence as if it had completed, so a hung job fails no syscall: the only
+    # traces are its duration in this process and an "NPU job timed out" line in the
+    # kernel log. The mark saves a journal cursor before the first NPU test and the check
+    # fails the run on any timeout, rk_iommu line or NPU-side WARNING logged after it.
+    # With an unreadable journal the mark still succeeds (so the NPU tests run) and the
+    # check reports SKIP.
+    add_test(NAME npu_klog_mark
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/npu_klog_fixture.sh
+                     mark ${CMAKE_CURRENT_BINARY_DIR}/npu_klog.cursor)
+    set_tests_properties(npu_klog_mark PROPERTIES FIXTURES_SETUP npu_klog TIMEOUT 60)
+    add_test(NAME npu_klog_check
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/npu_klog_fixture.sh
+                     check ${CMAKE_CURRENT_BINARY_DIR}/npu_klog.cursor)
+    set_tests_properties(npu_klog_check PROPERTIES
+        FIXTURES_CLEANUP npu_klog SKIP_RETURN_CODE 2 TIMEOUT 60)
+
+    # A test that submits to the NPU.
+    #   RESOURCE_LOCK npu   one at a time under `ctest -j`: two `rocket` jobs in flight
+    #                       compute wrong answers on the RK3576, across processes.
+    #   TIMEOUT             a child stuck in D state otherwise holds the suite for 1500 s.
+    #   FAIL_REGULAR_EXPRESSION
+    #                       a fenced wait past the slow-wait mark (src/rocket_fence_watch.c)
+    #                       fails the test that made it, whatever its own verdict was.
+    function(rocket_npu_test name)
+        cmake_parse_arguments(T "" "TIMEOUT" "COMMAND;ENVIRONMENT" ${ARGN})
+        if(NOT T_COMMAND)
+            set(T_COMMAND ${name})
+        endif()
+        if(NOT T_TIMEOUT)
+            set(T_TIMEOUT 300)
+        endif()
+        add_test(NAME ${name} COMMAND ${T_COMMAND})
+        set_tests_properties(${name} PROPERTIES
+            SKIP_RETURN_CODE 2
+            RESOURCE_LOCK npu
+            TIMEOUT ${T_TIMEOUT}
+            FIXTURES_REQUIRED npu_klog
+            FAIL_REGULAR_EXPRESSION "past the [0-9]+ ms slow-wait mark")
+        if(T_ENVIRONMENT)
+            set_tests_properties(${name} PROPERTIES ENVIRONMENT "${T_ENVIRONMENT}")
+        endif()
+    endfunction()
+
+    # A test that never opens the device. Pure arithmetic cannot skip, so it has no skip
+    # code unless SKIP_OFF_PART says it checks one part's planner and skips on another.
+    function(rocket_host_test name)
+        cmake_parse_arguments(T "SKIP_OFF_PART" "" "COMMAND" ${ARGN})
+        if(NOT T_COMMAND)
+            set(T_COMMAND ${name})
+        endif()
+        add_test(NAME ${name} COMMAND ${T_COMMAND})
+        set_tests_properties(${name} PROPERTIES TIMEOUT 300)
+        if(T_SKIP_OFF_PART)
+            set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 2)
+        endif()
+    endfunction()
+
+    # --- host-only ---------------------------------------------------------------
+    rocket_host_test(bytes_moved_rocket COMMAND bytes_moved_rocket 512 3840 4096)
+    rocket_host_test(chain_layout_rocket)
+    rocket_host_test(chain_verify_gate)
+    rocket_host_test(matmul_plan_gate SKIP_OFF_PART)    # the RK3588 planners; skips elsewhere
+    rocket_host_test(regcmd_rk3576_gate)                # forces ROCKET_CHIP=rk3576 itself
+
+    # --- the DPU LUT and elementwise ops -----------------------------------------
+    rocket_npu_test(activation_lut_rocket)
+    rocket_npu_test(leaky_relu_rocket)
+    rocket_npu_test(recip_rsqrt_rocket)
+    rocket_npu_test(lut_tanh_rocket)
+    rocket_npu_test(exp_lut_rocket)
+    rocket_npu_test(softplus_mish_rocket)
+    rocket_npu_test(elu_rocket)
+    rocket_npu_test(ew_minmax_rocket)
+    rocket_npu_test(prelu_rocket)
+    rocket_npu_test(ew_mul_rocket)
+    rocket_npu_test(conv_act_rocket)
+    rocket_npu_test(gelu_rocket)
+
+    # The conv and pooling gates do real work even off-device (a cube-layout self-check),
+    # but exit 2 when no device opened: the host checks passing is not the NPU passing.
+    rocket_npu_test(conv2d_fp16_rocket)
+    rocket_npu_test(scratch_cache_gate)
+
+    # The RK3576 gates. Each skips on any other part (and with no NPU), so they are inert
+    # in an RK3588 ctest run. The conv gate runs `all` -- every group including
+    # depthwise, which computes bit-exactly on this part.
+    rocket_npu_test(rk3576_conv_gate COMMAND rk3576_conv_gate all)
+    rocket_npu_test(rk3576_conv_lib_gate)
+    rocket_npu_test(rk3576_argb_ic1)
+    rocket_npu_test(rk3576_matmul_gate)
+    rocket_npu_test(rk3576_mm_fp16_gate)
+    rocket_npu_test(rk3576_perchannel_gate)
     # The PPU. `gate` and not `sweep`: the destination base is settled, and the sweep
     # is the probe that settled it rather than a check on anything.
-    add_test(NAME rk3576_pool_probe COMMAND rk3576_pool_probe gate)
-    set_tests_properties(rk3576_pool_probe PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(rk3576_pool_probe COMMAND rk3576_pool_probe gate)
     # A pool writing a SLICE of a shared concatenation buffer, whose channel-group stride is
     # the plane where the pool's own surface is round4(ow*oh). Asserts the arithmetic, that
     # nothing outside the slice moved, and that a stride below the plane is still refused.
-    add_test(NAME rk3576_pool_place COMMAND rk3576_pool_probe place)
-    set_tests_properties(rk3576_pool_place PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rk3576_add_probe COMMAND rk3576_add_probe gate)
-    set_tests_properties(rk3576_add_probe PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rk3576_residual_add COMMAND rk3576_residual_add gate)
-    set_tests_properties(rk3576_residual_add PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rk3576_lut_probe COMMAND rk3576_lut_probe gate)
-    set_tests_properties(rk3576_lut_probe PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rk3576_act_gate COMMAND rk3576_act_gate gate)
-    set_tests_properties(rk3576_act_gate PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(rk3576_pool_place COMMAND rk3576_pool_probe place)
+    rocket_npu_test(rk3576_add_probe COMMAND rk3576_add_probe gate)
+    rocket_npu_test(rk3576_residual_add COMMAND rk3576_residual_add gate)
+    rocket_npu_test(rk3576_lut_probe COMMAND rk3576_lut_probe gate)
+    rocket_npu_test(rk3576_act_gate COMMAND rk3576_act_gate gate)
     # Two producers writing slices of one buffer, against the row-major path they replace.
-    add_test(NAME rk3576_offset_cube COMMAND rk3576_offset_cube gate)
-    set_tests_properties(rk3576_offset_cube PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(rk3576_offset_cube COMMAND rk3576_offset_cube gate)
     # What a producer leaves past its live output channels, which is what an unaligned join
     # reads as its border constant.
-    add_test(NAME rk3576_pad_channels COMMAND rk3576_pad_channels)
-    set_tests_properties(rk3576_pad_channels PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(rk3576_pad_channels)
     # A feature cube whose channel groups sit further apart than the plane, which is what a
     # depthwise producer's surface is.
-    add_test(NAME rk3576_surf_stride COMMAND rk3576_surf_stride)
-    set_tests_properties(rk3576_surf_stride PROPERTIES SKIP_RETURN_CODE 2)
-    # And a feature plane whose ROWS sit further apart than the plane is wide — the same
+    rocket_npu_test(rk3576_surf_stride)
+    # And a feature plane whose ROWS sit further apart than the plane is wide -- the same
     # question one register down, asked of the CNA rather than of the PPU.
-    add_test(NAME rk3576_conv_pitch COMMAND rk3576_conv_pitch)
-    set_tests_properties(rk3576_conv_pitch PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(rk3576_conv_pitch)
     # A whole quantized classifier, layer by layer against TFLite's own intermediates.
-    # It skips without the model blob, which is not committed — build it once with
+    # It skips without the model blob, which is not committed -- build it once with
     # tests/data/rk3576-net/fetch.sh + mknet.py. ROCKET_SRC_DIR is how it finds the blob
     # from a build directory.
-    add_test(NAME rk3576_net_gate COMMAND rk3576_net_gate all)
-    set_tests_properties(rk3576_net_gate PROPERTIES SKIP_RETURN_CODE 2
-        ENVIRONMENT "ROCKET_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME rk3576_coeff_c COMMAND rk3576_coeff_c all)
-    set_tests_properties(rk3576_coeff_c PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(rk3576_net_gate COMMAND rk3576_net_gate all
+                    ENVIRONMENT "ROCKET_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}")
+    rocket_npu_test(rk3576_coeff_c COMMAND rk3576_coeff_c all)
     # A datapath with no encoder for the running part must fail loudly rather than emit
     # the RK3588 program, which that part completes without writing anything.
-    add_test(NAME rk3576_refusal_gate COMMAND rk3576_refusal_gate)
-    set_tests_properties(rk3576_refusal_gate PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME conv1d_rocket COMMAND conv1d_rocket)
-    set_tests_properties(conv1d_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME conv_transpose_rocket COMMAND conv_transpose_rocket)
-    set_tests_properties(conv_transpose_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME resize_rocket COMMAND resize_rocket)
-    set_tests_properties(resize_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME pool_fp16_rocket COMMAND pool_fp16_rocket)
-    add_test(NAME pool_int8_rocket COMMAND pool_int8_rocket)
-    add_test(NAME reduce_mean_rocket COMMAND reduce_mean_rocket)
-    add_test(NAME reduce_feature_rocket COMMAND reduce_feature_rocket)
-    set_tests_properties(reduce_feature_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME cumsum_rocket COMMAND cumsum_rocket)
-    set_tests_properties(cumsum_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME rmsnorm_rocket COMMAND rmsnorm_rocket)
-    set_tests_properties(rmsnorm_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME norm_vision_rocket COMMAND norm_vision_rocket)
-    set_tests_properties(norm_vision_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME ffn_rocket COMMAND ffn_rocket)
-    set_tests_properties(ffn_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME ffn_fused_rocket COMMAND ffn_fused_rocket)
-    set_tests_properties(ffn_fused_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME softmax_rocket COMMAND softmax_rocket)
-    set_tests_properties(softmax_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME cross_entropy_rocket COMMAND cross_entropy_rocket)
-    set_tests_properties(cross_entropy_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME layernorm_rocket COMMAND layernorm_rocket)
-    set_tests_properties(layernorm_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME mha_rocket COMMAND mha_rocket)
-    set_tests_properties(mha_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(rk3576_refusal_gate)
+
+    # --- conv, pooling, reduce, norms, attention ---------------------------------
+    rocket_npu_test(conv1d_rocket)
+    rocket_npu_test(conv_transpose_rocket)
+    rocket_npu_test(resize_rocket)
+    rocket_npu_test(pool_fp16_rocket)
+    rocket_npu_test(pool_int8_rocket)
+    rocket_npu_test(reduce_mean_rocket)
+    rocket_npu_test(reduce_feature_rocket)
+    rocket_npu_test(cumsum_rocket)
+    rocket_npu_test(rmsnorm_rocket)
+    rocket_npu_test(norm_vision_rocket)
+    rocket_npu_test(ffn_rocket)
+    rocket_npu_test(ffn_fused_rocket)
+    rocket_npu_test(softmax_rocket)
+    rocket_npu_test(cross_entropy_rocket)
+    rocket_npu_test(layernorm_rocket)
+    rocket_npu_test(mha_rocket)
     # Default invocation: per-worker QK/AV submit chaining is ON by default (the persistent
     # batched-context path), so this gates the chained path across every FA shape (cos=1.0).
     # Uses the gapped one-job layout (no kernel param); the fully-chained one-IRQ layout adds
-    # ROCKET_BATCH_SUBMIT=1 + the kernel half, exercised on-device by hand.
-    add_test(NAME flash_attn_rocket COMMAND flash_attn_rocket)
-    set_tests_properties(flash_attn_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    # ROCKET_BATCH_SUBMIT=1 + the kernel half, exercised on-device by hand. About 100 s.
+    rocket_npu_test(flash_attn_rocket TIMEOUT 600)
     # The same gate with chaining OFF, to keep the per-head (one-submit-per-head) path covered.
-    add_test(NAME flash_attn_rocket_nochain COMMAND flash_attn_rocket)
-    set_tests_properties(flash_attn_rocket_nochain PROPERTIES
-        SKIP_RETURN_CODE 2 ENVIRONMENT "ROCKET_FA_CHAIN=0")
-    add_test(NAME encoder_block_rocket COMMAND encoder_block_rocket)
-    set_tests_properties(encoder_block_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME siglip_rocket COMMAND siglip_rocket)
-    set_tests_properties(siglip_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME sam_rocket COMMAND sam_rocket)
-    set_tests_properties(sam_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME conv2d_int8_rocket COMMAND conv2d_int8_rocket)
-    add_test(NAME matmul_tiled_rocket COMMAND matmul_tiled_rocket)
-    add_test(NAME fc_data_bank_sweep_rocket COMMAND fc_data_bank_sweep_rocket)
-    set_tests_properties(fc_data_bank_sweep_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME matmul_kacc_chain_rocket COMMAND matmul_kacc_chain_rocket)
-    set_tests_properties(matmul_kacc_chain_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME matmul_mt_rocket    COMMAND matmul_mt_rocket)
-    add_test(NAME matmul_batch_rocket COMMAND matmul_batch_rocket)
-    set_tests_properties(matmul_batch_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME matmul_fp32out_rocket COMMAND matmul_fp32out_rocket 64 4096 512)
-    set_tests_properties(matmul_fp32out_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME matmul_int8_dequant_rocket COMMAND matmul_int8_dequant_rocket)
-    set_tests_properties(matmul_int8_dequant_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME matmul_prepacked_crossm_rocket COMMAND matmul_prepacked_crossm_rocket)
-    set_tests_properties(matmul_prepacked_crossm_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME matmul_correctness_matrix_rocket COMMAND matmul_correctness_matrix_rocket 512 1024 1024)
-    set_tests_properties(matmul_tiled_rocket matmul_mt_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    set_tests_properties(matmul_correctness_matrix_rocket PROPERTIES SKIP_RETURN_CODE 3)
-    # asymmetric-Nt tiling (ROCKET_MM_ASYM, default ON): gate its bit-exactness on a shape where
-    # it fires (N=4096>cap N-tiled, K=4096 K-tiled => Nt 256->128, Kt 384->512). The base
-    # correctness_matrix above (1024x1024) also fires it now that the default is ON; this pins the
-    # firing shape explicitly, and the _sym gate below keeps the symmetric plan (=0) covered too.
-    add_test(NAME matmul_correctness_matrix_asym COMMAND matmul_correctness_matrix_rocket 512 4096 4096)
-    set_tests_properties(matmul_correctness_matrix_asym PROPERTIES SKIP_RETURN_CODE 3 ENVIRONMENT "ROCKET_MM_ASYM=1")
-    add_test(NAME matmul_correctness_matrix_sym COMMAND matmul_correctness_matrix_rocket 512 4096 4096)
-    set_tests_properties(matmul_correctness_matrix_sym PROPERTIES SKIP_RETURN_CODE 3 ENVIRONMENT "ROCKET_MM_ASYM=0")
-    add_test(NAME crossop_chain_rocket COMMAND crossop_chain_rocket)
-    set_tests_properties(crossop_chain_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(flash_attn_rocket_nochain COMMAND flash_attn_rocket TIMEOUT 600
+                    ENVIRONMENT "ROCKET_FA_CHAIN=0")
+    rocket_npu_test(encoder_block_rocket)
+    # The ViT encoders score against artifacts extracted on a host with the models
+    # (tools/siglip_extract.py, tools/sam_extract.py), which are not committed. Name their
+    # directories at configure time and the gates run, the resident path included, and
+    # fail if the directory is empty. Leave them unset and the gates skip.
+    set(ROCKETNPU_SIGLIP_ARTIFACTS "" CACHE PATH "SigLIP gate artifacts (siglip_weights.f16, pixels/hidden/postln.f32)")
+    set(ROCKETNPU_SAM_ARTIFACTS "" CACHE PATH "SAM gate artifacts (sam_weights.f16, pixels/hidden/neck.f32)")
+    if(ROCKETNPU_SIGLIP_ARTIFACTS)
+        rocket_npu_test(siglip_rocket COMMAND siglip_rocket ${ROCKETNPU_SIGLIP_ARTIFACTS}
+                        TIMEOUT 900 ENVIRONMENT "ROCKET_SIGLIP_BENCH=2")
+    else()
+        rocket_npu_test(siglip_rocket TIMEOUT 900)
+    endif()
+    if(ROCKETNPU_SAM_ARTIFACTS)
+        rocket_npu_test(sam_rocket COMMAND sam_rocket ${ROCKETNPU_SAM_ARTIFACTS} TIMEOUT 900)
+    else()
+        rocket_npu_test(sam_rocket TIMEOUT 900)
+    endif()
+    rocket_npu_test(conv2d_int8_rocket)
 
-    # Bit-exact dtype + depthwise gates — the int8/int4/int16/bf16/tf32 tiled-or-resident
-    # matmul paths and the int8 depthwise conv the READMEs market as bit-exact. Each exits
-    # with code 2 when no NPU is present (and conv_dw_int8_runtime also when its host-packing
-    # fixtures are absent), so `ctest` reports SKIP off-device and FAIL only on a real
-    # on-device regression. The bf16/tf32 tiled and int16-exact gates require an explicit
-    # <M K N> (their mains have no default shape); the rest use built-in defaults.
-    add_test(NAME matmul_int8_tiled_rocket     COMMAND matmul_int8_tiled_rocket)
-    add_test(NAME mixed_chain_coexist_rocket   COMMAND mixed_chain_coexist_rocket)
-    add_test(NAME matmul_int4_tiled_rocket     COMMAND matmul_int4_tiled_rocket)
-    add_test(NAME matmul_int4_groupwise_rocket COMMAND matmul_int4_groupwise_rocket)
-    add_test(NAME matmul_bf16_tiled_rocket     COMMAND matmul_bf16_tiled_rocket 512 3840 4096)
-    add_test(NAME matmul_bf16_stream_rocket    COMMAND matmul_bf16_stream_rocket 512 3840 4096 4)
-    add_test(NAME matmul_tf32_tiled_rocket     COMMAND matmul_tf32_tiled_rocket 512 3840 4096)
-    add_test(NAME matmul_int8_prepacked_rocket COMMAND matmul_int8_prepacked_rocket)
-    add_test(NAME matmul_int8_crossm_rocket    COMMAND matmul_int8_crossm_rocket)
-    add_test(NAME matmul_int8_groupwise_rocket COMMAND matmul_int8_groupwise_rocket)
-    add_test(NAME matmul_int8_prepacked_gw_rocket COMMAND matmul_int8_prepacked_gw_rocket)
+    # --- the matmul family --------------------------------------------------------
+    rocket_npu_test(matmul_tiled_rocket)
+    rocket_npu_test(fc_data_bank_sweep_rocket)
+    rocket_npu_test(matmul_kacc_chain_rocket)
+    rocket_npu_test(matmul_mt_rocket)
+    rocket_npu_test(matmul_batch_rocket)
+    rocket_npu_test(matmul_fp32out_rocket COMMAND matmul_fp32out_rocket 64 4096 512)
+    rocket_npu_test(matmul_int8_dequant_rocket)
+    rocket_npu_test(matmul_prepacked_crossm_rocket)
+    # Every row is verified (FULL_ROWS=1), and K != N in every registration: with K == N a
+    # field that swapped the two would compute a plausible surface.
+    rocket_npu_test(matmul_correctness_matrix_rocket
+                    COMMAND matmul_correctness_matrix_rocket 512 1024 768
+                    ENVIRONMENT "FULL_ROWS=1")
+    # asymmetric-Nt tiling (ROCKET_MM_ASYM, default ON): gate its bit-exactness on a shape where
+    # it fires (N=4096>cap N-tiled, K=3840 K-tiled => Nt 256->128, Kt 384->512, the last K-tile
+    # partial). The base correctness_matrix above also fires it now that the default is ON; this
+    # pins the firing shape explicitly, and the _sym gate below keeps the symmetric plan (=0)
+    # covered too.
+    rocket_npu_test(matmul_correctness_matrix_asym
+                    COMMAND matmul_correctness_matrix_rocket 512 3840 4096
+                    ENVIRONMENT "ROCKET_MM_ASYM=1;FULL_ROWS=1")
+    rocket_npu_test(matmul_correctness_matrix_sym
+                    COMMAND matmul_correctness_matrix_rocket 512 3840 4096
+                    ENVIRONMENT "ROCKET_MM_ASYM=0;FULL_ROWS=1")
+    rocket_npu_test(crossop_chain_rocket)
+
+    # Bit-exact dtype + depthwise gates -- the int8/int4/int16/bf16/tf32 tiled-or-resident
+    # matmul paths and the int8 depthwise conv. The bf16/tf32 tiled and int16-exact gates
+    # require an explicit <M K N> (their mains have no default shape); the rest use built-in
+    # defaults. conv_dw_int8_runtime fails when its committed fixtures are absent.
+    rocket_npu_test(matmul_int8_tiled_rocket)
+    rocket_npu_test(mixed_chain_coexist_rocket)
+    rocket_npu_test(matmul_int4_tiled_rocket)
+    rocket_npu_test(matmul_int4_groupwise_rocket)
+    rocket_npu_test(matmul_bf16_tiled_rocket COMMAND matmul_bf16_tiled_rocket 512 3840 4096)
+    rocket_npu_test(matmul_bf16_stream_rocket COMMAND matmul_bf16_stream_rocket 512 3840 4096 4)
+    rocket_npu_test(matmul_tf32_tiled_rocket COMMAND matmul_tf32_tiled_rocket 512 3840 4096)
+    rocket_npu_test(matmul_int8_prepacked_rocket)
+    rocket_npu_test(matmul_int8_crossm_rocket)
+    rocket_npu_test(matmul_int8_groupwise_rocket)
+    rocket_npu_test(matmul_int8_prepacked_gw_rocket)
     # group=576 (the default above) has Kt == group, so it never exercises the resident
-    # path's kt_per_group > 1 branch — the one that maps several K-tiles onto ONE quant
+    # path's kt_per_group > 1 branch -- the one that maps several K-tiles onto ONE quant
     # group's scale. group=1440 forces Kt=480 (3 tiles per group) and gates that mapping.
-    add_test(NAME matmul_int8_prepacked_gw_wide_rocket
-             COMMAND matmul_int8_prepacked_gw_rocket 256 2880 512 1440 2)
-    # The default N=512 splits into 128-wide slices — BELOW the 256 tile cap, so every N-tile
+    rocket_npu_test(matmul_int8_prepacked_gw_wide_rocket
+                    COMMAND matmul_int8_prepacked_gw_rocket 256 2880 512 1440 2)
+    # The default N=512 splits into 128-wide slices -- BELOW the 256 tile cap, so every N-tile
     # already fits its slice exactly and the tile-padding path is never taken. The real MoE
     # expert shape (N=2880 over 5 worker fds -> a 576-wide slice, the first width that exceeds
     # the cap) is what exercises i8_pick_nt, and it is also the shape whose bit-exactness the
     # fix must not disturb: shrinking Nt frees CBUF banks, and if that let Kt grow the resident
     # path would re-tile K and stop matching the one-shot oracle. Both are gated here.
-    add_test(NAME matmul_int8_prepacked_gw_moe_rocket
-             COMMAND matmul_int8_prepacked_gw_rocket 256 2880 2880 576 2)
-    add_test(NAME matmul_int8_crossm_gw_rocket COMMAND matmul_int8_crossm_gw_rocket)
-    add_test(NAME matmul_int4_prepacked_rocket COMMAND matmul_int4_prepacked_rocket)
-    add_test(NAME matmul_int4_prepacked_gw_rocket COMMAND matmul_int4_prepacked_gw_rocket)
-    add_test(NAME matmul_int4_crossm_rocket    COMMAND matmul_int4_crossm_rocket)
-    add_test(NAME matmul_int16_exact_rocket    COMMAND matmul_int16_exact_rocket 512 3840 4096)
-    add_test(NAME replay_dw_mesa               COMMAND replay_dw_mesa)
-    add_test(NAME conv_dw_int8_runtime         COMMAND conv_dw_int8_runtime)
-    set_tests_properties(
-        matmul_int8_tiled_rocket matmul_int4_tiled_rocket matmul_int4_groupwise_rocket
-        matmul_bf16_tiled_rocket matmul_bf16_stream_rocket matmul_tf32_tiled_rocket
-        matmul_int8_prepacked_rocket matmul_int8_crossm_rocket
-        matmul_int8_groupwise_rocket matmul_int8_prepacked_gw_rocket
-        matmul_int8_prepacked_gw_wide_rocket matmul_int8_prepacked_gw_moe_rocket
-        matmul_int8_crossm_gw_rocket
-        matmul_int4_prepacked_rocket matmul_int4_prepacked_gw_rocket
-        matmul_int4_crossm_rocket
-        matmul_int16_exact_rocket replay_dw_mesa conv_dw_int8_runtime
-        mixed_chain_coexist_rocket
-        PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(matmul_int8_prepacked_gw_moe_rocket
+                    COMMAND matmul_int8_prepacked_gw_rocket 256 2880 2880 576 2)
+    rocket_npu_test(matmul_int8_crossm_gw_rocket)
+    rocket_npu_test(matmul_int4_prepacked_rocket)
+    rocket_npu_test(matmul_int4_prepacked_gw_rocket)
+    rocket_npu_test(matmul_int4_crossm_rocket)
+    rocket_npu_test(matmul_int16_exact_rocket COMMAND matmul_int16_exact_rocket 512 3840 4096)
+    rocket_npu_test(replay_dw_mesa)
+    rocket_npu_test(conv_dw_int8_runtime)
+    # The OUT_CVT tie rule, which no scale a caller passes can reach: it builds its ties
+    # on purpose and asserts half to even at bit 30 clear, half away from zero set.
+    rocket_npu_test(requant_round_probe)
 
+    # --- the uAPI -------------------------------------------------------------------
     # The mainline-uAPI gates only exist in a builtin-provider build (see the foreach
     # above); registering them otherwise would name targets that were never created.
     if(ROCKETNPU_PROVIDER STREQUAL "builtin")
-    # uAPI conformance gate: runtime-verifies the drm_rocket_* contracts the
-    # shim depends on (BO/regcmd-IOVA window, PREP_BO absolute-deadline semantics).
-    # The cross-kernel canary — a kernel that drifts fails here, not deep in matmul.
-    add_test(NAME uapi_selftest_rocket COMMAND uapi_selftest_rocket)
-    set_tests_properties(uapi_selftest_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    # Every rejection site in rocket_ioctl_submit_job() is reached BEFORE the job's
-    # IOMMU domain reference is taken, and rocket_job_cleanup() puts that reference
-    # unconditionally — so a malformed submit from any client holding /dev/accel/accel0
-    # (group `render`) oopses the kernel. Each case runs in a forked child, so the
-    # gate reports which site did it instead of dying with it, and stops at the first.
-    add_test(NAME uapi_submit_errpath_rocket COMMAND uapi_submit_errpath_rocket)
-    set_tests_properties(uapi_submit_errpath_rocket PROPERTIES SKIP_RETURN_CODE 2)
-    add_test(NAME uapi_bo_ranges_rocket COMMAND uapi_bo_ranges_rocket)
-    set_tests_properties(uapi_bo_ranges_rocket PROPERTIES SKIP_RETURN_CODE 2)
+        # uAPI conformance gate: runtime-verifies the drm_rocket_* contracts the
+        # shim depends on (BO/regcmd-IOVA window, PREP_BO absolute-deadline semantics).
+        # The cross-kernel canary -- a kernel that drifts fails here, not deep in matmul.
+        rocket_npu_test(uapi_selftest_rocket)
+        # Every rejection site in rocket_ioctl_submit_job() is reached BEFORE the job's
+        # IOMMU domain reference is taken, and rocket_job_cleanup() puts that reference
+        # unconditionally -- so a malformed submit from any client holding /dev/accel/accel0
+        # (group `render`) oopses the kernel. Each case runs in a forked child, so the
+        # gate reports which site did it instead of dying with it, and stops at the first.
+        rocket_npu_test(uapi_submit_errpath_rocket)
+        rocket_npu_test(uapi_bo_ranges_rocket)
     endif()
     # The per-context IOVA allocator is freed in rocket_postclose(), but a BO's IOVA
-    # node is removed in its GEM free path — which the drm_sched free worker can run
+    # node is removed in its GEM free path -- which the drm_sched free worker can run
     # after that close. Submitting and closing without waiting races the two on
     # purpose; the verdict is the kernel log, since the defect fails no syscall.
-    add_test(NAME uapi_bo_lifetime_rocket COMMAND uapi_bo_lifetime_rocket 64)
-    set_tests_properties(uapi_bo_lifetime_rocket PROPERTIES SKIP_RETURN_CODE 2)
+    rocket_npu_test(uapi_bo_lifetime_rocket COMMAND uapi_bo_lifetime_rocket 64)
     # PREP_BO wait robustness: a SIGUSR1 storm (handler without SA_RESTART) must not turn the
     # interruptible kernel wait into a spurious timeout (EINTR retry), and a UINT64_MAX
     # "wait forever" timeout must saturate rather than wrap the signed deadline negative into an
     # instant poll. 60 iters/phase keeps the gate ~1s; exit 2 (SKIP) when no NPU is present.
-    add_test(NAME prep_signal_robust_rocket COMMAND prep_signal_robust_rocket)
-    set_tests_properties(prep_signal_robust_rocket PROPERTIES SKIP_RETURN_CODE 2 ENVIRONMENT "ROCKET_SIG_ITERS=60")
+    rocket_npu_test(prep_signal_robust_rocket ENVIRONMENT "ROCKET_SIG_ITERS=60")
 endif()

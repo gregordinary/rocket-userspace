@@ -38,6 +38,7 @@
 
 static pthread_barrier_t barrier;
 static double g_elapsed[8];
+static int g_done[8];
 
 static double now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     return ts.tv_sec*1000.0 + ts.tv_nsec/1e6; }
@@ -81,6 +82,7 @@ static void *worker(void *arg)
         if(rocket_submit_tasks(fd,tasks,TASKS_PER_JOB,inh,3,outh,1)){fprintf(stderr,"[t%ld] submit\n",id);break;}
         if(rocket_bo_prep(fd,&out,0,2000000000LL)){fprintf(stderr,"[t%ld] timeout\n",id);break;}
         rocket_bo_fini(fd,&out);
+        g_done[id]++;
     }
     g_elapsed[id]=now_ms()-t0;
 
@@ -100,7 +102,9 @@ int main(int argc,char**argv)
     for(long i=0;i<nthreads;i++) pthread_create(&th[i],NULL,worker,(void*)i);
     for(int i=0;i<nthreads;i++) pthread_join(th[i],NULL);
 
-    int total_jobs=nthreads*REPS;
+    /* Jobs that COMPLETED: a thread that broke out early ran fewer, and dividing REPS by
+     * its shorter time overstated the rate. */
+    int total_jobs=0; for(int i=0;i<nthreads;i++) total_jobs+=g_done[i];
     double max_e=0; for(int i=0;i<nthreads;i++) if(g_elapsed[i]>max_e) max_e=g_elapsed[i];
     printf("threads=%d  jobs/thread=%d  total_jobs=%d  wall(post-barrier max)=%.1f ms\n",
            nthreads,REPS,total_jobs,max_e);
@@ -108,5 +112,10 @@ int main(int argc,char**argv)
            total_jobs/(max_e/1000.0), max_e/total_jobs);
     printf("  => compare jobs/s across N: scales with N (up to 3) => cores parallel; flat => serialized\n");
     pthread_barrier_destroy(&barrier);
+    if (total_jobs != nthreads*REPS) {
+        printf("  %d of %d jobs completed: a thread stopped early, so the rate above is partial\n",
+               total_jobs, nthreads*REPS);
+        return 1;
+    }
     return 0;
 }

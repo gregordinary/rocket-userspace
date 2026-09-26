@@ -8,7 +8,8 @@
  * triangular ones MATRIX (out = in · L^T), so it reuses the validated fp32-output matmul
  * (rocket_matmul_fp16_f32out) and inherits its genuine fp32 K-accumulation — important
  * because a long prefix sums many terms. The fp32 result is narrowed to fp16 on read-back,
- * so this is fp16-rounding-accurate (relative tolerance), NOT bit-exact.
+ * and the gate bounds every element at one fp16 ulp of its reference; the part measures
+ * bit-exact on every shape here.
  *
  * Layers:
  *  1. REFERENCE self-check (anywhere, no NPU): the fp64-accumulate oracle agrees with an
@@ -70,15 +71,21 @@ static int check(int fd, int M, int N, const _Float16 *in, int exclusive, int re
     double maxref = 0;
     for (size_t i = 0; i < MN; i++) if (fabs((double)ref[i]) > maxref) maxref = fabs((double)ref[i]);
 
-    const double REL_TOL = 0.02;                 /* fp32-accum + single fp16 narrow ~5e-4; 2% is margin */
-    const double ABS_TOL = REL_TOL * maxref + 1e-2;
+    /* One fp16 ulp of each element's own reference. The part is bit-exact on every shape
+     * measured (2026-09-24, RK1), so this is margin for a summation order the reference
+     * does not share, and nothing more. The old bar needed an element to miss by 2%
+     * relatively AND by 2% of the largest prefix, which let a dropped column through: it
+     * moves every later prefix by one input element, ~2 here, against a bar near 4. */
     double max_abs = 0, max_rel = 0; int bad = 0;
     for (size_t i = 0; i < MN; i++) {
-        double ad = fabs((double)got[i] - (double)ref[i]);
-        double rd = ad / (fabs((double)ref[i]) + 1e-9);
+        double r = (double)ref[i];
+        int e; frexp(fabs(r) > 0x1.0p-14 ? r : 0x1.0p-14, &e);
+        const double ulp = ldexp(1.0, e - 11);      /* fp16: 10 fraction bits, [2^(e-1), 2^e) */
+        double ad = fabs((double)got[i] - r);
+        double rd = ad / (fabs(r) + 1e-9);
         if (ad > max_abs) max_abs = ad;
         if (rd > max_rel) max_rel = rd;
-        if (rd > REL_TOL && ad > ABS_TOL) {       /* wrong in BOTH metrics */
+        if (!(ad <= ulp)) {
             if (bad < 5) printf("    [m=%zu n=%zu] ref=%.5g got=%.5g d=%.4g\n",
                                 i / N, i % N, (double)ref[i], (double)got[i], ad);
             bad++;

@@ -46,12 +46,24 @@
 static int fails;
 static int checks;
 
+/* A refusal is a DECISION: a shape, a tiling or a support code, the generator's -1
+ * included, which is ROCKET_E_SHAPE. An allocation or device failure is nonzero too, and
+ * read as a refusal it would pass an entry that never reached its check. */
+static int refusal_class(int rc)
+{
+    return rc == ROCKET_E_SHAPE || rc == ROCKET_E_TILING || rc == ROCKET_E_UNSUPPORTED;
+}
+
 static void expect_refused(const char *what, int rc)
 {
     checks++;
     if (rc == 0) {
         printf("  FAIL   %-28s returned 0 — it emitted the RK3588 encoding and the job "
                "wrote nothing\n", what);
+        fails++;
+    } else if (!refusal_class(rc)) {
+        printf("  FAIL   %-28s returned %d, which is a failure and not a refusal\n",
+               what, rc);
         fails++;
     } else {
         printf("  PASS   %-28s refused (%d)\n", what, rc);

@@ -926,6 +926,26 @@ static const span_case SPANS[] = {
     { "asymmetric",        5,  -8192,  16384 },
 };
 
+/* Whether the part reads one table entry, or none, for this value. Out of the domain it
+ * reads a clamp, and at a whole multiple of the step from the table's base it reads one
+ * entry with nothing to interpolate. Either way the model is exact there, and the only
+ * tolerance the gate owes is at the positions it interpolates. */
+static int lut_exact_at(long v)
+{
+    const long step = 1L << g_sel;
+    if (v < g_le_start || v >= g_lo_end) return 1;
+    return ((v < 0 ? v - g_le_start : v) % step) == 0;
+}
+
+/* TWO TABLES. The ramp is the one table whose interpolation the model can state exactly:
+ * any linear function is its own interpolant, so a residual is the hardware's and not the
+ * model's. But at 31 per index behind a >>8 it moves the output one count per ~8 entries,
+ * so an index off by fewer rounds away. The SAWTOOTH, ((i & 255) - 128) * 256, reads the
+ * index modulo 256 straight out, one count per entry, and is scored only where a single
+ * entry is read, so it asks the index question with interpolation left out of it. */
+enum { TABLE_RAMP = 0, TABLE_SAW, TABLE_N };
+static const char *TABLE_NAME[TABLE_N] = { "ramp", "sawtooth" };
+
 static int mode_gate(harness *h)
 {
     int16_t *le = calloc(RK3576_LUT_ENTRIES, sizeof(int16_t));
@@ -933,61 +953,75 @@ static int mode_gate(harness *h)
     int8_t  *out = calloc(h->out_bytes, 1);
     int32_t A[OC]; int16_t C[OC];
     unsigned mul, shift, t, c, i;
-    int rc = 1, fails = 0;
+    int rc = 1, fails = 0, tk;
 
     if (!le || !lo || !out) goto done;
     gate_schedule(A, C);
     rocket_rk3576_requant_params(1.0f / 256.0f, &mul, &shift);
-    /* A ramp is the one table whose interpolation the model can state exactly: any
-     * linear function is its own interpolant, so a residual is the hardware's and not
-     * the model's. */
-    for (i = 0; i < RK3576_LUT_ENTRIES; i++) {
-        le[i] = (int16_t)(i * RAMP_STEP);
-        lo[i] = (int16_t)((RK3576_LUT_ENTRIES + i) * RAMP_STEP);
-    }
     printf("gate: index = (value - LE_START) / 2^sel, against the part\n");
-    printf("      OUT_CVT mul %u shift %u, table ramp %d per index\n",
-           mul, shift, RAMP_STEP);
+    printf("      OUT_CVT mul %u shift %u. Where one entry is read the model is exact and so\n"
+           "      is the gate; one count is allowed only where two entries are interpolated\n",
+           mul, shift);
 
-    for (t = 0; t < sizeof SPANS / sizeof *SPANS; t++) {
-        int worst = 0, over1 = 0, n = 0, shown = 0;
-        g_sel = SPANS[t].sel;
-        g_le_start = SPANS[t].le_start;
-        g_lo_end = SPANS[t].lo_end;
-        if (run_pair(h, le, lo, A, C, 1, CLAMP_LO, CLAMP_HI, out) != 0) goto done;
-        for (c = 0; c < OC; c++)
-            for (i = 0; i < NPIX; i++) {
-                long v = ((long)((int)i - 128) + A[c]) * C[c];
-                double m = lut_model(v, le, lo, (double)CLAMP_LO, (double)CLAMP_HI);
-                long q = rte_shift((long)(m < 0 ? m - 0.5 : m + 0.5) * (long)mul, shift);
-                int want = q > 127 ? 127 : (q < -128 ? -128 : (int)q);
-                int have = out[out_index(h->surf_elems, PLANE, c,
-                                         i / PLANE, i % PLANE)];
-                int d = have - want; if (d < 0) d = -d;
-                if (d > worst) worst = d;
-                if (d > 1) {
-                    over1++;
-                    if (shown < 6) {
-                        printf("     oc=%-2u C=%-5d A=%-7d v=%-8ld want %4d got %4d\n",
-                               c, (int)C[c], A[c], v, want, have);
-                        shown++;
-                    }
-                }
-                n++;
+    for (tk = 0; tk < TABLE_N; tk++) {
+        for (i = 0; i < RK3576_LUT_ENTRIES; i++) {
+            if (tk == TABLE_RAMP) {
+                le[i] = (int16_t)(i * RAMP_STEP);
+                lo[i] = (int16_t)((RK3576_LUT_ENTRIES + i) * RAMP_STEP);
+            } else {
+                le[i] = (int16_t)(((int)(i & 255u) - 128) * 256);
+                lo[i] = (int16_t)(((int)((RK3576_LUT_ENTRIES + i) & 255u) - 128) * 256);
             }
-        printf("  %-18s sel=%d LE_START=%-7d LO_END=%-6d  max |diff| %d, "
-               "%d of %d past one count  (load wrote %u/4096, surface untouched "
-               "%zu/%zu, %u redo%s)  %s\n",
-               SPANS[t].name, g_sel, g_le_start, g_lo_end, worst, over1, n,
-               h->scratch_moved, h->out_untouched, h->out_bytes,
-               h->redos, h->redos == 1 ? "" : "s",
-               over1 ? "FAIL" : "PASS");
-        if (over1) fails++;
-        sleep_ms(150);
+        }
+        printf("  table: %s\n", TABLE_NAME[tk]);
+        for (t = 0; t < sizeof SPANS / sizeof *SPANS; t++) {
+            int worst = 0, bad = 0, n = 0, exact_n = 0, shown = 0;
+            g_sel = SPANS[t].sel;
+            g_le_start = SPANS[t].le_start;
+            g_lo_end = SPANS[t].lo_end;
+            if (run_pair(h, le, lo, A, C, 1, CLAMP_LO, CLAMP_HI, out) != 0) goto done;
+            for (c = 0; c < OC; c++)
+                for (i = 0; i < NPIX; i++) {
+                    long v = ((long)((int)i - 128) + A[c]) * C[c];
+                    const int exact = lut_exact_at(v);
+                    double m;
+                    long q;
+                    int want, have, d;
+                    /* The sawtooth jumps by 255 entries' worth at a wrap, so its
+                     * interpolated samples are the interpolation's question, not this one. */
+                    if (tk == TABLE_SAW && !exact) continue;
+                    m = lut_model(v, le, lo, (double)CLAMP_LO, (double)CLAMP_HI);
+                    q = rte_shift((long)(m < 0 ? m - 0.5 : m + 0.5) * (long)mul, shift);
+                    want = q > 127 ? 127 : (q < -128 ? -128 : (int)q);
+                    have = out[out_index(h->surf_elems, PLANE, c, i / PLANE, i % PLANE)];
+                    d = have - want; if (d < 0) d = -d;
+                    if (d > worst) worst = d;
+                    exact_n += exact;
+                    if (d > (exact ? 0 : 1)) {
+                        bad++;
+                        if (shown < 6) {
+                            printf("     oc=%-2u C=%-5d A=%-7d v=%-8ld %s want %4d got %4d\n",
+                                   c, (int)C[c], A[c], v, exact ? "one entry" : "interp",
+                                   want, have);
+                            shown++;
+                        }
+                    }
+                    n++;
+                }
+            printf("  %-18s sel=%d LE_START=%-7d LO_END=%-6d  max |diff| %d, %d of %d past "
+                   "their bound (%d read one entry)  (load wrote %u/4096, surface untouched "
+                   "%zu/%zu, %u redo%s)  %s\n",
+                   SPANS[t].name, g_sel, g_le_start, g_lo_end, worst, bad, n, exact_n,
+                   h->scratch_moved, h->out_untouched, h->out_bytes,
+                   h->redos, h->redos == 1 ? "" : "s",
+                   (bad || !exact_n) ? "FAIL" : "PASS");
+            if (bad || !exact_n) fails++;
+            sleep_ms(150);
+        }
     }
-    printf("== %d of %d spans explained by the model ==\n",
-           (int)(sizeof SPANS / sizeof *SPANS) - fails,
-           (int)(sizeof SPANS / sizeof *SPANS));
+    printf("== %d of %d table x span cells explained by the model ==\n",
+           TABLE_N * (int)(sizeof SPANS / sizeof *SPANS) - fails,
+           TABLE_N * (int)(sizeof SPANS / sizeof *SPANS));
     rc = fails ? 1 : 0;
 done:
     free(le); free(lo); free(out);

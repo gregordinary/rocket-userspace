@@ -30,6 +30,8 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "rocket_fanout.h"   /* rocket_fanout_nstep: the N split the fan-out paths use */
+#include "test_fill.h"
 
 static int64_t now_us(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -47,7 +49,10 @@ static inline float bf16rt(float f) {
 static double sample_err(const float *A, const float *B, const float *C,
                          int M, int K, int N, int samples, int *nonfin) {
     size_t MN = (size_t)M * N;
-    size_t stride = MN > (size_t)samples ? MN / (size_t)samples : 1;
+    /* coprime to M*N, so the samples land on every column (MN/samples was 256 at
+     * 512x4096, which put them all on 16 columns) */
+    size_t stride = MN > (size_t)samples
+                  ? (size_t)tf_coprime_stride((int)MN, (int)(MN / (size_t)samples)) : 1;
     double max_abs = 0.0, max_ref = 0.0;
     *nonfin = 0;
     for (size_t idx = 0; idx < MN; idx += stride) {
@@ -69,7 +74,8 @@ int main(int argc, char **argv) {
     int K  = argc > 2 ? atoi(argv[2]) : 3840;
     int N  = argc > 3 ? atoi(argv[3]) : 4096;
     int NT = argc > 4 ? atoi(argv[4]) : 4;
-    const float tol  = (float)env_dbl("ROCKET_BF16_TOL", 0.01);
+    /* 1e-5: the part measures ~8.5e-8 here, and one dropped K term reads ~3e-3 */
+    const float tol  = (float)env_dbl("ROCKET_BF16_TOL", 1e-5);
     const float mag  = (float)env_dbl("ROCKET_BF16_MAG", 10.0);
     const int   samp = env_int("ROCKET_BF16_SAMPLES", 8192);
     const int   reps = env_int("ROCKET_BF16_REPS", 3);
@@ -99,7 +105,7 @@ int main(int argc, char **argv) {
     int rc = rocket_matmul_bf16(fd, M, K, N, A, B, Cr);
     double ms_ref = (now_us() - t0) / 1000.0;
     rocket_close(fd);
-    if (rc) { fprintf(stderr, "rocket_matmul_bf16 (ref) failed (%d)\n", rc); return rc; }
+    if (rc) { fprintf(stderr, "rocket_matmul_bf16 (ref) failed (%d)\n", rc); return 1; }
 
     int nf = 0;
     double err_ref = sample_err(A, B, Cr, M, K, N, samp, &nf);
@@ -114,7 +120,7 @@ int main(int argc, char **argv) {
         t0 = now_us();
         rc = rocket_matmul_bf16_mt(M, K, N, A, B, Cmt, NT);
         double ms = (now_us() - t0) / 1000.0;
-        if (rc) { fprintf(stderr, "rocket_matmul_bf16_mt failed (%d)\n", rc); return rc; }
+        if (rc) { fprintf(stderr, "rocket_matmul_bf16_mt failed (%d)\n", rc); return 1; }
         ms_mt = ms;   /* keep the last (warm) */
     }
     int mt_bitexact = (memcmp(Cmt, Cr, (size_t)M*N*sizeof(float)) == 0);
@@ -125,7 +131,7 @@ int main(int argc, char **argv) {
     if (!s1) { fprintf(stderr, "stream_create(1) failed\n"); return -1; }
     rc = rocket_matmul_bf16_stream(s1, M, K, N, A, B, Cs1);
     rocket_bf16_stream_free(s1);
-    if (rc) { fprintf(stderr, "bf16_stream(nt=1) failed (%d)\n", rc); return rc; }
+    if (rc) { fprintf(stderr, "bf16_stream(nt=1) failed (%d)\n", rc); return 1; }
     int s1_bitexact = (memcmp(Cs1, Cr, (size_t)M*N*sizeof(float)) == 0);
 
     /* ---- streaming, nthreads=NT (warm: persistent fds + resident scratch) ---- */
@@ -136,7 +142,7 @@ int main(int argc, char **argv) {
         t0 = now_us();
         rc = rocket_matmul_bf16_stream(sn, M, K, N, A, B, Csn);
         double ms = (now_us() - t0) / 1000.0;
-        if (rc) { fprintf(stderr, "bf16_stream(nt=%d) failed (%d)\n", NT, rc); rocket_bf16_stream_free(sn); return rc; }
+        if (rc) { fprintf(stderr, "bf16_stream(nt=%d) failed (%d)\n", NT, rc); rocket_bf16_stream_free(sn); return 1; }
         ms_sn = ms;   /* last (warm) */
     }
     rocket_bf16_stream_free(sn);
@@ -155,12 +161,27 @@ int main(int argc, char **argv) {
 
     /* Pass = nthreads=1 streaming bit-identical to single-fd (the core guarantee: same
      * tiling + accum order), and mt + nthreads>1 streaming within tol of the exact
-     * double reference with no nonfinite. The nthreads>1 paths are usually bit-exact
-     * too (N-split preserves per-element accum order when every slice tiles the same
-     * Kt), but a small final N-slice can pick a different Kt and re-round, so that is
-     * reported, not required. */
+     * double reference with no nonfinite. The nthreads>1 paths keep each element's
+     * accumulation order when every N-slice plans the same Kt as the whole shape, and
+     * then they must be bit-exact too. Only a slice that plans a different Kt (a small
+     * final one, usually) may re-round, and only then is bit-exactness reported rather
+     * than required. */
+    int same_kt = 1;
+    {
+        int Kt_full = 0, Kt_w = 0;
+        int step = rocket_fanout_nstep(N, NT, 16);
+        rocket_matmul_plan_bf16(M, K, N, NULL, &Kt_full, NULL);
+        for (int n0 = 0; n0 < N; n0 += step) {
+            int w = (N - n0 < step) ? N - n0 : step;
+            if (rocket_matmul_plan_bf16(M, K, w, NULL, &Kt_w, NULL) < 0 || Kt_w != Kt_full)
+                same_kt = 0;
+        }
+    }
+    printf("every N-slice plans the whole shape's Kt: %s, so nthreads>1 bit-exactness is %s\n",
+           same_kt ? "yes" : "no", same_kt ? "REQUIRED" : "reported only");
     int pass = s1_bitexact
-            && !nf_mt && !nf_sn && err_mt < tol && err_sn < tol;
+            && !nf_mt && !nf_sn && err_mt < tol && err_sn < tol
+            && (!same_kt || (mt_bitexact && sn_bitexact));
     printf("==> %s (bf16 fast paths %s)\n",
            pass ? "PASS" : "FAIL",
            pass ? "bit-identical to single-fd + track fp32 reference"

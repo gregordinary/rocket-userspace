@@ -17,6 +17,8 @@
  * single go/no-go question for the MUL_MAT_ID handler: at that small-M_e expert
  * shape, does the STREAMING (pack-per-call, weights can't stay resident across
  * 32 experts x 24 layers) NPU path still beat a multi-core CPU fp16 GEMM?
+ * It checks each call's return code and never scores the output: its speedup means
+ * something only for a path the gates show correct (matmul_mt_rocket owns that).
  *
  * The NPU side is rocket_matmul_fp16_mt (the realistic first-handler path,
  * includes per-call weight pack). The CPU side is an OpenMP cache-blocked

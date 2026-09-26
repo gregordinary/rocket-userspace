@@ -25,6 +25,15 @@
  * multiple oc-groups (OC>16), stride>1, pad>0, and dilation>1 — so no degenerate
  * single-group case can hide a wrong layout (the tf32/int4 lesson).
  *
+ * THE INSTRUMENT (tests/test_fill.h). Inputs are hashed integers in [-3,3] and weights
+ * in [-2,2], a different seed per shape and tensor, so every sum is an exact fp16 integer
+ * (the gate asserts max|ref| < 2048) and both comparisons are exact. The output starts
+ * as an fp16 NaN sentinel. The fill used to be (i%5)-2 and (i%3)-1, which made the
+ * weights a function of the kernel column alone on every shape with KW=3, 8 of the 10
+ * direct shapes and all three tiled ones, and made the 64x10x12 and 64x48x40 inputs
+ * identical across channels. An OC-tile or channel-group mixup passed there, under a
+ * bar of max_abs <= 1.0.
+ *
  * Usage: conv2d_fp16_rocket            (run the built-in shape sweep)
  *        conv2d_fp16_rocket IC IH IW OC KH KW SY SX PT PL DY DX  (one custom shape)
  */
@@ -37,6 +46,7 @@
 #include "rocket_npu.h"
 #include "rocket_conv.h"
 #include "npu_matmul.h"   /* feature_data, weight_conv_fp16, gen_conv2d_fp16 */
+#include "test_fill.h"
 
 static int dwg(void) { const char *e = getenv("ROCKET_CONV_DW_GROUP"); int g = e?atoi(e):32; return g>0?g:32; }
 
@@ -132,6 +142,15 @@ static int cube_self_check(const rocket_conv2d_desc *d,
  * was refused would print N "skipping" lines and exit PASS over zero evidence. */
 static int g_checked = 0;
 
+static uint64_t shape_seed(const rocket_conv2d_desc *d)
+{
+    const int f[] = { d->ic, d->ih, d->iw, d->oc, d->kh, d->kw, d->stride_y, d->stride_x,
+                      d->pad_top, d->pad_left, d->dil_y, d->dil_x, d->depthwise };
+    uint64_t h = 0x13198A2E03707344ull;
+    for (size_t i = 0; i < sizeof f / sizeof f[0]; i++) h = tf_hash(h, (uint64_t)(int64_t)f[i]);
+    return h;
+}
+
 static int run_shape(int fd, const rocket_conv2d_desc *d)
 {
     int OH = rocket_conv2d_oh(d), OW = rocket_conv2d_ow(d);
@@ -150,9 +169,11 @@ static int run_shape(int fd, const rocket_conv2d_desc *d)
     _Float16 *out = malloc(out_n*sizeof(_Float16)), *ref = malloc(out_n*sizeof(_Float16));
     if (!in || !W || !out || !ref) { fprintf(stderr,"oom\n"); return -1; }
 
-    /* small integer values keep results exact in fp16 */
-    for (size_t i = 0; i < in_n; i++) in[i] = (_Float16)((int)(i % 5) - 2);
-    for (size_t i = 0; i < wt_n; i++) W[i]  = (_Float16)((int)(i % 3) - 1);
+    /* small hashed integers keep every result exact in fp16, with no period */
+    const uint64_t seed = shape_seed(d);
+    tf_fill_f16_int(in, in_n, tf_hash(seed, 1), -3, 3);
+    tf_fill_f16_int(W,  wt_n, tf_hash(seed, 2), -2, 2);
+    const int dims[3] = { d->oc, OH, OW };
 
     int fail = cube_self_check(d, in, W);
 
@@ -180,23 +201,27 @@ static int run_shape(int fd, const rocket_conv2d_desc *d)
      * The label says which. -5 = depthwise gated (skip, not fail). */
     {
         const char *tag = (fd >= 0) ? "HW end-to-end" : "CPU-tiled decomp";
-        memset(out, 0, out_n*sizeof(_Float16));
+        tf_sentinel_f16(out, out_n);
         int r = rocket_conv2d_fp16(fd, d, in, W, out);
         if (r == -5) { printf("  %s: depthwise gated (ROCKET_CONV_DW_NATIVE) — SKIP\n", tag); }
         else if (r) { printf("  %s: rocket_conv2d_fp16 = %d (FAIL)\n", tag, r); fail = 1; }
         else {
             g_checked++;
+            tf_sentinel_f16(ref, out_n);
             rocket_conv2d_ref_fp16(d, in, W, ref);
-            double max_abs = 0; int bad = 0;
-            for (size_t i = 0; i < out_n; i++) {
-                double ad = fabs((float)out[i] - (float)ref[i]);
-                if (ad > max_abs) max_abs = ad;
-                if (ad > 1.0 && bad < 6) { printf("    [%zu] ref=%.2f got=%.2f\n",
-                                                  i,(float)ref[i],(float)out[i]); bad++; }
+            double peak = 0;
+            for (size_t i = 0; i < out_n; i++)
+                if (fabs((float)ref[i]) > peak) peak = fabs((float)ref[i]);
+            if (!(peak < 2048.0)) {
+                printf("  max|ref| = %.0f is not below 2048, so fp16 is not exact here and the "
+                       "fill range is wrong for this shape (FAIL)\n", peak);
+                fail = 1;
             }
-            printf("  %s: max_abs=%.3f -> %s\n",
-                   tag, max_abs, max_abs <= 1.0 ? "PASS" : "FAIL");
-            if (max_abs > 1.0) fail = 1;
+            long bad = tf_cmp_f16(fd >= 0 ? "  HW end-to-end" : "  CPU-tiled decomp",
+                                  out, ref, dims, 3);
+            printf("  %s: %ld of %zu elements differ, max|ref| %.0f -> %s\n",
+                   tag, bad, out_n, peak, bad ? "FAIL" : "PASS");
+            if (bad) fail = 1;
         }
     }
 
@@ -253,6 +278,11 @@ int main(int argc, char **argv)
         printf("no shape reached a numeric check — every case was refused or "
                "skipped; this gate proved nothing\n");
         fail = 1;
+    }
+    if (fd < 0 && !fail) {
+        /* The host checks passed, but the device path never ran, so this is not a pass. */
+        printf("no NPU: the host checks passed and the device path never ran -> SKIP\n");
+        return 2;
     }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;

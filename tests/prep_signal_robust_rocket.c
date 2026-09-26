@@ -40,6 +40,7 @@
 
 #include "rocket_npu.h"
 #include "npu_matmul.h"
+#include "test_fill.h"
 
 /* ---- signal plumbing ---------------------------------------------------- */
 static volatile sig_atomic_t g_sig_count = 0;
@@ -207,6 +208,10 @@ int main(int argc, char **argv)
     int a_waitfail = 0, a_corrupt = 0;
     atomic_store(&g_spam_on, 1);
     for (int i = 0; i < iters; i++) {
+        /* Re-stamp every iteration: the job computes the same bytes each time, so without a
+         * fresh sentinel a wait that returned before the job wrote would read the previous
+         * iteration's correct output and pass the check. */
+        tf_sentinel_bo_f16(g_fd, &g_output);
         int s = submit_once();
         if (s != 0) { fprintf(stderr, "submit failed: %d (%s)\n", s, strerror(-s)); a_waitfail++; continue; }
         int rc = rocket_bo_prep(g_fd, &g_output, 0, 2000000000LL);   /* 2 s */
@@ -222,6 +227,7 @@ int main(int argc, char **argv)
     int b_instant = 0, b_corrupt = 0;
     int64_t dt_min = INT64_MAX, dt_max = 0, dt_sum = 0;
     for (int i = 0; i < iters; i++) {
+        tf_sentinel_bo_f16(g_fd, &g_output);   /* as in phase A */
         int s = submit_once();
         if (s != 0) { fprintf(stderr, "submit failed: %d (%s)\n", s, strerror(-s)); b_instant++; continue; }
         int64_t t0 = now_ns();

@@ -22,6 +22,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static double now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     return ts.tv_sec*1000.0 + ts.tv_nsec/1e6; }
@@ -47,47 +48,50 @@ int main(int argc, char **argv)
      * bytes that already matched and the gate saw nothing. It missed a live one: CBUF
      * operand reuse crossing a job boundary, which corrupts a 128-column tile with
      * plausible values. Vary the data along both axes and the same mixup is loud. */
-    { uint32_t st = 0x9e3779b9u;
-      #define MT_NEXT() (st = st*1664525u + 1013904223u, (float)((st>>8)&0xffff)/65535.f)
-      for (size_t i=0;i<(size_t)M*K;i++) A[i]=(_Float16)((MT_NEXT()*2.f-1.f)*0.35f);
-      for (size_t i=0;i<(size_t)N*K;i++) B[i]=(_Float16)((MT_NEXT()*2.f-1.f)*0.35f);
-      #undef MT_NEXT
-    }
+    /* And INTEGER-valued (tests/test_fill.h): in [-1,1] every partial and final sum is
+     * an exact fp16 integer at these K, so the check below is exact. With fractional
+     * inputs the bar had to allow fp16 rounding, and at 0.5 absolute AND 5% relative it
+     * let a dropped k, about 0.04 against sums near 2.5, through every time. */
+    tf_fill_f16_int(A, (size_t)M*K, 0x3A7A11ull, -1, 1);
+    tf_fill_f16_int(B, (size_t)N*K, 0x3A7A12ull, -1, 1);
 
     /* CPU reference — ALL M rows. Tile-boundary / tail-row corruption (the bug class
      * the multicore fan-out is most likely to hit) lives in the LAST rows, so a
      * first-64-row spot-check would silently miss it. Computed once (one O(M*N*K)
      * pass, comparable to a single NPU run). */
+    double peak = 0;
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){
         float a=0; for (int k=0;k<K;k++) a+=(float)A[(size_t)m*K+k]*(float)B[(size_t)n*K+k];
         ref[(size_t)m*N+n]=a;
+        if (fabs(a) > peak) peak = fabs(a);
     }
+    _Float16 *want = malloc((size_t)M*N*sizeof(_Float16));
+    if (!want) { fprintf(stderr, "host alloc failed\n"); return 1; }
+    for (size_t i=0;i<(size_t)M*N;i++) want[i]=(_Float16)ref[i];
+    if (!(peak < 2048.0)) {
+        printf("max|ref| = %.0f is not below 2048, so fp16 is not exact here (FAIL)\n", peak);
+        return 1;
+    }
+    const int dims[2] = { M, N };
 
     double gflop = 2.0*M*N*K/1e9;
     double base = 0;
     int fails = 0;
     for (int T=1; T<=4; T++) {
-        for (size_t i=0;i<(size_t)M*N;i++) C[i]=(_Float16)-99.0f;
+        tf_sentinel_f16(C, (size_t)M*N);
         double t0 = now_ms();
         int r = rocket_matmul_fp16_mt(M,K,N,A,B,C,T);
         double dt = now_ms()-t0;
         if (r) { fprintf(stderr,"T=%d: matmul failed (%d)\n",T,r); return 1; }
 
-        /* An element is bad only if wrong in BOTH abs AND rel (large abs alone =
-         * fp16 rounding on a big value; large rel alone = near-zero reference). */
-        float max_abs=0, max_rel=0; long nbad=0;
-        for (int m=0;m<M;m++) for (int n=0;n<N;n++){
-            float got=(float)C[(size_t)m*N+n], want=ref[(size_t)m*N+n];
-            float ad=fabsf(got-want), rd=ad/(fabsf(want)+1e-6f);
-            if (ad>max_abs) max_abs=ad;
-            if (rd>max_rel) max_rel=rd;
-            if (ad>0.5f && rd>0.05f) nbad++;
-        }
+        /* exact: the integer inputs make every correct element an exact fp16 integer */
+        char tag[16]; snprintf(tag, sizeof tag, "  T=%d", T);
+        long nbad = tf_cmp_f16(tag, C, want, dims, 2);
         int t_fail = (nbad!=0);
         if (t_fail) fails++;
         if (T==1) base=dt;
-        printf("T=%d: %7.1f ms  %6.2f GFLOP/s  %.2fx  verify max_abs=%.3f max_rel=%.4f nbad=%ld -> %s\n",
-               T, dt, gflop/(dt/1000.0), base/dt, max_abs, max_rel, nbad,
+        printf("T=%d: %7.1f ms  %6.2f GFLOP/s  %.2fx  verify %ld of %zu differ (max|ref| %.0f) -> %s\n",
+               T, dt, gflop/(dt/1000.0), base/dt, nbad, (size_t)M*N, peak,
                t_fail?"FAIL":"PASS");
     }
     /* DETERMINISM at the widest fan-out. The reference check above is a one-shot, and
@@ -100,7 +104,7 @@ int main(int argc, char **argv)
         _Float16 *first = malloc((size_t)M*N*sizeof(_Float16));
         int moved = 0;
         for (int r = 0; r < REPS && first; r++) {
-            for (size_t i=0;i<(size_t)M*N;i++) C[i]=(_Float16)-99.0f;
+            tf_sentinel_f16(C, (size_t)M*N);
             if (rocket_matmul_fp16_mt(M,K,N,A,B,C,T)) { fprintf(stderr,"rep %d failed\n",r); fails++; break; }
             if (r == 0) memcpy(first, C, (size_t)M*N*sizeof(_Float16));
             else if (memcmp(first, C, (size_t)M*N*sizeof(_Float16)) != 0) moved++;
@@ -111,6 +115,6 @@ int main(int argc, char **argv)
         free(first);
     }
 
-    free(A); free(B); free(C); free(ref);
+    free(A); free(B); free(C); free(ref); free(want);
     return fails ? 1 : 0;
 }

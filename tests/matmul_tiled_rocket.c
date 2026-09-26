@@ -22,6 +22,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static int64_t now_us(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -29,7 +30,8 @@ static int64_t now_us(void) {
 }
 
 int main(int argc, char **argv) {
-    int M = 128, K = 1024, N = 1024;
+    /* K != N: with K == N a field that swapped the two would compute a plausible surface */
+    int M = 128, K = 1024, N = 768;
     if (argc == 4) { M = atoi(argv[1]); K = atoi(argv[2]); N = atoi(argv[3]); }
     else if (argc != 1) { printf("usage: %s [M K N]\n", argv[0]); return -1; }
 
@@ -50,10 +52,13 @@ int main(int argc, char **argv) {
     float    *R = malloc((size_t)M * N * sizeof(float));   /* reference */
     if (!A || !B || !C || !R) { fprintf(stderr, "host alloc failed\n"); return -1; }
 
-    /* Small integer inputs keep results inside fp16 range even for large K. */
-    srand(1234);
-    for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (_Float16)(rand() % 3);
-    for (size_t i = 0; i < (size_t)N * K; i++) B[i] = (_Float16)(rand() % 3);
+    /* Signed small integers (tests/test_fill.h): every partial and final sum stays an
+     * exact fp16 integer well below 2048, so the check below is exact. The old rand()%3
+     * was non-negative, which put every output near K (about 1024 here), and its bar let
+     * an element pass unless it was off by more than 1.0 AND 2%, so a dropped k (at most
+     * 4) always passed. */
+    tf_fill_f16_int(A, (size_t)M * K, 0x7A11EDAull, -2, 2);
+    tf_fill_f16_int(B, (size_t)N * K, 0x7A11EDBull, -2, 2);
 
     int verify_fail = 0;
     int fd = rocket_open();
@@ -61,12 +66,12 @@ int main(int argc, char **argv) {
      * like a hard failure, so this gate skips cleanly off-device. */
     if (fd < 0) { printf("no NPU (%d) -> SKIP\n", fd); free(A); free(B); free(C); free(R); return 2; }
 
-    memset(C, 0, (size_t)M * N * sizeof(_Float16));
+    tf_sentinel_f16(C, (size_t)M * N);
     int64_t t0 = now_us();
     int ret = rocket_matmul_fp16(fd, M, K, N, A, B, C);
     int64_t us = now_us() - t0;
     rocket_close(fd);
-    if (ret) { fprintf(stderr, "rocket_matmul_fp16 = %d\n", ret); goto out; }
+    if (ret) { fprintf(stderr, "rocket_matmul_fp16 = %d\n", ret); verify_fail = 1; goto out; }
 
     double secs = us / 1e6;
     double gflop = 2.0 * M * K * N / 1e9;
@@ -81,30 +86,26 @@ int main(int argc, char **argv) {
             R[(size_t)m*N+n] = s;
         }
 
-    /* Compare. An element counts as bad only when it is wrong in BOTH absolute AND
-     * relative terms — large abs alone is just big-magnitude fp16 rounding, large rel
-     * alone is a near-zero reference. The integer inputs make a correct result
-     * fp16-exact, so a genuinely-bad element (layout/scatter corruption) is off by a
-     * lot in both. PASS requires zero bad elements; the OLD "max_rel<=0.02 OR
-     * max_abs<=1.0" could pass garbage if it stayed small in one metric. */
-    double max_abs = 0, max_rel = 0; long nbad = 0; int shown = 0;
-    for (size_t i = 0; i < (size_t)M * N; i++) {
-        float got = (float)C[i], exp = (float)(_Float16)R[i];
-        double ad = fabs(got - exp);
-        double rd = ad / (fabs(exp) + 1e-6);
-        if (ad > max_abs) max_abs = ad;
-        if (rd > max_rel) max_rel = rd;
-        if (rd > 0.02 && ad > 1.0) {
-            nbad++;
-            if (shown < 8) { printf("  mismatch [%zu] exp=%.1f got=%.1f\n", i, exp, got); shown++; }
+    /* Compare exactly: the integer inputs make every correct element an exact fp16
+     * integer, so any difference is a defect. */
+    {
+        _Float16 *want = malloc((size_t)M * N * sizeof(_Float16));
+        if (!want) { fprintf(stderr, "host alloc failed\n"); verify_fail = 1; goto out; }
+        double peak = 0;
+        for (size_t i = 0; i < (size_t)M * N; i++) {
+            want[i] = (_Float16)R[i];
+            if (fabs(R[i]) > peak) peak = fabs(R[i]);
         }
+        const int dims[2] = { M, N };
+        long nbad = tf_cmp_f16("verify", C, want, dims, 2);
+        verify_fail = (nbad != 0) || !(peak < 2048.0);
+        printf("verify: %ld of %zu elements differ, max|ref| %.0f -> %s\n", nbad,
+               (size_t)M * N, peak, verify_fail ? "FAIL" : "PASS");
+        free(want);
     }
-    verify_fail = (nbad != 0);
-    printf("verify: max_abs=%.3f max_rel=%.4f nbad=%ld -> %s\n",
-           max_abs, max_rel, nbad, verify_fail ? "FAIL" : "PASS");
 
 out:
     free(A); free(B); free(C); free(R);
-    /* exit nonzero on EITHER an NPU error (ret) OR a numeric verification failure */
-    return ret ? ret : (verify_fail ? 1 : 0);
+    /* exit 1 on EITHER an NPU error OR a numeric verification failure */
+    return verify_fail ? 1 : 0;
 }

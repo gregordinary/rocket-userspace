@@ -9,6 +9,7 @@
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "rocket_attn.h"
 #include "rocket_npu.h"       /* rocket_open / rocket_close (the mt worker fds)  */
@@ -36,6 +37,93 @@ static void host_softmax_rows(int M, int N, const _Float16 *in, _Float16 *out){
         float s = 0.f; for (int n=0;n<N;n++){ float e=expf((float)xp[n]-mx); op[n]=(_Float16)e; s+=e; }
         float inv = s>0.f ? 1.f/s : 0.f; for (int n=0;n<N;n++) op[n]=(_Float16)((float)op[n]*inv);
     }
+}
+
+/* ############################################################################
+ * ROCKET_FA_PROFILE — where the flash-attention head range's time goes
+ * ##########################################################################*/
+/* The frontend's own bracket around rocket_flash_attn_fp16* is a CRITICAL-PATH
+ * interval: the handler runs on the dispatch thread while the caller's scheduler
+ * waits, so that bracket is wall. It cannot say what is INSIDE it, and the answer
+ * decides whether a host-side lever (a vectorised exp, say) has anything to buy.
+ * ROCKET_FA_PROFILE=1 splits one head range into six buckets and prints one
+ * summary line at exit.
+ *
+ * HOW TO READ IT, AND HOW NOT TO. The buckets are clock_gettime intervals taken on
+ * WORKER threads, and a range runs on each of the caller's worker fds at once, so
+ * THE SUMS ARE NOT A SHARE OF ANYTHING -- they are a sum over concurrent threads
+ * and exceed the wall by roughly the worker count. What is comparable to the
+ * caller's bracket is `max-range`, the largest single range total, because the
+ * dispatch thread waits for the slowest worker. So the usable quantity is a RATIO
+ * inside one range -- softmax / max-range, say -- applied to the wall the caller
+ * measured. Never add a bucket to a wall, and never quote a bucket as a percentage
+ * of one.
+ *
+ * TWO lines are printed and the SECOND is the one to divide. The first carries the
+ * bucket sums; the second carries the max range's OWN buckets, which is what the
+ * ratio above actually asks for. Dividing a summed bucket by a summed total answers
+ * a different question -- it weights every range equally and assumes descheduling
+ * inflated each bucket alike -- so it is a cross-check on the second line, not a
+ * substitute for it. Where they disagree, the max-range line is the claim.
+ *
+ * A bucket also counts time the thread spent descheduled: at the default five
+ * workers on four A76s two workers already share a core, and the frontend's own
+ * threads are on those cores too. That makes every bucket an upper bound on its
+ * term, which is enough to CLOSE a lever and not enough to size one. */
+static _Atomic int g_fa_prof = -1;
+static int fa_prof_on(void) {
+    if (g_fa_prof < 0) g_fa_prof = getenv("ROCKET_FA_PROFILE") != NULL;
+    return g_fa_prof;
+}
+typedef struct { double gather, qk, mask, softmax, av, scatter; } fa_prof;
+static double fa_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+/* p != NULL only when the knob is set, so an unprofiled build reads one pointer. */
+#define FA_T0(p) ((p) ? fa_now_ms() : 0.0)
+#define FA_ACC(p, field, t0) do { if (p) (p)->field += fa_now_ms() - (t0); } while (0)
+
+static pthread_mutex_t g_fa_prof_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { fa_prof sum; fa_prof max; double max_range; long ranges; } g_fa_prof_acc;
+static int g_fa_prof_armed = 0;
+static void fa_prof_dump(void) {
+    const fa_prof *a = &g_fa_prof_acc.sum;
+    const double dev  = a->qk + a->av;
+    const double host = a->gather + a->mask + a->softmax + a->scatter;
+    const fa_prof *x = &g_fa_prof_acc.max;
+    ROCKET_LOGI("ROCKET FA profile total(ms): gather=%.0f qk=%.0f mask=%.0f softmax=%.0f "
+                "av=%.0f scatter=%.0f  device=%.0f host=%.0f  max-range=%.0f  over %ld ranges "
+                "(worker-thread intervals summed over CONCURRENT workers: read ratios within "
+                "max-range, never as a share of the wall)\n",
+                a->gather, a->qk, a->mask, a->softmax, a->av, a->scatter, dev, host,
+                g_fa_prof_acc.max_range, g_fa_prof_acc.ranges);
+    /* The max range's own buckets. This is the line to divide: every term here was
+     * measured on ONE thread over ONE interval, so a share of max-range is a share of a
+     * real interval, and the dispatch thread waited for exactly this range. */
+    ROCKET_LOGI("ROCKET FA profile max-range(ms): gather=%.1f qk=%.1f mask=%.1f softmax=%.1f "
+                "av=%.1f scatter=%.1f  total=%.1f\n",
+                x->gather, x->qk, x->mask, x->softmax, x->av, x->scatter,
+                g_fa_prof_acc.max_range);
+}
+static void fa_prof_merge(const fa_prof *p) {
+    if (!p) return;
+    const double tot = p->gather + p->qk + p->mask + p->softmax + p->av + p->scatter;
+    pthread_mutex_lock(&g_fa_prof_mu);
+    if (!g_fa_prof_armed) { atexit(fa_prof_dump); g_fa_prof_armed = 1; }
+    g_fa_prof_acc.sum.gather  += p->gather;
+    g_fa_prof_acc.sum.qk      += p->qk;
+    g_fa_prof_acc.sum.mask    += p->mask;
+    g_fa_prof_acc.sum.softmax += p->softmax;
+    g_fa_prof_acc.sum.av      += p->av;
+    g_fa_prof_acc.sum.scatter += p->scatter;
+    /* Keep the max range's OWN buckets, not just its total: the ratio this instrument
+     * exists to produce is a bucket's share INSIDE one range, and the sums are over
+     * concurrent workers, so sum/sum answers a different question when the buckets are
+     * unevenly inflated by descheduling. Both are printed; they should agree. */
+    if (tot > g_fa_prof_acc.max_range) { g_fa_prof_acc.max_range = tot; g_fa_prof_acc.max = *p; }
+    g_fa_prof_acc.ranges++;
+    pthread_mutex_unlock(&g_fa_prof_mu);
 }
 
 /* ---- CPU fp64 reference (the golden oracle) ----------------------------------- */
@@ -514,7 +602,8 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
                                   int n_head, int n_kv_heads, float scale, float softcap,
                                   const _Float16 *Q, const _Float16 *K, const _Float16 *V,
                                   const _Float16 *mask, _Float16 *out,
-                                  fa_scratch *s, int h0, int h1, int host_sm, int Gmax)
+                                  fa_scratch *s, int h0, int h1, int host_sm, int Gmax,
+                                  fa_prof *pf)
 {
     const int gqa = n_head / n_kv_heads, dh = head_dim;
     const int Tp = (n_tokens + 3) & ~3, Kn = (n_kv + 31) & ~31;
@@ -534,38 +623,52 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
         const int G = (h1 - gh < Gmax) ? (h1 - gh) : Gmax;
 
         /* gather the group's QK operands; sc[g] receives qh[g]·kh[g]^T */
+        double t0 = FA_T0(pf);
         for (int g = 0; g < G; g++) {
             const int h = gh + g, hk = h / gqa;
             fa_gather_q(qh + (size_t)g * qd, Q + (size_t)h  * n_tokens * dh, n_tokens, Tp, dh);
             fa_gather_k(kh + (size_t)g * kd, K + (size_t)hk * n_kv     * dh, n_kv, Kn, dh);
             pA[g] = qh + (size_t)g * qd; pB[g] = kh + (size_t)g * kd; pC[g] = sc + (size_t)g * tk;
         }
+        FA_ACC(pf, gather, t0);
+        t0 = FA_T0(pf);
         rc = s->qk ? rocket_mm_batch_run(s->qk, Tp, dh, Kn, G, pA, pB, pC)
                    : rocket_matmul_fp16_batch(fd, Tp, dh, Kn, G, pA, pB, pC);
+        FA_ACC(pf, qk, t0);
         if (rc) break;
 
         /* per head: scale+mask -> softmax -> gather V; P[g],vh[g] feed the batched AV */
         for (int g = 0; g < G; g++) {
             const int h = gh + g, hk = h / gqa;
             _Float16 *scg = sc + (size_t)g * tk, *Pg = P + (size_t)g * tk;
+            t0 = FA_T0(pf);
             fa_mask_scores(scg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+            FA_ACC(pf, mask, t0);
+            t0 = FA_T0(pf);
             if (host_sm) host_softmax_rows(Tp, Kn, scg, Pg);
-            else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, scg, Pg)) != 0) break;
+            else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, scg, Pg)) != 0) { FA_ACC(pf, softmax, t0); break; }
+            FA_ACC(pf, softmax, t0);
+            t0 = FA_T0(pf);
             fa_gather_v(vh + (size_t)g * kd, V + (size_t)hk * dh * n_kv, n_kv, Kn, dh);
+            FA_ACC(pf, gather, t0);
             pA[g] = Pg; pB[g] = vh + (size_t)g * kd; pC[g] = cx + (size_t)g * qd;
         }
         if (rc) break;
+        t0 = FA_T0(pf);
         rc = s->av ? rocket_mm_batch_run(s->av, Tp, Kn, dh, G, pA, pB, pC)
                    : rocket_matmul_fp16_batch(fd, Tp, Kn, dh, G, pA, pB, pC);
+        FA_ACC(pf, av, t0);
         if (rc) break;
 
         /* scatter each head's ctx into its output slice */
+        t0 = FA_T0(pf);
         for (int g = 0; g < G; g++) {
             _Float16 *Oh = out + (size_t)(gh + g) * n_tokens * dh;
             const _Float16 *cg = cx + (size_t)g * qd;
             for (int t = 0; t < n_tokens; t++)
                 memcpy(Oh + (size_t)t * dh, cg + (size_t)t * dh, dh * sizeof(_Float16));
         }
+        FA_ACC(pf, scatter, t0);
     }
     return rc;
 }
@@ -589,7 +692,7 @@ static int fa_heads_range_tiled(int fd, int n_tokens, int n_kv, int head_dim,
                                 int n_head, int n_kv_heads, float scale, float softcap,
                                 const _Float16 *Q, const _Float16 *K, const _Float16 *V,
                                 const _Float16 *mask, _Float16 *out,
-                                fa_scratch *s, int h0, int h1, int Kbp)
+                                fa_scratch *s, int h0, int h1, int Kbp, fa_prof *pf)
 {
     const int gqa = n_head / n_kv_heads, dh = head_dim;
     const int Tp  = (n_tokens + 3) & ~3;
@@ -603,22 +706,32 @@ static int fa_heads_range_tiled(int fd, int n_tokens, int n_kv, int head_dim,
         const _Float16 *Kh = K + (size_t)hk * n_kv     * dh;   /* [n_kv,dh]     */
         const _Float16 *Vh = V + (size_t)hk * dh       * n_kv; /* [dh,n_kv]     */
 
+        double t0 = FA_T0(pf);
         fa_gather_q(qh, Qh, n_tokens, Tp, dh);
         for (int i = 0; i < Tp; i++) { m[i] = -INFINITY; l[i] = 0.0f; }
         memset(acc, 0, (size_t)Tp * dh * sizeof(float));
+        FA_ACC(pf, gather, t0);
 
         for (int j0 = 0; j0 < n_kv; j0 += Kbp) {
             const int w  = (n_kv - j0 < Kbp) ? (n_kv - j0) : Kbp;  /* real keys this tile */
             const int wp = (w + 31) & ~31;                         /* matmul N/K %32      */
 
+            t0 = FA_T0(pf);
             fa_gather_k(kh, Kh + (size_t)j0 * dh, w, wp, dh);
             fa_gather_v_tile(vh, Vh, j0, w, wp, dh, n_kv);
+            FA_ACC(pf, gather, t0);
 
             /* tile scores sc[Tp,wp] = qh·kh^T  (M=Tp,K=dh,N=wp) */
-            if ((rc = rocket_matmul_fp16(fd, Tp, dh, wp, qh, kh, sc)) != 0) return rc;
+            t0 = FA_T0(pf);
+            rc = rocket_matmul_fp16(fd, Tp, dh, wp, qh, kh, sc);
+            FA_ACC(pf, qk, t0);
+            if (rc != 0) return rc;
+            t0 = FA_T0(pf);
             fa_mask_scores_tile(sc, mask, n_tokens, n_kv, j0, w, Tp, wp, scale, softcap);
+            FA_ACC(pf, mask, t0);
 
             /* fold the tile into the running softmax -> P[Tp,wp] (fp16, feeds the AV matmul) */
+            t0 = FA_T0(pf);
             for (int i = 0; i < Tp; i++) {
                 const _Float16 *sr = sc + (size_t)i * wp;
                 _Float16 *pr = P + (size_t)i * wp;
@@ -636,22 +749,33 @@ static int fa_heads_range_tiled(int fd, int n_tokens, int n_kv, int head_dim,
                 if (corr != 1.0f) { float *ar = acc + (size_t)i * dh; for (int c = 0; c < dh; c++) ar[c] *= corr; }
                 m[i] = mnew;
             }
+            FA_ACC(pf, softmax, t0);
 
             /* running output += P_tile·V_tile  (M=Tp,K=wp,N=dh); B=vh[dh,wp] */
-            if ((rc = rocket_matmul_fp16(fd, Tp, wp, dh, P, vh, pv)) != 0) return rc;
+            t0 = FA_T0(pf);
+            rc = rocket_matmul_fp16(fd, Tp, wp, dh, P, vh, pv);
+            FA_ACC(pf, av, t0);
+            if (rc != 0) return rc;
+            /* The running-output accumulate is the tiled path's own scatter: it folds a
+             * tile's P·V into acc, which is what the materialized path does with a memcpy
+             * once per head. Charged to scatter so the two paths' buckets mean the same. */
+            t0 = FA_T0(pf);
             for (int i = 0; i < Tp; i++) {
                 float *ar = acc + (size_t)i * dh; const _Float16 *pr = pv + (size_t)i * dh;
                 for (int c = 0; c < dh; c++) ar[c] += (float)pr[c];
             }
+            FA_ACC(pf, scatter, t0);
         }
 
         /* finalize out_h = acc / l (rows with no visible key -> l==0 -> 0) */
+        t0 = FA_T0(pf);
         _Float16 *Oh = out + (size_t)h * n_tokens * dh;
         for (int t = 0; t < n_tokens; t++) {
             float inv = l[t] > 0.0f ? 1.0f / l[t] : 0.0f;
             const float *ar = acc + (size_t)t * dh; _Float16 *orow = Oh + (size_t)t * dh;
             for (int c = 0; c < dh; c++) orow[c] = (_Float16)(ar[c] * inv);
         }
+        FA_ACC(pf, scatter, t0);
     }
     return 0;
 }
@@ -685,10 +809,19 @@ static int fa_heads_range(int fd, int n_tokens, int n_kv, int head_dim, int dv,
      * Checked FIRST — it owns the scratch sizing above (sc/kh/vh sized to one Kbp tile, not
      * Kn), so the chained-batch path below (which would grow its own Kn-wide group buffers)
      * must not run here. fa_tile_kv_width matches fa_scratch_ensure's decision exactly. */
+    /* One fa_prof per RANGE, merged once on the way out, so the accumulator's mutex is
+     * taken once per worker call and never inside a head loop. NULL when the knob is
+     * unset, which is what makes every timer a null pointer test. */
+    fa_prof prof = {0};
+    fa_prof *pf = fa_prof_on() ? &prof : NULL;
+
     const int Kbp = mla ? 0 : fa_tile_kv_width(Kn);
-    if (Kbp)
-        return fa_heads_range_tiled(fd, n_tokens, n_kv, head_dim, n_head, n_kv_heads,
-                                    scale, softcap, Q, K, V, mask, out, s, h0, h1, Kbp);
+    if (Kbp) {
+        rc = fa_heads_range_tiled(fd, n_tokens, n_kv, head_dim, n_head, n_kv_heads,
+                                  scale, softcap, Q, K, V, mask, out, s, h0, h1, Kbp, pf);
+        fa_prof_merge(pf);
+        return rc;
+    }
 
     /* Dispatch a multi-head range to the chained-batch path when ROCKET_FA_CHAIN is on
      * and a group of >1 heads fits the score-matrix budget (Gmax>1) — collapsing the
@@ -710,12 +843,12 @@ static int fa_heads_range(int fd, int n_tokens, int n_kv, int head_dim, int dv,
          * unwritten are rewritten from h0, because every group writes only its own
          * output slices. */
         for (; Gmax > 1; Gmax /= 2) {
-            int rc = fa_heads_range_batched(fd, n_tokens, n_kv, head_dim, n_head, n_kv_heads,
-                                            scale, softcap, Q, K, V, mask, out, s, h0, h1,
-                                            host_sm, Gmax);
-            if (rc != ROCKET_E_NOMEM && rc != ROCKET_E_DEVICE) return rc;
+            int rcb = fa_heads_range_batched(fd, n_tokens, n_kv, head_dim, n_head, n_kv_heads,
+                                             scale, softcap, Q, K, V, mask, out, s, h0, h1,
+                                             host_sm, Gmax, pf);
+            if (rcb != ROCKET_E_NOMEM && rcb != ROCKET_E_DEVICE) { fa_prof_merge(pf); return rcb; }
             ROCKET_LOGW("rocket_flash_attn: a chained group of %d heads was refused (%d); "
-                        "retrying at %d\n", Gmax, rc, Gmax / 2);
+                        "retrying at %d\n", Gmax, rcb, Gmax / 2);
         }
         /* Gmax==1 chains nothing, so fall through to the per-head path. */
     }
@@ -727,27 +860,44 @@ static int fa_heads_range(int fd, int n_tokens, int n_kv, int head_dim, int dv,
         const _Float16 *Vh = V + (size_t)hk * dv       * n_kv;   /* [dv,n_kv]           */
 
         /* gather this head's operands into the padded matmul tiles */
+        double t0 = FA_T0(pf);
         fa_gather_q(qh, Qh, n_tokens, Tp, dh);
         fa_gather_k(kh, Kh, n_kv, Kn, dh);
         fa_gather_v(vh, Vh, n_kv, Kn, dv);
+        FA_ACC(pf, gather, t0);
 
         /* scores[Tp,Kn] = qh·kh^T  (M=Tp,K=dh,N=Kn) */
-        if ((rc = rocket_matmul_fp16(fd, Tp, dh, Kn, qh, kh, sc)) != 0) return rc;
+        t0 = FA_T0(pf);
+        rc = rocket_matmul_fp16(fd, Tp, dh, Kn, qh, kh, sc);
+        FA_ACC(pf, qk, t0);
+        if (rc != 0) { fa_prof_merge(pf); return rc; }
 
         /* scale + soft-cap + mask, in place; pad key columns -> -inf */
+        t0 = FA_T0(pf);
         fa_mask_scores(sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+        FA_ACC(pf, mask, t0);
 
         /* P = softmax(scores) over the Kn columns (pad columns -> ~0) */
+        t0 = FA_T0(pf);
         if (host_sm) host_softmax_rows(Tp, Kn, sc, P);
-        else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, sc, P)) != 0) return rc;
+        else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, sc, P)) != 0) {
+            FA_ACC(pf, softmax, t0); fa_prof_merge(pf); return rc;
+        }
+        FA_ACC(pf, softmax, t0);
 
         /* ctx[Tp,dv] = P·v_hk  (M=Tp,K=Kn,N=dv); B=vh[dv,Kn] so B[n=c][k=j]=V[c,j] */
-        if ((rc = rocket_matmul_fp16(fd, Tp, Kn, dv, P, vh, ctx)) != 0) return rc;
+        t0 = FA_T0(pf);
+        rc = rocket_matmul_fp16(fd, Tp, Kn, dv, P, vh, ctx);
+        FA_ACC(pf, av, t0);
+        if (rc != 0) { fa_prof_merge(pf); return rc; }
 
+        t0 = FA_T0(pf);
         _Float16 *Oh = out + (size_t)h * n_tokens * dv;
         for (int t = 0; t < n_tokens; t++) memcpy(Oh + (size_t)t * dv, ctx + (size_t)t * dv, dv * sizeof(_Float16));
+        FA_ACC(pf, scatter, t0);
     }
     (void)rc;
+    fa_prof_merge(pf);
     return 0;
 }
 

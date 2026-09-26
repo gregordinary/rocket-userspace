@@ -71,11 +71,11 @@ static inline uint32_t ppu_recip_kernel_fp16(int k)
  * regcmd into params->tasks and sets params->task_count. Returns 0, <0 on bad params
  * (e.g. dim/kernel field overflow). Single job (no spatial tiling).
  *
- * NPU FACT: the PPU has NO native int8 pooling precision (PROC_PRECISION=int8 reads the
- * cube as fp16 — HW-confirmed; the allbilly reference emits PROC_PRECISION=fp16 for every
- * pool, with no int8 example). int8/uint8 pooling routes through THIS fp16 path with an
- * int8<->fp16 cube boundary (rocket_pool_int8/_uint8) — MAX is bit-exact because int8 is
- * exact in fp16. */
+ * This generator emits the fp16 precision pair only. The PPU also pools natively in int8
+ * (PROC_PRECISION 0 + IN_PRECISION 1 over a C2=16 byte cube, with an integer Q16
+ * reciprocal and the integer pad fill) — measured bit-exact for MAX, MIN and AVG, but not
+ * plumbed here. int8/uint8 pooling routes through THIS fp16 path with an int8<->fp16 cube
+ * boundary (rocket_pool_int8/_uint8); MAX is bit-exact because int8 is exact in fp16. */
 int gen_pool_fp16(pool_params_t *params);
 
 

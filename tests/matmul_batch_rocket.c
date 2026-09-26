@@ -40,8 +40,10 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static int g_fail = 0;
+static unsigned g_round = 0;   /* one per test_batch_ctx call, mixed into its fill seeds */
 
 static void fill(_Float16 *v, size_t n, float amp, uint32_t seed)
 {
@@ -62,9 +64,9 @@ static int test_batch(int fd, int M, int K, int N, int nbatch)
     _Float16 *Bbuf = malloc((size_t)nbatch * bn * sizeof(_Float16));
     _Float16 *Gbuf = malloc((size_t)nbatch * cn * sizeof(_Float16));   /* batched   */
     _Float16 *Rbuf = malloc((size_t)nbatch * cn * sizeof(_Float16));   /* per-item  */
-    const _Float16 **A = malloc((size_t)nbatch * sizeof(*A));
-    const _Float16 **B = malloc((size_t)nbatch * sizeof(*B));
-    _Float16 **G = malloc((size_t)nbatch * sizeof(*G));
+    const _Float16 **A = calloc((size_t)nbatch, sizeof(*A));
+    const _Float16 **B = calloc((size_t)nbatch, sizeof(*B));
+    _Float16 **G = calloc((size_t)nbatch, sizeof(*G));
     if (!Abuf || !Bbuf || !Gbuf || !Rbuf || !A || !B || !G) {
         fprintf(stderr, "oom\n");
         free(Abuf); free(Bbuf); free(Gbuf); free(Rbuf); free(A); free(B); free(G);
@@ -80,6 +82,7 @@ static int test_batch(int fd, int M, int K, int N, int nbatch)
 
     /* oracle: each item through the validated one-shot path */
     int rc = 0;
+    tf_sentinel_f16(Gbuf, (size_t)nbatch * cn);
     for (int i = 0; i < nbatch && !rc; i++)
         rc = rocket_matmul_fp16(fd, M, K, N, A[i], B[i], Rbuf + (size_t)i * cn);
     if (rc) { printf("  per-item ref M=%d K=%d N=%d n=%d -> FAIL (%d)\n", M, K, N, nbatch, rc);
@@ -118,6 +121,9 @@ out_fail:
 static int test_batch_ctx(int fd, rocket_mm_batch *b, int M, int K, int N, int nbatch)
 {
     const size_t an = (size_t)M * K, bn = (size_t)N * K, cn = (size_t)M * N;
+    /* A repeat of a shape gets NEW operands. With the same ones, a context that reused
+     * the previous call's packed operands or its output would still read bit-exact. */
+    const uint32_t round = 7919u * ++g_round;
     _Float16 *Abuf = malloc((size_t)nbatch * an * sizeof(_Float16));
     _Float16 *Bbuf = malloc((size_t)nbatch * bn * sizeof(_Float16));
     _Float16 *Gbuf = malloc((size_t)nbatch * cn * sizeof(_Float16));   /* ctx batched */
@@ -131,13 +137,14 @@ static int test_batch_ctx(int fd, rocket_mm_batch *b, int M, int K, int N, int n
         return 1;
     }
     for (int i = 0; i < nbatch; i++) {
-        fill(Abuf + (size_t)i * an, an, 1.0f, (uint32_t)(M * 7 + K + i * 131 + N));
-        fill(Bbuf + (size_t)i * bn, bn, 1.0f, (uint32_t)(N * 5 + K + i * 977 + M));
+        fill(Abuf + (size_t)i * an, an, 1.0f, (uint32_t)(M * 7 + K + i * 131 + N) + round);
+        fill(Bbuf + (size_t)i * bn, bn, 1.0f, (uint32_t)(N * 5 + K + i * 977 + M) + round);
         A[i] = Abuf + (size_t)i * an;
         B[i] = Bbuf + (size_t)i * bn;
         G[i] = Gbuf + (size_t)i * cn;
     }
     int rc = 0;
+    tf_sentinel_f16(Gbuf, (size_t)nbatch * cn);
     for (int i = 0; i < nbatch && !rc; i++)
         rc = rocket_matmul_fp16(fd, M, K, N, A[i], B[i], Rbuf + (size_t)i * cn);
     if (!rc) rc = rocket_mm_batch_run(b, M, K, N, nbatch, A, B, G);

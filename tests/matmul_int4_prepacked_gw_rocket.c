@@ -25,6 +25,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static int8_t rand_i4(void)    { return (int8_t)(rand() % 15 - 7); }          /* [-7,7] */
 static float  rand_scale(void) { return 0.5f + (rand() % 1000) / 1000.0f; }   /* [0.5,1.5) */
@@ -141,9 +142,15 @@ int main(int argc, char **argv) {
     }
     /* reuse w0 — guards against scratch aliasing across calls */
     ref_gw(M, K, N, group, A, B[0], as, bs[0], ref);
-    if (!oneshot(M, K, N, A, B[0], as, bs[0], Co, group)) {
-        memset(Cr, 0, Csz*sizeof(float));
-        if (!rocket_matmul_int4_prepacked_gw(ctx, M, K, N, A, as, bs[0], Cr, rw[0])) {
+    /* An error on either call is a failure: skipping the comparison would pass a reuse
+     * path that cannot run at all. */
+    if (oneshot(M, K, N, A, B[0], as, bs[0], Co, group)) {
+        printf("  [reuse-w0] the one-shot oracle failed -> FAIL\n"); fails++;
+    } else {
+    for (size_t i_ = 0; i_ < Csz; i_++) Cr[i_] = NAN;   /* a skipped write never compares equal */
+        if (rocket_matmul_int4_prepacked_gw(ctx, M, K, N, A, as, bs[0], Cr, rw[0])) {
+            printf("  [reuse-w0] the resident call failed -> FAIL\n"); fails++;
+        } else {
             if (cmp_oneshot("reuse-w0", Cr, Co, Csz)) fails++;
             if (cmp_ref("reuse-w0", Cr, ref, Csz))    fails++;
         }

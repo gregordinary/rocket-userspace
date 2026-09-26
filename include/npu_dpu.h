@@ -143,6 +143,10 @@ typedef struct npu_dpu_desc {
   * question (tests/matmul_int8_dequant_rocket.c sweeps them). */
  uint8_t  out_cvt_minus_exp;  // 0x4088 bits[19:12]
  uint8_t  out_cvt_cvt_type;   // 0x4088 bit31
+ /* 0x4088 bit30, CVT_ROUND in Mesa's registers.xml: how the integer requant rounds an
+  * exact tie. 0 (every generator's value) rounds half to even. See
+  * npu_out_cvt_round_bit(). */
+ uint8_t  out_cvt_round;      // 0x4088 bit30
  uint16_t bn_mul_operand;     // 0x4068 DPU_BN_MUL_CFG[31:16]: fp16 per-tensor scale
                               // (NVDLA SDP X-mul "channel/per-pixel"); 0 + bn_mul_bypass
                               // keeps the BN stage off (byte-identical). The dequant-fold alt path uses this.
@@ -159,6 +163,12 @@ typedef struct npu_dpu_desc {
  uint8_t  lut_en;
  const lut_epilogue_t *lut_ep;
 } npu_dpu_desc;
+
+/* The OUT_CVT_SHIFT bit-30 word for an integer requant: `requested` (the descriptor's
+ * out_cvt_round) shifted into place, unless ROCKET_OUT_CVT_ROUND is set, which overrides
+ * it on every integer OUT_CVT_SHIFT write of both encoders. That knob exists for
+ * tests/requant_round_probe.c. The float-affine LUT writes leave the bit clear. */
+uint32_t npu_out_cvt_round_bit(unsigned requested);
 
 
 #ifdef __cplusplus

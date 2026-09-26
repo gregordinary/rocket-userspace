@@ -486,6 +486,11 @@ int main(int argc, char **argv)
                "skipped; this gate proved nothing\n");
         fail = 1;
     }
+    if (fd < 0 && !fail) {
+        /* The host checks passed, but the device path never ran, so this is not a pass. */
+        printf("no NPU: the host checks passed and the device path never ran -> SKIP\n");
+        return 2;
+    }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

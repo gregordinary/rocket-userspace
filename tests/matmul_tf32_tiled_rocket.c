@@ -35,6 +35,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static int64_t now_us(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -57,7 +58,9 @@ static inline float tf32rt(float f) {
 int main(int argc, char **argv) {
     if (argc != 4) { printf("usage: %s <M> <K> <N>  (try 512 3840 4096)\n", argv[0]); return -1; }
     int M = atoi(argv[1]), K = atoi(argv[2]), N = atoi(argv[3]);
-    const float tol     = (float)env_dbl("ROCKET_TF32_TOL", 2e-3);
+    /* 1e-5: the part measures ~9.1e-8 at 512x3840x4096, and one dropped K term reads
+     * ~3e-3, which the old 2e-3 let through. */
+    const float tol     = (float)env_dbl("ROCKET_TF32_TOL", 1e-5);
     const float mag     = (float)env_dbl("ROCKET_TF32_MAG", 10.0);
     const int   samples = env_int("ROCKET_TF32_SAMPLES", 8192);
 
@@ -82,14 +85,17 @@ int main(int argc, char **argv) {
     int ret = rocket_matmul_tf32(fd, M, K, N, A, B, C);
     double ms = (now_us() - t0) / 1000.0;
     rocket_close(fd);
-    if (ret) { fprintf(stderr, "rocket_matmul_tf32 failed (%d)\n", ret); free(A); free(B); free(C); return ret; }
+    if (ret) { fprintf(stderr, "rocket_matmul_tf32 failed (%d)\n", ret); free(A); free(B); free(C); return 1; }
     double gops = 2.0 * (double)M * N * K / (ms / 1000.0) / 1e9;
     printf("rocket_matmul_tf32 = 0  (%.2f ms, %.1f GOP/s)\n", ms, gops);
 
     /* sample-based verification: exact double dot product (tf32-rounded inputs) on
-     * demand. Errors normalized to the global output scale (max|ref| over sample). */
+     * demand. Errors normalized to the global output scale (max|ref| over sample). The
+     * stride is coprime to M*N, so the samples land on every column: MN/samples was 256
+     * at 512x4096 and put them all on 16 columns. */
     size_t MN = (size_t)M * N;
-    size_t stride = MN > (size_t)samples ? MN / (size_t)samples : 1;
+    size_t stride = MN > (size_t)samples
+                  ? (size_t)tf_coprime_stride((int)MN, (int)(MN / (size_t)samples)) : 1;
     int checked = 0, nonfin = 0, shown = 0;
     double max_abs = 0.0, max_ref = 0.0, max_rel = 0.0;
     for (size_t idx = 0; idx < MN; idx += stride) {

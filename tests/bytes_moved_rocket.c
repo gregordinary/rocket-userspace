@@ -74,7 +74,7 @@ int main(int argc, char **argv)
 {
     if (argc < 4) {
         fprintf(stderr, "usage: %s M K N [fp16|int8|int4|bf16|tf32] [--no-kacc] [--no-reuse] [--bw GBs]\n", argv[0]);
-        return 2;
+        return 1;   /* host arithmetic: nothing here can skip, so no exit 2 */
     }
     int M = atoi(argv[1]), K = atoi(argv[2]), N = atoi(argv[3]);
     const char *dt = (argc > 4 && argv[4][0] != '-') ? argv[4] : "fp16";
@@ -93,7 +93,7 @@ int main(int argc, char **argv)
     int njobs_plan = rocket_matmul_plan(M, K, N, &Mt, &Kt, &Nt);
     if (njobs_plan < 0 || Mt<=0 || Kt<=0 || Nt<=0) {
         fprintf(stderr, "rocket_matmul_plan rejected %dx%dx%d (need K%%32, N%%16, M%%4)\n", M, K, N);
-        return 2;
+        return 1;
     }
     int nMt = (M + Mt - 1) / Mt, nKt = (K + Kt - 1) / Kt, nNt = (N + Nt - 1) / Nt;
     long njobs = (long)nMt * nNt * nKt;

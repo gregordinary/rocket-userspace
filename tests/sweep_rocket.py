@@ -103,6 +103,8 @@ def driver_sweep(args):
             # baseline: no ROCKET_MM_* (the plan's own max-Kt choice)
             base, ok, _ = run_driver(bench, M, K, N, {}, args.timeout)
             def_gf = max((g for g, _ in base.values()), default=0.0)
+            if not ok:
+                print("  !! the DEFAULT configuration failed its own check: no gain below is real")
             best = (def_gf, "default", best_t(base))
             hdr = "  cfg".ljust(22) + "".join(f"  T{t}".rjust(9) for t in (1,2,3,4))
             print(hdr); print("  " + "-"*(len(hdr)-2))
@@ -117,7 +119,8 @@ def driver_sweep(args):
                         res, ok, _ = run_driver(bench, M, K, N, ov, args.timeout)
                         print(row(cfgname, res, flag="" if ok else " !FAIL"))
                         gf = max((g for g, _ in res.values()), default=0.0)
-                        if gf > best[0]:
+                        # a configuration whose output was wrong is never the best one
+                        if ok and gf > best[0]:
                             best = (gf, cfgname, best_t(res))
             gain = 100.0 * (best[0] - def_gf) / def_gf if def_gf else 0.0
             print(f"  -> best {best[1]} @ T{best[2]}: {best[0]:.1f} GFLOP/s "

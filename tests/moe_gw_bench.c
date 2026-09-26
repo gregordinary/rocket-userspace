@@ -28,6 +28,8 @@
  *   sudo -E ./moe_gw_bench
  *   for d in fdab0000 fdac0000 fdad0000; do echo auto | sudo tee /sys/devices/platform/$d.npu/power/control; done
  * Run 1 is always discarded (cold clock); the reported figure is the median of the rest.
+ * It checks each call's return code and never scores the output: correctness of the
+ * resident group-wise path is matmul_int8_prepacked_gw_rocket's, at this same shape.
  *
  * Usage: moe_gw_bench [M K N group [iters]]     (default 256 2880 2880 576, 7 iters)
  */

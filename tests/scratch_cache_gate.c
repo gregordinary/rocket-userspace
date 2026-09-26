@@ -49,7 +49,7 @@ static int verify(const char *what, const _Float16 *C, const _Float16 *A,
             float got = (float)C[(size_t)m * N + n];
             float ad = fabsf(got - a), rd = ad / (fabsf(a) + 1e-6f);
             if (rd > maxrel) maxrel = rd;
-            if (ad > 0.5f && rd > 0.05f) bad++;
+            if (!(ad <= 0.5f || rd <= 0.05f)) bad++;   /* a NaN sentinel counts */
         }
     }
     if (bad) printf("    FAIL %s: %d bad elements, max_rel=%.4f\n", what, bad, maxrel);
@@ -97,7 +97,7 @@ int main(int argc, char **argv)
     printf("sweeping %d distinct M against one resident weight (cache holds 32)\n", nshape);
     for (int i = 0; i < nshape; i++) {
         int M = 256 + 4 * i;
-        memset(C, 0, (size_t)M * N * sizeof(_Float16));
+        for (size_t j = 0; j < (size_t)M * N; j++) C[j] = (_Float16)NAN;   /* sentinel */
         int rc = rocket_matmul_fp16_prepacked(ctx, M, K, N, A, C, w);
         if (rc != 0) { printf("    FAIL: shape %d (M=%d) returned %d\n", i, M, rc); fails++; continue; }
         char tag[64]; snprintf(tag, sizeof tag, "shape %d M=%d", i, M);
@@ -105,10 +105,14 @@ int main(int argc, char **argv)
     }
     printf("  -> %s\n", fails ? "FAIL" : "PASS");
 
-    /* 3: the FIRST shape is now long evicted. Touching it must rebuild, not resurrect. */
-    printf("re-touching the evicted first shape (M=256)\n");
+    /* 3: the FIRST shape is now long evicted. Touching it must rebuild, not resurrect. The
+     * re-touch gets NEW activations: with the ones every earlier shape used, a resurrected
+     * scratch still holding shape 0's packed input or output would read back the right
+     * answer, and the check could not tell rebuilt from stale. */
+    printf("re-touching the evicted first shape (M=256) with new activations\n");
     int before = fails;
-    memset(C, 0, (size_t)256 * N * sizeof(_Float16));
+    fill(A, (size_t)256 * K, 3);
+    for (size_t i = 0; i < (size_t)256 * N; i++) C[i] = (_Float16)NAN;
     int rc = rocket_matmul_fp16_prepacked(ctx, 256, K, N, A, C, w);
     if (rc != 0) { printf("    FAIL: re-touch returned %d\n", rc); fails++; }
     else fails += verify("re-touched M=256", C, A, B, 256, K, N);
@@ -122,7 +126,7 @@ int main(int argc, char **argv)
     else {
         for (int i = 0; i < nshape; i++) {
             int M = 256 + 4 * i;
-            memset(C, 0, (size_t)M * N * sizeof(_Float16));
+            for (size_t j = 0; j < (size_t)M * N; j++) C[j] = (_Float16)NAN;   /* sentinel */
             if (rocket_matmul_fp16_stream(st, M, K, N, A, B, C) != 0) {
                 printf("    FAIL: stream shape %d (M=%d)\n", i, M); fails++; continue;
             }

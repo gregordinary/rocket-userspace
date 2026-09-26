@@ -50,7 +50,7 @@ int main(int argc, char **argv)
            W, M, N, M, K, N, K, kacc);
 
     int fd = rocket_open();
-    if (fd < 0) { fprintf(stderr, "rocket_open failed\n"); return 1; }
+    if (fd < 0) { fprintf(stderr, "rocket_open failed\n"); return 2; }
 
     mm_plan pl;
     if (mm_plan_init(&pl, M, K, N) < 0) { fprintf(stderr, "unsupported shape\n"); return 1; }
@@ -162,5 +162,5 @@ int main(int argc, char **argv)
     mm_bos_free(fd, &sc);
     free((void*)A); free(ref); free(Brow); free(C); free(C1);
     rocket_close(fd);
-    return (verify_fail || alias_fail) ? 2 : 0;
+    return (verify_fail || alias_fail) ? 1 : 0;   /* 2 is the skip code: never a FAIL */
 }

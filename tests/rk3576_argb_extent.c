@@ -222,6 +222,11 @@ int main(int argc, char **argv)
     const char *only = argc > 1 ? argv[1] : NULL;
     int in_zp = argc > 2 ? atoi(argv[2]) : 0;
     int fd, i, ran = 0, honoured = 0, denied = 0, bad_control = 0;
+    /* Every asymmetric cell selected has to RUN: the record is all eight honoured, so a
+     * refused one is a narrowed envelope and not a pass, and a run that skipped cells
+     * cannot be read as one that asked them. The symmetric cells score the packed arm too,
+     * which the asymmetric cells' controls only read in the interior. */
+    int asym_cells = 0, sym_bad = 0;
 
     if (strcmp(hw->name, "rk3576") != 0) {
         printf("rk3576_argb_extent: profile is %s, not rk3576 — skipping\n", hw->name);
@@ -242,6 +247,7 @@ int main(int argc, char **argv)
         rocket_conv2d_desc d = {0};
 
         if (only && !strstr(g->name, only)) continue;
+        asym_cells += asym;
         img = malloc((size_t)IC * g->ih * g->iw);
         W   = malloc((size_t)g->oc * IC * g->kh * g->kw);
         if (!img || !W) { free(img); free(W); break; }
@@ -290,6 +296,22 @@ int main(int argc, char **argv)
         }
 
         run_arm(fd, "packed", g, 0, img, W, in_zp, &packed);
+        if (!asym) {
+            int all = !packed.refused && packed.touched &&
+                      packed.exact[0] == packed.total[0] &&
+                      packed.exact[1] == packed.total[1] &&
+                      packed.exact[2] == packed.total[2] &&
+                      packed.exact[3] == packed.total[3];
+            if (!all) {
+                printf("      the packed path at a SYMMETRIC pad is %s\n",
+                       packed.refused ? "REFUSED" : "not exact");
+                sym_bad++;
+            }
+        } else if (packed.refused) {
+            denied++;
+            printf("      the packed path REFUSED an asymmetric extent the record has it "
+                   "honouring\n");
+        }
         if (asym && !packed.refused) {
             int all = packed.exact[0] == packed.total[0] &&
                       packed.exact[1] == packed.total[1] &&
@@ -318,8 +340,9 @@ int main(int argc, char **argv)
         free(img); free(W);
     }
 
-    printf("== %d asymmetric cells ran: %d honoured, %d not, %d controls failed ==\n",
-           ran, honoured, denied, bad_control);
+    printf("== %d of %d asymmetric cells ran: %d honoured, %d not, %d controls failed; "
+           "%d symmetric cell(s) wrong ==\n",
+           ran, asym_cells, honoured, denied, bad_control, sym_bad);
     rocket_close(fd);
-    return (denied || bad_control || !ran) ? 1 : 0;
+    return (denied || bad_control || sym_bad || !ran || ran != asym_cells) ? 1 : 0;
 }

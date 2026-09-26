@@ -21,6 +21,7 @@
 #include "rocket_npu.h"
 #include "rocket_ffn.h"
 #include "rocket_activation.h"   /* ROCKET_ACTIVATION_SILU / _GELU */
+#include "test_fill.h"
 
 static int g_fail = 0;
 
@@ -49,13 +50,16 @@ static int judge(const char *tag, const _Float16 *got, const _Float16 *ref, size
     for (size_t i = 0; i < n; i++) {
         double ad = fabs((double)got[i] - (double)ref[i]);
         if (ad > max_abs) max_abs = ad;
-        if (ad > 0.05 * maxv + 1e-3 && ad > 0.10 * (fabs((double)ref[i]) + 1e-3)) bad++;
+        /* the negation of "within bound", so a NaN (an element nothing wrote) counts */
+        if (!(ad <= 0.05 * maxv + 1e-3 || ad <= 0.10 * (fabs((double)ref[i]) + 1e-3))) bad++;
     }
-    /* COSINE is the pass criterion: for a multi-op fp16+LUT block, fp16 rounding + the ~1%
-     * SiLU LUT perturb magnitude but not direction; a layout/readback corruption collapses
-     * cosine (the broken standalone-GELU showed cos=0.05). max_abs/coarse_miss are reported
-     * for diagnostics — a nonzero tail is the SiLU LUT's large-|x| domain edge, not a block bug. */
-    int ok = (cos >= cos_bar);
+    /* COSINE catches a direction change: a layout/readback corruption collapses it (the
+     * broken standalone-GELU showed cos=0.05). It cannot see a few elements go missing:
+     * the n=65536 case leaves 8 of them in the activation's second tile, and those move a
+     * cosine over 65536 elements by almost nothing. So the per-element coarse miss count is
+     * a pass criterion too. It reads 0 on every case measured (2026-09-24, RK1), and the
+     * output starts as an fp16 NaN sentinel, so a missing element is a miss. */
+    int ok = (cos >= cos_bar) && (bad == 0);
     printf("  %s: cos=%.6f max_abs=%.4g coarse_miss=%d -> %s\n", tag, cos, max_abs, bad,
            ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
@@ -71,6 +75,7 @@ static int test_geglu(int fd, int kind, int n)
     fill(gate, n, 6.f, 11u + kind);     /* gate logits ~[-6,6] (SiLU's accurate band) */
     fill(up,   n, 2.5f, 99u + kind);
     rocket_geglu_ref_fp16(gate, up, kind, ref, n);
+    tf_sentinel_f16(got, (size_t)n);
     int rc = rocket_geglu_fp16(fd, gate, up, kind, got, n);
     char tag[64]; snprintf(tag, sizeof tag, "geglu %s n=%d",
                            kind==ROCKET_ACTIVATION_GELU?"gelu":"silu", n);
@@ -92,6 +97,7 @@ static int test_ffn(int fd, int M, int H, int I, int kind)
     fill(Wu, wI, 0.35f, 3u);  fill(Wd, wd, 0.35f, 4u);
 
     rocket_ffn_ref_fp16(M,H,I,x,Wg,Wu,Wd,kind,ref);
+    tf_sentinel_f16(got, oH);
     int rc = rocket_ffn_fp16(fd,M,H,I,x,Wg,Wu,Wd,kind,got);
     char tag[80]; snprintf(tag,sizeof tag,"ffn %s M=%d H=%d I=%d",
                            kind==ROCKET_ACTIVATION_GELU?"gelu":"silu",M,H,I);

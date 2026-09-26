@@ -27,11 +27,18 @@
  * not fail the ioctl that triggers it. A run can therefore pass every syscall and
  * still be the failing side of the A/B.
  *
- * GATE (registered in CTest): exit 0 = no BO-lifetime signature in the log,
- * 1 = one appeared, 2 = no NPU device, no program for this part, or the log is
- * unreadable (needs root to be a gate).
+ * THE PROGRAM IS THE PART'S OWN. Each part gets a job it runs to completion: a 1x1
+ * int8 conv on the RK3576 and a repeated fp16 matmul on the RK3588. This probe once
+ * built the RK3576 program on every part, and on the RK3588 each of its 64 submits
+ * hung a core until the kernel's watchdog retired it, so every ctest run there left
+ * 64 "NPU job timed out" lines and 64 core resets that were read as by design. Any
+ * such line in the window is now a failure, as is any rk_iommu line.
  *
- * Usage: sudo -E ./uapi_bo_lifetime_rocket [iterations]     (default 200)
+ * GATE (registered in CTest): exit 0 = no signature in the log, 1 = one appeared,
+ * 2 = no NPU device, no program for this part, or the kernel journal is unreadable
+ * (test_klog.h: the caller's own access, then sudo -n).
+ *
+ * Usage: ./uapi_bo_lifetime_rocket [iterations]     (default 64)
  */
 #define _GNU_SOURCE
 #include <stdint.h>
@@ -45,6 +52,7 @@
 #include "npu_matmul.h"
 #include "rocket_hw_profile.h"
 #include "npu_regcmd_rk3576.h"
+#include "test_klog.h"
 
 /* The strings a live BO-lifetime defect puts in the log.
  *
@@ -54,57 +62,67 @@
  * `WARNING: drivers/gpu/drm/drm_mm.c:965 at drm_mm_takedown+0x28/0x38` and the
  * "allocator still has nodes" wording does not appear at all, so a message-only
  * detector reads clean on a kernel where the defect is firing every iteration.
- * The rest catch the consequences once the allocator has been freed under it. */
+ * The rest catch the consequences once the allocator has been freed under it, and the
+ * last two catch a job this probe submitted that the part did not run: a hang the
+ * watchdog retired, or a fault in the NPU's IOMMU. */
 static const char *const SIGNATURES[] = {
     "drm_mm_takedown",
     "rocket_postclose",
     "rocket_gem_bo_free",
     "drm_gem_shmem_release",
+    "timed out",
+    "rk_iommu",
 };
 #define N_SIG ((int)(sizeof SIGNATURES / sizeof SIGNATURES[0]))
 
-static long dmesg_lines(void)
+/* The RK3588's job: a 64x64x64 fp16 matmul repeated over 64 tasks of one job, so it is
+ * still running when the file closes. The operands are left zeroed: what the race needs
+ * is a well-formed program this part runs, not an answer. Returns 1 if it submitted. */
+static int submit_rk3588(int fd, int *built)
 {
-    FILE *f = popen("dmesg 2>/dev/null | wc -l", "r");
-    long n = -1;
-    if (!f) return -1;
-    if (fscanf(f, "%ld", &n) != 1) n = -1;
-    pclose(f);
-    return n;
-}
+    enum { M = 64, K = 64, N = 64, NTASK = 64 };
+    rocket_bo in = {0}, wt = {0}, rc_bo = {0}, out = {0};
+    rocket_bo *all[] = { &in, &wt, &rc_bo, &out };
+    uint64_t ops[512] = {0};
+    rocket_task_desc tasks[NTASK];
+    unsigned i;
+    int submitted = 0;
 
-/* Read the log delta ONCE and count every signature in it.
- *
- * A live defect puts a full WARN backtrace in the ring buffer per iteration, so by the
- * time the probe reports, dmesg is large — and re-reading it once per signature turned
- * a two-second probe into a two-minute one. Counts land in `hits`, and up to
- * `keep` matching lines are copied out for the report. */
-static int dmesg_scan(long from, const char *const *sigs, int nsig, long *hits,
-                      char (*sample)[200], int keep, int *nsample)
-{
-    char cmd[128], line[1024];
-    FILE *f;
-    int i;
+    if (rocket_bo_alloc(fd, (size_t)M * K * sizeof(_Float16) + 4096, &in) ||
+        rocket_bo_alloc(fd, (size_t)N * K * sizeof(_Float16) + 4096, &wt) ||
+        rocket_bo_alloc(fd, sizeof ops, &rc_bo) ||
+        rocket_bo_alloc(fd, (size_t)M * N * sizeof(_Float16) + 4096, &out))
+        goto out;
 
-    snprintf(cmd, sizeof cmd, "dmesg 2>/dev/null | tail -n +%ld", from + 1);
-    f = popen(cmd, "r");
-    if (!f) return -1;
-    for (i = 0; i < nsig; i++) hits[i] = 0;
-    *nsample = 0;
-    while (fgets(line, sizeof line, f)) {
-        int matched = 0;
-        for (i = 0; i < nsig; i++)
-            if (strstr(line, sigs[i])) { hits[i]++; matched = 1; }
-        if (matched && *nsample < keep) {
-            size_t n = strcspn(line, "\n");
-            if (n >= sizeof sample[0]) n = sizeof sample[0] - 1;
-            memcpy(sample[*nsample], line, n);
-            sample[*nsample][n] = 0;
-            (*nsample)++;
+    {
+        matmul_params_t p = {
+            .m = M, .k = K, .n = N, .tasks = ops, .fp32tofp16 = 1,
+            .input_dma   = (uint32_t)in.dma_address,
+            .weights_dma = (uint32_t)wt.dma_address,
+            .output_dma  = (uint32_t)out.dma_address,
+        };
+        if (gen_matmul_fp16(&p) != 0 || p.task_count == 0) goto out;
+        *built = 1;
+
+        rocket_bo_prep(fd, &rc_bo, 1, 0);
+        memcpy(rc_bo.ptr, ops, p.task_count * sizeof(uint64_t));
+        rocket_bo_fini(fd, &rc_bo);
+
+        for (i = 0; i < NTASK; i++)
+            tasks[i] = (rocket_task_desc){ (uint32_t)rc_bo.dma_address, p.task_count };
+        {
+            uint32_t inh[] = { in.handle, wt.handle, rc_bo.handle };
+            uint32_t outh[] = { out.handle };
+            if (rocket_submit_tasks(fd, tasks, NTASK, inh, 3, outh, 1) == 0) submitted = 1;
         }
     }
-    pclose(f);
-    return 0;
+
+out:
+    /* As on the RK3576 below: free the handles and close while the job may still run. */
+    for (i = 0; i < sizeof all / sizeof all[0]; i++)
+        if (all[i]->handle) rocket_bo_free(fd, all[i]);
+    rocket_close(fd);
+    return submitted;
 }
 
 /* One fd's worth of the race: allocate, submit a program this part runs, and close
@@ -121,6 +139,8 @@ static int submit_and_close(int *built)
     const unsigned IC = 32, OC = 32, IW = 32, IH = 32;
 
     if (fd < 0) return 0;
+    if (strcmp(rocket_hw_current()->name, "rk3576") != 0)
+        return submit_rk3588(fd, built);
 
     if (rocket_bo_alloc(fd, (size_t)IC * IH * IW, &in) ||
         rocket_bo_alloc(fd, (size_t)OC * IC, &wt) ||
@@ -173,7 +193,7 @@ int main(int argc, char **argv)
     int built = 0, submitted = 0, i, bad = 0, nsample = 0;
     long hits[N_SIG];
     char sample[8][200];
-    long mark;
+    tk_mark mark;
 
     if (iters <= 0) iters = 64;
 
@@ -189,10 +209,9 @@ int main(int argc, char **argv)
     printf("  info : a BO referenced by an in-flight job must survive its file's\n"
            "         postclose, and its IOVA node must be removable afterwards\n");
 
-    mark = dmesg_lines();
-    if (mark < 0) {
-        printf("  info : dmesg unreadable — this probe's verdict IS the kernel log, so\n"
-               "         run it as root (skip)\n");
+    if (tk_mark_take(&mark) < 0) {
+        printf("  info : the kernel journal is unreadable, and this probe's verdict IS the\n"
+               "         kernel log: add the user to `adm`, or allow `sudo -n` (skip)\n");
         return 2;
     }
 
@@ -209,7 +228,7 @@ int main(int argc, char **argv)
     sleep(2);
 
     printf("  info : %d of %d iterations submitted a job\n", submitted, iters);
-    if (dmesg_scan(mark, SIGNATURES, N_SIG, hits, sample, 8, &nsample) < 0) {
+    if (tk_scan(&mark, SIGNATURES, N_SIG, hits, sample, 8, &nsample) < 0) {
         printf("  info : could not read the kernel log back (skip)\n");
         return 2;
     }
@@ -222,7 +241,8 @@ int main(int argc, char **argv)
     if (bad) {
         printf("  ---- : first matching log lines\n");
         for (i = 0; i < nsample; i++) printf("         %s\n", sample[i]);
-        printf("\n== the BO-lifetime defect is LIVE on this kernel ==\n");
+        printf("\n== the kernel logged a BO-lifetime signature, a job timeout or an IOMMU "
+               "fault ==\n");
         return 1;
     }
     printf("\n== %d submits, no BO-lifetime signature in the log ==\n", submitted);

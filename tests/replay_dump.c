@@ -20,6 +20,7 @@
 #include <math.h>
 
 #include "rocket_matmul.h"
+#include "rocket_fanout.h"   /* rocket_fanout_shared_pack: the effective decision */
 
 static int g_M, g_N, g_Mp, g_K;
 static const float *g_ref;
@@ -90,23 +91,24 @@ int main(int argc, char **argv)
     printf("\n-- standalone recompute (same bytes) --\n");
     rocket_matmul_fp16_mt(Mp,K,N,A,B,Cr,4);              report("mt", Cr);
 
-    unsetenv("ROCKET_NO_SHARED_PACK");
+    /* The shared-pack decision is read ONCE per process (rocket_fanout_shared_pack caches
+     * it on the first fan-out call, which the arms above already made), so setting or
+     * clearing ROCKET_NO_SHARED_PACK here changes nothing: these arms used to be labelled
+     * SHARED and NOSHARE and both ran whatever the process started with. Run the probe
+     * twice, with and without ROCKET_NO_SHARED_PACK=1, to compare the two. */
+    const char *pk = rocket_fanout_shared_pack() ? "SHARED" : "NOSHARE";
+    char lab[64];
     rocket_ctx *c1=rocket_ctx_create(4);
     rocket_weights *w1=rocket_weights_pack(c1,Mp,K,N,B);
-    rocket_matmul_fp16_prepacked(c1,Mp,K,N,A,Cr,w1);     report("prepacked SHARED", Cr);
+    rocket_matmul_fp16_prepacked(c1,Mp,K,N,A,Cr,w1);
+    snprintf(lab, sizeof lab, "prepacked %s (T=4)", pk);  report(lab, Cr);
     rocket_weights_free(c1,w1); rocket_ctx_free(c1);
 
-    setenv("ROCKET_NO_SHARED_PACK","1",1);
-    rocket_ctx *c2=rocket_ctx_create(4);
-    rocket_weights *w2=rocket_weights_pack(c2,Mp,K,N,B);
-    rocket_matmul_fp16_prepacked(c2,Mp,K,N,A,Cr,w2);     report("prepacked NOSHARE", Cr);
-    rocket_weights_free(c2,w2); rocket_ctx_free(c2);
-
     /* single-thread (one fd, one N-slice -> exercises full N in one plan) */
-    setenv("ROCKET_NO_SHARED_PACK","1",1);
     rocket_ctx *c3=rocket_ctx_create(1);
     rocket_weights *w3=rocket_weights_pack(c3,Mp,K,N,B);
-    rocket_matmul_fp16_prepacked(c3,Mp,K,N,A,Cr,w3);     report("prepacked T=1 NOSHARE", Cr);
+    rocket_matmul_fp16_prepacked(c3,Mp,K,N,A,Cr,w3);
+    snprintf(lab, sizeof lab, "prepacked %s (T=1)", pk);  report(lab, Cr);
     rocket_weights_free(c3,w3); rocket_ctx_free(c3);
 
     free(A);free(B);free(Cpp);free(Cmt);free(ref);free(Cr);

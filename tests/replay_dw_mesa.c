@@ -7,8 +7,11 @@
  * regcmd (gen_conv2d_dw_int8 with int8_out=1) for the captured shape/scales, runs
  * it on /dev/accel/accel0, and compares the int8 output byte-for-byte to Mesa's
  * captured mesa-output. This validates the int8-out requant datapath end-to-end
- * against ground truth with ZERO host-packing logic of our own (Mesa's BOs are
- * reused verbatim) — the decisive test that the regcmd is HW-correct.
+ * against Mesa's own output with ZERO host-packing logic of ours (Mesa's BOs are
+ * reused verbatim): it says our register program is Mesa's, pad word aside (below).
+ * It does not say the program computes the model's function. The capture ran an int8
+ * model through Mesa's uint8 driver, and its input is constant, so it cannot see the
+ * input-cube addressing either. conv_dw_int8_runtime gates the function against TFLite.
  *
  * Captured shape: IC=64 8x8 K3x3 s1 p1, per-tensor int8
  *   in  scale 0.03657235 zp -2 ; w scale 0.00079638 zp 0 ; out scale 0.00691164 zp 5
@@ -20,7 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "rocket_npu.h"
+#include "rocket_hw_profile.h"
 #include "npu_matmul.h"
+#include "npu_hw.h"       /* CNA_PAD_CON1 */
 
 #define CBUF_BANK 32768
 
@@ -48,6 +53,15 @@ int main(int argc, char **argv) {
 
     int fd = rocket_open();
     if (fd < 0) { fprintf(stderr, "no /dev/accel/accel0 (%d)\n", fd); return 2; }
+    /* The capture is an RK3588 program and gen_conv2d_dw_int8 is an RK3588 generator,
+     * which refuses on any other part by construction. That is a missing device, not a
+     * failure of this one. */
+    if (strcmp(rocket_hw_current()->name, "rk3588") != 0) {
+        printf("replay_dw_mesa: an RK3588 capture, and this part is %s -> SKIP\n",
+               rocket_hw_current()->name);
+        rocket_close(fd);
+        return 2;
+    }
 
     rocket_bo guard = {0}, regcmd = {0}, input = {0}, weights = {0}, biases = {0}, output = {0};
     uint64_t regs[256] = {0};
@@ -93,6 +107,19 @@ int main(int argc, char **argv) {
     };
     int g = gen_conv2d_dw_int8(&p);
     if (g != 0) { fprintf(stderr, "gen failed %d\n", g); goto out; }
+    /* Mesa's pad word, not ours. The generator writes the pad byte into every lane of
+     * CNA_PAD_CON1; Mesa writes it once, sign-extended (0x0000007e here), and the odd
+     * channels among the first 32 read byte 1, so its output pads those 16 lanes with 0.
+     * The replay reproduces Mesa's program, so it carries Mesa's word. */
+    {
+        int patched = 0;
+        for (uint32_t i = 0; i < p.task_count; i++)
+            if ((regs[i] & 0xffff) == CNA_PAD_CON1) {
+                regs[i] = (regs[i] & ~(0xffffffffull << 16)) | ((uint64_t)0x7eu << 16);
+                patched++;
+            }
+        if (patched != 1) { fprintf(stderr, "PAD_CON1 written %d times, want 1\n", patched); goto out; }
+    }
     rocket_bo_prep(fd, &regcmd, 1, 0);
     memcpy(regcmd.ptr, regs, (size_t)p.task_count * sizeof(uint64_t));
     rocket_bo_fini(fd, &regcmd);

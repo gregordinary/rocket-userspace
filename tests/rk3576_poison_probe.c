@@ -67,7 +67,12 @@
  *                                    programs that raise a DPU completion from the ones
  *                                    the driver has to time out on
  *
- * Program kinds: int8fc fp16fc int8d fp16d i32 i32w dw
+ * Program kinds: int8fc fp16fc int8d fp16d i32 i32w dw mmf16
+ *
+ * `mmf16` is the matmul-form fp16 program (gen_matmul_fp16_rk3576), one job at M 1, K 256,
+ * N 64 with an fp32 output: GA-5.1's repeat shape. It is not a convolution, so it carries
+ * no conv_params_t geometry and `scan`, `heal` and `xadd` do not apply to it; `pair`,
+ * `chain` and `scope` do.
  *
  * Env knobs:
  *   ROCKET_PP_GAP_MS   gap between A's completion and B's submit (default 0)
@@ -108,10 +113,10 @@
 #define SENTINEL 0xAA
 #define C2 16
 
-enum { PK_INT8FC, PK_FP16FC, PK_INT8D, PK_FP16D, PK_I32, PK_I32W, PK_DW, PK_N };
+enum { PK_INT8FC, PK_FP16FC, PK_INT8D, PK_FP16D, PK_I32, PK_I32W, PK_DW, PK_MMF16, PK_N };
 
 static const char *const KIND_NAME[PK_N] = {
-    "int8fc", "fp16fc", "int8d", "fp16d", "i32", "i32w", "dw"
+    "int8fc", "fp16fc", "int8d", "fp16d", "i32", "i32w", "dw", "mmf16"
 };
 
 /* One geometry per kind. The two first-conv kinds share theirs exactly, so the
@@ -127,6 +132,7 @@ static const struct geom KIND_GEOM[PK_N] = {
     /* i32    */ { 32, 32, 8, 8, 1, 1, 0 },
     /* i32w   */ { 32, 32, 8, 8, 1, 1, 0 },
     /* dw     */ { 32, 32, 8, 8, 3, 1, 1 },
+    /* mmf16  */ { 256, 64, 1, 1, 1, 1, 0 },   /* K, N, M; see prog_init */
 };
 
 struct prog {
@@ -180,7 +186,7 @@ static int kind_of(const char *s)
  * emitter contracts, which is not a free axis on either side. -1 = no counterpart. */
 static const int COUNTERPART[PK_N] = {
     /* int8fc */ -1, /* fp16fc */ PK_INT8FC, /* int8d */ -1, /* fp16d */ PK_INT8D,
-    /* i32 */ PK_INT8D, /* i32w */ PK_INT8D, /* dw */ -1
+    /* i32 */ PK_INT8D, /* i32w */ PK_INT8D, /* dw */ -1, /* mmf16 */ -1
 };
 
 /* Per-run addresses. Two programs here hold two sets of BOs, so these differ for a
@@ -200,6 +206,15 @@ static int prog_emit(int fd, struct prog *pr)
     pr->p.tasks = pr->ops;
     pr->p.task_count = 0;
     switch (pr->kind) {
+    case PK_MMF16: {
+        const struct geom *g = &KIND_GEOM[PK_MMF16];
+        rc = gen_matmul_fp16_rk3576(pr->ops, g->ih, g->ic, g->oc, pr->p.input_dma,
+                                    pr->p.weights_dma, pr->p.output_dma, pr->p.bias_dma);
+        if (rc != RK3576_MM_FP16_OPS) return -1;
+        pr->p.task_count = RK3576_MM_FP16_OPS;
+        rc = 0;
+        break;
+    }
     case PK_I32:  rc = gen_conv2d_int8_rk3576_i32out(&pr->p); break;
     case PK_I32W: rc = gen_conv2d_int8_rk3576_i32out_wide(&pr->p); break;
     case PK_DW:   rc = gen_conv2d_dw_int8_rk3576(&pr->p); break;
@@ -235,6 +250,40 @@ static int prog_init(int fd, struct prog *pr, int kind)
 
     memset(pr, 0, sizeof *pr);
     pr->kind = kind;
+
+    /* The matmul form: its own buffers, every operand 1.0 so each output is K. */
+    if (kind == PK_MMF16) {
+        unsigned m = g->ih, k = g->ic, n = g->oc;
+        size_t wb = rocket_rk3576_mm_fp16_weight_bytes(k, n);
+        size_t cb = rocket_rk3576_mm_fp16_coef_bytes(n);
+        size_t ib = rocket_rk3576_mm_fp16_in_bytes(m, k);
+        pr->obytes = rocket_rk3576_mm_fp16_out_bytes(m, n);
+        if (rocket_bo_alloc(fd, ib, &pr->in) < 0) return -1;
+        if (rocket_bo_alloc(fd, wb, &pr->w) < 0) return -1;
+        if (rocket_bo_alloc(fd, cb, &pr->b) < 0) return -1;
+        if (rocket_bo_alloc(fd, pr->obytes, &pr->o) < 0) return -1;
+        if (rocket_bo_alloc(fd, sizeof pr->ops, &pr->r) < 0) return -1;
+        rocket_bo_prep(fd, &pr->in, 1, 0);
+        memset(pr->in.ptr, 0, ib);
+        for (i = 0; i < m * k; i++) ((uint16_t *)pr->in.ptr)[i] = 0x3C00;
+        rocket_bo_fini(fd, &pr->in);
+        rocket_bo_prep(fd, &pr->w, 1, 0);
+        for (i = 0; i < wb / 2; i++) ((uint16_t *)pr->w.ptr)[i] = 0x3C00;
+        rocket_bo_fini(fd, &pr->w);
+        rocket_bo_prep(fd, &pr->b, 1, 0);
+        rocket_rk3576_mm_fp16_pack_coef(pr->b.ptr, cb, n);
+        rocket_bo_fini(fd, &pr->b);
+        pr->p.input_dma   = (uint32_t)pr->in.dma_address;
+        pr->p.weights_dma = (uint32_t)pr->w.dma_address;
+        pr->p.bias_dma    = (uint32_t)pr->b.dma_address;
+        pr->p.output_dma  = (uint32_t)pr->o.dma_address;
+        pr->in_h[0] = pr->in.handle; pr->in_h[1] = pr->w.handle;
+        pr->in_h[2] = pr->b.handle;  pr->in_h[3] = pr->r.handle;
+        pr->out_h[0] = pr->o.handle;
+        if (prog_emit(fd, pr) != 0) return -1;
+        pr->live = 1;
+        return 0;
+    }
 
     if (argb) in_bytes = (size_t)g->ih * g->iw * g->ic * esz;
     else      in_bytes = (size_t)((icreg + 31) / 32) * 32 * g->ih * g->iw * esz;

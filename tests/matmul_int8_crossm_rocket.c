@@ -25,7 +25,8 @@
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
 
-static int8_t rand_i8(void) { return (int8_t)(rand() % 255 - 127); }
+/* the whole int8 range: a fill that stops at -127 cannot see a -128 mis-encoded */
+static int8_t rand_i8(void) { return (int8_t)(rand() % 256 - 128); }
 
 static int oneshot(int M, int K, int N, const int8_t *A, const int8_t *B, int32_t *C) {
     int fd = rocket_open();

@@ -25,8 +25,18 @@
  *                  IDENTICALLY — FUSION stays ~0 through a spike), NOT a fusion bug, and is
  *                  narrow (|x|<~0.0015). Reported, not failed.
  *
- *  PASS = regcmd smoke + FUSION <= 0.02 (all shapes/kinds) + conv->tanh ACC clean away
- *  from the x≈0 band. Exit: 0 PASS, 1 FAIL, 2 no-NPU SKIP.
+ *  PASS = regcmd smoke + FUSION <= 0.02 (all shapes/kinds) + ACC within its bound in the
+ *  CURVED region for every kind: 0.02 for tanh, 0.05 for SiLU and GELU. The curved region
+ *  is the one the fused entry claims ("fine only for curved-region inputs",
+ *  rocket_activation.h): |x| >= 0.02, and for GELU also x >= -3, the flat negative tail
+ *  where the single-pass table spikes ~128 (QUIRK 1). Both excluded bands are counted and
+ *  reported, never failed. Exit: 0 PASS, 1 FAIL, 2 no-NPU SKIP.
+ *
+ *  FUSION alone is not an independent check: the fused epilogue and the flying LUT take
+ *  their tables from the same builder, so a wrong table passes it. ACC against the CPU
+ *  function is the independent half, and it used to be asserted for tanh only, and only
+ *  on a shape with no x≈0 spike at all. The fused output starts as an fp16 NaN sentinel,
+ *  so an element nothing wrote fails ACC.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -38,6 +48,7 @@
 #include "rocket_conv.h"
 #include "rocket_activation.h"
 #include "npu_matmul.h"   /* conv_params_t, gen_conv2d_fp16 */
+#include "test_fill.h"
 
 static uint32_t rng = 0x1234567u;
 static float frand(void) { rng = rng*1664525u + 1013904223u; return (rng>>8)*(1.0f/16777216.0f); }
@@ -98,7 +109,7 @@ static int run_shape(int fd, const rocket_conv2d_desc *d, int tiled)
     for (size_t k=0;k<sizeof(KINDS)/sizeof(KINDS[0]);k++) {
         int kind = KINDS[k];
         rocket_activation_ref_fp16(kind, cvt, ref, N);                 /* true f(conv) */
-        memset(got,0,(size_t)N*2);
+        tf_sentinel_f16(got, (size_t)N);
         int r = rocket_conv2d_act_fp16(fd, d, kind, in, W, got);       /* fused, one job */
         if (r) { printf("  %-4s: rocket_conv2d_act_fp16=%d FAIL\n", rocket_activation_name(kind), r); fail=1; continue; }
         g_checked++;
@@ -107,22 +118,24 @@ static int run_shape(int fd, const rocket_conv2d_desc *d, int tiled)
         int rc = rocket_conv2d_fp16(fd, d, in, W, s1);
         if (!rc) rc = rocket_activation_fp16(fd, kind, s1, fly, N);     /* WIDE_LUT set in main() */
 
-        double mf=0, ma=0; int x0=0;
+        double mf=0, ma=0, mc=0; int x0=0, tail=0, nan=0;
         for (int i=0;i<N;i++) {
-            double dfu=fabs((float)got[i]-(float)fly[i]); if(dfu>mf) mf=dfu;
-            double dac=fabs((float)got[i]-(float)ref[i]); if(dac>ma) ma=dac;
-            if (dac>0.5 && fabs((float)cvt[i])<0.02) x0++;
+            double x=(float)cvt[i], g=(float)got[i];
+            if (isnan(g)) { nan++; continue; }
+            double dfu=fabs(g-(float)fly[i]); if(dfu>mf) mf=dfu;
+            double dac=fabs(g-(float)ref[i]); if(dac>ma) ma=dac;
+            if (fabs(x) < 0.02) { if (dac>0.5) x0++; continue; }           /* LE/LO mux band */
+            if (kind==ROCKET_ACTIVATION_GELU && x < -3.0) { if (dac>0.5) tail++; continue; }
+            if (dac>mc) mc=dac;                                             /* curved region */
         }
-        int fuse_ok = (rc==0 && mf<=0.02);
-        printf("  %-4s: FUSION(vs flying LUT)=%.4f%s  ACC(vs true f)=%.4f  x0-spikes=%d -> %s\n",
-               rocket_activation_name(kind), mf, rc?"(flyref err)":"", ma, x0,
-               fuse_ok ? "fusion OK" : "FUSION FAIL");
-        if (!fuse_ok) fail = 1;
-        /* shippable claim: conv->tanh is genuinely accurate where the input avoids the
-         * x≈0 boundary band (no spikes) — assert it on the clean single-tile shapes. */
-        if (kind==ROCKET_ACTIVATION_TANH && !tiled && x0==0 && ma>0.05) {
-            printf("        tanh ACC %.4f > 0.05 (no x0 spike) -> FAIL\n", ma); fail=1;
-        }
+        const double tol = (kind==ROCKET_ACTIVATION_TANH) ? 0.02 : 0.05;
+        int fuse_ok = (rc==0 && nan==0 && mf<=0.02);
+        int acc_ok = (nan==0 && mc<=tol);
+        printf("  %-4s: FUSION(vs flying LUT)=%.4f%s  ACC(curved, vs true f)=%.4f (bound %.2f)  "
+               "ACC(all)=%.4f  x0-spikes=%d  tail-spikes=%d  unwritten=%d -> %s\n",
+               rocket_activation_name(kind), mf, rc?"(flyref err)":"", mc, tol, ma, x0, tail, nan,
+               (fuse_ok && acc_ok) ? "OK" : (!fuse_ok ? "FUSION FAIL" : "ACC FAIL"));
+        if (!fuse_ok || !acc_ok) fail = 1;
     }
     free(in);free(W);free(cvt);free(ref);free(got);free(s1);free(fly);
     return fail;

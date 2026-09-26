@@ -33,6 +33,7 @@
 #include "rocket_log.h"
 #include "rocket_sysfs.h"        /* the one enumeration of the bound NPU cores */
 #include "rocket_busy_poll.h"    /* the shared completion-wait spin budget    */
+#include "rocket_fence_watch.h"   /* how long each fenced wait took            */
 #include "rocket_rk3576_internal.h"   /* rocket_rk3576_bo_pool_drain, called from rocket_close */            // centralized log channel
 #include "rocket_hw_profile.h"     // chip detection (warn on unprofiled silicon)
 
@@ -450,15 +451,25 @@ int rocket_bo_ranges_supported(void)
     return c;
 }
 
-int rocket_bo_prep_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
-                          unsigned n, uint64_t timeout_ns)
+static int rkt_bo_prep_wait(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns);
+
+static uint64_t rkt_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int rkt_bo_prep_ranges_wait(int fd, rocket_bo *bo, const rocket_bo_range *r,
+                                   unsigned n, uint64_t timeout_ns)
 {
     struct drm_rocket_prep_bo_ranges prep = {0};
     int64_t deadline = 0;
     int rc;
 
+    /* The untimed body, not rocket_bo_prep: the public wrapper times this wait already. */
     if (!n || !r || !rocket_bo_ranges_supported())
-        return rocket_bo_prep(fd, bo, 0, timeout_ns);
+        return rkt_bo_prep_wait(fd, bo, 0, timeout_ns);
 
     /* The same absolute-deadline conversion and the same saturation as
      * rocket_bo_prep; see the long note there. */
@@ -484,6 +495,19 @@ int rocket_bo_prep_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
         return -e;
     }
     return 0;
+}
+
+/* A timed wait (timeout_ns > 0) is reported to the fence watch, the same as
+ * rocket_bo_prep's: see the note there. */
+int rocket_bo_prep_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
+                          unsigned n, uint64_t timeout_ns)
+{
+    if (!timeout_ns)
+        return rkt_bo_prep_ranges_wait(fd, bo, r, n, 0);
+    uint64_t t0 = rkt_now_ns();
+    int rc = rkt_bo_prep_ranges_wait(fd, bo, r, n, timeout_ns);
+    rkt_fence_wait_note(rkt_now_ns() - t0, bo->handle);
+    return rc;
 }
 
 int rocket_bo_fini_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
@@ -725,7 +749,7 @@ static int rkt_prep_poll(int fd, uint32_t handle)
     return 0;
 }
 
-int rocket_bo_prep(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns)
+static int rkt_bo_prep_wait(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns)
 {
     /* CONFIRMED from rocket_gem.c: drm_rocket_prep_bo is {handle, reserved,
      * timeout_ns}, no direction flag. The kernel waits on the BO's WRITE-usage
@@ -810,6 +834,21 @@ int rocket_bo_prep(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns)
         return -e;
     }
     return 0;
+}
+
+/* Every timed wait (timeout_ns > 0) is reported to the fence watch with its duration.
+ * The kernel retires a job that runs 500 ms and signals its fence, and PREP_BO then
+ * returns 0 exactly as it does for a job that completed, so the duration is the only
+ * trace a hung job leaves in this process. A timeout_ns == 0 call is a cache sync, not
+ * a wait, and is not counted. */
+int rocket_bo_prep(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns)
+{
+    if (!timeout_ns)
+        return rkt_bo_prep_wait(fd, bo, dir, 0);
+    uint64_t t0 = rkt_now_ns();
+    int rc = rkt_bo_prep_wait(fd, bo, dir, timeout_ns);
+    rkt_fence_wait_note(rkt_now_ns() - t0, bo->handle);
+    return rc;
 }
 
 int rocket_bo_fini(int fd, rocket_bo *bo)

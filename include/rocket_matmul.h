@@ -159,9 +159,11 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
  *   - M carries NO constraint. M=1 computes, and so does every plane the M rows can
  *     be cut into. This is the opposite of the RK3588, where rows are the conv's
  *     spatial height, height < 4 mis-computes, and M==1 is padded to 4.
- *   - N is TILED, and the tile is what buys throughput: a submit costs ~1.4 ms
- *     whatever it carries, so MACs per submit is the only lever and N is the only
- *     free axis. ROCKET_RK3576_MM_NT overrides the default tile.
+ *   - N is TILED, and the tile is what buys throughput. At the feature budget a
+ *     submit's device time rises from about 0.12 ms at N 32 to 0.91 ms at N 2048, so
+ *     the device's rate rises almost linearly with N and N is the only free axis
+ *     [HW sweep, rocket 1.6.0, 786 MHz, 2026-09-25]. ROCKET_RK3576_MM_NT overrides
+ *     the default tile.
  *   - K IS NOT tiled here, and the entry REFUSES a K it cannot contract in one task.
  *     The boundary is K >= 6176, for every (M, N) enumerated: the planner shrinks the
  *     output-channel tile by halves to 32 channels before it gives up, so what decides
@@ -348,8 +350,15 @@ int rocket_matmul_int8_rk3576_perc_wbo(int fd, int M, int K, int N,
  * them per tile per call; ROCKET_RK3576_BO_POOL_MB caps the pooled bytes (default 64).
  * Default OFF: holding device memory across calls is the exposure the pool shares with
  * the weight object above — whether the per-call free is what keeps IOMMU mapping churn
- * inside what the BO-lifetime fixes were written for is unmeasured. The knob is read on
- * every allocation, so an A/B can flip it between arms in one process. The pool does
+ * inside what the BO-lifetime fixes were written for is unmeasured. Both knobs are read
+ * once per process, so an A/B runs one process per arm. A pooled BO keeps the size it
+ * was allocated at, and a request takes the smallest free BO that covers it, so after
+ * the mix of entries or shapes changes a small request can hold a far larger buffer.
+ * PREP_BO and FINI_BO sync the whole BO, so the call pays cache maintenance at that size,
+ * and a pooled cost depends on what the process ran before. Five entries sharing a pool
+ * put the fp16 resident call 0.09-0.16 ms above its device time at 9 of 18 shapes. One
+ * entry alone, whose three buffers are all small, sat 0.014-0.043 ms above at all 18
+ * [HW sweep, H96 MAX M9, tests/rk3576_mm_fp16_cost, 2026-09-25]. The pool does
  * not change any surface: a pooled BO is fully rewritten before use by the same packs
  * that filled a fresh one, and the poisoning sentinel stamps the output BO per task
  * either way. rocket_rk3576_bo_pool_drain(fd) frees whatever the pool holds for `fd`
@@ -410,6 +419,115 @@ typedef struct rocket_rk3576_i32_stats {
     unsigned refused;       /* tasks that exhausted their attempts */
 } rocket_rk3576_i32_stats;
 void rocket_rk3576_i32_last_stats(rocket_rk3576_i32_stats *out);
+
+/* ---- the RK3576 fp16 matmul, the whole of K in one task -------------------------
+ *
+ *     C[m][n] = sum_k A[m][k] * B[n][k]      A: M*K fp16, B: N*K fp16, C: M*N fp32
+ *
+ * All three are row-major, and B is one row per output channel, as rocket_matmul_fp16()
+ * takes it. The activation goes in as it arrives, the weights are permuted into the part's
+ * layout, and the output is the tasks' own fp32 surface, so nothing is scattered or
+ * gathered on the host.
+ *
+ * This is NOT the fp16 convolution program, which contracts sixteen input channels a
+ * task and made fp16 30-299x slower than int8 on this part. It is the matmul form of
+ * gahingwoo/charsiu (`524e10a`), transcribed word for word.
+ *
+ * ENVELOPE: 1 <= M <= 2048, 32 <= K <= 6144 with K%32 == 0, 64 <= N <= 8192 with
+ * N%16 == 0. Anything else returns ROCKET_E_UNSUPPORTED before a buffer is allocated.
+ * K and N are one task's bounds, measured on the part: K 6176 never completes, and at
+ * N 8960 the job writes the first 768 columns and hangs. M is the gate's bound. One task
+ * carries at most 4096/(K/32) rows, since its input must fit the CBUF data window, and
+ * a task past that computes a wrong surface on every row rather than failing, so the
+ * entry cuts M into equal tasks under that bound (512 rows at K 256, 85 at K 1536, 21 at
+ * K 6144) and submits them as one job: one ioctl and one fence per call.
+ *
+ * Measured: exact against a CPU reference whose fills make every sum exact in fp32, at
+ * 23 one-task shapes to the bounds (the window at three K, K 6144, N 8192, an 8 MiB
+ * weight) and at 6 shapes of 2 to 25 tasks, up to 2048x1536x256; a row-major weight
+ * control was wrong on 64 of 64. [HW gate, H96 MAX M9, rocket 1.6.0,
+ * tests/rk3576_mm_fp16_gate, 2026-09-25]
+ *
+ * ROUNDING. Each group of 32 consecutive products along K is summed with no intermediate
+ * rounding, the group sum is rounded to fp32, and the group sums are accumulated in K order
+ * in fp32, both roundings to nearest even. That model matches every output bit for bit at
+ * M 4, N 64, K 32 to 2048, over full-mantissa fills with products spread over 2^-28 to 2^-6;
+ * blocks of 16 or 64, or rounding each product, miss by up to hundreds of ulps at K 2048.
+ * Two runs are identical. [HW sweep, H96 MAX M9, rocket 1.6.0, tests/rk3576_mm_fp16_round,
+ * 2026-09-25]
+ *
+ * COST. The device's share at M 512 K 1536 N 1536 is 4.5 ms, about 2.1x the int8
+ * resident entry's at the same shape: each task re-reads the whole weight, and this
+ * program contracts at about half the int8 program's rate. Per call, this entry pays
+ * for five buffers it allocates, fills and frees; ROCKET_MM_PROFILE prints its buckets.
+ * [HW sweep, H96 MAX M9, 786 MHz, governor performance, tests/rk3576_mm_fp16_cost,
+ * 2026-09-25]
+ *
+ * Its fp32 output does NOT poison the next submit, unlike this part's int32 writers and fp16
+ * convolution: in one process at a zero gap, the int8 direct program wrote 20 of 20 after
+ * it, and so did this entry after itself. [HW sweep, H96 MAX M9, rk3576_poison_probe, 2026-09-25]
+ *
+ * A call whose output still holds the sentinel stamp after the fence is redone after a
+ * power cycle, and refused with ROCKET_E_DEVICE past eight attempts; C is unspecified
+ * after that refusal. rocket_rk3576_mm_fp16_last_attempts() says how many submits the last
+ * call took, so a result that needed a redo is visible to the caller: 1 means the first
+ * submit wrote. */
+int rocket_matmul_fp16_rk3576(int fd, int M, int K, int N,
+                              const _Float16 *A, const _Float16 *B, float *C);
+unsigned rocket_rk3576_mm_fp16_last_attempts(void);
+
+/* ---- the same fp16 matmul with the weight resident in a device BO ---------------
+ *
+ * rocket_rk3576_wbo_fp16 holds one weight, permuted once into the part's layout in a
+ * device BO, and the coefficient buffer for its N beside it. The entry below is
+ * rocket_matmul_fp16_rk3576() with that object in place of `B`: the same program, the
+ * same envelope, the same write check and redo. What it drops is the two buffers the
+ * per-call entry allocates, fills and frees every call. Neither changes between calls:
+ * the weight permutation is a pass over all N*K elements, and the coefficients depend on
+ * N alone.
+ *
+ * WHAT IT HOLDS. Two device BOs allocated on `fd`, freed only by
+ * rocket_rk3576_wbo_fp16_free() or the fd closing: the weight, K*N*2 bytes, and the
+ * coefficient buffer, rocket_rk3576_mm_fp16_coef_bytes(N), about 257 KiB whatever N is.
+ * Nearly all of the coefficient buffer is padding against RDMA reads past its table.
+ * Whether the job needs the padding is unmeasured, so a handle per model weight also
+ * holds about 257 KiB of padding per weight.
+ *
+ * WHAT A STALE OBJECT DOES. The object is not checked against anything on each call.
+ * An object created from different bytes than the caller thinks, or outliving the weight
+ * it was created from, computes a full, correctly sized, entirely plausible surface from
+ * the OLD weight. K and N are the one cheap consistency check, and a mismatch refuses
+ * with ROCKET_E_SHAPE. M is free per call, inside the envelope.
+ *
+ * A K or N outside the envelope refuses at create with ROCKET_E_UNSUPPORTED, before a
+ * buffer is allocated.
+ *
+ * Measured: bit-identical to rocket_matmul_fp16_rk3576() at all 29 gated shapes, and one
+ * handle exact at eleven M from 1 to 1500, one to three tasks [HW gate, H96 MAX M9,
+ * rocket 1.6.0, tests/rk3576_mm_fp16_gate, 2026-09-25].
+ *
+ * COST, against rocket_matmul_int8_rk3576_perc_wbo() at the same shape, both resident,
+ * paired within a round:
+ *
+ *   M 1-16, K to 2048, N to 256     0.86-0.94x at 14 of 17 shapes, 1.07-1.50x at K 2048
+ *   K 1536 N 1536, M 16 to 512      1.5-1.6x at M 16, 2.0x at 64, 2.0-2.2x from 128 to 512
+ *   M 512 K 1536, N 256 to 8192     1.8-1.9x, 2.0-2.1x at 1536 and 4096, 2.6x at 8192
+ *   M 512 N 1536, K 256 to 6144     2.7x at K 256, 1.9-2.0x at 4096, 1.0x at 6144
+ *
+ * The gap does not shrink with M: past one task the fp16 program re-reads the weight
+ * once a task and contracts at about half the int8 program's rate, and at M 512 K 1536
+ * N 1536 its device share is 4.5 ms against the int8 entry's 2.1 ms. It closes at
+ * K 6144 because the int8 entry slows there. At 512x1536x1536 a call is 17.5-17.8 ms,
+ * 4.5 of it on the device and 7.2 allocating and freeing the call's buffers; with
+ * ROCKET_RK3576_BO_POOL=1 it is 6.9 ms against the int8 entry's pooled 4.8.
+ * [HW sweep, H96 MAX M9, 786 MHz, governor performance, A72s, tests/rk3576_mm_fp16_cost,
+ * 2026-09-25] */
+struct rocket_rk3576_wbo_fp16;
+int rocket_rk3576_wbo_fp16_create(int fd, int K, int N, const _Float16 *B,
+                                  struct rocket_rk3576_wbo_fp16 **out);
+void rocket_rk3576_wbo_fp16_free(int fd, struct rocket_rk3576_wbo_fp16 *w);
+int rocket_matmul_fp16_rk3576_wbo(int fd, int M, int K, int N, const _Float16 *A,
+                                  const struct rocket_rk3576_wbo_fp16 *wbo, float *C);
 
 int rocket_matmul_plan_int8(int M, int K, int N, int *Mt, int *Kt, int *Nt);
 int rocket_matmul_int8(int fd, int M, int K, int N,
@@ -649,7 +767,9 @@ int rocket_matmul_fp16_prepacked(rocket_ctx *ctx, int M, int K, int N,
  *   rocket_stream_free(s);
  *
  * Returns 0 on success; <0 to tell the caller to fall back to the per-call mt
- * path (e.g. the shape cache is full or the shape is unsupported).
+ * path (e.g. the shape cache is full or the shape is unsupported). M==1 is such a
+ * shape, as on the resident paths: the one-shot rocket_matmul_fp16 pads a single row
+ * to a height-4 tile, and this entry does not (tests/correctness_matrix.sh asserts it).
  *
  * NOT thread-safe: a stream mutates its shared per-shape scratch (the A-pack buffer +
  * per-worker weight/IO BOs, re-packed each call) and grows its shape cache on first use

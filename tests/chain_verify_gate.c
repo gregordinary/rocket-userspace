@@ -106,6 +106,39 @@ int main(void)
     CHECK(rkt_chain_verify(&bo, td, 3) == 0, "verify rejected a correctly packed chain");
     printf("[ok] a correct chain verifies\n");
 
+    /* 1b. The packed words, decoded WITHOUT the library. pack and verify share
+     *     rkt_amount_encode, so an encoding error in it would be written and read back
+     *     the same way and case 1 would still pass. Here the test derives each trailer
+     *     word itself: the kernel's PC_DATA_AMOUNT field, (n + 1) / 2 - 1 for the next
+     *     program's n words, and the next program's IOVA in a PC_BASE_ADDRESS write. */
+    for (int i = 0; i < 3; i++) {
+        const uint64_t *w = (const uint64_t *)mem + OFFS[i];
+        const uint32_t n = COUNTS[i];
+        const int last = (i == 2);
+        const uint32_t want_amount = ((last ? COUNTS[i] : COUNTS[i + 1]) + 1) / 2 - 1;
+        const uint64_t amt = w[n - 3], base = w[n - 4];
+        CHECK((uint16_t)(amt >> 48) == OP_REG_PC && (uint16_t)(amt & 0xffff) == PC_REGISTER_AMOUNTS,
+              "task %d: the amount op is not a PC_REGISTER_AMOUNTS write (0x%016llx)", i,
+              (unsigned long long)amt);
+        CHECK((uint32_t)(amt >> 16) == want_amount,
+              "task %d: PC_DATA_AMOUNT is %u, the kernel's encoding of %u words is %u", i,
+              (uint32_t)(amt >> 16), last ? COUNTS[i] : COUNTS[i + 1], want_amount);
+        if (last) {
+            CHECK((uint16_t)(base >> 48) == OP_NONE,
+                  "task %d (last): the link slot is not the inert OP_NONE (0x%016llx)", i,
+                  (unsigned long long)base);
+        } else {
+            const uint32_t want_base = BO_IOVA + (uint32_t)(OFFS[i + 1] * sizeof(uint64_t));
+            CHECK((uint16_t)(base >> 48) == OP_REG_PC && (uint16_t)(base & 0xffff) == PC_BASE_ADDRESS,
+                  "task %d: the link op is not a PC_BASE_ADDRESS write (0x%016llx)", i,
+                  (unsigned long long)base);
+            CHECK((uint32_t)(base >> 16) == want_base,
+                  "task %d: the link points at 0x%08x, the next program is at 0x%08x", i,
+                  (uint32_t)(base >> 16), want_base);
+        }
+    }
+    printf("[ok] the packed trailers match the kernel's encoding, decoded independently\n");
+
     /* 2. THE DEFECT: task 0 declares the wrong length for task 1. Every address is
      *    right, every program is present, and the only thing wrong is a number that
      *    pack_at had no way to check. */

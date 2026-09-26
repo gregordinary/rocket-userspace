@@ -30,6 +30,7 @@
 #include "rocket_npu.h"
 #include "rocket_activation.h"
 #include "npu_activation.h"
+#include "test_fill.h"
 
 /* fp16 LUT (Q0.15 + linear interp + fp16 out): HW-measured max_abs is ~0.0015
  * (sigmoid) / ~0.0005 (hardsigmoid). The gated kinds (x*gate(x)) amplify the
@@ -48,7 +49,7 @@ static int run_kind(int fd, int kind, int n, double tol)
     for (int i = 0; i < n; i++)
         in[i] = (_Float16)(-8.0 + 16.0 * ((double)i / (double)(n - 1)));   /* [-8, 8] */
 
-    memset(out, 0, (size_t)n * sizeof(_Float16));
+    tf_sentinel_f16(out, (size_t)n);   /* an element nothing wrote reads NaN, not 0 */
     int r = rocket_activation_fp16(fd, kind, in, out, n);
     if (r) { printf("  %-12s n=%-5d rocket_activation_fp16=%d  -> FAIL\n",
                     rocket_activation_name(kind), n, r); free(in); free(out); free(ref); return 1; }
@@ -58,12 +59,13 @@ static int run_kind(int fd, int kind, int n, double tol)
     for (int i = 0; i < n; i++) {
         double ad = fabs((double)(float)out[i] - (double)(float)ref[i]);
         if (ad > max_abs) max_abs = ad;
-        if (ad > tol && bad < 6) {
-            printf("    [%d] x=%.3f ref=%.5f got=%.5f |d|=%.5f\n",
-                   i, (float)in[i], (float)ref[i], (float)out[i], ad); bad++;
+        if (!(ad <= tol)) {       /* counts a NaN sentinel left unwritten */
+            if (bad < 6) printf("    [%d] x=%.3f ref=%.5f got=%.5f |d|=%.5f\n",
+                                i, (float)in[i], (float)ref[i], (float)out[i], ad);
+            bad++;
         }
     }
-    int pass = max_abs <= tol;
+    int pass = (bad == 0);
     printf("  %-12s n=%-5d max_abs=%.5f (tol=%.3f) -> %s\n",
            rocket_activation_name(kind), n, max_abs, tol, pass ? "PASS" : "FAIL");
     free(in); free(out); free(ref);
@@ -76,12 +78,18 @@ static int run_ew_mul(int fd, int n)
     _Float16 *a = malloc((size_t)n*sizeof(_Float16)), *b = malloc((size_t)n*sizeof(_Float16));
     _Float16 *o = malloc((size_t)n*sizeof(_Float16)), *r = malloc((size_t)n*sizeof(_Float16));
     if (!a||!b||!o||!r){ free(a);free(b);free(o);free(r); return 1; }
+    /* Small NONZERO integers with hashed signs (tests/test_fill.h): the product is exact
+     * in fp16 and never zero. The old periodic fill had a zero factor in 31% of the
+     * elements, where an unwritten element over a zeroed output passed. */
     for (int i = 0; i < n; i++) {
-        a[i] = (_Float16)(((i % 7) - 3));            /* small ints -> exact fp16 product */
-        b[i] = (_Float16)(((i % 5) - 2));
+        int av = tf_int(0xE3A1, (uint64_t)i, 1, 3), bv = tf_int(0xE3B1, (uint64_t)i, 1, 2);
+        if (tf_hash(0xE3A2, (uint64_t)i) & 1) av = -av;
+        if (tf_hash(0xE3B2, (uint64_t)i) & 1) bv = -bv;
+        a[i] = (_Float16)av;
+        b[i] = (_Float16)bv;
         r[i] = (_Float16)((float)a[i] * (float)b[i]);
     }
-    memset(o, 0, (size_t)n*sizeof(_Float16));
+    tf_sentinel_f16(o, (size_t)n);
     int rc = rocket_ew_mul_fp16(fd, a, b, o, n);
     int fail = 0;
     if (rc) { printf("  ew_mul       n=%-5d rocket_ew_mul_fp16=%d -> FAIL\n", n, rc); fail = 1; }
@@ -90,10 +98,13 @@ static int run_ew_mul(int fd, int n)
         for (int i = 0; i < n; i++) {
             double ad = fabs((double)(float)o[i] - (double)(float)r[i]);
             if (ad > max_abs) max_abs = ad;
-            if (ad > 0 && bad < 6) { printf("    [%d] a=%.0f b=%.0f ref=%.0f got=%.3f\n",
-                                            i,(float)a[i],(float)b[i],(float)r[i],(float)o[i]); bad++; }
+            if (!(ad == 0.0)) {      /* counts a NaN sentinel left unwritten */
+                if (bad < 6) printf("    [%d] a=%.0f b=%.0f ref=%.0f got=%.3f\n",
+                                    i,(float)a[i],(float)b[i],(float)r[i],(float)o[i]);
+                bad++;
+            }
         }
-        fail = max_abs != 0.0;   /* small-int products are bit-exact */
+        fail = (bad != 0);   /* small-int products are bit-exact */
         printf("  ew_mul       n=%-5d max_abs=%.5f -> %s\n", n, max_abs, fail ? "FAIL" : "PASS");
     }
     free(a); free(b); free(o); free(r);

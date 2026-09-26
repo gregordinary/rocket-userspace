@@ -263,16 +263,23 @@ void rocket_conv2d_ref_int8(const rocket_conv2d_desc *d,
                             const int8_t *in, const int8_t *W, int32_t *out);
 
 /* ---- native int8 DEPTHWISE CONV_2D (int8-OUT, on-chip requant) -------------
- * The Teflon-cracked depthwise path: int8 in x int8 weight reduced per channel, then
- * REQUANTIZED ON-CHIP to int8 (no int32 readback) — bit-exact to Mesa/Teflon ground
- * truth (tests/replay_dw_mesa.c). PER-TENSOR quant only (Teflon's constraint); a
- * per-channel depthwise filter must stay on the dequant->fp16-DW->requant path until
- * the BS_MUL per-OC requant lands. The driver folds Mesa's zero-point correction into
- * the bias and centers the in/weight cubes in the uint8 domain, so the caller passes
- * the raw model tensors: in/w/out are int8 (model domain, [C][IH][IW] / [C][KH][KW] /
- * [C][OH][OW]); bias is the TFLite int32 bias [C] (may be NULL = no bias); the six
- * quant params are per-tensor. Single CBUF pass (no DW spatial tiling on this
- * path); channel-tiles like the fp16 DW path. Returns 0, negative on error. */
+ * int8 in x int8 weight reduced per channel, then REQUANTIZED ON-CHIP to int8 (no int32
+ * readback), on Mesa's int8-output depthwise register program. TFLite's int8 depthwise:
+ * the accumulator is TFLite's exactly (a padded tap contributes nothing), and the requant
+ * is the DPU's OUT_CVT multiplier and shift, so an output can differ from TFLite's by
+ * one where it sits at a rounding boundary. Measured on the RK1 (tests/conv_dw_int8_runtime.c):
+ * bit-exact against a host model of that requant at five shapes with zero points at both
+ * ends of the int8 range, and within one of TFLite's reference kernels on 11 of 4096
+ * outputs of a real model.
+ *
+ * PER-TENSOR quant and symmetric weights (w_zp == 0, as TFLite's int8 weights are); any
+ * other w_zp returns ROCKET_E_UNSUPPORTED on the NPU path. A per-channel depthwise filter
+ * must stay on the dequant->fp16-DW->requant path until the BS_MUL per-OC requant lands.
+ * The caller passes the raw model tensors: in/w/out are int8 (model domain, [C][IH][IW] /
+ * [C][KH][KW] / [C][OH][OW]); bias is the TFLite int32 bias [C] (may be NULL = no bias);
+ * the scales and zero points are per-tensor, and the driver folds the input zero point
+ * into the bias. Single CBUF pass (no DW spatial tiling on this path); channel-tiles like
+ * the fp16 DW path. Returns 0, negative on error. */
 int rocket_conv2d_dw_int8(int fd, const rocket_conv2d_desc *d,
                           const int8_t *in, const int8_t *w, const int32_t *bias,
                           float in_scale, float w_scale, float out_scale,
@@ -285,12 +292,17 @@ int rocket_conv2d_dw_int8_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
 /* ---- transposed convolution (ConvTranspose2d / "deconvolution") -------------
  * The transpose of a strided conv: each input pixel scatter-adds a kernel-weighted
  * copy into a LARGER output — learned upsampling for segmentation heads, decoder /
- * super-resolution / GAN-generator blocks, and the FPN learned-upsample. It is NOT a
- * new HW primitive: it is lowered onto the validated forward CONV_2D engine, so it
- * inherits the HW-exact direct-conv tiling/CBUF path bit-for-bit. The lowering: the
- * input is interior-dilated (stride-1 zeros inserted between pixels) + border-padded,
- * the kernel is spatially rotated 180 deg with its in/out channels transposed, and a
- * STRIDE-1 forward conv produces the result.
+ * super-resolution / GAN-generator blocks, and the FPN learned-upsample. Two routes,
+ * chosen per descriptor by rocket_conv_transpose2d_route():
+ *   - the CNA's hardware deconvolution mode, for a direct conv at power-of-two strides
+ *     whose compact input fits one CBUF pass: one task per output-channel tile, the
+ *     hardware dilates the input, and the kernel is rotated and channel-transposed on
+ *     the host;
+ *   - the lowering, for everything else: the input is interior-dilated (stride-1 zeros
+ *     inserted between pixels) + border-padded on the host, the kernel is spatially
+ *     rotated 180 deg with its in/out channels transposed, and a STRIDE-1 forward conv
+ *     produces the result, inheriting the HW-exact direct-conv tiling bit-for-bit.
+ * Both are bit-exact against the scatter reference.
  *
  * Tensor layouts (row-major, batch 1):
  *   input    in [IC][IH][IW]
@@ -335,6 +347,24 @@ static inline int rocket_conv_transpose2d_ow(const rocket_conv_transpose2d_desc 
 /* Validate against the supported set (lowering feasibility + forward-conv CBUF fit).
  * Returns 0 if runnable, <0 (negated reason) otherwise. Pure, no hardware. */
 int rocket_conv_transpose2d_plan(const rocket_conv_transpose2d_desc *d);
+
+/* Which route rocket_conv_transpose2d_fp16 takes for a descriptor. Pure, no hardware.
+ *
+ *   ROCKET_CONV_TRANSPOSE_DECONV (1): the CNA's hardware deconvolution mode, one task per
+ *     output-channel tile over the COMPACT input, with the output extent programmed as the
+ *     transposed one. Taken on the RK3588 for a DIRECT transposed conv with dilation 1,
+ *     power-of-two strides (2, 4 or 8 on at least one axis, 1 on the other), output_padding
+ *     below the stride, k-1-pad at most 11, IC a multiple of 32, and a compact input that
+ *     fits one CBUF pass beside a 16-channel weight tile. Bit-exact against the scatter
+ *     reference, and 0.35-0.54x the lowering's wall at decoder shapes
+ *     [HW sweep, Turing RK1 at 600 MHz, 2026-09-23].
+ *   ROCKET_CONV_TRANSPOSE_LOWERED (0): the dilated-input lowering described above.
+ *   <0: refused, with rocket_conv_transpose2d_plan's reasons.
+ *
+ * ROCKET_CONV_TRANSPOSE_HW=0 forces the lowering. */
+#define ROCKET_CONV_TRANSPOSE_LOWERED 0
+#define ROCKET_CONV_TRANSPOSE_DECONV  1
+int rocket_conv_transpose2d_route(const rocket_conv_transpose2d_desc *d);
 
 /* Run the transposed conv on the NPU. in / W / out are row-major fp16 in the layouts
  * above. Returns 0, negative on error. The _ctx form reuses a resident BO pool. */

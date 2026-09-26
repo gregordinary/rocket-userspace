@@ -28,6 +28,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_resize.h"
+#include "test_fill.h"
 
 static int g_fail = 0;
 /* Cases that actually reached the driver and were compared against the reference.
@@ -50,7 +51,11 @@ static void run_case(int fd, int mode, int C, int IH, int IW, int sy, int sx)
     _Float16 *ref = malloc(out_n*sizeof(_Float16));
     if (!in || !out || !ref) { fprintf(stderr,"oom\n"); g_fail=1; goto done; }
 
-    for (size_t i = 0; i < in_n; i++) in[i] = (_Float16)((int)(i % 7) - 3);
+    /* hashed small integers (tests/test_fill.h): (i%7)-3 was w-3 in every row and channel
+     * of the 10x7 case, so a row or channel mixup copied equal values */
+    tf_fill_f16_int(in, in_n, tf_hash(0x2E51, (uint64_t)(mode * 7919 + C * 131 + IH * 17 + IW * 5 +
+                                                          sy * 3 + sx)), -3, 3);
+    tf_sentinel_f16(out, out_n);
 
     int r = mode ? rocket_upsample_bilinear_fp16(fd, in, out, C, IH, IW, sy, sx)
                  : rocket_upsample_nearest_fp16 (fd, in, out, C, IH, IW, sy, sx);
@@ -65,9 +70,12 @@ static void run_case(int fd, int mode, int C, int IH, int IW, int sy, int sx)
     for (size_t i = 0; i < out_n; i++) {
         double ad = fabs((float)out[i] - (float)ref[i]);
         if (ad > max_abs) max_abs = ad;
-        if (ad > tol && bad < 4) { printf("    [%zu] ref=%.3f got=%.3f\n", i,(float)ref[i],(float)out[i]); bad++; }
+        if (!(ad <= tol)) {       /* a NaN sentinel left unwritten counts too */
+            if (bad < 4) printf("    [%zu] ref=%.3f got=%.3f\n", i,(float)ref[i],(float)out[i]);
+            bad++;
+        }
     }
-    int ok = (mode ? max_abs <= tol : max_abs == 0.0);
+    int ok = (bad == 0);
     printf("  %s C=%d %dx%d -> %dx%d  x%d,%d: max_abs=%.4f -> %s\n",
            name, C, IH, IW, OH, OW, sy, sx, max_abs, ok ? "PASS" : "FAIL");
     if (!ok) g_fail = 1;
@@ -77,7 +85,9 @@ done:
 
 /* bilinear math properties (run on the NPU output if fd>=0, else the reference):
  * a constant must stay constant in the interior; a y/x ramp must become the
- * half-pixel-mapped ramp. */
+ * half-pixel-mapped ramp. Every channel gets its own offset and every channel is
+ * checked: a channel mixup lands the wrong offset on a plane, which reading channel 0
+ * alone could not see. */
 static void run_properties(int fd, int C, int IH, int IW, int sy, int sx)
 {
     if (rocket_upsample_bilinear_plan(C, IH, IW, sy, sx)) return;
@@ -85,31 +95,42 @@ static void run_properties(int fd, int C, int IH, int IW, int sy, int sx)
     size_t in_n=(size_t)C*IH*IW, out_n=(size_t)C*OH*OW;
     _Float16 *in=malloc(in_n*sizeof(_Float16)), *out=malloc(out_n*sizeof(_Float16));
     if (!in||!out){fprintf(stderr,"oom\n");g_fail=1;free(in);free(out);return;}
+#define CH_OFF(c) (0.25 * (double)(c))   /* exact in fp16 for every channel used here */
 
-    /* (1) constant -> constant interior */
-    for (size_t i=0;i<in_n;i++) in[i]=(_Float16)2.0f;
-    rocket_upsample_bilinear_fp16(fd,in,out,C,IH,IW,sy,sx);
-    double cmax=0;
-    for (int oh=sy;oh<OH-sy;oh++) for (int ow=sx;ow<OW-sx;ow++) {
-        double ad=fabs((float)out[(size_t)oh*OW+ow]-2.0); if(ad>cmax)cmax=ad;   /* channel 0 */
+    /* (1) constant -> constant interior, a different constant per channel */
+    for (int c=0;c<C;c++) for (size_t i=0;i<(size_t)IH*IW;i++)
+        in[(size_t)c*IH*IW+i]=(_Float16)(2.0+CH_OFF(c));
+    tf_sentinel_f16(out, out_n);
+    int rc = rocket_upsample_bilinear_fp16(fd,in,out,C,IH,IW,sy,sx);
+    double cmax=0; int cnan=0;
+    for (int c=0;c<C;c++) for (int oh=sy;oh<OH-sy;oh++) for (int ow=sx;ow<OW-sx;ow++) {
+        double ad=fabs((float)out[((size_t)c*OH+oh)*OW+ow]-(2.0+CH_OFF(c)));
+        if (isnan(ad)) cnan=1; else if (ad>cmax) cmax=ad;
     }
-    printf("  bilinear partition-of-unity (const interior) x%d,%d: max|Δ|=%.4f -> %s\n",
-           sy,sx,cmax, cmax<=0.02?"PASS":"FAIL");
-    if (cmax>0.02) g_fail=1;
+    int ok1 = (rc==0 && !cnan && cmax<=0.02);
+    printf("  bilinear partition-of-unity (const interior, all %d channels) x%d,%d: rc=%d "
+           "max|Δ|=%.4f -> %s\n", C, sy,sx, rc, cmax, ok1?"PASS":"FAIL");
+    if (!ok1) g_fail=1;
 
-    /* (2) y-ramp -> half-pixel ramp interior:  in[y][x]=y  =>  out[oh] ≈ (oh+0.5)/sy-0.5 */
-    for (int y=0;y<IH;y++) for (int x=0;x<IW;x++) in[(size_t)y*IW+x]=(_Float16)(float)y;
-    rocket_upsample_bilinear_fp16(fd,in,out,C,IH,IW,sy,sx);
-    double rmax=0;
-    for (int oh=sy;oh<OH-sy;oh++){
-        double want=(oh+0.5)/sy-0.5;
+    /* (2) y-ramp -> half-pixel ramp interior:  in[c][y][x]=y+off(c)  =>
+     *     out[c][oh] ≈ (oh+0.5)/sy-0.5+off(c) */
+    for (int c=0;c<C;c++) for (int y=0;y<IH;y++) for (int x=0;x<IW;x++)
+        in[((size_t)c*IH+y)*IW+x]=(_Float16)((double)y+CH_OFF(c));
+    tf_sentinel_f16(out, out_n);
+    rc = rocket_upsample_bilinear_fp16(fd,in,out,C,IH,IW,sy,sx);
+    double rmax=0; int rnan=0;
+    for (int c=0;c<C;c++) for (int oh=sy;oh<OH-sy;oh++){
+        double want=(oh+0.5)/sy-0.5+CH_OFF(c);
         for (int ow=sx;ow<OW-sx;ow++){
-            double ad=fabs((float)out[(size_t)oh*OW+ow]-want); if(ad>rmax)rmax=ad;
+            double ad=fabs((float)out[((size_t)c*OH+oh)*OW+ow]-want);
+            if (isnan(ad)) rnan=1; else if (ad>rmax) rmax=ad;
         }
     }
-    printf("  bilinear linear-exactness (y-ramp interior) x%d,%d: max|Δ|=%.4f -> %s\n",
-           sy,sx,rmax, rmax<=0.05?"PASS":"FAIL");
-    if (rmax>0.05) g_fail=1;
+#undef CH_OFF
+    int ok2 = (rc==0 && !rnan && rmax<=0.05);
+    printf("  bilinear linear-exactness (y-ramp interior, all %d channels) x%d,%d: rc=%d "
+           "max|Δ|=%.4f -> %s\n", C, sy,sx, rc, rmax, ok2?"PASS":"FAIL");
+    if (!ok2) g_fail=1;
     free(in); free(out);
 }
 

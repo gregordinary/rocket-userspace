@@ -14,6 +14,12 @@
  * Diagnostic (stays unregistered): prints findings, returns 0 unless a call errors. Run with
  * ROCKET_ELU_NOREPAIR=1 to see the raw ELU glitch (default: repaired).
  *
+ * WHAT IT CANNOT SEE: the bar is an absolute 0.02, and near x=0 the abs, ELU and mish
+ * outputs are themselves at most ~0.02 in magnitude. So a glitch that writes 0, or the
+ * wrong small value, never crosses the bar: only a spike does (the +128/+8 mux toggle).
+ * Read "clean" as "no spike", not as "exact". The output starts as an fp16 NaN sentinel,
+ * so an element nothing wrote does show, as a NaN count.
+ *
  * Usage: x0_glitch_probe
  */
 #include <stdio.h>
@@ -24,6 +30,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_activation.h"
+#include "test_fill.h"
 
 static double softplus_d(double x){ return x>0?x+log1p(exp(-x)):log1p(exp(x)); }
 static double mish_d(double x){ return x*tanh(softplus_d(x)); }
@@ -37,21 +44,24 @@ static int probe(int fd, const char *nm, int is_elu, int kind, double (*ref)(dou
     const int n = (N + 7) & ~7;
     _Float16 *in = calloc(n, sizeof(_Float16)), *out = calloc(n, sizeof(_Float16));
     if (!in || !out) { free(in); free(out); return -1; }
+    tf_sentinel_f16(out, (size_t)n);
     for (int i = 0; i < N; i++) in[i] = (_Float16)(-0.02 + 4e-2 * ((double)i / (N - 1)));
 
     int r = is_elu ? rocket_elu_fp16(fd, 1.0f, in, out, n)
                    : rocket_activation_fp16(fd, kind, in, out, n);
     if (r) { printf("  %-9s call=%d FAIL\n", nm, r); free(in); free(out); return r; }
 
-    double worst = 0, wx = 0, wg = 0, ww = 0; int over = 0;
+    double worst = 0, wx = 0, wg = 0, ww = 0; int over = 0, nan = 0;
     for (int i = 0; i < N; i++) {
         double x = (double)(float)in[i], want = ref(x), got = (double)(float)out[i];
         double ad = fabs(got - want);
+        if (isnan(got)) { nan++; continue; }
         if (ad > worst) { worst = ad; wx = x; wg = got; ww = want; }
         if (ad > bar) over++;
     }
-    printf("  %-9s worst|Δ|=%.4g @x=%.6g (got=%.5g want=%.5g)  over(%.2g)=%d/%d  %s\n",
-           nm, worst, wx, wg, ww, bar, over, N, over ? "<-- GLITCH" : "clean");
+    printf("  %-9s worst|Δ|=%.4g @x=%.6g (got=%.5g want=%.5g)  over(%.2g)=%d/%d  unwritten=%d  %s\n",
+           nm, worst, wx, wg, ww, bar, over, N, nan,
+           (over || nan) ? "<-- GLITCH" : "clean (no spike)");
     free(in); free(out);
     return 0;
 }

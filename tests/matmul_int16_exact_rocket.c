@@ -61,12 +61,15 @@ int main(int argc, char **argv) {
     if (M <= 0 || (M % 4 != 0 && M != 1)) { fprintf(stderr, "M must be %%4 or 1\n"); return -1; }
     if (K <= 0 || K % 32 != 0) { fprintf(stderr, "K must be %%32\n"); return -1; }
     if (N <= 0 || N % 32 != 0) { fprintf(stderr, "N must be %%32 (int8 N-group)\n"); return -1; }
-    /* max |x| the signed/signed split represents exactly (see DOMAIN note above) */
-    int range = env_int("ROCKET_INT16_RANGE", 32639);
-    if (range < 1 || range > 32639) range = 32639;
+    /* The fill spans the entry's whole domain, [-32768, 32639] (see DOMAIN above), which
+     * is asymmetric: xh = -128 needs x <= -32641, so a symmetric +-32639 fill never sends
+     * the extreme high byte. ROCKET_INT16_RANGE still narrows it to +-range. */
+    int range = env_int("ROCKET_INT16_RANGE", 0);
+    if (range > 32639) range = 32639;
+    const int lo = range > 0 ? -range : -32768, hi = range > 0 ? range : 32639;
 
-    printf("int16 EXACT (byte-decomp): C[%d,%d] = A[%d,%d] x B[%d,%d]^T  range=+-%d\n",
-           M, N, M, K, N, K, range);
+    printf("int16 EXACT (byte-decomp): C[%d,%d] = A[%d,%d] x B[%d,%d]^T  range=[%d,%d]\n",
+           M, N, M, K, N, K, lo, hi);
 
     int fd = rocket_open();
     if (fd < 0) { printf("no NPU (%d) -> SKIP\n", fd); return 2; }
@@ -78,8 +81,14 @@ int main(int argc, char **argv) {
     if (!A||!B||!C||!R) { fprintf(stderr, "malloc failed\n"); return -1; }
 
     srand(1234);
-    for (int i = 0; i < M*K; i++) A[i] = (int16_t)(rand() % (2*range+1) - range);
-    for (int i = 0; i < N*K; i++) B[i] = (int16_t)(rand() % (2*range+1) - range);
+    for (int i = 0; i < M*K; i++) A[i] = (int16_t)(lo + rand() % (hi - lo + 1));
+    for (int i = 0; i < N*K; i++) B[i] = (int16_t)(lo + rand() % (hi - lo + 1));
+    {   /* say how often the extreme high byte occurs, so a run that never sent it shows */
+        long nxh = 0;
+        for (int i = 0; i < M*K; i++) { int8_t h, l; split_i16(A[i], &h, &l); nxh += (h == -128); }
+        printf("A elements whose high byte is -128: %ld of %d\n", nxh, M*K);
+        if (range == 0 && nxh == 0) { printf("the fill never reached xh = -128 -> FAIL\n"); return 1; }
+    }
 
     /* spot-check the split math matches the library's (catches a bad split early) */
     { int8_t h, l; split_i16(A[0], &h, &l);

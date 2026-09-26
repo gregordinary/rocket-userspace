@@ -16,14 +16,32 @@
  *
  *  2. ON-HARDWARE END-TO-END (only if /dev/accel/accel0 opens). Runs
  *     rocket_conv_transpose2d_fp16 on the NPU and compares to the direct scatter-add
- *     reference. This confirms the lowered forward conv runs HW-exact (the on-device task).
+ *     reference, through whichever route rocket_conv_transpose2d_route() names. A shape
+ *     on the hardware deconvolution route runs a second time with
+ *     ROCKET_CONV_TRANSPOSE_HW=0, and the two routes' outputs are compared too.
  *
- * Small integer inputs keep every result exact in fp16 (|sum| < 2048), so the bar is
- * max_abs == 0 for the lowering self-check and <= 1.0 for the HW path (fp16 narrowing).
+ * On an RK3588 the gate refuses to pass unless some shape actually took the hardware
+ * route, so a planner that silently declines everything cannot turn it green.
+ *
+ * THE INSTRUMENT (tests/test_fill.h). Every tensor gets a hashed fill with no period:
+ * integers in [-4,4] for the input and [-3,3] for the weights, a different seed per
+ * shape and per tensor. The results are exact integers, so every comparison is EXACT,
+ * element by element. The gate asserts max|ref| < 2048 for each shape, because that is
+ * what makes fp16 exact, rather than assuming it. The output starts as an fp16 NaN
+ * sentinel, so an element nothing wrote can never agree with its reference.
+ *
+ * Each of those replaced a blind spot. The old fill, W[i]=(i%3)-1, is a function of the
+ * kernel column alone on every 3x3 kernel, so a missing channel transpose or a vertical
+ * flip passed. At IC=OC=64 with a 4x4 kernel it gave [OC][IC] the same values as
+ * [IC][OC], and the old input (i%5)-2 was identical in every channel and row of a
+ * 24x20 plane. The bar was max_abs <= 1.0 over exact sums, which passes a dropped tap
+ * whose product is +-1, and the output started at zero.
  *
  * The sweep exercises stride 1/2/3, pad 0..K-1, output_padding, dilation>1, asymmetric
  * kernels, IC/OC crossing the cube group boundaries, an RGB-width input, and a large
- * shape that forces the forward conv to tile.
+ * shape that forces the forward conv to tile. Two shapes on the hardware route have a
+ * non-square kernel, unequal pads and unequal strides on the two axes, because a field
+ * swapped between them computes a plausible surface wherever the axes agree.
  *
  * Usage: conv_transpose_rocket            (built-in shape sweep)
  *        conv_transpose_rocket IC IH IW OC KH KW SY SX PT PL OPY OPX DY DX  (one shape)
@@ -36,6 +54,8 @@
 
 #include "rocket_npu.h"
 #include "rocket_conv.h"
+#include "rocket_hw_profile.h"
+#include "test_fill.h"
 
 /* Independent host lowering: dilate+pad the input, rot180+transpose the weights, run
  * the forward-conv CPU oracle. Returns the forward conv output (== the transpose). */
@@ -85,6 +105,33 @@ static void lowering_oracle(const rocket_conv_transpose2d_desc *d,
  * A per-case planner refusal returns 0, so without this a run in which EVERY shape
  * was refused would print N "skipping" lines and exit PASS over zero evidence. */
 static int g_checked = 0;
+static int g_deconv = 0;       /* of those, the ones on the hardware deconvolution route */
+
+/* One seed per shape: every field of the descriptor goes into it, so two shapes never
+ * share a fill by accident. */
+static uint64_t shape_seed(const rocket_conv_transpose2d_desc *d)
+{
+    const int f[] = { d->ic, d->ih, d->iw, d->oc, d->kh, d->kw, d->stride_y, d->stride_x,
+                      d->pad_top, d->pad_left, d->opad_y, d->opad_x, d->dil_y, d->dil_x,
+                      d->depthwise };
+    uint64_t h = 0x243F6A8885A308D3ull;
+    for (size_t i = 0; i < sizeof f / sizeof f[0]; i++) h = tf_hash(h, (uint64_t)(int64_t)f[i]);
+    return h;
+}
+
+/* Run the entry with ROCKET_CONV_TRANSPOSE_HW forced to `value`, then put back whatever
+ * the caller had: unsetting it would change the route of every later shape. */
+static int run_with_route_env(int fd, const rocket_conv_transpose2d_desc *d, const char *value,
+                              const _Float16 *in, const _Float16 *W, _Float16 *out)
+{
+    const char *prev = getenv("ROCKET_CONV_TRANSPOSE_HW");
+    char *saved = prev ? strdup(prev) : NULL;
+    setenv("ROCKET_CONV_TRANSPOSE_HW", value, 1);
+    int r = rocket_conv_transpose2d_fp16(fd, d, in, W, out);
+    if (saved) { setenv("ROCKET_CONV_TRANSPOSE_HW", saved, 1); free(saved); }
+    else unsetenv("ROCKET_CONV_TRANSPOSE_HW");
+    return r;
+}
 
 static int run_shape(int fd, const rocket_conv_transpose2d_desc *d)
 {
@@ -96,6 +143,9 @@ static int run_shape(int fd, const rocket_conv_transpose2d_desc *d)
 
     int plan = rocket_conv_transpose2d_plan(d);
     if (plan) { printf("  plan: unsupported (%d) — skipping\n", plan); return 0; }
+    const int route = rocket_conv_transpose2d_route(d);
+    printf("  route: %s\n", route == ROCKET_CONV_TRANSPOSE_DECONV
+                              ? "hardware deconvolution mode" : "lowering");
 
     size_t in_n  = (size_t)d->ic * d->ih * d->iw;
     /* W is [IC][OC][KH][KW] direct, [C][1][KH][KW] depthwise */
@@ -108,45 +158,61 @@ static int run_shape(int fd, const rocket_conv_transpose2d_desc *d)
     _Float16 *low = malloc(out_n * sizeof(_Float16));
     if (!in || !W || !out || !ref || !low) { fprintf(stderr, "oom\n"); return -1; }
 
-    for (size_t i = 0; i < in_n; i++) in[i] = (_Float16)((int)(i % 5) - 2);
-    for (size_t i = 0; i < wt_n; i++) W[i]  = (_Float16)((int)(i % 3) - 1);
+    const uint64_t seed = shape_seed(d);
+    tf_fill_f16_int(in, in_n, tf_hash(seed, 1), -4, 4);
+    tf_fill_f16_int(W,  wt_n, tf_hash(seed, 2), -3, 3);
+    const int dims[3] = { d->oc, OH, OW };
 
     int fail = 0;
 
     /* (1) lowering self-check: independent host lowering vs direct scatter definition */
+    tf_sentinel_f16(ref, out_n);
+    tf_sentinel_f16(low, out_n);
     rocket_conv_transpose2d_ref_fp16(d, in, W, ref);
     lowering_oracle(d, in, W, low);
     {
-        double max_abs = 0; int bad = 0;
-        for (size_t i = 0; i < out_n; i++) {
-            double ad = fabs((float)low[i] - (float)ref[i]);
-            if (ad > max_abs) max_abs = ad;
-            if (ad != 0.0 && bad < 6) {
-                printf("    low[%zu] scatter=%.2f lowered=%.2f\n", i, (float)ref[i], (float)low[i]); bad++;
-            }
+        /* The exact comparisons below hold only while every sum is an fp16 integer. */
+        double peak = 0;
+        for (size_t i = 0; i < out_n; i++)
+            if (fabs((float)ref[i]) > peak) peak = fabs((float)ref[i]);
+        if (!(peak < 2048.0)) {
+            printf("  max|ref| = %.0f is not below 2048, so fp16 is not exact here and the "
+                   "fill range is wrong for this shape (FAIL)\n", peak);
+            fail = 1;
         }
-        printf("  lowering self-check: max_abs=%.4f -> %s\n", max_abs, max_abs == 0.0 ? "PASS" : "FAIL");
-        if (max_abs != 0.0) fail = 1;
+        long bad = tf_cmp_f16("  lowering self-check", low, ref, dims, 3);
+        printf("  lowering self-check: max|ref|=%.0f -> %s\n", peak, bad ? "FAIL" : "PASS");
+        if (bad) fail = 1;
     }
 
-    /* (2) on hardware (or CPU-tiled forward conv when fd<0): NPU vs scatter reference */
+    /* (2) on hardware (or CPU-tiled forward conv when fd<0): NPU vs scatter reference,
+     * exactly, into a sentinel-filled buffer */
     {
         const char *tag = (fd >= 0) ? "HW end-to-end" : "CPU-lowered decomp";
-        memset(out, 0, out_n * sizeof(_Float16));
+        tf_sentinel_f16(out, out_n);
         int r = rocket_conv_transpose2d_fp16(fd, d, in, W, out);
         if (r) { printf("  %s: rocket_conv_transpose2d_fp16 = %d (FAIL)\n", tag, r); fail = 1; }
         else {
             g_checked++;
-            double max_abs = 0; int bad = 0;
-            for (size_t i = 0; i < out_n; i++) {
-                double ad = fabs((float)out[i] - (float)ref[i]);
-                if (ad > max_abs) max_abs = ad;
-                if (ad > 1.0 && bad < 6) {
-                    printf("    [%zu] ref=%.2f got=%.2f\n", i, (float)ref[i], (float)out[i]); bad++;
-                }
-            }
-            printf("  %s: max_abs=%.3f -> %s\n", tag, max_abs, max_abs <= 1.0 ? "PASS" : "FAIL");
-            if (max_abs > 1.0) fail = 1;
+            long bad = tf_cmp_f16(fd >= 0 ? "  HW end-to-end" : "  CPU-lowered decomp",
+                                  out, ref, dims, 3);
+            printf("  %s: %ld of %zu elements differ -> %s\n", tag, bad, out_n,
+                   bad ? "FAIL" : "PASS");
+            if (bad) fail = 1;
+        }
+    }
+
+    /* (3) the hardware route against the lowering, on the same shape, exactly */
+    if (fd >= 0 && route == ROCKET_CONV_TRANSPOSE_DECONV && !fail) {
+        g_deconv++;
+        tf_sentinel_f16(low, out_n);
+        int r = run_with_route_env(fd, d, "0", in, W, low);
+        if (r) { printf("  lowering A/B: rocket_conv_transpose2d_fp16 = %d (FAIL)\n", r); fail = 1; }
+        else {
+            long bad = tf_cmp_f16("  lowering A/B", low, out, dims, 3);
+            printf("  lowering A/B: %s -> %s\n", bad ? "differs" : "identical",
+                   bad ? "FAIL" : "PASS");
+            if (bad) fail = 1;
         }
     }
 
@@ -200,6 +266,22 @@ int main(int argc, char **argv)
             { .ic=64,.ih=8,.iw=8,.oc=64,.kh=4,.kw=4,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1,.depthwise=1 },
             /* DW 3x upsample, asymmetric input */
             { .ic=32,.ih=6,.iw=9,.oc=32,.kh=3,.kw=3,.stride_y=3,.stride_x=3,.dil_y=1,.dil_x=1,.depthwise=1 },
+            /* The hardware deconvolution route at decoder sizes, where the lowering's dilated
+             * input overflows one CBUF pass and tiles: 2x k4 p1 at 64 channels, 4x, an OC that
+             * is not a multiple of 16, a per-axis stride and a 2x with output_padding. */
+            { .ic=64,.ih=32,.iw=32,.oc=64,.kh=4,.kw=4,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 },
+            { .ic=32,.ih=16,.iw=16,.oc=32,.kh=4,.kw=4,.stride_y=4,.stride_x=4,.dil_y=1,.dil_x=1 },
+            { .ic=32,.ih=24,.iw=20,.oc=24,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.opad_y=1,.opad_x=1,.dil_y=1,.dil_x=1 },
+            { .ic=32,.ih=12,.iw=12,.oc=32,.kh=3,.kw=3,.stride_y=2,.stride_x=1,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 },
+            { .ic=128,.ih=16,.iw=16,.oc=64,.kh=4,.kw=4,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 },
+            /* The hardware route with the two axes different in every field it programs:
+             * a 4x2 kernel with pads (1,0), and a 2x4 kernel with pads (0,1), strides (2,4)
+             * and output_padding on one axis only. */
+            { .ic=32,.ih=10,.iw=14,.oc=48,.kh=4,.kw=2,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=0,.dil_y=1,.dil_x=1 },
+            { .ic=64,.ih=12,.iw=8,.oc=32,.kh=2,.kw=4,.stride_y=2,.stride_x=4,.pad_top=0,.pad_left=1,.opad_y=1,.dil_y=1,.dil_x=1 },
+            /* The same asymmetry on the lowering: a 3x5 kernel, pads (1,2), output_padding
+             * on x only. */
+            { .ic=48,.ih=9,.iw=13,.oc=40,.kh=3,.kw=5,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=2,.opad_x=1,.dil_y=1,.dil_x=1 },
         };
         for (size_t i = 0; i < sizeof(shapes)/sizeof(shapes[0]); i++) {
             fail |= run_shape(fd, &shapes[i]);
@@ -212,6 +294,17 @@ int main(int argc, char **argv)
         printf("no shape reached a numeric check — every case was refused or "
                "skipped; this gate proved nothing\n");
         fail = 1;
+    }
+    printf("%d shapes checked, %d of them on the hardware deconvolution route\n",
+           g_checked, g_deconv);
+    {
+        const char *e = getenv("ROCKET_CONV_TRANSPOSE_HW");
+        if (fd >= 0 && argc != 15 && argc != 16 && g_deconv == 0 && !(e && *e == '0') &&
+            strcmp(rocket_hw_current()->name, "rk3588") == 0) {
+            printf("the sweep's power-of-two shapes all LOWERED on an RK3588: the hardware "
+                   "route was never exercised\n");
+            fail = 1;
+        }
     }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : (fd < 0 ? 2 : 0);

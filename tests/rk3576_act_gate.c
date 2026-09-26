@@ -140,9 +140,19 @@ static int run_case(int fd, int kind, const struct act_quant *q,
 
     if (!in || !out) { free(in); free(out); return 1; }
 
-    /* Dense: every byte value appears, and appears in every channel, so a per-channel
-     * fault and a per-value one are both visible. */
-    for (i = 0; i < n; i++) in[i] = (int8_t)(int)((i % 256u) - 128u);
+    /* Dense: every byte value appears in every channel whose plane is a multiple of 256,
+     * so a per-value fault is visible. Each channel is the ramp rotated by 89c, so no two
+     * channels hold the same data and a channel mixup is visible too, which a plain i % 256
+     * over CHW was not at the 256-multiple planes. And each 256-element block of a plane
+     * is rotated by one more than the last, so no two rows of a channel match either: the
+     * ramp alone repeats every 256/w rows. Checked over every shape in the table. */
+    {
+        const size_t plane = (size_t)sh->h * sh->w;
+        for (i = 0; i < n; i++) {
+            size_t c = i / plane, q = i % plane;
+            in[i] = (int8_t)(int)(((q + q / 256u + 89u * c) & 255u) - 128u);
+        }
+    }
     memset(out, 0x5A, n);
 
     /* The same two scales the entry point derives, restated rather than borrowed: this

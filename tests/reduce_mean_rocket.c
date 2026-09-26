@@ -37,6 +37,7 @@
 #include "rocket_reduce.h"
 #include "npu_pool.h"      /* ppu_recip_kernel_fp16 (not used directly; layout parity) */
 #include "npu_matmul.h"    /* feature_data */
+#include "test_fill.h"
 
 /* ---- layer 1: factorisation ---- */
 static int check_factor(int n, int expect_ok)
@@ -131,11 +132,17 @@ static int run_shape(int fd, int C, int H, int W)
     _Float16 *ref = malloc((size_t)C * sizeof(_Float16));
     if (!in || !out || !ref) { fprintf(stderr, "oom\n"); free(in);free(out);free(ref); return 1; }
 
-    /* small pseudo-random values; per-channel mean is well-conditioned and O(1) */
+    /* Each channel is its own hashed offset in [0.5,2.5] plus noise in [-1,1], so every
+     * mean is O(1) and the channels' means differ. A zero-mean fill made each mean about
+     * 0.04, where a divisor off by 0.75x moves it by 0.01 and passed; and identical means
+     * across channels would hide a channel mixup. */
     uint32_t st = 0x1234u + (uint32_t)(C*131 + H*17 + W);
     for (size_t i = 0; i < n; i++) {
         st = st*1664525u + 1013904223u;
-        in[i] = (_Float16)(((float)((st >> 9) & 0x3ff) / 1023.f) * 4.f - 2.f);  /* [-2,2] */
+        float noise = ((float)((st >> 9) & 0x3ff) / 1023.f) * 2.f - 1.f;          /* [-1,1] */
+        float off = 0.5f + 2.0f * (float)(tf_hash(0x3EA7u, i / ((size_t)H * W)) >> 11)
+                                 * 0x1.0p-53f;                                     /* [0.5,2.5] */
+        in[i] = (_Float16)(off + noise);
     }
 
     int fail = self_check(C, H, W, in);
@@ -152,8 +159,9 @@ static int run_shape(int fd, int C, int H, int W)
             double rd = ad / (fabs((float)ref[c]) + 1e-3);
             if (ad > max_abs) max_abs = ad;
             if (rd > max_rel) max_rel = rd;
-            /* count as bad only if it misses in BOTH abs and rel (false-green-audit style) */
-            if (ad > 0.03 && rd > 0.05) {
+            /* 0.004 + 0.4% of |ref|: about 10x the multi-pass fp16 rounding at these
+             * magnitudes, and a divisor off by 2% already misses it */
+            if (!(ad <= 0.004 + 0.004 * fabs((float)ref[c]))) {
                 if (bad < 6) printf("    [c=%d] ref=%.4f got=%.4f d=%.4f\n",
                                     c, (float)ref[c], (float)out[c], ad);
                 bad++;
@@ -204,6 +212,10 @@ int main(int argc, char **argv)
     if (argc == 4) {
         fail = run_shape(fd, atoi(argv[1]), atoi(argv[2]), atoi(argv[3]));
         if (fd >= 0) rocket_close(fd);
+        if (fd < 0 && !fail) {
+            printf("no NPU: the host checks passed and the device path never ran -> SKIP\n");
+            return 2;
+        }
         printf("==== %s ====\n", fail ? "FAIL" : "PASS");
         return fail ? 1 : 0;
     }
@@ -235,6 +247,11 @@ int main(int argc, char **argv)
     }
 
     if (fd >= 0) rocket_close(fd);
+    if (fd < 0 && !fail) {
+        /* The host checks passed, but the device path never ran, so this is not a pass. */
+        printf("no NPU: the host checks passed and the device path never ran -> SKIP\n");
+        return 2;
+    }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

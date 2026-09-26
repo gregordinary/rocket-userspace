@@ -32,6 +32,7 @@
 #include "rocket_npu.h"
 #include "rocket_pool.h"
 #include "npu_matmul.h"   /* feature_data */
+#include "test_fill.h"
 
 static const char *mname(int m) { return m == POOL_METHOD_MAX ? "max" : "avg"; }
 
@@ -96,7 +97,11 @@ static int cube_self_check(const rocket_pool_desc *d, const _Float16 *in)
  * was refused would print N "skipping" lines and exit PASS over zero evidence. */
 static int g_checked = 0;
 
-static int run_shape(int fd, const rocket_pool_desc *d)
+/* `neg`: fill with negative values only, so every window at a padded border is all
+ * negative and a MAX pad that fills with 0 instead of -inf reads 0 where the answer is
+ * negative. With a mixed-sign fill a border window almost always holds a positive value,
+ * and that defect passed. */
+static int run_shape(int fd, const rocket_pool_desc *d, int neg)
 {
     int OH = rocket_pool_oh(d), OW = rocket_pool_ow(d);
     printf("%s C=%d %dx%d  k=%dx%d s=%dx%d p=%d,%d,%d,%d -> %dx%d\n",
@@ -110,8 +115,13 @@ static int run_shape(int fd, const rocket_pool_desc *d)
     _Float16 *in = malloc(in_n*sizeof(_Float16)), *out = malloc(out_n*sizeof(_Float16));
     _Float16 *ref = malloc(out_n*sizeof(_Float16));
     if (!in || !out || !ref) { fprintf(stderr, "oom\n"); return -1; }
-    /* distinct small values; integers keep max bit-exact and average near-exact in fp16 */
-    for (size_t i = 0; i < in_n; i++) in[i] = (_Float16)((int)(i % 13) - 6);
+    /* hashed small integers (tests/test_fill.h): max stays bit-exact, the average
+     * near-exact, and nothing repeats along any axis */
+    {
+        uint64_t seed = tf_hash(0x9001, (uint64_t)(d->c * 1000003 + d->ih * 1009 + d->iw * 31 +
+                                                   d->kh * 7 + d->kw + d->method * 5));
+        tf_fill_f16_int(in, in_n, seed, -6, neg ? -1 : 6);
+    }
 
     int fail = cube_self_check(d, in);
 
@@ -130,7 +140,7 @@ static int run_shape(int fd, const rocket_pool_desc *d)
 
     {   /* run the driver: HW end-to-end (fd>=0) or CPU oracle (fd<0) */
         const char *tag = (fd >= 0) ? "HW end-to-end" : "CPU fallback";
-        memset(out, 0, out_n*sizeof(_Float16));
+        tf_sentinel_f16(out, out_n);
         int r = rocket_pool_fp16(fd, d, in, out);
         if (r) { printf("  %s: rocket_pool_fp16 = %d (FAIL)\n", tag, r); fail = 1; }
         else {
@@ -142,14 +152,15 @@ static int run_shape(int fd, const rocket_pool_desc *d)
             for (size_t i = 0; i < out_n; i++) {
                 double ad = fabs((float)out[i] - (float)ref[i]);
                 if (ad > max_abs) max_abs = ad;
-                if (ad > tol && bad < 6) {
-                    printf("    [%zu] ref=%.4f got=%.4f d=%.4f\n",
-                           i, (float)ref[i], (float)out[i], ad); bad++;
+                if (!(ad <= tol)) {        /* a NaN sentinel left unwritten counts too */
+                    if (bad < 6) printf("    [%zu] ref=%.4f got=%.4f d=%.4f\n",
+                                        i, (float)ref[i], (float)out[i], ad);
+                    bad++;
                 }
             }
-            printf("  %s: max_abs=%.5f (tol=%.3f) -> %s\n",
-                   tag, max_abs, tol, max_abs <= tol ? "PASS" : "FAIL");
-            if (max_abs > tol) fail = 1;
+            printf("  %s: max_abs=%.5f (tol=%.3f) bad=%d -> %s\n",
+                   tag, max_abs, tol, bad, bad == 0 ? "PASS" : "FAIL");
+            if (bad) fail = 1;
         }
     }
     free(in); free(out); free(ref);
@@ -171,7 +182,7 @@ int main(int argc, char **argv)
             .c=atoi(argv[2]),.ih=atoi(argv[3]),.iw=atoi(argv[4]),
             .kh=atoi(argv[5]),.kw=atoi(argv[6]),.stride_y=atoi(argv[7]),.stride_x=atoi(argv[8]),
             .pad_top=atoi(argv[9]),.pad_left=atoi(argv[10]),.pad_bottom=atoi(argv[11]),.pad_right=atoi(argv[12]) };
-        fail = run_shape(fd, &d);
+        fail = run_shape(fd, &d, 0);
     } else {
         rocket_pool_desc shapes[] = {
             /* MAX: HW-validated shapes (2x2 s2, C=8) */
@@ -187,9 +198,23 @@ int main(int argc, char **argv)
             { .method=POOL_METHOD_AVG,.c=16,.ih=8, .iw=8, .kh=2,.kw=2,.stride_y=2,.stride_x=2 },         /* 2-plane avg */
             { .method=POOL_METHOD_AVG,.c=24,.ih=8, .iw=8, .kh=4,.kw=4,.stride_y=4,.stride_x=4 },         /* k=4, 3-plane */
             { .method=POOL_METHOD_AVG,.c=8, .ih=7, .iw=7, .kh=7,.kw=7,.stride_y=1,.stride_x=1 },         /* global avg -> 1x1 */
+            /* padded AVG (count-include-pad: the divisor stays kh*kw), same-pad and then with
+             * every field differing between the axes: kernel, stride and each pad */
+            { .method=POOL_METHOD_AVG,.c=16,.ih=8, .iw=6, .kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.pad_bottom=1,.pad_right=1 },
+            { .method=POOL_METHOD_AVG,.c=16,.ih=9, .iw=7, .kh=3,.kw=2,.stride_y=2,.stride_x=1,.pad_top=1,.pad_left=0,.pad_bottom=0,.pad_right=1 },
         };
         for (size_t i = 0; i < sizeof(shapes)/sizeof(shapes[0]); i++) {
-            fail |= run_shape(fd, &shapes[i]);
+            fail |= run_shape(fd, &shapes[i], 0);
+            printf("\n");
+        }
+        /* MAX over an ALL-NEGATIVE input with padding on every border and the axes
+         * asymmetric, so a zero pad fill is visible in every border window */
+        rocket_pool_desc negmax[] = {
+            { .method=POOL_METHOD_MAX,.c=8, .ih=6, .iw=6, .kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.pad_bottom=1,.pad_right=1 },
+            { .method=POOL_METHOD_MAX,.c=8, .ih=7, .iw=10,.kh=2,.kw=3,.stride_y=1,.stride_x=2,.pad_top=0,.pad_left=1,.pad_bottom=1,.pad_right=0 },
+        };
+        for (size_t i = 0; i < sizeof(negmax)/sizeof(negmax[0]); i++) {
+            fail |= run_shape(fd, &negmax[i], 1);
             printf("\n");
         }
     }
@@ -198,6 +223,11 @@ int main(int argc, char **argv)
         printf("no shape reached a numeric check — every case was refused or "
                "skipped; this gate proved nothing\n");
         fail = 1;
+    }
+    if (fd < 0 && !fail) {
+        /* The host checks passed, but the device path never ran, so this is not a pass. */
+        printf("no NPU: the host checks passed and the device path never ran -> SKIP\n");
+        return 2;
     }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;

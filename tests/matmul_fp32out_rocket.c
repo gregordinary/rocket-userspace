@@ -36,6 +36,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static int64_t now_us(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -54,7 +55,7 @@ int main(int argc, char **argv) {
 
     int Mt=0, Kt=0, Nt=0;
     int njobs = rocket_matmul_plan(M, K, N, &Mt, &Kt, &Nt);
-    if (njobs < 0) { fprintf(stderr, "unsupported shape (need K%%32, N%%16, M%%4||1)\n"); return 2; }
+    if (njobs < 0) { fprintf(stderr, "unsupported shape (need K%%32, N%%16, M%%4||1)\n"); return 1; }
     int nKt = (K + Kt - 1) / Kt;
     printf("fp32-OUT gate: C[%d,%d] = A[%d,%d] x B[%d,%d]^T  Mt=%d Kt=%d Nt=%d nKt=%d (%d jobs)\n",
            M, N, M, K, N, K, Mt, Kt, Nt, nKt, njobs);
@@ -102,9 +103,12 @@ int main(int argc, char **argv) {
     printf("  readback: fp16-out %.2f MB vs fp32-out %.2f MB (2x); weight pack %.2f MB "
            "(out/wt ratio %.2f)\n", out_mb_16, out_mb_32, wt_mb, wt_mb>0 ? (double)M*N*2/((double)N*K*2) : 0.0);
 
-    /* sample-based exact fp64 reference over the fp16 inputs. */
+    /* sample-based exact fp64 reference over the fp16 inputs. The stride is coprime to
+     * M*N: MN/samples is 4 at 64x512, which put every sample on lane 0 of a 4-lane fp32
+     * atom, 128 of the 512 columns. */
     size_t MN = (size_t)M*N;
-    size_t stride = MN > (size_t)samples ? MN/(size_t)samples : 1;
+    size_t stride = MN > (size_t)samples
+                  ? (size_t)tf_coprime_stride((int)MN, (int)(MN/(size_t)samples)) : 1;
     int checked=0, nonfin=0, shown=0;
     double max_ref=0, abs16=0, abs32=0;     /* track per-path max abs error + max|ref| */
     for (size_t idx=0; idx<MN; idx+=stride) {

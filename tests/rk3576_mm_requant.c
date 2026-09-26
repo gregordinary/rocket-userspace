@@ -66,6 +66,7 @@
 #include "rocket_rk3576_internal.h"
 #include "npu_regcmd_rk3576.h"
 #include "requant_model.h"
+#include "perchannel_model.h"   /* plan_c: the ramp planner, a second implementation */
 
 /* The host buffer's own stamp: an element the entry's de-scatter never reached. It has
  * to be distinguishable from a legitimate result, and every legitimate result is an
@@ -106,10 +107,11 @@ struct cell { int M, K, N; };
 /* ---- the per-output-column arm -------------------------------------------
  *
  * The per-column entry carries its scale on the coefficient group's int16 C ramp over a
- * shared (MUL, SHIFT), so the model here is the ramp and not an exact scale: it calls
- * the SAME planner the entry does and applies `(acc + bias) * C[n]` then the shared
- * shift. That is deliberate — the question is whether the DEVICE implements the
- * epilogue the planner assumes, not whether the planner is a good approximation. What
+ * shared (MUL, SHIFT), so the model here is the ramp and not an exact scale: it plans the
+ * ramp with perchannel_model.h's plan_c, a second implementation of the library's
+ * planner, and applies `(acc + bias) * C[n]` then the shared shift. The question is
+ * whether the DEVICE implements the epilogue the planner's RULE assumes; a model that
+ * called the entry's own planner would agree with a planner defect by construction. What
  * the ramp gives up against an exact per-column scale is a separate quantity and is
  * reported alongside, from the entry's own `worst_rel_err`.
  *
@@ -124,13 +126,16 @@ static int perc_arm(int fd, int M, int K, int N, const int8_t *A, const int8_t *
     int8_t *C = malloc((size_t)M * N);
     int8_t *model = malloc((size_t)M * N);
     int64_t *sum_abs_w = calloc((size_t)N, sizeof *sum_abs_w);
-    int32_t *tile_bias = NULL;
-    int16_t *cmul = NULL;
+    int32_t *bias_n = calloc((size_t)N, sizeof *bias_n);   /* plan_c indexes the whole layer */
+    int16_t *cmul = calloc((size_t)N, sizeof *cmul);
     double worst = -1.0, worst_sa = -1.0, model_worst = 0.0;
     long long wrong = 0, vs_exact = 0;
     int maxd = 0, maxd_exact = 0, nt = 0, rc, shown = 0, bad = 0;
 
-    if (!C || !model || !sum_abs_w) { free(C); free(model); free(sum_abs_w); return -1; }
+    if (!C || !model || !sum_abs_w || !bias_n || !cmul) {
+        free(C); free(model); free(sum_abs_w); free(bias_n); free(cmul); return -1;
+    }
+    if (bias) memcpy(bias_n, bias, (size_t)N * sizeof *bias_n);
 
     for (int n = 0; n < N; n++) {
         const int8_t *w = B + (size_t)n * K;
@@ -140,43 +145,42 @@ static int perc_arm(int fd, int M, int K, int N, const int8_t *A, const int8_t *
     }
     if (rocket_matmul_plan_int8_rk3576(M, K, N, NULL, NULL, &nt) < 0 || nt <= 0) {
         printf("  perc %4d x %5d x %4d  no plan — not scored\n", M, K, N);
-        free(C); free(model); free(sum_abs_w);
+        free(C); free(model); free(sum_abs_w); free(bias_n); free(cmul);
         return 1;
     }
 
-    /* Plan every tile the way the entry does, and requant this tile's columns. */
+    /* Plan every tile the way the entry does, and requant this tile's columns. The tile
+     * width is the pure planner's; the ramp inside it is plan_c's. */
     for (int n0 = 0; n0 < N; n0 += nt) {
         unsigned tile_n = (unsigned)(N - n0 < nt ? N - n0 : nt);
-        unsigned nreg = rocket_rk3576_pad_oc(tile_n);
-        float base = 0.0f;
-        double err = 0.0;
         unsigned mul, shift;
+        double gain;
 
-        free(tile_bias); free(cmul);
-        tile_bias = calloc(nreg, sizeof *tile_bias);
-        cmul = calloc(nreg, sizeof *cmul);
-        if (!tile_bias || !cmul) { bad = 1; break; }
-        if (bias) for (unsigned j = 0; j < tile_n; j++) tile_bias[j] = bias[n0 + j];
-
-        if (rocket_rk3576_plan_perchannel("model", (unsigned)n0, tile_n, nreg, tile_bias,
-                                          sum_abs_w, 1.0f, scale_n, 1.0f, NULL,
-                                          cmul, &base, &err) != 0) { bad = 1; break; }
-        if (err > model_worst) model_worst = err;
-        requant_params(base, &mul, &shift);
+        for (unsigned j = 0; j < tile_n; j++)
+            if (!(scale_n[n0 + j] > 0.0f)) bad = 1;
+        if (bad) break;
+        plan_c((unsigned)n0, tile_n, NULL, sum_abs_w, bias_n, 1.0f, scale_n, 1.0f,
+               cmul, &mul, &shift);
+        gain = (double)mul / (double)((uint64_t)1 << shift);
+        for (unsigned j = 0; j < tile_n; j++) {
+            double cs = (double)scale_n[n0 + j];
+            double err = fabs((double)cmul[n0 + j] * gain - cs) / cs;
+            if (err > model_worst) model_worst = err;
+        }
         for (int m = 0; m < M; m++)
             for (unsigned j = 0; j < tile_n; j++) {
-                int64_t v = (int64_t)acc[(size_t)m * N + n0 + j] * (int64_t)cmul[j];
+                int64_t v = (int64_t)acc[(size_t)m * N + n0 + j] * (int64_t)cmul[n0 + j];
                 model[(size_t)m * N + n0 + j] =
                     (int8_t)requant_sat8(requant_round_shift(v * (int64_t)mul, shift));
             }
     }
-    if (bad) { free(C); free(model); free(sum_abs_w); free(tile_bias); free(cmul); return -1; }
+    if (bad) { free(C); free(model); free(sum_abs_w); free(bias_n); free(cmul); return -1; }
 
     memset(C, HOST_STAMP, (size_t)M * N);
     rc = rocket_matmul_int8_rk3576_perc(fd, M, K, N, A, B, bias, scale_n, C, &worst);
     if (rc != 0) {
         printf("  perc %4d x %5d x %4d  REFUSED rc=%d\n", M, K, N, rc);
-        free(C); free(model); free(sum_abs_w); free(tile_bias); free(cmul);
+        free(C); free(model); free(sum_abs_w); free(bias_n); free(cmul);
         return 1;
     }
 
@@ -211,7 +215,7 @@ static int perc_arm(int fd, int M, int K, int N, const int8_t *A, const int8_t *
     {
         int8_t *C_sa = malloc((size_t)M * N);
         long long diff = 0;
-        if (!C_sa) { free(C); free(model); free(sum_abs_w); free(tile_bias); free(cmul);
+        if (!C_sa) { free(C); free(model); free(sum_abs_w); free(bias_n); free(cmul);
                      return -1; }
         memset(C_sa, HOST_STAMP, (size_t)M * N);
         rc = rocket_matmul_int8_rk3576_perc_sa(fd, M, K, N, A, B, bias, scale_n,
@@ -240,7 +244,7 @@ static int perc_arm(int fd, int M, int K, int N, const int8_t *A, const int8_t *
         int8_t *C_w = malloc((size_t)M * N);
         long long diffw = 0, diffp = 0;
         double worst_w = -1.0;
-        if (!C_w) { free(C); free(model); free(sum_abs_w); free(tile_bias); free(cmul);
+        if (!C_w) { free(C); free(model); free(sum_abs_w); free(bias_n); free(cmul);
                     return -1; }
         rc = rocket_rk3576_wbo_create(fd, K, N, B, &wbo);
         if (rc != 0 || !wbo) {
@@ -321,7 +325,7 @@ static int perc_arm(int fd, int M, int K, int N, const int8_t *A, const int8_t *
         free(C_w);
     }
 
-    free(C); free(model); free(sum_abs_w); free(tile_bias); free(cmul);
+    free(C); free(model); free(sum_abs_w); free(bias_n); free(cmul);
     return wrong ? 1 : 0;
 }
 

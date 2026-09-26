@@ -53,8 +53,11 @@ for ((c=1;c<=CYCLES;c++)); do
   for idx in "${!CFG_LABELS[@]}"; do
     L="${CFG_LABELS[$idx]}"
     out=$(run_one "$L" "${CFG_IRQ[$idx]}" "${CFG_TS[$idx]}")
-    med=$(echo "$out" | sed -n 's/.*submit_us_median=\([0-9.]*\).*/\1/p')
-    minv=$(echo "$out" | sed -n 's/.*submit_us_min=\([0-9.]*\).*/\1/p')
+    # submit_overhead_rocket's RESULT keys; the old submit_us_median=/submit_us_min= were
+    # never printed, so every median here came back empty
+    med=$(echo "$out" | sed -n 's/.*submit_us_blocking_median=\([0-9.]*\).*/\1/p')
+    minv=$(echo "$out" | sed -n 's/.*submit_us_blocking_min=\([0-9.]*\).*/\1/p')
+    [ -n "$med" ] || echo "WARN: no submit_us_blocking_median in the probe's output"
     # which cpu actually serviced the npu irq (delta in interrupt counts)
     echo "cycle $c  $L  median=$med  min=$minv"
     ACC[$L]="${ACC[$L]:-} $med"

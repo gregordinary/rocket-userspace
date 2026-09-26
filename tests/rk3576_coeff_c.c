@@ -22,9 +22,10 @@
  * product the host chose. The requant is left at unity, so the surface IS the BS
  * stage's output.
  *
- * Usage:  rk3576_coeff_c [order|perchan|range|clamp|product|all]   (default: all)
+ * Usage:  rk3576_coeff_c [order|perchan|range|clamp|product|shift|all]   (default: all)
  *         `all` is the gate: order, perchan, range, clamp. `product` is a
- *         characterisation — its inexact cells ARE the decoded saturation.
+ *         characterisation — its inexact cells ARE the decoded saturation. `shift`
+ *         reads the product under a nonzero DPU shift word.
  * Exit:   0 every question answered consistently, 1 a disagreement, 2 no NPU (skip).
  */
 #define _POSIX_C_SOURCE 200809L
@@ -32,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "rocket_npu.h"
 #include "npu_matmul.h"
@@ -44,6 +46,10 @@
 /* Both are 1-BASED on every axis, and both live in the library. */
 int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
 int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+
+/* The DPU shift word the `shift` mode writes (bits[5:0] shift the non-negative results,
+ * bits[13:8] the negative ones). Zero, as every other mode leaves it, is no shift. */
+static uint32_t g_shift_word;
 
 static size_t out_index(unsigned surf_elems, unsigned ow, unsigned c,
                         unsigned y, unsigned x)
@@ -117,6 +123,10 @@ static int run_one_scaled(int fd, unsigned oc_n, unsigned nic, int fval, int wva
         rocket_bo_fini(fd, &bo_b);
         goto done;
     }
+    /* The shift word is the first word of the last 64-byte group, which is where the
+     * emitter points BS_BASE_ADDR1. The packer leaves it zero: no shift. */
+    if (g_shift_word)
+        memcpy((uint8_t *)bo_b.ptr + coeff - 64, &g_shift_word, sizeof g_shift_word);
     rocket_bo_fini(fd, &bo_b);
 
     p.ic = (uint16_t)icreg; p.ih = (uint16_t)ih; p.iw = (uint16_t)iw;
@@ -427,6 +437,139 @@ static int probe_clamp(int fd)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * shift: is `(acc + A) * C` held WIDE under a nonzero shift word, where does the
+ * shift apply, and how does it round?
+ *
+ * `clamp` reads the saturation with the shift word at zero, where saturate-then-shift
+ * and shift-then-saturate are the same arithmetic. With a shift they are not:
+ *
+ *   wide:  C = 2^14 and a shift of 14, so a wide chain returns (acc + A) itself, at
+ *          products from ~2^27 to ~2^45. A product saturated at int32 FIRST returns
+ *          (2^31 - 1) >> 14 = 131071 for everything past 2^31.
+ *   order: C = 3 * 2^13 and a shift of 14, at an accumulator that is not a multiple of
+ *          2^14. Multiply-then-shift gives 1.5 * acc; a shift of (acc + A) first gives
+ *          (acc >> 14) * 24576.
+ *   round: C = 1, a shift of 1 and an odd A, so every result is an exact half. That
+ *          reads the shift's own tie rule against five candidates.
+ *
+ * The requant scale divides each expected BS value back to a known int8 target, as
+ * `product` does, so the int8 surface can witness a value far past its own range.
+ * ------------------------------------------------------------------------ */
+static int shift_expect(double bs, double v_wide)
+{
+    double x = 100.0 * bs / v_wide;
+    return (int)(x < -128.0 ? -128 : (x > 127.0 ? 127 : (x < 0 ? x - 0.5 : x + 0.5)));
+}
+
+static long long rnd_rule(int rule, long long a)
+{
+    /* a / 2 under: 0 half-up, 1 half-away-from-0, 2 half-to-even, 3 truncate, 4 floor */
+    long long q;
+    switch (rule) {
+    case 0: return (a + 1) >> 1;
+    case 1: q = ((a < 0 ? -a : a) + 1) >> 1; return a < 0 ? -q : q;
+    case 2: q = (a + 1) >> 1; if ((a & 1) && (q & 1)) q -= 1; return q;
+    case 3: q = (a < 0 ? -a : a) >> 1; return a < 0 ? -q : q;
+    default: return a >> 1;
+    }
+}
+
+static int probe_shift(int fd)
+{
+    static const struct { unsigned nic; int32_t A; } WIDE[] = {
+        { 1, 0 }, { 4, 0 }, { 16, 0 }, { 32, 0 },
+        { 1, 100000000 }, { 1, 1000000000 }, { 1, 2000000000 },
+    };
+    static const char *RULE[] = { "half-up", "half-away-from-0", "half-to-even",
+                                  "truncate-toward-0", "floor" };
+    const unsigned OC = 32;
+    const int target = 100;
+    int32_t bias[32];
+    int16_t cmul[32];
+    int got[32];
+    unsigned i, c;
+    int r, bad = 0, wide_ok = 0, wide_sat = 0;
+
+    printf("shift wide: C = 16384, shift word 0x0E0E (14 on both signs). A wide chain "
+           "reads %d everywhere\n", target);
+    printf("  %-12s %-10s %-5s %-6s %-6s %s\n", "product", "acc+A", "got", "wide",
+           "sat1st", "");
+    g_shift_word = 0x0E0E;
+    for (i = 0; i < sizeof WIDE / sizeof WIDE[0]; i++) {
+        long long v = (long long)WIDE[i].nic * 100 * 100 + WIDE[i].A;
+        double prod = (double)v * 16384.0;
+        double sat = prod > 2147483647.0 ? 2147483647.0 / 16384.0 : (double)v;
+        int e_wide = target, e_sat = shift_expect(floor(sat), (double)v);
+        for (c = 0; c < OC; c++) { bias[c] = WIDE[i].A; cmul[c] = 16384; }
+        if (run_one_scaled(fd, OC, WIDE[i].nic, 100, 100, bias, cmul,
+                           (float)((double)target / (double)v), got) != 0) {
+            bad++; continue;
+        }
+        for (c = 1; c < OC; c++) if (got[c] != got[0]) break;
+        printf("  %-12.4g %-10lld %-5d %-6d %-6d %s\n", prod, v, got[0], e_wide, e_sat,
+               c < OC ? "CHANNELS DIFFER" :
+               got[0] == e_wide && got[0] == e_sat ? "(does not discriminate)" :
+               got[0] == e_wide ? "WIDE" : got[0] == e_sat ? "saturated first" : "neither");
+        if (c < OC) { bad++; continue; }
+        if (got[0] == e_wide && got[0] != e_sat) wide_ok++;
+        else if (got[0] == e_sat && got[0] != e_wide) wide_sat++;
+        else if (got[0] != e_wide) bad++;
+    }
+
+    {
+        const unsigned nic = 16;
+        const long long acc = 160000;                 /* not a multiple of 2^14 */
+        const long long after = acc * 24576 >> 14;    /* 240000 */
+        const long long before = (acc >> 14) * 24576; /* 221184 */
+        int e_after = target, e_before = shift_expect((double)before, (double)after);
+        printf("shift order: acc %lld, C = 24576, shift 14: multiply-then-shift %lld, "
+               "shift-then-multiply %lld\n", acc, after, before);
+        for (c = 0; c < OC; c++) { bias[c] = 0; cmul[c] = 24576; }
+        if (run_one_scaled(fd, OC, nic, 100, 100, bias, cmul,
+                           (float)((double)target / (double)after), got) != 0) {
+            bad++;
+        } else {
+            printf("  got %d: multiply-then-shift predicts %d, shift-then-multiply %d -> %s\n",
+                   got[0], e_after, e_before,
+                   got[0] == e_after ? "MULTIPLY THEN SHIFT" :
+                   got[0] == e_before ? "SHIFT THEN MULTIPLY" : "neither");
+            if (got[0] != e_after && got[0] != e_before) bad++;
+        }
+    }
+
+    {
+        int live[5] = { 1, 1, 1, 1, 1 }, nomatch = 0;
+        g_shift_word = 0x0101;
+        printf("shift round: C = 1, shift 1 on both signs, A = 2c - 31 (every result a "
+               "half)\n");
+        for (c = 0; c < OC; c++) { bias[c] = 2 * (int)c - 31; cmul[c] = 1; }
+        if (run_one(fd, OC, 0, 1, bias, cmul, got) != 0) {
+            bad++;
+        } else {
+            for (c = 0; c < OC; c++) {
+                int any = 0;
+                for (r = 0; r < 5; r++) {
+                    if (rnd_rule(r, bias[c]) == got[c]) any = 1;
+                    else live[r] = 0;
+                }
+                if (!any) {
+                    if (nomatch < 4)
+                        printf("  A %+d -> got %d, which no rule gives\n", (int)bias[c], got[c]);
+                    nomatch++;
+                }
+            }
+            printf("  consistent rules:");
+            for (r = 0; r < 5; r++) if (live[r]) printf("  %s", RULE[r]);
+            printf("%s\n", nomatch ? "  (and some elements match NONE)" : "");
+            if (nomatch) bad++;
+        }
+    }
+    g_shift_word = 0;
+    printf("shift: %d cells read wide, %d read saturated first\n", wide_ok, wide_sat);
+    return bad ? -1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "all";
@@ -453,6 +596,10 @@ int main(int argc, char **argv)
         (void)probe_product(fd);
     if (!strcmp(mode, "all") || !strcmp(mode, "clamp"))
         if (probe_clamp(fd) != 0) fail = 1;
+    /* NOT in `all` either: `shift` is a characterisation of the shift word, not a
+     * property the shipping ramp relies on. */
+    if (!strcmp(mode, "shift"))
+        if (probe_shift(fd) != 0) fail = 1;
 
     rocket_close(fd);
     printf("rk3576_coeff_c: %s\n", fail ? "a question came back inconsistent" : "ok");

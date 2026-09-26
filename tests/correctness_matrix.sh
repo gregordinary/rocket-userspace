@@ -14,28 +14,29 @@
 #     sudo -E tests/correctness_matrix.sh          # full matrix
 #     sudo -E COS_THRESH=0.999 tests/correctness_matrix.sh
 #
-# Exit 0 iff every run PASSed or SKIPped; nonzero (and a FAIL list) otherwise.
+# Exit 0 iff every run PASSed or was declined where EXPECT_DECLINE said it would be;
+# nonzero (and a FAIL list) otherwise. A run with no NPU is counted as a SKIP, and a
+# matrix with any skip exits 2, because a skipped cell checked nothing.
 set -u
 BIN="${BIN:-build/matmul_correctness_matrix_rocket}"
 [ -x "$BIN" ] || { echo "missing $BIN (build it first)"; exit 2; }
 
-pass=0; fail=0; skip=0; fails=""
+pass=0; declined=0; fail=0; skip=0; fails=""
 
 tally() {  # tally <out> <rc> <label>
     echo "$1"
-    # The test binary's EXIT STATUS is the authority: report() returns 0 on PASS, 1 on
-    # FAIL, and the harness returns 0 on SKIP (2/3 on usage/alloc/no-NPU). So a nonzero
-    # rc is a failure regardless of text (covers crashes too); the printed text only
-    # disambiguates PASS vs SKIP when rc==0.
-    if [ "${2:-1}" -ne 0 ]; then
-        fail=$((fail+1)); fails="$fails\n  [$3] (rc=$2) $1"
-        return
-    fi
+    # The test binary's EXIT STATUS is the authority: 0 is a numeric check that passed
+    # or a decline EXPECT_DECLINE asked for, 2 is no NPU, anything else is a failure
+    # (crashes included). The printed text only tells the two kinds of 0 apart.
+    case "${2:-1}" in
+        0) ;;
+        2) skip=$((skip+1)); return;;
+        *) fail=$((fail+1)); fails="$fails\n  [$3] (rc=$2) $1"; return;;
+    esac
     case "$1" in
-        *SKIP*) skip=$((skip+1));;
+        *"DECLINED as expected"*) declined=$((declined+1));;
         *PASS*) pass=$((pass+1));;
-        *FAIL*) fail=$((fail+1)); fails="$fails\n  [$3] (rc=0 but FAIL text!) $1";;
-        *)      fail=$((fail+1)); fails="$fails\n  [$3] (rc=0, no PASS/SKIP) $1";;
+        *)      fail=$((fail+1)); fails="$fails\n  [$3] (rc=0, no PASS) $1";;
     esac
 }
 run() {  # run <mode> <M> <K> <N> [env...]   (fp16)
@@ -77,11 +78,17 @@ for s in "${SHAPES[@]}"; do
 done
 
 echo "############ PART 2 — all four entry points, representative shapes ############"
+# The one-shot entries pad M=1 to a height-4 tile. The streaming and resident entries
+# refuse it (rocket_matmul.h), and those two cells assert the refusal at its stage.
 for s in "attn_q 3840 4096" "ffn_down 15360 3840"; do
   set -- $s; K=$2 N=$3
   for mode in tiled mt stream prepacked; do
     for M in 1 4 512; do
-      run "$mode" "$M" "$K" "$N" SAMPLE_ROWS=48
+      case "$mode/$M" in
+        stream/1)    run "$mode" "$M" "$K" "$N" SAMPLE_ROWS=48 EXPECT_DECLINE=path ;;
+        prepacked/1) run "$mode" "$M" "$K" "$N" SAMPLE_ROWS=48 EXPECT_DECLINE=pack ;;
+        *)           run "$mode" "$M" "$K" "$N" SAMPLE_ROWS=48 ;;
+      esac
     done
   done
 done
@@ -126,12 +133,14 @@ for dt in int8 int4 int16 bf16 tf32; do
   done
 done
 
-echo "############ PART 5 — resident (prepacked) int8/int4: M==1 must SKIP, M>=4 PASS ############"
+echo "############ PART 5 — resident (prepacked) int8/int4: M==1 must be refused at the pack, M>=4 PASS ############"
 for dt in int8 int4; do
-  for M in 1 4 512; do run_dt prepacked "$M" 3840 4096 "$dt" SAMPLE_ROWS=32; done
+  run_dt prepacked 1 3840 4096 "$dt" SAMPLE_ROWS=32 EXPECT_DECLINE=pack
+  for M in 4 512; do run_dt prepacked "$M" 3840 4096 "$dt" SAMPLE_ROWS=32; done
 done
 
 echo
-echo "================ SUMMARY: PASS=$pass  SKIP=$skip  FAIL=$fail ================"
+echo "================ SUMMARY: PASS=$pass  DECLINED(expected)=$declined  SKIP=$skip  FAIL=$fail ================"
 if [ "$fail" -ne 0 ]; then echo -e "FAILURES:$fails"; exit 1; fi
-echo "ALL GREEN (every run PASS or SKIP)"
+if [ "$skip" -ne 0 ]; then echo "INCOMPLETE: $skip cell(s) found no NPU and checked nothing"; exit 2; fi
+echo "ALL GREEN (every run PASS, or refused where it was expected to be)"

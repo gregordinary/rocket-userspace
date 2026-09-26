@@ -89,13 +89,15 @@ static int do_cap(int fd, size_t sz, int map)
     rocket_bo *bo = calloc(MAX, sizeof(*bo));
     uint64_t *a = calloc(MAX, sizeof(*a));
     if (!bo || !a) { free(bo); free(a); return -1; }
-    int n = 0;
-    while (n < MAX && rocket_bo_alloc(fd, sz, &bo[n]) == 0) {
+    int n = 0, arc = 0;
+    while (n < MAX && (arc = rocket_bo_alloc(fd, sz, &bo[n])) == 0) {
         a[n] = bo[n].dma_address;
         n++;
     }
-    printf("cap: size=%zu fits=%d total=%.3f GiB\n",
-           sz, n, (double)n * (double)sz / 1073741824.0);
+    /* the errno says WHICH ceiling stopped it: ENOSPC is the IOVA window, ENOMEM memory */
+    printf("cap: size=%zu fits=%d total=%.3f GiB (stopped by %s)\n",
+           sz, n, (double)n * (double)sz / 1073741824.0,
+           n < MAX ? strerror(arc < 0 ? -arc : arc) : "the probe's own limit");
 
     if (n > 0) {
         qsort(a, (size_t)n, sizeof(*a), addr_cmp);
@@ -140,7 +142,11 @@ static int do_churn(int fd, size_t sz, int batch, int rounds)
     for (int r = 0; r < rounds; r++) {
         int n = 0;
         for (int i = 0; i < batch; i++) {
-            if (rocket_bo_alloc(fd, sz, &bo[i]) != 0) { failed++; break; }
+            int arc2 = rocket_bo_alloc(fd, sz, &bo[i]);
+            if (arc2 != 0) {
+                if (!failed) printf("  first churn failure: %s\n", strerror(arc2 < 0 ? -arc2 : arc2));
+                failed++; break;
+            }
             n++;
         }
         for (int i = 0; i < n; i++) rocket_bo_free(fd, &bo[i]);

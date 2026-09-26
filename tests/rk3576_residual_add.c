@@ -391,7 +391,12 @@ int main(int argc, char **argv)
          * things the elementwise stage cannot express and this lowering can. */
         int worst = 0; double ms = 0;
         int rc = one(fd, &SHAPES[i], 0.021f, 0.013f, -7, 11, &worst, &ms);
-        if (rc == 2) { printf("  %-18s refused\n", SHAPES[i].name); refused++; continue; }
+        /* Every shape here is expressible and measured exact, so a refusal is a failure:
+         * counted apart, a run that refused all twelve would pass. */
+        if (rc == 2) {
+            printf("  %-18s REFUSED, which this gate does not expect\n", SHAPES[i].name);
+            refused++; fails++; continue;
+        }
         fails += rc;
         ran++;
     }
@@ -400,7 +405,11 @@ int main(int argc, char **argv)
     for (i = 0; i < N_SHAPES; i += 4) {
         int worst = 0; double ms = 0;
         int rc = one(fd, &SHAPES[i], 0.017f, 0.017f, 0, 0, &worst, &ms);
-        if (rc == 2) { refused++; continue; }
+        if (rc == 2) {
+            printf("  %-18s REFUSED at equal scales, which this gate does not expect\n",
+                   SHAPES[i].name);
+            refused++; fails++; continue;
+        }
         fails += rc;
         ran++;
     }

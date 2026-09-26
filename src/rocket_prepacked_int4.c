@@ -403,10 +403,10 @@ static void *rk4_thread(void *a) {
     memset(acc, 0, (size_t)M * nsub * sizeof(int64_t));
     uint64_t npu_regs[256] = {0};
     rocket_task_desc *tasks = w->tasks;
-    /* Contiguous chaining is HW-blocked for the integer datapath (the int32 CACC
-     * clears per-kick, not per-task, so chained tasks accumulate onto the previous
-     * task's residual — first-tile-exact, rest-garbage). Force gapped; the resident
-     * path still batches into one ioctl (lever 1). See rocket_prepacked_int8.c. */
+    /* Contiguous chaining stays off. The int8 matmul chains bit-exactly
+     * (tests/int8_chain_probe), but this path writes int16 through its own output
+     * stage, and no int4 chain has been scored against a CPU model. Gapped still
+     * batches into one ioctl (lever 1). See rocket_prepacked_int8.c. */
     int chained = 0;
     (void)rkt_chain_enabled;
     int total = nMt * nNt * nKt, done_tiles = 0, nb = 0;
@@ -552,10 +552,10 @@ static void *rk4_thread_gw(void *a) {
     memset(facc, 0, (size_t)M * nsub * sizeof(float));
     uint64_t npu_regs[256] = {0};
     rocket_task_desc *tasks = w->tasks;
-    /* Contiguous chaining is HW-blocked for the integer datapath (the int32 CACC
-     * clears per-kick, not per-task, so chained tasks accumulate onto the previous
-     * task's residual — first-tile-exact, rest-garbage). Force gapped; the resident
-     * path still batches into one ioctl (lever 1). See rocket_prepacked_int8.c. */
+    /* Contiguous chaining stays off. The int8 matmul chains bit-exactly
+     * (tests/int8_chain_probe), but this path writes int16 through its own output
+     * stage, and no int4 chain has been scored against a CPU model. Gapped still
+     * batches into one ioctl (lever 1). See rocket_prepacked_int8.c. */
     int chained = 0;
     (void)rkt_chain_enabled;
     int total = nMt * nNt * nKt, done_tiles = 0, nb = 0;

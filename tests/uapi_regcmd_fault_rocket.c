@@ -57,7 +57,10 @@
  *
  * This is a PROBE, not a gate: it deliberately faults the NPU, which costs a job
  * timeout and a core reset. Run it by hand on a board you are willing to reboot.
- * It prints the dmesg delta itself so the WARN, if any, is attributed.
+ * It prints the kernel log's delta itself, read from a journal cursor
+ * (test_klog.h), so the WARN, if any, is attributed. A dmesg line count was the mark
+ * before, and it reads an empty log under dmesg_restrict and a frozen one once the
+ * ring buffer rolls.
  *
  * Usage: sudo -E ./uapi_regcmd_fault_rocket [read|write]
  *   read  (default) — unmapped regcmd IOVA: the PC's instruction fetch faults
@@ -69,7 +72,8 @@
  *                     encodings differ and neither runs on the other: an int8
  *                     convolution on the RK3576, an fp16 matmul on the RK3588.
  *
- * Exit: 0 = ran (read the report), 2 = no NPU device or no encoder for this part.
+ * Exit: 0 = ran (read the report), 2 = no NPU device, no encoder for this part, or
+ * an unreadable kernel journal (the report would be empty).
  */
 #define _GNU_SOURCE
 #include <stdint.h>
@@ -83,34 +87,13 @@
 #include "npu_matmul.h"
 #include "rocket_hw_profile.h"
 #include "npu_regcmd_rk3576.h"
+#include "test_klog.h"
 
 /* An IOVA no BO on this fd can hold. The per-fd allocator bump-starts at 0 and
  * this probe maps a few pages, so anything up in the 3 GB region is unmapped --
  * and it stays inside the 32-bit window the PC's BASE_ADDRESS register can
  * express, so the fault is the IOMMU's and not a truncation. */
 #define UNMAPPED_IOVA 0xC0DE0000u
-
-static long dmesg_lines(void)
-{
-    FILE *f = popen("dmesg 2>/dev/null | wc -l", "r");
-    if (!f) return -1;
-    long n = -1;
-    if (fscanf(f, "%ld", &n) != 1) n = -1;
-    pclose(f);
-    return n;
-}
-
-static void dmesg_since(long from)
-{
-    if (from < 0) { printf("  info : dmesg unreadable (need root?)\n"); return; }
-    char cmd[256];
-    snprintf(cmd, sizeof cmd,
-             "dmesg 2>/dev/null | tail -n +%ld | grep -iE "
-             "'rocket|iommu|WARNING|Call trace|DMA' | head -30", from + 1);
-    printf("  ---- : dmesg delta\n");
-    fflush(stdout);
-    if (system(cmd) != 0) { /* nothing matched, or no dmesg: both are results */ }
-}
 
 int main(int argc, char **argv)
 {
@@ -210,7 +193,15 @@ int main(int argc, char **argv)
            (unsigned long long)in.dma_address, (unsigned long long)out.dma_address,
            regcmd_iova);
 
-    long mark = dmesg_lines();
+    tk_mark mark;
+    if (tk_mark_take(&mark) < 0) {
+        printf("  info : the kernel journal is unreadable, and this probe's report IS the\n"
+               "         kernel log: add the user to `adm`, or allow `sudo -n` (skip)\n");
+        for (unsigned i = 0; i < nbo; i++)
+            if (bos[i]->handle) rocket_bo_free(fd, bos[i]);
+        rocket_close(fd);
+        return 2;
+    }
 
     rocket_task_desc t = { .regcmd = regcmd_iova, .regcmd_count = regcmd_count };
     uint32_t inh[] = { in.handle, wt.handle, bias.handle, rc_bo.handle };
@@ -231,13 +222,14 @@ int main(int argc, char **argv)
     rocket_bo_fini(fd, &out);
 
     sleep(1);
-    dmesg_since(mark);
+    printf("  ---- : kernel log delta\n");
+    tk_print_since(&mark, "rocket|iommu|WARNING|Call trace|DMA", 30);
 
 out:
     for (unsigned i = 0; i < nbo; i++)
         if (bos[i]->handle) rocket_bo_free(fd, bos[i]);
     rocket_close(fd);
 
-    printf("\nprobe ran; read the dmesg delta above for WARNING / rocket_job_irq_handler\n");
+    printf("\nprobe ran; read the kernel log delta above for WARNING / rocket_job_irq_handler\n");
     return 0;
 }

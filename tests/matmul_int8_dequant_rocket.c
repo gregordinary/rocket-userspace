@@ -10,7 +10,9 @@
  *   - OUT_CVT_SCALE and the BN-MUL operand are uint16 INTEGER multipliers (NOT fp16
  *     and NOT fixed-point: scale=2 -> x2, BN-MUL 0x3800 -> x14336);
  *   - OUT_CVT_SHIFT (bits[5:0]) is an INTEGER right-shift applied in the integer
- *     domain BEFORE the float cast (so it TRUNCATES — fractions are lost);
+ *     domain BEFORE the float cast, so the fraction is lost: it ROUNDS to the nearest
+ *     integer, an exact half going where OUT_CVT_SHIFT bit 30 says (0, which this test
+ *     writes, is half to even; tests/requant_round_probe.c measures both);
  *   - the float-affine minus_exp / cvt_type decode (the LUT path) is a NO-OP on the
  *     raw int32 CACC — it only applies to the LUT/EW float datapath;
  *   - fp16 output uses the int8-datapath writer geometry size_e=3 / surf_add=stride*2.
@@ -21,8 +23,8 @@
  *     65504 -> HALVES the output readback (2 B vs int32's 4 B) for range-bounded acc.
  *   + a per-tensor INTEGER gain folds exactly (out = acc*scale).
  *   - a FRACTIONAL W8A8 dequant scale CANNOT fold to a fractional float: (acc*scale)>>shift
- *     truncates to an integer. So the host per-row*per-channel dequant stays; the int8
- *     readback lever is bigger-Kt, not OUT_CVT. (The integer truncate IS exactly
+ *     rounds to an integer. So the host per-row*per-channel dequant stays; the int8
+ *     readback lever is bigger-Kt, not OUT_CVT. (The integer rounding IS exactly
  *     right for int8->int8 requant — the conv int8-out path uses it.)
  *
  * MODES:

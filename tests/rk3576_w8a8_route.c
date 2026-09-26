@@ -92,6 +92,11 @@
 /* An element the entry's de-scatter never reached. Every legitimate result is an int8,
  * so there is no free value — the count still holding it is reported separately. */
 #define HOST_STAMP ((int8_t)0x5A)
+/* The library's own write-guard sentinel, ROCKET_RK3576_SENTINEL_BYTE. A surface the guard
+ * failed to repair reaches the caller holding it, where the host stamp would read as
+ * written. Neither byte is a value this route can produce: CALSAFE 3 holds every frozen
+ * output to about +-42, and the stamp is 90 and the sentinel -91. */
+#define LIB_SENTINEL ((int8_t)0xA5)
 
 static uint32_t xs32(uint32_t *s)
 {
@@ -319,7 +324,7 @@ static int run_cell(int fd, int M, int K, int N, uint32_t seed,
                 double got = (double)v / (double)scf[n];
                 double want = (double)acc[(size_t)m * N + n];
                 if (v >= 127 || v <= -127) sats++;
-                if ((int8_t)v == HOST_STAMP) stamped++;
+                if ((int8_t)v == HOST_STAMP || (int8_t)v == LIB_SENTINEL) stamped++;
                 se += (got - want) * (got - want);
                 ss += want * want;
             }
@@ -406,7 +411,8 @@ int main(int argc, char **argv)
                100.0 * r.est_med, 100.0 * r.est_worst,
                100.0 * r.rms_rel, 100.0 * r.worst_rel_err, 100.0 * r.sat_frac);
         if (r.stamped) {
-            printf("      FAIL: %ld elements still hold the host stamp\n", r.stamped);
+            printf("      FAIL: %ld elements still hold the host stamp or the library's "
+                   "sentinel\n", r.stamped);
             fail++;
         }
         if (r.shift_p1 > 63u || r.shift_frozen > 63u) {

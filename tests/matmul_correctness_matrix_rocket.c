@@ -33,9 +33,24 @@
  *            (int16 = the bit-exact int16->int64 path, rocket_matmul_int16_exact)
  *   nthreads = workers for mt/stream/prepacked   (default 4)
  * Env: COS_THRESH (default 0.9995), SAMPLE_ROWS (default 96), SEED (default 0),
- *      FULL_ROWS=1 (verify every row, ignores SAMPLE_ROWS).
+ *      FULL_ROWS=1 (verify every row, ignores SAMPLE_ROWS),
+ *      EXPECT_DECLINE=pack|path (the run must be refused, at that stage),
+ *      ELEM_TOL_C (default 16; the fp16 per-element bound below).
  *
- * Prints one machine-parseable RESULT line + PASS/FAIL; exit 0 on PASS or SKIP.
+ * THE COSINE IS NOT THE WHOLE VERDICT. A whole-tensor cosine of 0.9995 cannot see one
+ * dropped K term at K=1024, which reads about 0.99951, and it averages a localized error
+ * away. So two per-element checks sit beside it. The integer dtypes are exact by
+ * construction and must match EXACTLY. fp16 must keep every element within
+ * ELEM_TOL_C * 2^-11 * rms(ref) * sqrt(nKt + 1): the rounding of an fp16 running sum
+ * over nKt K-tiles. That bound is 4-6x the largest error measured on the RK1 at K from
+ * 1024 to 15360, and at K=1024 it still flags the majority of the elements a dropped K
+ * term moves. bf16 and tf32 keep the cosine alone.
+ *
+ * Prints one machine-parseable RESULT line. Exit 0 only when a numeric check ran and
+ * passed, or when EXPECT_DECLINE named the stage that refused. Exit 2 when the device
+ * cannot be opened. Exit 1 on everything else: a wrong answer, a path that declined
+ * without EXPECT_DECLINE, a decline at the wrong stage, a usage error, a host allocation
+ * failure. A declined path used to print SKIP and exit 0, which ctest read as PASS.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -87,11 +102,29 @@ static int report(const char *mode, const char *dtype, int M, int K, int N,
     double cos = (na > 0 && nb > 0) ? dot / (sqrt(na) * sqrt(nb))
                                     : ((na == 0 && nb == 0) ? 1.0 : 0.0);
     int pass = (cos >= cos_thresh);
+
+    /* the per-element checks the cosine cannot make */
+    const int is_int = !strcmp(dtype, "int8") || !strcmp(dtype, "int4") ||
+                       !strcmp(dtype, "int16");
+    const int is_fp16 = !strcmp(dtype, "fp16");
+    double elem_tol = 0.0, worst = 0.0;
+    if (is_int) {
+        pass = pass && (max_abs == 0.0);
+    } else if (is_fp16) {
+        double c = getenv("ELEM_TOL_C") ? atof(getenv("ELEM_TOL_C")) : 16.0;
+        double rms_ref = sqrt(nb / (double)ncmp);
+        int nkt = Kt > 0 ? (K + Kt - 1) / Kt : 1;
+        elem_tol = c * 0x1.0p-11 * (rms_ref > 1.0 ? rms_ref : 1.0) * sqrt((double)nkt + 1.0);
+        worst = max_abs / elem_tol;
+        pass = pass && (max_abs <= elem_tol);
+    }
     printf("RESULT dt=%-5s mode=%-9s M=%-5d K=%-6d N=%-6d Mpad=%-5d Kt=%-5d njobs=%-4d rows=%-3d "
-           "cos=%.6f max_abs=%.3f rmse=%.4f frac_bad=%.4f -> %s\n",
+           "cos=%.6f max_abs=%.3f rmse=%.4f frac_bad=%.4f",
            dtype, mode, M, K, N, Mpad, Kt, njobs, nr,
-           cos, max_abs, sqrt(sse / (double)ncmp), (double)nbad / (double)ncmp,
-           pass ? "PASS" : "FAIL");
+           cos, max_abs, sqrt(sse / (double)ncmp), (double)nbad / (double)ncmp);
+    if (is_int)  printf(" exact=%s", max_abs == 0.0 ? "yes" : "NO");
+    if (is_fp16) printf(" elem_tol=%.4f worst/tol=%.2f", elem_tol, worst);
+    printf(" -> %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
 
@@ -99,7 +132,7 @@ int main(int argc, char **argv) {
     if (argc < 4) {
         printf("usage: %s M K N [tiled|mt|stream|prepacked] [fp16|int8|int4|int16|bf16|tf32] [nthreads]\n",
                argv[0]);
-        return 2;
+        return 1;
     }
     int M = atoi(argv[1]), K = atoi(argv[2]), N = atoi(argv[3]);
     const char *mode  = (argc > 4) ? argv[4] : "tiled";
@@ -109,6 +142,20 @@ int main(int argc, char **argv) {
     double cos_thresh = getenv("COS_THRESH") ? atof(getenv("COS_THRESH")) : 0.9995;
     int sample_rows   = getenv("SAMPLE_ROWS") ? atoi(getenv("SAMPLE_ROWS")) : 96;
     uint64_t seed     = getenv("SEED") ? strtoull(getenv("SEED"), NULL, 0) : 0;
+    const char *expect_decline = getenv("EXPECT_DECLINE");   /* "pack" | "path" | NULL */
+    if (expect_decline && !*expect_decline) expect_decline = NULL;
+
+    /* Probe the device once, up front: every later open or context failure is then a
+     * path error rather than a missing device. */
+    {
+        int probe = rocket_open();
+        if (probe < 0) {
+            printf("RESULT dt=%-5s mode=%-9s M=%-5d K=%-6d N=%-6d -> SKIP (no NPU: %d)\n",
+                   dtype, mode, M, K, N, probe);
+            return 2;
+        }
+        rocket_close(probe);
+    }
     g_state = seed ^ ((uint64_t)M * 0x100000001B3ULL) ^ ((uint64_t)K << 21)
                    ^ ((uint64_t)N << 42) ^ ((uint64_t)dtype[0] << 8);
 
@@ -127,7 +174,7 @@ int main(int argc, char **argv) {
     int want = full_rows ? M : (sample_rows < M ? sample_rows : M);
     int *rows = malloc((size_t)M * sizeof(int));       /* at most M distinct rows */
     char *picked = calloc((size_t)M, 1);               /* O(1) dedup */
-    if (!rows || !picked) { fprintf(stderr, "host alloc failed\n"); return 3; }
+    if (!rows || !picked) { fprintf(stderr, "host alloc failed\n"); return 1; }
     int nr = 0;
 #define ADD_ROW(I) do { int _i=(I); if (_i>=0 && _i<M && !picked[_i]) { picked[_i]=1; rows[nr++]=_i; } } while (0)
     if (full_rows) {
@@ -144,38 +191,47 @@ int main(int argc, char **argv) {
 
     double *got = calloc((size_t)nr * N, sizeof(double));
     double *ref = calloc((size_t)nr * N, sizeof(double));
-    if (!got || !ref) { fprintf(stderr, "host alloc failed\n"); return 3; }
+    if (!got || !ref) { fprintf(stderr, "host alloc failed\n"); return 1; }
 
-    int ret = 0, skip = 0;
+    int ret = 0;
 
-#define SKIP_IF(cond, msg) do { if (cond) { \
-        printf("RESULT dt=%-5s mode=%-9s M=%-5d K=%-6d N=%-6d -> SKIP (%s)\n", \
-               dtype, mode, M, K, N, msg); skip = 1; goto done; } } while (0)
+    /* A refusal. With EXPECT_DECLINE naming this stage it is the result under test and
+     * exits 0; anything else is a failure, because a gate registration that meets it
+     * expected a number. */
+#define DECLINED(stage, msg) do { \
+        int _want = expect_decline && !strcmp(expect_decline, stage); \
+        printf("RESULT dt=%-5s mode=%-9s M=%-5d K=%-6d N=%-6d -> %s (%s declined: %s)\n", \
+               dtype, mode, M, K, N, _want ? "DECLINED as expected" : "FAIL", stage, msg); \
+        ret = _want ? 0 : 1; goto done; } while (0)
+    /* A combination this harness cannot run: a usage error, never a pass. */
+#define UNSUPPORTED(msg) do { \
+        printf("RESULT dt=%-5s mode=%-9s M=%-5d K=%-6d N=%-6d -> FAIL (harness: %s)\n", \
+               dtype, mode, M, K, N, msg); ret = 1; goto done; } while (0)
 
     if (!strcmp(dtype, "fp16")) {
         _Float16 *A = calloc((size_t)Mpad * K, sizeof(_Float16));
         _Float16 *B = malloc((size_t)N * K * sizeof(_Float16));
         _Float16 *C = malloc((size_t)Mpad * N * sizeof(_Float16));
-        if (!A || !B || !C) { fprintf(stderr, "oom\n"); return 3; }
+        if (!A || !B || !C) { fprintf(stderr, "oom\n"); return 1; }
         for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (_Float16)frand();
         for (size_t i = 0; i < (size_t)N * K; i++) B[i] = (_Float16)frand();
         int r;
         if (!strcmp(mode, "tiled")) {
-            int fd = rocket_open(); if (fd < 0) return 3;
+            int fd = rocket_open(); if (fd < 0) return 1;
             r = rocket_matmul_fp16(fd, Mpad, K, N, A, B, C); rocket_close(fd);
         } else if (!strcmp(mode, "mt")) {
             r = rocket_matmul_fp16_mt(Mpad, K, N, A, B, C, nthreads);
         } else if (!strcmp(mode, "stream")) {
-            rocket_stream *s = rocket_stream_create(nthreads); if (!s) return 3;
+            rocket_stream *s = rocket_stream_create(nthreads); if (!s) return 1;
             r = rocket_matmul_fp16_stream(s, Mpad, K, N, A, B, C); rocket_stream_free(s);
         } else if (!strcmp(mode, "prepacked")) {
-            rocket_ctx *ctx = rocket_ctx_create(nthreads); if (!ctx) return 3;
+            rocket_ctx *ctx = rocket_ctx_create(nthreads); if (!ctx) return 1;
             rocket_weights *w = rocket_weights_pack(ctx, Mpad, K, N, B);
-            if (!w) { free(A);free(B);free(C); rocket_ctx_free(ctx); SKIP_IF(1, "weights_pack declined"); }
+            if (!w) { free(A);free(B);free(C); rocket_ctx_free(ctx); DECLINED("pack", "rocket_weights_pack"); }
             r = rocket_matmul_fp16_prepacked(ctx, Mpad, K, N, A, C, w);
             rocket_weights_free(ctx, w); rocket_ctx_free(ctx);
-        } else { fprintf(stderr, "bad mode\n"); return 2; }
-        if (r) { free(A);free(B);free(C); SKIP_IF(1, "path declined"); }
+        } else { fprintf(stderr, "bad mode\n"); return 1; }
+        if (r) { free(A);free(B);free(C); DECLINED("path", "the matmul entry returned nonzero"); }
         for (int ri = 0; ri < nr; ri++) { int m = rows[ri];
             for (int n = 0; n < N; n++) { float s = 0;
                 for (int k = 0; k < K; k++) s += (float)A[(size_t)m*K+k] * (float)B[(size_t)n*K+k];
@@ -188,31 +244,31 @@ int main(int argc, char **argv) {
         int8_t *A = calloc((size_t)Mpad * K, 1);
         int8_t *B = malloc((size_t)N * K);
         int32_t *C = malloc((size_t)Mpad * N * sizeof(int32_t));
-        if (!A || !B || !C) { fprintf(stderr, "oom\n"); return 3; }
+        if (!A || !B || !C) { fprintf(stderr, "oom\n"); return 1; }
         for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (int8_t)irand(lo, hi);
         for (size_t i = 0; i < (size_t)N * K; i++) B[i] = (int8_t)irand(lo, hi);
         int r;
         if (!strcmp(mode, "tiled")) {
-            int fd = rocket_open(); if (fd < 0) return 3;
+            int fd = rocket_open(); if (fd < 0) return 1;
             r = is4 ? rocket_matmul_int4(fd, Mpad, K, N, A, B, C)
                     : rocket_matmul_int8(fd, Mpad, K, N, A, B, C);
             rocket_close(fd);
         } else if (!strcmp(mode, "prepacked")) {
             if (is4) {
-                rocket_i4_ctx *ctx = rocket_i4_ctx_create(nthreads); if (!ctx) return 3;
+                rocket_i4_ctx *ctx = rocket_i4_ctx_create(nthreads); if (!ctx) return 1;
                 rocket_i4_weights *w = rocket_i4_weights_pack(ctx, Mpad, K, N, B);
-                if (!w) { free(A);free(B);free(C); rocket_i4_ctx_free(ctx); SKIP_IF(1,"i4 pack declined"); }
+                if (!w) { free(A);free(B);free(C); rocket_i4_ctx_free(ctx); DECLINED("pack", "rocket_i4_weights_pack"); }
                 r = rocket_matmul_int4_prepacked(ctx, Mpad, K, N, A, C, w);
                 rocket_i4_weights_free(ctx, w); rocket_i4_ctx_free(ctx);
             } else {
-                rocket_i8_ctx *ctx = rocket_i8_ctx_create(nthreads); if (!ctx) return 3;
+                rocket_i8_ctx *ctx = rocket_i8_ctx_create(nthreads); if (!ctx) return 1;
                 rocket_i8_weights *w = rocket_i8_weights_pack(ctx, Mpad, K, N, B);
-                if (!w) { free(A);free(B);free(C); rocket_i8_ctx_free(ctx); SKIP_IF(1,"i8 pack declined"); }
+                if (!w) { free(A);free(B);free(C); rocket_i8_ctx_free(ctx); DECLINED("pack", "rocket_i8_weights_pack"); }
                 r = rocket_matmul_int8_prepacked(ctx, Mpad, K, N, A, C, w);
                 rocket_i8_weights_free(ctx, w); rocket_i8_ctx_free(ctx);
             }
-        } else { free(A);free(B);free(C); SKIP_IF(1, "mode N/A for int dtype"); }
-        if (r) { free(A);free(B);free(C); SKIP_IF(1, "path declined"); }
+        } else { free(A);free(B);free(C); UNSUPPORTED("mode N/A for int dtype"); }
+        if (r) { free(A);free(B);free(C); DECLINED("path", "the matmul entry returned nonzero"); }
         for (int ri = 0; ri < nr; ri++) { int m = rows[ri];
             for (int n = 0; n < N; n++) { int64_t s = 0;
                 for (int k = 0; k < K; k++) s += (int)A[(size_t)m*K+k] * (int)B[(size_t)n*K+k];
@@ -220,16 +276,16 @@ int main(int argc, char **argv) {
         free(A); free(B); free(C);
 
     } else if (!strcmp(dtype, "int16")) {   /* bit-exact int16->int64 */
-        SKIP_IF(strcmp(mode, "tiled"), "int16 = one-shot only");
+        if (strcmp(mode, "tiled")) UNSUPPORTED("int16 = one-shot only");
         int16_t *A = calloc((size_t)Mpad * K, sizeof(int16_t));
         int16_t *B = malloc((size_t)N * K * sizeof(int16_t));
         int64_t *C = malloc((size_t)Mpad * N * sizeof(int64_t));
-        if (!A || !B || !C) { fprintf(stderr, "oom\n"); return 3; }
+        if (!A || !B || !C) { fprintf(stderr, "oom\n"); return 1; }
         for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (int16_t)irand(-1000, 1000);
         for (size_t i = 0; i < (size_t)N * K; i++) B[i] = (int16_t)irand(-1000, 1000);
-        int fd = rocket_open(); if (fd < 0) return 3;
+        int fd = rocket_open(); if (fd < 0) return 1;
         int r = rocket_matmul_int16_exact(fd, Mpad, K, N, A, B, C); rocket_close(fd);
-        if (r) { free(A);free(B);free(C); SKIP_IF(1, "path declined"); }
+        if (r) { free(A);free(B);free(C); DECLINED("path", "rocket_matmul_int16_exact returned nonzero"); }
         for (int ri = 0; ri < nr; ri++) { int m = rows[ri];
             for (int n = 0; n < N; n++) { int64_t s = 0;
                 for (int k = 0; k < K; k++) s += (int64_t)A[(size_t)m*K+k] * (int64_t)B[(size_t)n*K+k];
@@ -238,18 +294,18 @@ int main(int argc, char **argv) {
 
     } else if (!strcmp(dtype, "bf16") || !strcmp(dtype, "tf32")) {
         int isbf = !strcmp(dtype, "bf16");
-        SKIP_IF(strcmp(mode, "tiled"), "bf16/tf32 = one-shot only");
+        if (strcmp(mode, "tiled")) UNSUPPORTED("bf16/tf32 = one-shot only");
         float *A = calloc((size_t)Mpad * K, sizeof(float));
         float *B = malloc((size_t)N * K * sizeof(float));
         float *C = malloc((size_t)Mpad * N * sizeof(float));
-        if (!A || !B || !C) { fprintf(stderr, "oom\n"); return 3; }
+        if (!A || !B || !C) { fprintf(stderr, "oom\n"); return 1; }
         for (size_t i = 0; i < (size_t)M * K; i++) A[i] = frand();
         for (size_t i = 0; i < (size_t)N * K; i++) B[i] = frand();
-        int fd = rocket_open(); if (fd < 0) return 3;
+        int fd = rocket_open(); if (fd < 0) return 1;
         int r = isbf ? rocket_matmul_bf16(fd, Mpad, K, N, A, B, C)
                      : rocket_matmul_tf32(fd, Mpad, K, N, A, B, C);
         rocket_close(fd);
-        if (r) { free(A);free(B);free(C); SKIP_IF(1, "path declined"); }
+        if (r) { free(A);free(B);free(C); DECLINED("path", "the matmul entry returned nonzero"); }
         for (int ri = 0; ri < nr; ri++) { int m = rows[ri];
             for (int n = 0; n < N; n++) { float s = 0;
                 for (int k = 0; k < K; k++) {
@@ -260,11 +316,16 @@ int main(int argc, char **argv) {
                 ref[(size_t)ri*N+n] = s; got[(size_t)ri*N+n] = (double)C[(size_t)m*N+n]; } }
         free(A); free(B); free(C);
 
-    } else { fprintf(stderr, "unknown dtype '%s'\n", dtype); return 2; }
+    } else { fprintf(stderr, "unknown dtype '%s'\n", dtype); return 1; }
 
     ret = report(mode, dtype, M, K, N, Mpad, Kt, njobs, nr, got, ref, cos_thresh);
+    if (expect_decline) {
+        printf("RESULT dt=%-5s mode=%-9s M=%-5d K=%-6d N=%-6d -> FAIL (EXPECT_DECLINE=%s, "
+               "and the path ran)\n", dtype, mode, M, K, N, expect_decline);
+        ret = 1;
+    }
 
 done:
     free(rows); free(got); free(ref);
-    return skip ? 0 : ret;
+    return ret;
 }

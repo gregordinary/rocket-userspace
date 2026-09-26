@@ -40,23 +40,31 @@ static void fill(_Float16 *v, size_t n, float amp, uint32_t seed)
 static int compare(const char *tag, const _Float16 *got, const _Float16 *ref,
                    size_t n, double rel_tol)
 {
+    /* An absolute bound of 4 fp16 ulps at the largest output. A normalized output is
+     * O(1), and the part lands within one ulp of the fp64 reference on every shape
+     * measured (2026-09-24, RK1), so this has 3x headroom. The old bar needed an element
+     * to miss by rel_tol relatively AND by rel_tol*maxv absolutely, which let a divisor
+     * of N-1 instead of N through: that scales every output by sqrt((N-1)/N), 0.8% at
+     * H=64, about 0.023 at these magnitudes against a bound of about 0.006. rel_tol is
+     * kept in the signature for the callers and no longer decides anything. */
+    (void)rel_tol;
     double maxv = 0;
     for (size_t i = 0; i < n; i++) { double a = fabs((double)ref[i]); if (a > maxv) maxv = a; }
-    const double abs_tol = rel_tol * maxv + 1e-4;
+    const double abs_tol = 4.0 * 0x1.0p-11 * (maxv > 1.0 ? maxv : 1.0);
     double max_abs = 0, max_rel = 0; int bad = 0;
     for (size_t i = 0; i < n; i++) {
         double ad = fabs((double)got[i] - (double)ref[i]);
         double rd = ad / (fabs((double)ref[i]) + 1e-9);
         if (ad > max_abs) max_abs = ad;
         if (rd > max_rel) max_rel = rd;
-        if (rd > rel_tol && ad > abs_tol) {
+        if (!(ad <= abs_tol)) {
             if (bad < 5) printf("    [%zu] ref=%.5g got=%.5g d=%.4g\n", i, (double)ref[i], (double)got[i], ad);
             bad++;
         }
     }
     int ok = (bad == 0);
-    printf("  %s: maxv=%.4g max_abs=%.4g max_rel=%.2g bad=%d -> %s\n",
-           tag, maxv, max_abs, max_rel, bad, ok ? "PASS" : "FAIL");
+    printf("  %s: maxv=%.4g max_abs=%.4g (bound %.4g) max_rel=%.2g bad=%d -> %s\n",
+           tag, maxv, max_abs, abs_tol, max_rel, bad, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 

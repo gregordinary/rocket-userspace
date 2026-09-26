@@ -24,6 +24,7 @@
 
 #include "rocket_sam.h"
 #include "rocket_npu.h"
+#include "test_fill.h"
 
 static float *read_f32(const char *path, size_t n, const char **err)
 {
@@ -76,7 +77,13 @@ static double score(const rocket_sam_model *m, const _Float16 *hid, const _Float
 
 int main(int argc, char **argv)
 {
-    const char *dir = (argc > 1) ? argv[1] : "./sam-artifacts";
+    /* The artifact directory: argv[1], else ROCKET_SAM_ARTIFACTS, else the default. A
+     * directory someone NAMED that turns out empty is a failure, not a skip; only the
+     * unconfigured default may skip. */
+    const char *env_dir = getenv("ROCKET_SAM_ARTIFACTS");
+    const int named = (argc > 1) || (env_dir && *env_dir);
+    const char *dir = (argc > 1) ? argv[1] : (env_dir && *env_dir) ? env_dir : "./sam-artifacts";
+    const int miss_rc = named ? 1 : 2;
     char wpath[1024], ppath[1024], hpath[1024], npath[1024];
     snprintf(wpath, sizeof wpath, "%s/sam_weights.f16", dir);
     snprintf(ppath, sizeof ppath, "%s/pixels.f32", dir);
@@ -85,7 +92,12 @@ int main(int argc, char **argv)
 
     rocket_sam_model m;
     int lrc = rocket_sam_load(wpath, &m);
-    if (lrc != 0) { printf("note: no weight blob %s (%d) — SKIP\n", wpath, lrc); return 2; }
+    if (lrc != 0) {
+        printf("note: no weight blob %s (%d) — %s\n", wpath, lrc,
+               named ? "FAIL (this directory was named as the artifacts)"
+                     : "SKIP (set ROCKET_SAM_ARTIFACTS or -DROCKETNPU_SAM_ARTIFACTS)");
+        return miss_rc;
+    }
     printf("sam: d=%d layers=%d heads=%d dhead=%d d_ff=%d grid=%d win=%d neck_out=%d eps=%g\n",
            m.d, m.n_layers, m.n_head, m.dhead, m.d_ff, m.grid, m.win, m.neck_out, m.eps);
 
@@ -98,8 +110,9 @@ int main(int argc, char **argv)
     float *href = read_f32(hpath, (size_t)(m.n_layers + 1) * Gd, &err);
     float *nref = read_f32(npath, Nn, &err);
     if (!pix || !href || !nref) {
-        printf("note: missing/!size refs in %s (%s) — SKIP\n", dir, err ? err : "?");
-        free(pix); free(href); free(nref); rocket_sam_free(&m); return 2;
+        printf("note: missing/!size refs in %s (%s) — %s\n", dir, err ? err : "?",
+               named ? "FAIL" : "SKIP");
+        free(pix); free(href); free(nref); rocket_sam_free(&m); return miss_rc;
     }
 
     _Float16 *pix16 = malloc(pix_n * sizeof(_Float16));
@@ -124,6 +137,13 @@ int main(int argc, char **argv)
         double hmean = score(&m, hid, out, href, nref, "host", &neck_cos);
         ok &= (hmean >= 0.99) && (neck_cos >= 0.99);
         printf("note: no NPU (host-only run) — device gate skipped\n");
+        if (ok) {
+            /* the host self-check passed, and the device path never ran: not a pass */
+            printf("fidelity SKIP (host reference only)\n");
+            free(pix); free(href); free(nref); free(pix16); free(hid); free(out);
+            rocket_sam_free(&m);
+            return 2;
+        }
     } else {
         printf("=== NPU one-shot (fd>=0) ===\n");
         double t0 = now_ms();
@@ -143,14 +163,19 @@ int main(int argc, char **argv)
         rocket_sam_ctx *c = rocket_sam_ctx_create(&m, nthreads);
         tc = now_ms() - tc;
         if (!c) {
-            printf("  resident ctx create FAILED — skipping\n");
+            printf("  resident ctx create FAILED -> FAIL\n");
+            ok = 0;
         } else {
             printf("  resident ctx created in %.0f ms\n", tc);
+            /* `out` and `hid` still hold the one-shot run's answer: without a fresh
+             * sentinel a resident path that wrote nothing would score as that answer */
+            tf_sentinel_f16(out, Nn);
+            tf_sentinel_f16(hid, (size_t)(m.n_layers + 1) * Gd);
             rc = rocket_sam_encode_ctx(c, pix16, out, hid);
             if (rc == 0) {
                 double rmean = score(&m, hid, out, href, nref, "res", &neck_cos);
                 ok &= (rmean >= 0.99) && (neck_cos >= 0.99);
-            } else printf("  resident encode rc=%d -> FAIL\n", rc);
+            } else { printf("  resident encode rc=%d -> FAIL\n", rc); ok = 0; }
             if (bn > 0 && rc == 0) {
                 double *ts = malloc(bn * sizeof(double));
                 for (int i = 0; i < bn; i++) {

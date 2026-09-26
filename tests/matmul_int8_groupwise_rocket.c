@@ -34,7 +34,8 @@
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
 
-static int8_t rand_i8(void)    { return (int8_t)(rand() % 255 - 127); }        /* [-127,127] */
+/* the whole int8 range: a fill that stops at -127 cannot see a -128 mis-encoded */
+static int8_t rand_i8(void)    { return (int8_t)(rand() % 256 - 128); }
 static float  rand_scale(void) { return 0.5f + (rand() % 1000) / 1000.0f; }    /* [0.5,1.5)  */
 
 /* host fp64 reference: per-group scaled accumulation (exact integer inner products) */
@@ -117,16 +118,27 @@ int main(int argc, char **argv)
     int fd = rocket_open();
     if (fd < 0) { printf("no NPU (%d) -> SKIP\n", fd); return 2; }
 
-    int fails = 0, ran = 0;
+    /* In the built-in sweep every group must run: a group the planner refuses is the
+     * regime this gate exists for going unchecked, so it is a failure, and so is a sweep
+     * that never reaches BOTH regimes (kt_per_group == 1 and > 1). */
+    const int sweeping = (argc != 5);
+    int fails = 0, ran = 0, ran_one = 0, ran_multi = 0;
     for (int gi = 0; gi < ngroups; gi++) {
         int group = sweep[gi];
         if (group < 32 || group % 32 || K % group) {
-            printf("  group=%-5d SKIP (needs >=32, %%32, |K=%d)\n", group, K);
+            printf("  group=%-5d %s (needs >=32, %%32, |K=%d)\n", group,
+                   sweeping ? "FAIL" : "SKIP", K);
+            if (sweeping) fails++;
             continue;
         }
         int nG = K / group, Mt, Kt, Nt;
         int tiles = rocket_matmul_plan_int8_gw(M, K, N, group, &Mt, &Kt, &Nt);
-        if (tiles < 0) { printf("  group=%-5d SKIP (planner rejects: %d)\n", group, tiles); continue; }
+        if (tiles < 0) {
+            printf("  group=%-5d %s (planner rejects: %d)\n", group,
+                   sweeping ? "FAIL" : "SKIP", tiles);
+            if (sweeping) fails++;
+            continue;
+        }
         printf("  group=%-5d Mt=%d Kt=%d Nt=%d  nKt=%d  kt_per_group=%d  tiles=%d\n",
                group, Mt, Kt, Nt, K / Kt, group / Kt, tiles);
 
@@ -134,16 +146,22 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < (size_t)N * nG; i++) bs[i] = rand_scale();
         ref_gw(M, K, N, group, A, B, as, bs, ref);
 
-        memset(Cf, 0, Csz * sizeof(float));
+        for (size_t i = 0; i < Csz; i++) Cf[i] = NAN;   /* check() counts a NaN as non-finite */
         int rc = rocket_matmul_int8_groupwise(fd, M, K, N, A, B, as, bs, Cf, group);
         if (rc) { fprintf(stderr, "  rocket_matmul_int8_groupwise(group=%d) = %d\n", group, rc);
                   rocket_close(fd); return -1; }
         if (check(Cf, ref, Csz, nG)) fails++;
         ran++;
+        if (group / Kt > 1) ran_multi++; else ran_one++;
     }
     rocket_close(fd);
 
     if (!ran) { fprintf(stderr, "no group ran\n"); return -1; }
+    printf("regimes reached: kt_per_group == 1 by %d group(s), > 1 by %d\n", ran_one, ran_multi);
+    if (sweeping && (!ran_one || !ran_multi)) {
+        printf("the sweep did not reach both tiling regimes -> FAIL\n");
+        fails++;
+    }
     printf("\n==> %s (%d/%d groups failed)\n", fails ? "FAIL" : "ALL PASS", fails, ran);
     free(A); free(B); free(as); free(bs); free(Cf); free(ref);
     return fails ? -1 : 0;

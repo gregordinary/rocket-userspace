@@ -33,12 +33,13 @@
  *            ROCKET_RK3576_CBUF_RUNGS so a shape lands on the rung under test, and the F
  *            the planner chose is REPORTED per cell rather than assumed.
  *
- * A PROBE that asserts one thing: a cell the library ACCEPTED must be bit-exact. A cell it
- * refuses is reported and is not a failure — the envelope is allowed to be narrow, it is
- * not allowed to be wrong.
+ * It asserts two things. A cell the library accepted must be bit-exact. And every cell must
+ * be accepted: the record is all twelve stride cells and every cell of the rung map
+ * computing, so a refusal here is the envelope narrowing, which the gate reports as a
+ * failure rather than letting a run that asked nothing read as one that passed.
  *
  * Usage: rk3576_conv_sym [stride|rung|all]
- * Exit:  0, 1 on a wrong surface, 2 to skip (no NPU or wrong chip).
+ * Exit:  0, 1 on a wrong surface or a refusal, 2 to skip (no NPU or wrong chip).
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -125,7 +126,7 @@ static void cell(int fd, const char *name, unsigned ic, unsigned oc, unsigned iw
             : rocket_conv2d_int8_rk3576(fd, &d, in, W, bias, 1.0f, 1.0f,
                                         (float)divisor, in_zp, w_zp, out_zp, out);
     if (rc == ROCKET_E_UNSUPPORTED) {
-        printf("  %-26s REFUSED by the library (F=%d) — the envelope, not a failure\n",
+        printf("  %-26s REFUSED by the library (F=%d), where the record has it computing\n",
                name, (int)f);
         NREFUSED++;
         goto done;
@@ -298,7 +299,7 @@ int main(int argc, char **argv)
     if (!strcmp(mode, "rung")   || !strcmp(mode, "all")) arm_rung(fd);
 
     printf("\n%s: %d cell(s) run, %d wrong, %d refused by the library\n",
-           NFAIL ? "FAIL" : "PASS", NRUN, NFAIL, NREFUSED);
+           (NFAIL || NREFUSED || !NRUN) ? "FAIL" : "PASS", NRUN, NFAIL, NREFUSED);
     rocket_close(fd);
-    return NFAIL ? 1 : 0;
+    return (NFAIL || NREFUSED || !NRUN) ? 1 : 0;
 }

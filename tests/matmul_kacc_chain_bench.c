@@ -6,6 +6,9 @@
  * Times `iters` warm rocket_matmul_fp16 calls for one shape and reports per-iter ms.
  * The caller picks chained vs unchained via ROCKET_KACC_CHAIN (and ROCKET_MM_PROFILE
  * for the pack/gen/sync/submit/wait/read split). Not a CTest gate — a hand-run probe.
+ * It checks every call's return code and never scores the output, so its timing says
+ * nothing about correctness: matmul_kacc_chain_rocket owns that, chained against
+ * unchained, byte for byte.
  *
  * Usage: matmul_kacc_chain_bench [M K N [iters]]   (default 512 15360 3840 20)
  */
@@ -53,13 +56,15 @@ int main(int argc, char **argv) {
     printf("shape %dx%dx%d  Mt=%d Kt=%d Nt=%d nKt=%d  KACC_CHAIN=%s  iters=%d\n",
            M, K, N, Mt, Kt, Nt, nKt, chain ? chain : "(unset)", iters);
 
-    for (int w = 0; w < 3; w++) rocket_matmul_fp16(fd, M, K, N, A, B, C);  /* warm */
+    for (int w = 0; w < 3; w++)   /* warm */
+        if (rocket_matmul_fp16(fd, M, K, N, A, B, C)) { printf("warm-up call failed\n"); return 1; }
 
     double *t = malloc((size_t)iters * sizeof(double));
     for (int i = 0; i < iters; i++) {
         double t0 = now_ms();
-        rocket_matmul_fp16(fd, M, K, N, A, B, C);
+        int rc = rocket_matmul_fp16(fd, M, K, N, A, B, C);
         t[i] = now_ms() - t0;
+        if (rc) { printf("timed call %d failed (%d): no timing is valid\n", i, rc); return 1; }
     }
     rocket_close(fd);
 

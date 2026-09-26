@@ -84,7 +84,8 @@ and it adds no `rocket_*` name of its own that the library already defines.
 
 `rocket_npu.h` is where they are declared, and the header is not the definition of the
 seam. It also declares host-side entry points that stay in the core whatever the driver is
-(`rocket_affinity_*`, `rocket_pin_worker`, `rocket_num_big_cores`, `rocket_busy_poll_set_us`).
+(`rocket_affinity_*`, `rocket_pin_worker`, `rocket_num_big_cores`, `rocket_busy_poll_set_us`,
+`rocket_fence_wait_*`).
 Do not enumerate the seam by reading the header, and do not enumerate it by hand. The list
 grows, and a hand-kept copy goes stale silently:
 
@@ -133,6 +134,8 @@ fails with the missing symbols listed before an object is compiled.
 | `rocket_bf16_stream` / `rocket_matmul_bf16_stream` | **streaming bf16** for LLM prefill: persistent worker fds + per-shape resident scratch BOs, re-pack A/B per call (the bf16 sibling of `rocket_matmul_fp16_stream`; bit-identical to single-fd at `nthreads=1`). The in-model bf16 path. ~3.2x single-fd warm |
 | `rocket_matmul_tf32` / `rocket_matmul_plan_tf32` | tf32xtf32->fp32 tiled (raw fp32 in, HW rounds to 10-bit mantissa; the first 4-byte-input path) |
 | `rocket_matmul_int8_rk3576` / `rocket_matmul_plan_int8_rk3576` | **the RK3576's own int8 matmul**, and a different contract from `rocket_matmul_int8`: `C = sat8(round((A·Bᵀ + bias)·scale))`, an int8 surface through the DPU's requant rather than raw int32. That is why it is a separate entry and not a routing. Requires `K%32, N%32`; **M carries no constraint at all** on that part, so `M=1` is simply correct. N is tiled and is what buys throughput (a submit costs ~1.4 ms whatever it carries; `ROCKET_RK3576_MM_NT` overrides the tile). K past one task's contraction is split through the int32 entry below, with the requant done on the host |
+| `rocket_matmul_fp16_rk3576` | **the RK3576's fp16 matmul**: `C = A·Bᵀ` with fp16 A and B and an **fp32** C, all row-major, B one row per output channel. The whole of K in one task, where the fp16 convolution contracts sixteen channels a task. Accepts `1 <= M <= 2048`, `32 <= K <= 6144` with `K%32`, `64 <= N <= 8192` with `N%16`, and returns `ROCKET_E_UNSUPPORTED` outside them. K and N are one task's measured bounds. A task carries at most `4096/(K/32)` rows, the CBUF data window, so the entry cuts M into equal tasks under that and submits them as one job (`rocket_rk3576_mm_fp16_task_rows()`). A call whose output still holds the sentinel is redone after a power cycle, and `rocket_rk3576_mm_fp16_last_attempts()` reports how many submits the last call took. `ROCKET_MM_PROFILE` prints its buckets. Its output does not poison the next submit |
+| `rocket_matmul_fp16_rk3576_wbo` / `rocket_rk3576_wbo_fp16_create` / `rocket_rk3576_wbo_fp16_free` | **the same fp16 matmul with resident weights**: `create` permutes B into the part's layout once and builds the coefficient buffer for its N, both in device BOs, and the entry takes that handle in place of B. Bit-identical to `rocket_matmul_fp16_rk3576`, with M free per call inside the envelope. A K or N outside the envelope refuses at `create`, and a call whose K or N differs from the handle's refuses with `ROCKET_E_SHAPE`. The handle is not checked against the weight it came from, so a stale one computes a plausible surface from the old weight. Each handle holds K·N·2 bytes of weight and about 257 KiB of coefficients |
 | `rocket_matmul_int8_rk3576_i32` | **the RK3576's int32-output matmul, and its K split**: `C = A·Bᵀ + bias` in raw int32, K split internally and the partials summed on the host, so K is bounded only by memory. Requires `K%32, N%32`. The DPU's 32-bit writer keeps the INT8 surface's byte budget whatever the element width is, so it delivers only the first eight output channels of every thirty-two; this entry programs four times the output channels and scatters the real ones into the delivered slots, which is correct and costs a quarter of the int8 path's MACs per submit. It also idles ~150 ms between its submits and once on the way out, because an int32 job leaves the next submit of ANY kind writing nothing until 50-100 ms have passed (`ROCKET_RK3576_MM_GAP_MS` overrides). Use it for the K a single task cannot contract, not as a default matmul |
 
 Alignment requirements differ by dtype, following the native tile atoms:
@@ -152,7 +155,7 @@ therefore **pad M==1->4 internally** and return row 0. The pure planners and the
 streaming paths reject it instead, so pad single vectors to 4 caller-side. The plan functions are pure (no
 hardware) and preview the tiling.
 
-Everything in that table except `rocket_matmul_int8_rk3576` emits the **RK3588**
+Everything in that table except the RK3576 entries emits the **RK3588**
 geometry-register encoding. On a part that does not run it the entries **refuse**
 (`ROCKET_E_UNSUPPORTED`, naming the entry that does work) rather than submit a job that
 completes and writes nothing. The M rule above is one of the things that does not carry:
@@ -171,10 +174,11 @@ is the conv path. HW-validated **bit-exact**.
 | `rocket_conv2d_fp16` (`desc.depthwise=1`) | native depthwise (`DW_EN`, group G=32 + the DPU depthwise register fixes), channel + spatial tiled |
 | `rocket_conv2d_act_fp16(fd, d, kind, …)` / `_ctx` | **conv->activation FUSION**: a DIRECT fp16 conv post-processes its own CACC result with a smooth `f(x)` in the SAME NPU job (the DPU LUT epilogue ported into `gen_conv2d_task`): `out = f(conv(x))`, no 2nd round-trip. `kind` = `SILU`/`TANH`/`GELU`. HW-validated: the fused epilogue **bit-reproduces the standalone LUT** (<=0.0039), conv->tanh bit-accurate (`tests/conv_act_rocket.c`). Default-off byte-identical. HardSwish/depthwise rejected (flat-tail quirk / direct-only). *Caveat: a narrow x~0 LE/LO boundary glitch spikes all single-pass kinds; the 2-pass `x·gate(x)` route avoids it.* |
 | `rocket_conv2d_int8` | native **int8 DIRECT** `CONV_2D`: int8xint8->int32 raw accumulate (caller requants); OC pad 32 / IC pad 32, OC/OH/OW tiling. Bit-exact vs an int64 oracle. *(Also the substrate for the `tflite-rocket` delegate's native **uint8** convs, Option D: the caller recenters uint8->int8 `byte−128` and folds the centering into its requant + a box-sum; no driver change.)* |
-| `rocket_conv2d_dw_int8` | native **int8 DEPTHWISE** (int8-out, on-chip requant): per-tensor quant, the Mesa zero-point bias fold; bit-exact vs Teflon ground truth |
+| `rocket_conv2d_dw_int8` | native **int8 DEPTHWISE** (int8-out, on-chip requant): per-tensor quant, symmetric weights, the input zero point folded into the bias; TFLite's accumulator exactly, within one of TFLite at a rounding boundary |
 | `rocket_conv_ctx_create` / `rocket_conv2d_{fp16,int8}_ctx` / `_dw_int8_ctx` | the same convs with a **resident** BO pool reused across calls/tiles (ctx=NULL ⇒ byte-identical legacy alloc-per-call) |
 | `rocket_conv_pool_create` / `rocket_conv2d_int8_mt` / `rocket_conv_pool_free` | **multicore** int8/uint8 DIRECT conv: a pool of N worker fds (each its own resident `rocket_conv_ctx`) fans the conv's independent OC/OH/OW tiles across the 3 NPU cores. **Bit-identical** to `rocket_conv2d_int8` (same tiles/jobs); falls back to serial for single-tile convs. Mirrors `rocket_matmul_fp16_mt`'s one-fd-per-core design |
-| `rocket_conv_transpose2d_fp16(fd, d, in, W, out)` / `_ctx` | **ConvTranspose2d / deconv** (learned upsampling: segmentation/decoder/super-res, FPN learned-upsample). no hardware deconv mode is used; it is lowered to interior-dilate-input + `rot180(Wᵀ)` + a **stride-1 forward `rocket_conv2d_fp16`**, so it inherits the HW-exact conv tiling bit-for-bit. Weights `[IC][OC][KH][KW]` (in-channels first) direct or `[C][1][KH][KW]` depthwise (`desc.depthwise=1`, OC==IC, C%32). Supports stride/pad/output_padding/dilation, any OC/IC. `_plan` returns `−2` for the unimplemented `pad > d·(K−1)` crop case (clean decline). HW-validated bit-exact vs a scatter reference (`tests/conv_transpose_rocket.c`); cost scales with the *upsampled* size (sub-pixel stride² decomposition is the perf follow-on) |
+| `rocket_conv_transpose2d_fp16(fd, d, in, W, out)` / `_ctx` | **ConvTranspose2d / deconv** (learned upsampling: segmentation/decoder/super-res, FPN learned-upsample). Two routes, both bit-exact vs a scatter reference (`tests/conv_transpose_rocket.c`). On the RK3588 a **direct** transpose at power-of-two strides (2, 4 or 8), dilation 1, `IC%32==0` and a compact input that fits one CBUF pass runs on the CNA's **hardware deconvolution mode**, one task per output-channel tile: 0.35-0.54x the lowering's wall at decoder shapes. Everything else is lowered to interior-dilate-input + `rot180(Wᵀ)` + a **stride-1 forward `rocket_conv2d_fp16`**, inheriting the HW-exact conv tiling; its cost scales with the *upsampled* size. Weights `[IC][OC][KH][KW]` (in-channels first) direct or `[C][1][KH][KW]` depthwise (`desc.depthwise=1`, OC==IC, C%32). Supports stride/pad/output_padding/dilation, any OC/IC. `_plan` returns `−2` for the unimplemented `pad > d·(K−1)` crop case (clean decline) |
+| `rocket_conv_transpose2d_route(d)` | which of the two routes a descriptor takes (`ROCKET_CONV_TRANSPOSE_DECONV` / `_LOWERED`), or the plan's negative refusal. Pure. `ROCKET_CONV_TRANSPOSE_HW=0` forces the lowering |
 | `rocket_upsample_nearest_fp16` / `rocket_upsample_bilinear_fp16` (`rocket_resize.h`) | **integer-factor resize** (the FPN/decoder neck: `RESIZE_NEAREST_NEIGHBOR` / `RESIZE_BILINEAR`). Realised as a **depthwise ConvTranspose** with a fixed box (nearest) / separable-triangle (bilinear) kernel, where `pad=(k−s)/2` gives exactly `IH·s x IW·s`. Nearest = bit-exact block replication; bilinear = half-pixel 2-tap (the triangle's stride-subsample is a partition of unity), `align_corners=False` interior + zero boundary. `C%32` (depthwise group). HW-validated vs independent gather refs + partition-of-unity / linear-exactness properties (`tests/resize_rocket.c`) |
 
 Pure planners (`rocket_conv2d_plan` / `_oh` / `_ow` / `rocket_total_pad`, plus
@@ -186,11 +190,15 @@ cube layers (`gen_conv2d_int8` / `gen_conv2d_dw_int8`) and the runtime wrappers
 (`rocket_conv2d_int8` / `rocket_conv2d_dw_int8`). **DIRECT** = int8xint8->int32 raw + host
 per-axis requant, with the input zero-point correction folded into the bias, in
 `tflite-rocket`'s `rocket_out_nchw_to_nhwc_q_per_axis`. That is a real int8 accumulate,
-bit-identical to CPU TFLite. **DEPTHWISE** = int8-OUT with on-chip requant
+bit-identical to CPU TFLite.
+
+**DEPTHWISE** = int8-OUT with on-chip requant
 (`conv_params_t.int8_out=1`: QD_EN + per-OC int32 bias in the BS ALU + `OUT_CVT` requant),
-per-tensor, bit-exact vs Teflon (`tests/replay_dw_mesa.c`
-for the regcmd, `tests/conv_dw_int8_runtime.c` for the runtime). The `tflite-rocket` delegate
-routes signed-int8 convs to these under `--option native_int8=1`.
+per-tensor with symmetric weights. Its accumulator is TFLite's exactly and its requant is
+the DPU's. So an output can differ from CPU TFLite by one at a rounding boundary
+(`tests/conv_dw_int8_runtime.c`). `tests/replay_dw_mesa.c` checks the register program
+against Mesa's. The `tflite-rocket` delegate routes signed-int8 convs to these under
+`--option native_int8=1`.
 
 ## Activation API (`rocket_activation.h`)
 
@@ -252,7 +260,7 @@ the substrate for fused FFN / encoder blocks. Each is a CTest gate vs an fp64 or
 |---|---|
 | `rocket_reduce_feature_fp16(fd, M, H, in, out, mean)` | **feature-axis reduce** `sum_h x[m,h]` (or mean), per row -> fp32 `[M]`. The contraction RMSNorm/LayerNorm/softmax need, and the one the PPU **cannot** give (it pools spatial `[H,W]` *within* a channel, never across). Realised as a **ones-vector matmul** reusing `rocket_matmul_fp16_f32out` (no new regcmd, genuine fp32 K-accum). Essentially **bit-exact** (max_rel <= 1.4e-7) |
 | `rocket_cumsum_fp16(fd, M, N, in, out, exclusive, reverse)` | **cumsum / prefix sum** along the last axis (TFLite/ONNX `CumSum`). The feature reduce **widened from a single ones-COLUMN to a full triangular ones MATRIX**: `out = in·Lᵀ`, `L[n][k]=1` iff column `k` is in prefix `n` (incl/excl x forward/reverse pick the triangle). Same `rocket_matmul_fp16_f32out` reuse (no new regcmd, fp32 K-accum for long prefixes). HW **bit-exact** (max_abs 0 across all variants incl. T=1500) (`tests/cumsum_rocket.c`) |
-| `rocket_rmsnorm_fp16(fd, M, H, x, weight, eps, out)` | **RMSNorm** `x/sqrt(mean_h(x²)+eps)·weight[h]`. O(M·H) on the NPU (square->reduce->scale); the O(M) per-row rsqrt tail is **exact on the host** (sending M scalars to the DPU rsqrt LUT would add a round-trip *and* hit the LUT domain). fp16-square overflow (`|x|>256`) -> exact power-of-2 prescale. `weight` is the effective scale (Gemma: pass `1+w`). max_rel <= 3.5e-3 |
+| `rocket_rmsnorm_fp16(fd, M, H, x, weight, eps, out)` | **RMSNorm** `x/sqrt(mean_h(x²)+eps)·weight[h]`. O(M·H) on the NPU (square->reduce->scale); the O(M) per-row rsqrt tail is **exact on the host** (sending M scalars to the DPU rsqrt LUT would add a round-trip *and* hit the LUT domain). fp16-square overflow (`\|x\|>256`) -> exact power-of-2 prescale. `weight` is the effective scale (Gemma: pass `1+w`). max_rel <= 3.5e-3 |
 | `rocket_layernorm_fp16(fd, M, H, x, gamma, beta, eps, out)` | **LayerNorm** `(x−mean)/sqrt(var+eps)·gamma[h]+beta[h]` (the Whisper/encoder norm). **Both reductions share ONE feature-reduce job by STACKING rows**: `A=[x ; x⊙x]` (2M rows) under the ones weight -> first M = `sum(x)`, next M = `sum(x²)`. Host O(M) mean/var/rsqrt; the affine folds to `x⊙A+B` (one ew_mul + one ew_add). Same fp16-square overflow prescale as RMSNorm; `beta` may be NULL (`tests/layernorm_rocket.c`) |
 | `rocket_scale_rows_fp16(fd, M, N, in, r, out)` | **per-row broadcast multiply** `out[m,n]=in[m,n]·r[m]` (`r` fp32 `[M]`), the FFN/attention/softmax post-scale (the RMSNorm 1/rms folds here; the weight folds into the next matmul). The reusable building block |
 | `rocket_geglu_fp16(fd, gate, up, kind, prod, n)` | **gated activation** (GeGLU/SwiGLU core) `prod = act(gate)⊙up`, the only computation an FFN adds beyond matmul. `kind` = `SILU` (robust 2-pass) / `GELU`. Fully on the NPU (LUT + EW-mul) |
@@ -332,14 +340,40 @@ on the NPU. They double as the regression/bring-up checks.
 
 The correctness gates, including the bit-exact `int8`/`int4`/`int16`/`bf16`/`tf32`
 tiled-or-resident matmul paths and the int8 depthwise conv, are registered with CTest.
-Run `ctest` from the build directory after `cmake --build`. Each gate exits with the CTest
-skip code when no NPU is present, or for `conv_dw_int8_runtime` when its host-packing
-fixtures are absent. So the suite is green off-device and fails only on a
-real on-device regression. Perf probes and RE sweeps are built but left unregistered.
+Run `ctest` from the build directory after `cmake --build`. Perf probes and RE sweeps are
+built but left unregistered.
+
+Every registered test holds one exit-code contract:
+
+| Exit | Means |
+|---|---|
+| 0 | A numeric check ran and passed |
+| 1 | A wrong answer, a declined path, a usage error, a host allocation failure |
+| 2 | The device, or the part the test needs, is absent. CTest reports a skip |
+
+A path that declines is a failure, not a skip. A test built to assert a refusal says which
+stage refuses, and passes only when that stage does. Off-device the NPU tests skip, and the
+host-only ones (`bytes_moved_rocket`, `chain_layout_rocket`, `chain_verify_gate`,
+`matmul_plan_gate`, `regcmd_rk3576_gate`) still run and must pass. A skip is visible in the
+summary, so a board run that skips a device test has not checked it.
+
+Each NPU test is registered with `RESOURCE_LOCK npu`, so `ctest -j` never has two in flight.
+Each has a `TIMEOUT` of 300 s, or 600 s for flash attention and 900 s for the ViT encoders.
+
+A hung job fails no syscall. The `rocket` driver retires a job that runs 500 ms and signals
+its fence as if it had completed. A test that scores the untouched output BO can then pass.
+Two fixtures bracket the NPU tests to catch it. `npu_klog_mark` saves a kernel-journal cursor
+before the first one. `npu_klog_check` then fails the run on any `NPU job timed out`,
+`rk_iommu` or NPU-side `WARNING` line after it.
+
+The journal is read directly, which the `adm` or `systemd-journal` group allows, or through
+`sudo -n`. With neither, `npu_klog_check` reports a skip. Inside a test, a fenced wait past the
+slow-wait mark logs a warning and counts in `rocket_fence_wait_slow_count()`. The registration
+fails the test that made it.
 
 | test | purpose |
 |---|---|
-| `matmul_correctness_matrix_rocket` | **the layout/readback correctness gate**: realistic random inputs + **cosine-similarity** validation (catches silent layout/scatter/readback corruption that the exact-integer tests miss), dtype-aware (fp16/int8/int4/int16/bf16/tf32), M%4≠0 via padding, K>8192, all entry points. Driver: `tests/correctness_matrix.sh` (the full M/K/N x dtype x path matrix; 150 PASS / 6 SKIP / 0 FAIL) |
+| `matmul_correctness_matrix_rocket` | **the layout/readback correctness gate**: realistic random inputs + **cosine-similarity** validation (catches silent layout/scatter/readback corruption that the exact-integer tests miss), dtype-aware (fp16/int8/int4/int16/bf16/tf32), M%4≠0 via padding, K>8192, all entry points. A declined path fails unless `EXPECT_DECLINE=pack` or `=path` names the stage that must refuse. Driver: `tests/correctness_matrix.sh`, the full M/K/N x dtype x path matrix, which asserts each documented M=1 refusal (the fp16 streaming and resident entries, resident int8 and int4) at its stage |
 | `matmul_tiled_rocket` | tiled fp16 matmul + profiling/sweep knobs (the workhorse) |
 | `matmul_mt_rocket` | multicore correctness + scaling |
 | `matmul_prepacked_rocket` | resident-weights path vs mt vs CPU ref |
@@ -350,6 +384,7 @@ real on-device regression. Perf probes and RE sweeps are built but left unregist
 | `matmul_int8_rocket` | int8xint8->int32 readiness (encoding sweep) |
 | `matmul_int8_tiled_rocket` | tiled int8 (M/N tiles + host int64 K-accum), bit-exact |
 | `matmul_int8_prepacked_rocket` | resident int8 weights, bit-exact vs one-shot |
+| `int8_chain_probe` | independent int8 tasks self-chained into one kick with `ROCKET_JOB_BATCHED`, each scored against a CPU model, beside a gapped control and a chain whose first task reads zeros; prints the NPU interrupts each job raised |
 | `matmul_int8_groupwise_rocket` | one-shot **group-wise** int8 vs an fp64 reference, swept over both tiling regimes: `Kt == group` (one K-tile per quant group) and `Kt < group` (several tiles sharing one group's scale) |
 | `matmul_int8_prepacked_gw_rocket` | resident **group-wise** int8 (the native-quant path) vs the one-shot oracle + fp64, plus a distinct-weights-sharing-one-ctx aliasing guard, a wrong-entry-point guard, and the unaligned-call-M rejection. Registered twice: at `group=576` (bit-exact) and at a group wider than the CBUF cap (`Kt < group`) |
 | `matmul_int8_crossm_gw_rocket` | resident group-wise int8 weight packed once and reused at M = 512/256/768/64/8 with no re-pack, bit-exact at every M |
@@ -382,7 +417,10 @@ real on-device regression. Perf probes and RE sweeps are built but left unregist
 | `bytes_moved_rocket` | analytical DRAM-traffic model (pure, no NPU): per-phase bytes from shape+tiling+dtype+reuse, planner `njobs` cross-check, int8 readback-floor demo |
 | `conv2d_fp16_rocket` | general fp16 `CONV_2D` + native depthwise, bit-exact vs an NHWC oracle (direct, OC%16 pad, DW G=32, tiling) |
 | `pool_fp16_rocket` | on-NPU MaxPool / AveragePool (PPU): cube self-check + HW oracle (max bit-exact; avg <= fp16-recip tol) |
-| `pool_int8_rocket` | on-NPU int8 / uint8 MaxPool / AveragePool via the fp16 PPU route (no native int8 PPU precision): int8 & uint8 MAX bit-exact, int8 AVG ±1 ULP vs an integer golden |
+| `pool_int8_rocket` | on-NPU int8 / uint8 MaxPool / AveragePool via the fp16 PPU route: int8 & uint8 MAX bit-exact, int8 AVG ±1 ULP vs an integer golden |
+| `pool_int8_native_probe` | the PPU's NATIVE int8 pooling precision, as a map over the precision pair: `PPU_DATA_FORMAT[2:0]`=0 with `PPU_RDMA_DATA_FORMAT[1:0]`=1 over a C2=16 byte cube pools MAX, MIN and AVG bit-exactly, given an integer Q16 `0x10000/k` reciprocal and the integer pad fill. Probe, not a gate — the shipping entries stay fp16-routed |
+| `deconv_extent_probe` | the CNA deconvolution mode with the output extent PROGRAMMED rather than derived, through `rocket_conv2d_fp16_job_extent()`: one task per cell, scored over the whole surface against `rocket_conv_transpose2d_ref_fp16`. Bit-exact on the RK3588 up to 64×64 -> 128×128. Probe, not a gate — `rocket_conv_transpose2d_fp16` does not use the mode |
+| `requant_round_probe` | the OUT_CVT's tie rule at `OUT_CVT_SHIFT` bit 30 = 0 and 1 (`ROCKET_OUT_CVT_ROUND`), over ties it builds on purpose, since no round scale reaches one. It asserts the recorded rule: half to even with the bit clear and half away from zero with it set, each the one survivor of five candidate rules, on both parts (the RK3576 through `rocket_matmul_int8_rk3576`, the RK3588 through the int8 matmul's integer convert). A `ctest` and a `gates-rk3576.sh` row |
 | `reduce_mean_rocket` | on-NPU spatial reductions over [H,W]: GlobalAvgPool / Mean (HW vs fp64, tolerance) **and** GlobalMax/MinPool / ReduceMax/Min (**bit-exact**, idempotent), plus a factor and schedule/cube self-check (single + multi-pass, square + equal-count rect; host fallback for non-16-smooth / unequal-count) |
 | `cumsum_rocket` | on-NPU **cumsum / prefix sum** (triangular ones-matmul) vs an fp64 prefix-sum oracle, over all four variants (incl/excl x forward/reverse), M-tile boundary, N%32≠0, T=1500; **bit-exact** (max_abs 0). Independent O(N²) fp64 recompute self-check |
 | `conv2d_int8_rocket` | native int8 `CONV_2D`: cube self-check + single-job HW + the **tiled-runtime DIRECT arm** (big/wide/IC<32/OC-pad) bit-exact vs an int64 oracle |
@@ -396,8 +434,8 @@ real on-device regression. Perf probes and RE sweeps are built but left unregist
 | `flash_attn_rocket` | masked **grouped-query (flash) attention** vs an fp64 oracle (cosine sim; Gemma-4-12B head_dim 256 / 16 q-heads / 8-kv GQA + 1-kv MQA, sliding window, soft-cap, n_kv>T, unaligned T/n_kv); the **chained long-context** path (`ROCKET_FA_CHAIN_ELEMS` high -> a worker's whole head range in one QK+AV job, to 16K); the **online/tiled** path (`ROCKET_FA_TILE_KV` -> per-row masked-tile skip, short last tile, 16-tile 8K, grow/reuse ctx); `bench` mode A/Bs materialized vs tiled `_ctx` wall-time |
 | `encoder_block_rocket` | one **full Whisper encoder block** (LN+MHA+residual+LN+MLP) vs an fp64 block oracle (cosine sim; Whisper-base; T%16≠0) |
 | `siglip_rocket` | the **full SigLIP-B/16 vision encoder** vs an fp32 reference (per-layer cosine, mean 0.999998; + resident-path bench). SKIPs without the weight blob + oracle artifacts on disk |
-| `replay_dw_mesa` | int8 DW int8-out **regcmd** replayed on Mesa/Teflon's captured BOs, bit-exact vs `mesa-output` (ground truth) |
-| `conv_dw_int8_runtime` | int8 DW int8-out **runtime** (host packing) vs `mesa-output`, bit-exact (raw filter+bias from the tflite model; `tests/dw_dump_capture.py` pins the domain constants) |
+| `replay_dw_mesa` | int8 DW int8-out **regcmd** replayed on Mesa/Teflon's captured BOs, bit-exact vs `mesa-output`: our register program is Mesa's, pad word aside. Not a check of the function: the capture ran an int8 model through Mesa's uint8 driver, on a constant input |
+| `conv_dw_int8_runtime` | int8 DW int8-out **runtime** vs TFLite's reference kernels on the capture's model (`tests/dw_litert_ref.py` writes the fixture; within one at a rounding boundary, at most 2% of outputs) and vs an exact host model of the requant, bit-exact at five shapes; a nonzero weight zero point must refuse |
 | `dump_regcmd` | diff the generated regcmd on the laptop (no HW) |
 | `replay_dump` | replay a dumped in-context failing matmul |
 | `matmul_fp16_rocket` | standalone fp16xfp16->fp16/fp32 single-task smoke test (the `gen_matmul_fp16` path, no tiling) |
@@ -420,7 +458,9 @@ The library reads a few `ROCKET_*` env vars, and the `ggml-rocket` backend expos
 | `ROCKET_MM_ASYM` | on | Asymmetric Mt>Nt tiling. See below |
 | `ROCKET_N_THREADS` | profile | Worker count |
 | `ROCKET_WAIT_MS` | | Fence deadline |
+| `ROCKET_SLOW_WAIT_MS` | 450 | The slow-wait mark. A fenced wait that reaches it logs a warning naming the BO and counts in `rocket_fence_wait_slow_count()`, because the `rocket` driver retires a job that runs 500 ms and signals its fence as if it had completed |
 | `ROCKET_MM_PROFILE` | off | Bucket breakdown |
+| `ROCKET_FA_PROFILE` | off | Splits one flash-attention head range into gather / QK / mask / softmax / AV / scatter and prints two lines at exit: the bucket sums, then the largest single range's own buckets. The sums are worker-thread intervals added over concurrent workers, so they are not a share of anything; the second line is the one to divide, because its terms were measured on one thread over one interval and the dispatch thread waited for that range. The usable quantity is a bucket's share of `max-range` applied to the caller's measured wall |
 | `ROCKET_FA_CHAIN` | on | Batches a flash-attention worker's per-head QK/AV submits through a resident batched-matmul context. `=0` forces the per-head path |
 | `ROCKET_FA_CHAIN_ELEMS` | 32M score elems | Bounds the chained head group, so a worker's head range stays batched up to ~20K context. Raise it to chain at deeper context, for more scratch |
 | `ROCKET_FA_TILE_KV` | off | Opt-in online and tiled long-context flash attention. A memory escape hatch, slower than the materialized path on this dispatch-bound NPU |
@@ -536,8 +576,7 @@ because tiling never changes the result, and gated bit-exact under both settings
 `ROCKET_CONV_BATCH=1` (default off) coalesces a tiled int8/uint8 DIRECT conv's per-tile
 submits into one multi-task job (`conv2d_int8_batch_tiles`). This is the **gapped** "lever 1"
 form, and it is distinct from the chaining above. The kernel runs the tiles as separate HW
-kicks, so the int32 CACC clears per kick and **int8 stays bit-exact**, where chaining is
-fp16-only. The whole tile set pays one submit syscall, one fence and one IOMMU attach instead
+kicks. The whole tile set pays one submit syscall, one fence and one IOMMU attach instead
 of one per tile.
 
 Each tile lands at a bank-aligned, zeroed slot of the batched BOs, so its feature-DMA

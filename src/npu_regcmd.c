@@ -110,6 +110,16 @@ static inline int cna_feature_surf_stride(int line_stride, int datain_height) {
     return s < 0 ? 0 : s;
 }
 
+/* OUT_CVT_SHIFT bit 30. Declared in npu_dpu.h, and shared with the RK3576 encoder, which
+ * keeps the three fields at 0x40B4. The knob is read per emission, like the other probe
+ * knobs in this file, so a probe can flip it between two submits of one process. */
+uint32_t npu_out_cvt_round_bit(unsigned requested)
+{
+    const char *e = getenv("ROCKET_OUT_CVT_ROUND");
+    unsigned r = (e && *e) ? (unsigned)strtoul(e, NULL, 0) : requested;
+    return (uint32_t)(r & 1u) << 30;
+}
+
 /*
  * Emit the regcmd program incrementally and return the op count. Beyond the
  * CNA/CORE/DPU config, this arms RDMA_S_POINTER (early) and the DPU_RDMA block
@@ -296,11 +306,12 @@ static int gen_matmul_task(uint64_t *ops, npu_cna_desc *cna_desc,
   ops[i++] = NPUOP(OP_REG_DPU, dpu_desc->out_cvt_offset, DPU_OUT_CVT_OFFSET);
   value = ((dpu_desc->fp32tofp16_en & 0x1) << 16) | (dpu_desc->out_cvt_scale & 0xFFFF);
   ops[i++] = NPUOP(OP_REG_DPU, value, DPU_OUT_CVT_SCALE);
-  /* OUT_CVT_SHIFT word: bit31 cvt_type (1=float-affine), bits[19:12] minus_exp,
-   * bits[5:0] integer requant shift. All-zero default = the byte-identical integer
-   * pass-through used by fp16/bf16/tf32/int4/int16 and plain int32-out int8. The
-   * int8->float dequant fold sets cvt_type/minus_exp here. */
+  /* OUT_CVT_SHIFT word: bit31 cvt_type (1=float-affine), bit30 the integer requant's
+   * tie rule, bits[19:12] minus_exp, bits[5:0] integer requant shift. All-zero default
+   * = the byte-identical integer pass-through used by fp16/bf16/tf32/int4/int16 and plain
+   * int32-out int8. The int8->float dequant fold sets cvt_type/minus_exp here. */
   value = (((uint32_t)dpu_desc->out_cvt_cvt_type & 0x1) << 31) |
+          npu_out_cvt_round_bit(dpu_desc->out_cvt_round) |
           (((uint32_t)dpu_desc->out_cvt_minus_exp & 0xFF) << 12) |
           ((uint32_t)dpu_desc->out_cvt_shift & 0x3F);
   ops[i++] = NPUOP(OP_REG_DPU, value, DPU_OUT_CVT_SHIFT);
@@ -2226,17 +2237,13 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
   ops[i++] = NPUOP(OP_REG_DPU, 0xE, DPU_S_POINTER);
   ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE, DPU_RDMA_S_POINTER);
 
-  /* ROCKET_CNA_DECONV / _X / _Y: an UNVALIDATED hardware mode, wired for a probe only.
+  /* The deconvolution mode: CONV_CON1 bit 16 DECONV, and CONV_CON3 [13:11]/[10:8]
+   * DECONV_Y_STRIDE / DECONV_X_STRIDE holding stride-1. The CNA then interior-dilates its
+   * input by the stride, and with the output geometry programmed as the transposed extent
+   * one task computes a whole ConvTranspose (rockchip-npu-notes/encodings/conv-transpose.md).
+   * The descriptor carries it for rocket_conv_transpose2d_fp16's hardware route.
    *
-   * The CNA register map carries a transposed-convolution mode this library has never
-   * driven: CONV_CON1 bit 16 DECONV, and CONV_CON3 [13:11]/[10:8] DECONV_Y_STRIDE /
-   * DECONV_X_STRIDE. Nothing about it is decoded — not what the stride fields encode,
-   * not what layout it wants the kernel in, not what output geometry it produces — and
-   * the shipping transposed conv lowers onto a stride-1 forward conv instead, paying
-   * s^2 zero-MACs. The knobs exist so the part can be asked, without an API for a mode
-   * whose semantics are unknown. They are deliberately absent from npu_cna_desc.
-   *
-   * ROCKET_CNA_DECONV sets bit 16; _X and _Y write the two 3-bit stride fields RAW.
+   * ROCKET_CNA_DECONV / _X / _Y override the three fields RAW, for the deconv probes.
    *
    * NVDLA has no deconvolution mode at any revision, so this is Rockchip's own addition
    * and its ancestor's documentation says nothing about it. */
@@ -2244,9 +2251,9 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
     const char *dc = getenv("ROCKET_CNA_DECONV");
     const char *dx = getenv("ROCKET_CNA_DECONV_X");
     const char *dy = getenv("ROCKET_CNA_DECONV_Y");
-    unsigned ds = (dc && *dc) ? (unsigned)strtoul(dc, NULL, 0) : 0;
-    unsigned fx = (dx && *dx) ? (unsigned)strtoul(dx, NULL, 0) : 0;
-    unsigned fy = (dy && *dy) ? (unsigned)strtoul(dy, NULL, 0) : 0;
+    unsigned ds = (dc && *dc) ? (unsigned)strtoul(dc, NULL, 0) : cna_desc->deconv;
+    unsigned fx = (dx && *dx) ? (unsigned)strtoul(dx, NULL, 0) : cna_desc->deconv_x_stride;
+    unsigned fy = (dy && *dy) ? (unsigned)strtoul(dy, NULL, 0) : cna_desc->deconv_y_stride;
     value = ((cna_desc->proc_precision & 0x7) <<7) | ((cna_desc->in_precision & 0x7)<<4) |
       (cna_desc->conv_mode & 0xf);
     if (ds) value |= (1u << 16);
@@ -2441,7 +2448,9 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
     ops[i++] = NPUOP(OP_REG_DPU, dpu_desc->out_cvt_offset, DPU_OUT_CVT_OFFSET);
     value = ((dpu_desc->fp32tofp16_en & 0x1) << 16) | (dpu_desc->out_cvt_scale & 0xFFFF);
     ops[i++] = NPUOP(OP_REG_DPU, value, DPU_OUT_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, (dpu_desc->out_cvt_shift & 0x3F), DPU_OUT_CVT_SHIFT);
+    ops[i++] = NPUOP(OP_REG_DPU,
+                     npu_out_cvt_round_bit(dpu_desc->out_cvt_round) |
+                     (dpu_desc->out_cvt_shift & 0x3F), DPU_OUT_CVT_SHIFT);
   }
   ops[i++] = NPUOP(OP_REG_DPU, 0x0, DPU_EW_OP_VALUE_0);
   ops[i++] = NPUOP(OP_REG_DPU, 0x0, DPU_EW_OP_VALUE_1);
@@ -2567,6 +2576,22 @@ static int gen_conv2d_fill(conv_params_t *params, int depthwise)
      unsigned bias = getenv("ROCKET_CONV_DIL_RAW") ? 0 : 1;
      cna_desc.atrous_x_dilation = dx - bias;
      cna_desc.atrous_y_dilation = dy - bias;
+   }
+
+   /* The deconvolution mode (rocket_conv_transpose2d_fp16's hardware route): direct
+    * only, stride 1, and a power-of-two deconv stride on each axis. */
+   if (params->deconv_sy > 1 || params->deconv_sx > 1) {
+     unsigned dsy = params->deconv_sy > 1 ? params->deconv_sy : 1;
+     unsigned dsx = params->deconv_sx > 1 ? params->deconv_sx : 1;
+     if (depthwise || params->stride_y > 1 || params->stride_x > 1 ||
+         (dsy & (dsy - 1)) || (dsx & (dsx - 1)) || dsy > 8 || dsx > 8) {
+       ROCKET_LOGE("gen_conv2d_fp16: the deconvolution mode takes a direct stride-1 conv "
+                   "and power-of-two strides up to 8 (got %u x %u)\n", dsy, dsx);
+       return -1;
+     }
+     cna_desc.deconv = 1;
+     cna_desc.deconv_y_stride = (uint8_t)(dsy - 1);
+     cna_desc.deconv_x_stride = (uint8_t)(dsx - 1);
    }
 
    cna_desc.datain_width = IW;
@@ -3018,9 +3043,16 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
      if (params->int8_out) {
        /* int8 output + on-chip requant (== Mesa's DW int8 regcmd). */
        core_desc.qd_en = 1;                       /* HW-required for the requant writer */
-       /* CNA pads borders with the input zero-point in the uint8-centered domain
-        * (Mesa rkt_regcmd.c: pad_con1 = input_zero_point - 0x80, input_zp as uint8). */
-       cna_desc.pad_con1 = (uint32_t)(((uint32_t)params->input_zero_point & 0xff) - 0x80u);
+       /* CNA border pad: the zero point in the uint8-centered domain, one BYTE per lane.
+        * The odd channels among the first 32 of a group read byte 1 of the word and the
+        * rest read byte 0 [HW sweep, RK1: a unit weight at tap (0,0) reads each channel's
+        * pad back]. Mesa writes the byte once, sign-extended (rkt_regcmd.c: input_zero_point
+        * - 0x80), which pads those 16 lanes with 0x00 or 0xFF; its two hand-coded values
+        * (0xffff8080, 0x0b0b) are the byte written twice. So the byte goes in every lane. */
+       {
+         uint32_t pb = (((uint32_t)params->input_zero_point & 0xff) - 0x80u) & 0xffu;
+         cna_desc.pad_con1 = pb * 0x01010101u;
+       }
        dpu_desc.out_precision = precision_int8;    /* DPU_DATA_FORMAT = 0 */
        /* int8-out writer stride: size_e=3, surf_add = dst_surf_stride*4 (NOT the
         * int32-raw 7/8). Matches the Teflon capture (SURFACE_ADD=256=OH*OW*4). */

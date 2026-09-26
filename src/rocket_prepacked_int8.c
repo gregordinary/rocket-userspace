@@ -540,21 +540,19 @@ static void *rki_thread(void *a)
     else    memset(acc,  0, (size_t)M * nsub * sizeof(int64_t));
     uint64_t npu_regs[256] = {0};
     rocket_task_desc *tasks = w->tasks;
-    /* Submit layout. The resident int8 path already batches a job's tiles into ONE
-     * ioctl (lever 1, the submit-overhead win); each gapped task is a SEPARATE HW
-     * kick, so the integer int32 accumulator (CACC) clears between tasks.
+    /* Submit layout. The resident int8 path batches a job's tiles into ONE ioctl
+     * (lever 1, the submit-overhead win), and each gapped task is a separate HW kick.
      *
-     * Contiguous CHAINING (lever 2: one kick / one IRQ for the whole batch) is
-     * HW-BLOCKED for the integer datapath and forced off here. The chained layout
-     * is byte-identical to fp16's (chain_layout passes for int8/int4), but running
-     * the tasks back-to-back in one kick computes the FIRST task correctly and
-     * garbles every subsequent one — the CACC clears per-kick, not per-task, so
-     * task N+1 accumulates onto task N's residual int32 (HW sweep 2026-06-28:
-     * M/N/K-tiled all show first-tile-exact, rest-garbage; fp16 chains fine because
-     * it does not carry the integer accumulator). Same root as the
-     * no-cross-op-int32-accumulate ceiling. Re-enable only if a per-task CACC clear
-     * is found. */
-    int chained = 0;   /* integer chaining HW-blocked; gapped batch = lever 1 only */
+     * Contiguous CHAINING (lever 2: one kick and one IRQ for the whole batch) stays off
+     * here, and the reason is not a hardware bound. Independent int8 x int8 -> int32
+     * tasks self-chained into one kick compute bit-exactly against a CPU model, one NPU
+     * interrupt per kick (tests/int8_chain_probe: 4 tasks of 64x256x64 and 8 of
+     * 128x1024x128, RK3588, rocket 1.3.0, 2026-09-25). The first-tile-exact,
+     * rest-garbage result this path once cited was scored against a device oracle whose
+     * gapped multi-task jobs ran under the kernel's old global batching parameter, which
+     * garbled exactly those jobs. Chaining this path is a lever to gate on its own tiles
+     * and price, not a correctness fix. */
+    int chained = 0;   /* not gated on this path yet; gapped batch = lever 1 only */
     (void)rkt_chain_enabled;
 
     int total = nMt * nNt * nKt, done_tiles = 0, nb = 0;
@@ -612,7 +610,7 @@ static void *rki_thread(void *a)
                     uint32_t in_h[]  = { w->in_all.handle, t->wt->handle, w->regcmd.handle };
                     uint32_t out_h[] = { w->out_all.handle };
                     /* Resident submit scratch (w->submit_dt), no per-job calloc/free; batched=0
-                     * keeps the gapped per-task layout (integer chaining is HW-blocked here). */
+                     * keeps the gapped per-task layout (chaining is not gated on this path yet). */
                     if (prof) t0 = rki_now_ms();
                     if ((t->ret = rocket_submit_tasks_pre(fd, w->submit_dt, tasks, nb,
                                                           in_h, 3, out_h, 1, 0)) != 0)

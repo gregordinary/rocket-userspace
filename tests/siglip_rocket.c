@@ -22,6 +22,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_siglip.h"
+#include "test_fill.h"
 
 static float *read_f32(const char *path, size_t want, const char **err)
 {
@@ -59,7 +60,14 @@ static int cmp_d(const void *a, const void *b)
 
 int main(int argc, char **argv)
 {
-    const char *dir = (argc > 1) ? argv[1] : "./siglip-artifacts";
+    /* The artifact directory: argv[1], else ROCKET_SIGLIP_ARTIFACTS, else the default. A
+     * directory someone NAMED that turns out empty is a failure, not a skip: the gate was
+     * provisioned, and a missing blob there is a broken provisioning that a skip would
+     * hide for good. Only the unconfigured default may skip. */
+    const char *env_dir = getenv("ROCKET_SIGLIP_ARTIFACTS");
+    const int named = (argc > 1) || (env_dir && *env_dir);
+    const char *dir = (argc > 1) ? argv[1] : (env_dir && *env_dir) ? env_dir : "./siglip-artifacts";
+    const int miss_rc = named ? 1 : 2;
     char wpath[1024], ppath[1024], hpath[1024], lpath[1024];
     snprintf(wpath, sizeof wpath, "%s/siglip_weights.f16", dir);
     snprintf(ppath, sizeof ppath, "%s/pixels.f32", dir);
@@ -68,7 +76,12 @@ int main(int argc, char **argv)
 
     rocket_siglip_model m;
     int lrc = rocket_siglip_load(wpath, &m);
-    if (lrc != 0) { printf("note: no weight blob %s (%d) — SKIP\n", wpath, lrc); return 2; }
+    if (lrc != 0) {
+        printf("note: no weight blob %s (%d) — %s\n", wpath, lrc,
+               named ? "FAIL (this directory was named as the artifacts)"
+                     : "SKIP (set ROCKET_SIGLIP_ARTIFACTS or -DROCKETNPU_SIGLIP_ARTIFACTS)");
+        return miss_rc;
+    }
     printf("siglip: d=%d layers=%d heads=%d d_ff=%d L=%d patch_dim=%d eps=%g\n",
            m.d, m.n_layers, m.n_head, m.d_ff, m.L, m.patch_dim, m.eps);
 
@@ -81,8 +94,9 @@ int main(int argc, char **argv)
     float *href = read_f32(hpath, (size_t)(nL + 1) * Ld, &err);
     float *lref = read_f32(lpath, Ld, &err);
     if (!pix || !href || !lref) {
-        printf("note: missing/!size oracle in %s (%s) — SKIP\n", dir, err ? err : "?");
-        free(pix); free(href); free(lref); rocket_siglip_free(&m); return 2;
+        printf("note: missing/!size oracle in %s (%s) — %s\n", dir, err ? err : "?",
+               named ? "FAIL" : "SKIP");
+        free(pix); free(href); free(lref); rocket_siglip_free(&m); return miss_rc;
     }
 
     int fd = rocket_open();
@@ -127,21 +141,29 @@ int main(int argc, char **argv)
         rocket_siglip_ctx *c = rocket_siglip_ctx_create(&m, nthreads);
         tc = now_ms() - tc;
         if (!c) {
-            printf("  resident ctx create FAILED (IOVA / fd?) — bench skipped\n");
+            printf("  resident ctx create FAILED (IOVA / fd?) -> FAIL\n");
+            ok = 0;
         } else {
             printf("  resident ctx created in %.0f ms (packed %d static weights, nthreads=%d)\n",
                    tc, 1 + 6 * nL, nthreads);
             _Float16 *hid2 = malloc((size_t)(nL + 1) * Ld * sizeof(_Float16));
+            /* `out` still holds the one-shot run's answer: without a fresh sentinel a
+             * resident path that wrote nothing would score as that answer */
+            tf_sentinel_f16(out, Ld);
+            if (hid2) tf_sentinel_f16(hid2, (size_t)(nL + 1) * Ld);
             int rc2 = rocket_siglip_encode_ctx(c, pix16, out, hid2);
             if (rc2 == 0 && hid2) {
                 double s2 = 0;
                 for (int kk = 1; kk <= nL; kk++)
                     s2 += cosine_f16_f32(hid2 + (size_t)kk * Ld, href + (size_t)kk * Ld, Ld);
                 double cpost = cosine_f16_f32(out, lref, Ld);
+                int res_ok = (s2 / nL >= 0.99 && cpost >= 0.99);
                 printf("  resident path: mean-layer cos=%.6f  post-LN cos=%.6f  %s\n",
-                       s2 / nL, cpost, (s2 / nL >= 0.99 && cpost >= 0.99) ? "OK" : "DRIFT");
+                       s2 / nL, cpost, res_ok ? "OK" : "DRIFT -> FAIL");
+                if (!res_ok) ok = 0;
             } else {
-                printf("  resident encode rc=%d\n", rc2);
+                printf("  resident encode rc=%d -> FAIL\n", rc2);
+                ok = 0;
             }
             free(hid2);
 

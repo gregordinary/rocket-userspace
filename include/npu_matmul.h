@@ -205,6 +205,13 @@ typedef struct {
    * Read ONLY by the RK3576 non-ARGB generators; the RK3588 ones never look at it,
    * so every existing path is byte-identical. */
   uint32_t  in_pitch_w;
+  /* The CNA deconvolution mode: the input is interior-dilated by these strides in
+   * hardware. 0 or 1 (default) is off, which is byte-identical. 2, 4 or 8 turns it on;
+   * any other value is refused. The caller programs oh/ow as the TRANSPOSED extent, pads
+   * by k-1-p, flips the kernel and transposes its channels, and keeps stride_y/x at 1.
+   * Read ONLY by the RK3588 fp16 direct generator (gen_conv2d_fp16). */
+  uint8_t   deconv_sy;
+  uint8_t   deconv_sx;
   uint32_t  task_count;   /* OUT: number of NPUOP words written      */
 } conv_params_t;
 

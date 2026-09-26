@@ -47,6 +47,7 @@
 #include "npu_regcmd_rk3576.h"
 #include "rocket_hw_profile.h"
 #include "requant_model.h"
+#include "perchannel_model.h"   /* plan_c: the ramp planner, a second implementation */
 
 typedef struct {
     const char *name;
@@ -132,41 +133,6 @@ static void sleep_ms(int ms)
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
-}
-
-/*
- * The library's own C-ramp planner, spelled again here so the model predicts the same
- * registers. It is deliberately a SECOND implementation from the documented rule rather
- * than a call into the first: a model that shares the planner cannot catch the planner.
- */
-static void plan_c(unsigned oc0, unsigned tile_oc, const unsigned *perm,
-                   const int64_t *sum_abs_w, const int32_t *A,
-                   float in_scale, const float *w_scale, float out_scale,
-                   int16_t *C, unsigned *mul, unsigned *shift)
-{
-    double best = 0.0, base;
-    unsigned j;
-    for (j = 0; j < tile_oc; j++) {
-        unsigned c = perm[oc0 + j];
-        double cs = (double)in_scale * (double)w_scale[c] / (double)out_scale;
-        double bound = 128.0 * (double)sum_abs_w[c] + fabs((double)A[oc0 + j]) + 1.0;
-        double cmax = (double)INT32_MAX / bound;
-        double need;
-        if (cmax > 32767.0) cmax = 32767.0;
-        if (cmax < 1.0)     cmax = 1.0;
-        need = cs / cmax;
-        if (need > best) best = need;
-    }
-    rocket_rk3576_requant_params((float)best, mul, shift);
-    base = (double)*mul / (double)((uint64_t)1 << *shift);
-    for (j = 0; j < tile_oc; j++) {
-        unsigned c = perm[oc0 + j];
-        double cs = (double)in_scale * (double)w_scale[c] / (double)out_scale;
-        long long v = (long long)(cs / base + 0.5);
-        if (v < 1)     v = 1;
-        if (v > 32767) v = 32767;
-        C[oc0 + j] = (int16_t)v;
-    }
 }
 
 /* The library sorts the output channels by scale so each tile spans as little of the

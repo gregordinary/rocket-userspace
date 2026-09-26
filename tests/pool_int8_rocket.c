@@ -3,11 +3,11 @@
 /*
  * pool_int8_rocket.c — standalone test for on-NPU int8 / uint8 MaxPool / AveragePool.
  *
- * NPU FACT (RE'd here): the RK3588 PPU has no native int8 pooling precision — a job with
- * PROC_PRECISION=int8 over a packed int8 cube reads the bytes as fp16 (garbage); the
- * allbilly reference emits PROC_PRECISION=fp16 for every pool. So int8/uint8 pooling
- * ROUTES THROUGH the fp16 PPU path (rocket_pool_int8 / rocket_pool_uint8): int8/uint8 are
- * exact in fp16, so MAX is bit-exact and AVG matches the fp16(65536/k) recip.
+ * This gates the SHIPPING path, which routes int8/uint8 pooling through the fp16 PPU job
+ * (rocket_pool_int8 / rocket_pool_uint8): int8/uint8 are exact in fp16, so MAX is
+ * bit-exact and AVG matches the fp16(65536/k) recip. The PPU's own native int8 precision
+ * exists and is measured separately by tests/pool_int8_native_probe.c; it is not what
+ * this gate covers.
  *
  * Two layers:
  *   1. INDEPENDENT INTEGER GOLDEN: plain-arithmetic max / round(exact-average), computed
@@ -28,6 +28,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_pool.h"
+#include "test_fill.h"
 
 static const char *mname(int m) { return m == POOL_METHOD_MAX ? "max" : "avg"; }
 
@@ -72,7 +73,9 @@ static void golden(const rocket_pool_desc *d, const int8_t *in, int8_t *out, int
  * was refused would print N "skipping" lines and exit PASS over zero evidence. */
 static int g_checked = 0;
 
-static int run_shape(int fd, const rocket_pool_desc *d, int is_uint8)
+/* `neg` (int8 only): fill with negative values only, so a padded MAX border window is all
+ * negative and a pad that fills with 0 instead of the dtype minimum reads 0 there. */
+static int run_shape(int fd, const rocket_pool_desc *d, int is_uint8, int neg)
 {
     int OH = rocket_pool_oh(d), OW = rocket_pool_ow(d);
     printf("%s %s C=%d %dx%d  k=%dx%d s=%dx%d p=%d,%d,%d,%d -> %dx%d\n",
@@ -85,10 +88,13 @@ static int run_shape(int fd, const rocket_pool_desc *d, int is_uint8)
     size_t in_n = (size_t)d->c*d->ih*d->iw, out_n = (size_t)d->c*OH*OW;
     int8_t *in = malloc(in_n), *out = malloc(out_n), *gold = malloc(out_n);
     if (!in || !out || !gold) { fprintf(stderr, "oom\n"); return -1; }
-    /* spread across the range incl. the sign boundary (exercises the recenter + clamp). */
-    for (size_t i = 0; i < in_n; i++) {
-        int v = (int)((i*37 + 11) % 251);                 /* 0..250 */
-        in[i] = is_uint8 ? (int8_t)(uint8_t)v : (int8_t)(v - 125);
+    /* the whole range incl. the sign boundary (exercises the recenter + clamp), hashed so
+     * nothing repeats along any axis (tests/test_fill.h) */
+    {
+        uint64_t seed = tf_hash(0x9008, (uint64_t)(d->c * 1000003 + d->ih * 1009 + d->iw * 31 +
+                                                   d->kh * 7 + d->kw + d->method * 5 + is_uint8));
+        if (is_uint8) tf_fill_u8((uint8_t *)in, in_n, seed, 0, 255);
+        else          tf_fill_i8(in, in_n, seed, -128, neg ? -1 : 127);
     }
 
     int fail = 0;
@@ -105,7 +111,7 @@ static int run_shape(int fd, const rocket_pool_desc *d, int is_uint8)
 
     {
         const char *tag = (fd >= 0) ? "HW end-to-end" : "CPU fallback";
-        memset(out, 0, out_n);
+        tf_sentinel_bytes(out, out_n);
         int r = is_uint8 ? rocket_pool_uint8(fd, d, (uint8_t*)in, (uint8_t*)out)
                          : rocket_pool_int8(fd, d, in, out);
         if (r) { printf("  %s: rocket_pool_%s = %d (FAIL)\n", tag, is_uint8?"uint8":"int8", r); fail = 1; }
@@ -145,28 +151,34 @@ int main(int argc, char **argv)
             .c=atoi(argv[3]),.ih=atoi(argv[4]),.iw=atoi(argv[5]),
             .kh=atoi(argv[6]),.kw=atoi(argv[7]),.stride_y=atoi(argv[8]),.stride_x=atoi(argv[9]),
             .pad_top=atoi(argv[10]),.pad_left=atoi(argv[11]),.pad_bottom=atoi(argv[12]),.pad_right=atoi(argv[13]) };
-        fail = run_shape(fd, &d, is_u8);
+        fail = run_shape(fd, &d, is_u8, 0);
     } else {
-        struct { rocket_pool_desc d; int u8; } shapes[] = {
+        struct { rocket_pool_desc d; int u8, neg; } shapes[] = {
             /* int8 MAX: single & multi C-plane, stride, global, same-pad, C not %16 */
-            {{ .method=POOL_METHOD_MAX,.c=16,.ih=4, .iw=4, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 0},
-            {{ .method=POOL_METHOD_MAX,.c=16,.ih=6, .iw=6, .kh=3,.kw=3,.stride_y=1,.stride_x=1 }, 0},
-            {{ .method=POOL_METHOD_MAX,.c=32,.ih=8, .iw=8, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 0},
-            {{ .method=POOL_METHOD_MAX,.c=48,.ih=10,.iw=12,.kh=3,.kw=3,.stride_y=2,.stride_x=2 }, 0},
-            {{ .method=POOL_METHOD_MAX,.c=16,.ih=7, .iw=7, .kh=7,.kw=7,.stride_y=1,.stride_x=1 }, 0},
-            {{ .method=POOL_METHOD_MAX,.c=16,.ih=6, .iw=6, .kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.pad_bottom=1,.pad_right=1 }, 0},
-            {{ .method=POOL_METHOD_MAX,.c=24,.ih=5, .iw=5, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 0},
+            {{ .method=POOL_METHOD_MAX,.c=16,.ih=4, .iw=4, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 0, 0},
+            {{ .method=POOL_METHOD_MAX,.c=16,.ih=6, .iw=6, .kh=3,.kw=3,.stride_y=1,.stride_x=1 }, 0, 0},
+            {{ .method=POOL_METHOD_MAX,.c=32,.ih=8, .iw=8, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 0, 0},
+            {{ .method=POOL_METHOD_MAX,.c=48,.ih=10,.iw=12,.kh=3,.kw=3,.stride_y=2,.stride_x=2 }, 0, 0},
+            {{ .method=POOL_METHOD_MAX,.c=16,.ih=7, .iw=7, .kh=7,.kw=7,.stride_y=1,.stride_x=1 }, 0, 0},
+            {{ .method=POOL_METHOD_MAX,.c=16,.ih=6, .iw=6, .kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.pad_bottom=1,.pad_right=1 }, 0, 0},
+            {{ .method=POOL_METHOD_MAX,.c=24,.ih=5, .iw=5, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 0, 0},
             /* uint8 MAX: the detection dtype, values straddling 128 */
-            {{ .method=POOL_METHOD_MAX,.c=16,.ih=8, .iw=8, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 1},
-            {{ .method=POOL_METHOD_MAX,.c=32,.ih=6, .iw=6, .kh=3,.kw=3,.stride_y=1,.stride_x=1 }, 1},
-            {{ .method=POOL_METHOD_MAX,.c=24,.ih=7, .iw=7, .kh=7,.kw=7,.stride_y=1,.stride_x=1 }, 1},
+            {{ .method=POOL_METHOD_MAX,.c=16,.ih=8, .iw=8, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 1, 0},
+            {{ .method=POOL_METHOD_MAX,.c=32,.ih=6, .iw=6, .kh=3,.kw=3,.stride_y=1,.stride_x=1 }, 1, 0},
+            {{ .method=POOL_METHOD_MAX,.c=24,.ih=7, .iw=7, .kh=7,.kw=7,.stride_y=1,.stride_x=1 }, 1, 0},
             /* int8 AVG: pad-free (exact count) — the fp16 recip path, rounded to int8 */
-            {{ .method=POOL_METHOD_AVG,.c=16,.ih=4, .iw=4, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 0},
-            {{ .method=POOL_METHOD_AVG,.c=16,.ih=8, .iw=8, .kh=4,.kw=4,.stride_y=4,.stride_x=4 }, 0},
-            {{ .method=POOL_METHOD_AVG,.c=32,.ih=7, .iw=7, .kh=7,.kw=7,.stride_y=1,.stride_x=1 }, 0},
+            {{ .method=POOL_METHOD_AVG,.c=16,.ih=4, .iw=4, .kh=2,.kw=2,.stride_y=2,.stride_x=2 }, 0, 0},
+            {{ .method=POOL_METHOD_AVG,.c=16,.ih=8, .iw=8, .kh=4,.kw=4,.stride_y=4,.stride_x=4 }, 0, 0},
+            {{ .method=POOL_METHOD_AVG,.c=32,.ih=7, .iw=7, .kh=7,.kw=7,.stride_y=1,.stride_x=1 }, 0, 0},
+            /* padding, with every field differing between the axes: a padded AVG
+             * (count-include-pad), a MAX over an all-negative int8 input so a zero pad fill
+             * shows in every border window, and the same MAX in the uint8 domain */
+            {{ .method=POOL_METHOD_AVG,.c=16,.ih=9, .iw=7, .kh=3,.kw=2,.stride_y=2,.stride_x=1,.pad_top=1,.pad_left=0,.pad_bottom=0,.pad_right=1 }, 0, 0},
+            {{ .method=POOL_METHOD_MAX,.c=16,.ih=7, .iw=10,.kh=2,.kw=3,.stride_y=1,.stride_x=2,.pad_top=0,.pad_left=1,.pad_bottom=1,.pad_right=0 }, 0, 1},
+            {{ .method=POOL_METHOD_MAX,.c=16,.ih=7, .iw=10,.kh=2,.kw=3,.stride_y=1,.stride_x=2,.pad_top=0,.pad_left=1,.pad_bottom=1,.pad_right=0 }, 1, 0},
         };
         for (size_t i = 0; i < sizeof(shapes)/sizeof(shapes[0]); i++) {
-            fail |= run_shape(fd, &shapes[i].d, shapes[i].u8);
+            fail |= run_shape(fd, &shapes[i].d, shapes[i].u8, shapes[i].neg);
             printf("\n");
         }
     }
@@ -175,6 +187,11 @@ int main(int argc, char **argv)
         printf("no shape reached a numeric check — every case was refused or "
                "skipped; this gate proved nothing\n");
         fail = 1;
+    }
+    if (fd < 0 && !fail) {
+        /* The host checks passed, but the device path never ran, so this is not a pass. */
+        printf("no NPU: the host checks passed and the device path never ran -> SKIP\n");
+        return 2;
     }
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;

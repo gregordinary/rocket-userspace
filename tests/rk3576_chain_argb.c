@@ -41,9 +41,11 @@
  * This is a PROBE and reports; the packed path's arithmetic is gated by
  * rk3576_argb_pad and rk3576_argb_extent.
  *
- * Usage: rk3576_chain_argb [iterations]     (default 8)
+ * Usage: rk3576_chain_argb [gate] [iterations]     (default 8)
  * Exit:  0 the question is answered either way, 1 the probe could not run it,
- *        2 no NPU or the wrong chip.
+ *        2 no NPU or the wrong chip. With `gate` the answer is asserted: 0 only when every
+ *        cell ran, the stem and its consumer were correct in every iteration, and the
+ *        consumer could tell its written input from an unwritten one. 1 otherwise.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -74,6 +76,10 @@ static const struct { unsigned iw, k, s, oc; } CASES[] = {
     { 128u, 3u, 2u, 32u },
 };
 #define N_CASES ((int)(sizeof CASES / sizeof CASES[0]))
+
+/* Columns that could not tell a written input from an unwritten one. Such a column scores
+ * "correct" whether or not the chain ordered anything, so a gate run fails on any. */
+static int g_blind;
 
 struct prog {
     rocket_bo     w, b, r;         /* weights, coefficients, its own regcmd BO */
@@ -420,9 +426,11 @@ static int run_case(int fd, unsigned iw, unsigned k, unsigned s, unsigned oc, in
                    (unsigned long long)t_sep, (unsigned long long)t_chain);
         }
 
-        if (it == 0 && !memcmp(yref, ystale, y_bytes))
+        if (it == 0 && !memcmp(yref, ystale, y_bytes)) {
             printf("       NOTE: the consumer's written and unwritten inputs give the SAME "
                    "output here, so its column cannot distinguish them\n");
+            g_blind++;
+        }
     }
 
     *ok_stem += n_stem;
@@ -440,7 +448,8 @@ out:
 int main(int argc, char **argv)
 {
     const struct rocket_hw_profile *hw = rocket_hw_current();
-    int iters = argc > 1 ? atoi(argv[1]) : 8;
+    const int gate = argc > 1 && !strcmp(argv[1], "gate");
+    int iters = argc > 1 + gate ? atoi(argv[1 + gate]) : 8;
     int fd, i, ok_stem = 0, ok_next = 0, ran = 0, skipped = 0, could_not = 0;
 
     if (strcmp(hw->name, "rk3576") != 0) {
@@ -474,5 +483,13 @@ int main(int argc, char **argv)
         printf("== it does NOT chain cleanly — read the per-iteration verdicts for the "
                "boundary it failed at ==\n");
     rocket_close(fd);
+    if (gate) {
+        const int ok = !skipped && !could_not && !g_blind && ran == N_CASES * iters &&
+                       ok_stem == ran && ok_next == ran;
+        printf("GATE: %s\n", ok ? "PASS, every cell ran and both boundaries were correct in "
+                                  "every iteration"
+                                : "FAIL");
+        return ok ? 0 : 1;
+    }
     return could_not && !ran ? 1 : 0;
 }

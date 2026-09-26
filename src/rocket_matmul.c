@@ -81,7 +81,29 @@ static int mm_profile(void) {
 
 /* Phase profiling: set ROCKET_MM_PROFILE=1 to print an AGGREGATE breakdown (one
  * summary line at exit) across every matmul + worker. Workers run concurrently so
- * the accumulator is mutex-guarded; the atexit dump is armed on first use. */
+ * the accumulator is mutex-guarded; the atexit dump is armed on first use.
+ *
+ * WHAT THESE BUCKETS ARE, AND WHAT THEY CANNOT SCORE. Every bucket is a sum of
+ * now_ms() (CLOCK_MONOTONIC) intervals taken ON A WORKER THREAD, so a bucket
+ * measures elapsed time and not CPU time. rocket_pin_worker_based pins worker i to
+ * big core i mod the big-core count, and the RK3588 has four A76s, so at the default
+ * five workers two already share a core -- and inside a frontend the host's own
+ * compute threads run on the same cores. An interval therefore counts the time the
+ * thread spent descheduled as well as the time it spent working.
+ *
+ * CONSEQUENCE: A BUCKET IS AN UPPER BOUND ON ITS TERM, NEVER A SHARE OF THE WALL.
+ * On a single-fd microbenchmark the two coincide (one thread, nothing beside it),
+ * which is the regime the published phase splits were taken in. Inside a model they
+ * do not: on Gemma-4-12B F16 at -p 2048 these buckets summed to 2.77x the prefill
+ * wall, and packB read as a wall share came out about 33x above the same term
+ * derived from two measured walls. An upper bound that is small still CLOSES a
+ * lever; it cannot SIZE one. To size a term inside a model, difference two measured
+ * walls that differ by it.
+ *
+ * packB IS NOT ZERO JUST BECAUSE A RESIDENCY LEDGER SAYS "0 streamed". That ledger's
+ * denominator is the weights OFFERED to its route; a matmul that was never a
+ * candidate (below the min-M gate, no stable weight name) still takes the streaming
+ * path and still pays a per-call weight scatter counted here. */
 static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { double pack, packA, packB, gen, sync, submit, wait, read; long calls; } g_prof;
 static int g_prof_armed = 0;

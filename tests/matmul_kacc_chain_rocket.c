@@ -176,12 +176,20 @@ int main(int argc, char **argv)
         };
         for (size_t i = 0; i < sizeof(S) / sizeof(S[0]); i++) {
             int r = run_one(fd, S[i].M, S[i].K, S[i].N, S[i].ref);
-            if (r != 2) { ran++; fails += (r == 1); }
+            /* Every shape here is chosen to engage chaining, so one that does not is a
+             * shape this gate no longer checks: a failure, not a quiet drop. */
+            if (r == 2) {
+                printf("  [%d x %d x %d] did not engage chaining -> FAIL\n",
+                       S[i].M, S[i].K, S[i].N);
+                fails++;
+                continue;
+            }
+            ran++; fails += (r == 1);
         }
     }
     rocket_close(fd);
 
-    if (ran == 0) { printf("no K-tiled shape exercised chaining -> SKIP\n"); return 2; }
+    if (ran == 0) { printf("no K-tiled shape exercised chaining -> FAIL\n"); return 1; }
     printf("\nkacc-chain gate: %d shape(s) run, %d failed -> %s\n",
            ran, fails, fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

@@ -44,8 +44,13 @@ static const uint16_t EXCLUDE_ADDR[] = {
 /* The requant triple is computed from the model's quant scales, which differ
  * between the capture's model and the gate's inputs. The gate checks that the
  * emitter puts requant HERE (offset/scale/shift, three consecutive registers), not
- * that it reproduces another model's numbers. */
-static const uint16_t EXCLUDE_QUANT[] = { 0x40AC, 0x40B0, 0x40B4 };
+ * that it reproduces another model's numbers. OUT_CVT_SHIFT (0x40B4) is compared above
+ * its shift field instead of excluded: bit 30 is the tie rule, and all 206 of the
+ * captures' writes carry it clear, half to even, which is what every emitter here
+ * writes. */
+static const uint16_t EXCLUDE_QUANT[] = { 0x40AC, 0x40B0 };
+#define OUT_CVT_SHIFT_76    0x40B4
+#define OUT_CVT_SHIFT_FIELD 0x3Fu
 
 /* DPU epilogue registers the captures show tracking the MODEL rather than the
  * geometry: they take one value per capture file and are constant across every
@@ -229,6 +234,14 @@ static int run_case(const struct rk3576_golden_case *c, struct gate_result *tot,
         if (IN(gr, EXCLUDE_ADDR) || IN(gr, EXCLUDE_QUANT) || IN(gr, EXCLUDE_MODEL)) {
             excluded++; continue;
         }
+        if (gr == OUT_CVT_SHIFT_76) {
+            if ((ev & ~OUT_CVT_SHIFT_FIELD) == (gv & ~OUT_CVT_SHIFT_FIELD)) { checked++; continue; }
+            printf("  FAIL %-34s [%3zu] %s 0x%04x  golden 0x%08x  emitted 0x%08x: the bits "
+                   "above the shift field differ, and bit 30 is the tie rule\n",
+                   c->name, i, blk(gt), gr, gv, ev);
+            fail++;
+            continue;
+        }
         if (ev == gv) { checked++; continue; }
         /* CNA 0x1014 carries the stride pair in its low bits and, in the vendor's
          * multi-task program variant only, bit 28 as well. Every capture that sets
@@ -307,6 +320,11 @@ int main(int argc, char **argv)
     struct gate_result tot = {0};
     int fail = 0;
     unsigned n_dw = 0, n_direct = 0, n_argb = 0, n_epi = 0;
+
+    /* Host-only: this compares the RK3576 encoder's words against the vendor's, and the
+     * generators refuse off the RK3576 so that no other part is sent this program. Force
+     * the profile before anything resolves it, so the check runs on any build host. */
+    setenv("ROCKET_CHIP", "rk3576", 1);
 
     /* This gate drives the emitter with the vendor's own geometries verbatim, and
      * several captures are ic=16 or ic=12 — partial 32-channel groups, which the

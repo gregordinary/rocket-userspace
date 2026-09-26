@@ -26,6 +26,10 @@
 #include "rocket_attn.h"
 
 static int g_fail = 0;
+/* Q and K amplitude for test_fa. 1.0 is post-norm unit scale. The soft-cap case raises it:
+ * at dh=256 unit-scale logits have an SD near 0.33, which the old case's cap of 50 changed
+ * by about 5e-6, so the capped path ran and nothing checked it. */
+static float g_qk_amp = 1.0f;
 
 static void fill(_Float16 *v, size_t n, float amp, uint32_t seed)
 {
@@ -68,12 +72,33 @@ static int test_fa(int fd, rocket_fa_ctx *c, int T, int n_kv, int dh, int dv, in
     _Float16 *M = malloc(mn * sizeof(_Float16));
     _Float16 *got = malloc(on * sizeof(_Float16)), *ref = malloc(on * sizeof(_Float16));
     if (!Q || !K || !V || !M || !got || !ref) { fprintf(stderr, "oom\n"); return 1; }
-    fill(Q, qn, 1.0f, T * 7 + dh);   /* post-norm unit-scale activations */
-    fill(K, kn, 1.0f, n_kv * 3 + 1);
+    fill(Q, qn, g_qk_amp, T * 7 + dh);   /* post-norm unit-scale activations by default */
+    fill(K, kn, g_qk_amp, n_kv * 3 + 1);
     fill(V, vn, 1.0f, n_kv * 5 + 2);
     make_mask(M, T, n_kv, window);
 
     rocket_flash_attn_ref_fp16(T, n_kv, dh, dv, nh, nkvh, scale, softcap, Q, K, V, M, ref);
+    if (softcap > 0.0f) {
+        /* The case has to reach the cap: an output the cap does not change cannot tell a
+         * path that applies it from one that skips it. */
+        _Float16 *nocap = malloc(on * sizeof(_Float16));
+        if (!nocap) { fprintf(stderr, "oom\n"); return 1; }
+        rocket_flash_attn_ref_fp16(T, n_kv, dh, dv, nh, nkvh, scale, 0.0f, Q, K, V, M, nocap);
+        double d = 0, na = 0, nb = 0;
+        for (size_t i = 0; i < on; i++) {
+            d += (double)ref[i] * (double)nocap[i];
+            na += (double)ref[i] * (double)ref[i]; nb += (double)nocap[i] * (double)nocap[i];
+        }
+        double cos_cap = d / (sqrt(na) * sqrt(nb) + 1e-30);
+        free(nocap);
+        printf("  soft-cap %.0f: the capped and uncapped references agree to cos=%.6f\n",
+               softcap, cos_cap);
+        if (!(cos_cap < 0.999)) {
+            printf("  the cap barely changes the output, so this case cannot see it -> FAIL\n");
+            free(Q);free(K);free(V);free(M);free(got);free(ref);
+            return 1;
+        }
+    }
     int rc = c
         ? rocket_flash_attn_fp16_ctx(c, T, n_kv, dh, dv, nh, nkvh, scale, softcap, Q, K, V, M, got)
         : nthreads > 0
@@ -173,7 +198,13 @@ int main(int argc, char **argv)
         g_fail |= test_fa(fd, NULL, 128, 128, 256, 256, 16, 1, 0,    0.0f, 0);  /* global layer: MQA         */
         g_fail |= test_fa(fd, NULL, 100, 100, 256, 256, 16, 8, 0,    0.0f, 0);  /* T%4!=0, n_kv%32!=0        */
         g_fail |= test_fa(fd, NULL, 64,  512, 256, 256, 16, 8, 0,    0.0f, 0);  /* n_kv>T (cached prefix)    */
-        g_fail |= test_fa(fd, NULL, 128, 128, 256, 256, 16, 8, 0,   50.0f, 0);  /* logit soft-cap path       */
+        /* The logit soft-cap path, with logits PAST the cap: amplitude 4 gives an SD near
+         * 5.3 at dh=256, so a cap of 5 bends a large share of them while fp16 still holds a
+         * logit that size to a few thousandths. test_fa refuses the case if the cap does
+         * not move the output. */
+        g_qk_amp = 4.0f;
+        g_fail |= test_fa(fd, NULL, 128, 128, 256, 256, 16, 8, 0,    5.0f, 0);  /* logit soft-cap path       */
+        g_qk_amp = 1.0f;
 
         /* MLA (dv != dh): DeepSeek-V2-Lite shape — dh=192 (128 nope + 64 rope), dv=128, and
          * MLA is MQA-like (n_kv_heads=1 on the compressed latent). Forces the materialized

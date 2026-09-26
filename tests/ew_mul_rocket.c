@@ -113,7 +113,7 @@ int main(int argc, char **argv)
 
     if (K % 32 || N % 16 || (M % 4)) {
         fprintf(stderr, "need K%%32==0, N%%16==0, M%%4==0 (K==N here)\n");
-        return 2;
+        return 1;
     }
 
     /* Pick the EW op encoding. gen_matmul_fp16 reads ROCKET_EW_CFG; default it to

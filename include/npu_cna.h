@@ -84,6 +84,14 @@ typedef struct npu_cna_desc {
   uint8_t atrous_x_dilation;  // 0x1014 [20:16]  (rate-1)
   uint8_t atrous_y_dilation;  // 0x1014 [25:21]  (rate-1)
 
+  /* The deconvolution mode: CONV_CON1 bit 16 set, and CONV_CON3's DECONV strides as the
+   * RAW field value (= stride - 1; power-of-two strides only). The CNA then
+   * interior-dilates its input by the stride. 0 (default) is off. Read ONLY by
+   * gen_conv2d_task. */
+  uint8_t deconv;             // 0x100C bit16
+  uint8_t deconv_x_stride;    // 0x1014 [10:8]   (stride-1)
+  uint8_t deconv_y_stride;    // 0x1014 [13:11]  (stride-1)
+
   /* CNA_PAD_CON1 (0x10A4): the constant the CNA pads borders with. For the int8-out
    * (uint8-centered) datapath this is the input zero-point in the shifted domain
    * (= input_zp_uint8 - 0x80); 0 for the float / int32-raw paths (read only by the

@@ -31,6 +31,7 @@
 #include "rocket_hw_profile.h"   /* CBUF bank count from the active hardware profile */
 #include "npu_matmul.h"
 #include "rocket_conv.h"
+#include "rocket_conv_internal.h"
 #include "rocket_activation.h"   /* lut_epilogue_t builder + ref (conv->act fusion) */
 #include "rocket_affinity.h"
 #include "rocket_chain.h"        /* rkt_chain_pack — gapped multi-task batched submit */
@@ -62,8 +63,7 @@
 /* Batched-submit of a DIRECT int8/uint8 conv's independent tiles: lay each tile's
  * complete regcmd in its own slot of one regcmd BO and submit the slice as ONE
  * multi-task job (lever-1, gapped) instead of one ioctl per tile. The job runs the
- * tasks as separate HW kicks (the int32 CACC clears per kick, so int8 stays exact —
- * unlike fp16 chaining), but pays ONE submit syscall + ONE fence wait + ONE IOMMU
+ * tasks as separate HW kicks, but pays ONE submit syscall + ONE fence wait + ONE IOMMU
  * attach for the whole slice. Bit-identical to the per-tile path; opt-in while it
  * proves out. CONV_RC_STRIDE is the per-task regcmd slot (>= gen_conv2d_int8's 256-word
  * cap). */
@@ -378,7 +378,8 @@ static int conv2d_one_job(int fd, rocket_conv_ctx *ctx,
                           int IC, int IH, int IW, int OC, int OH, int OW,
                           int KH, int KW, int sy, int sx, int pt, int pl,
                           int dy, int dx, int DW, int G, const lut_epilogue_t *act,
-                          const _Float16 *in, const _Float16 *W, _Float16 *out)
+                          const _Float16 *in, const _Float16 *W, _Float16 *out,
+                          int dsy, int dsx)
 {
     const int Cpad = DW ? ((IC + G - 1) / G) * G : IC;
     /* conv->activation fusion is the DIRECT-conv path only (the smooth FFN/Whisper
@@ -483,6 +484,7 @@ static int conv2d_one_job(int fd, rocket_conv_ctx *ctx,
         .output_dma = (uint32_t)out_bo->dma_address,
         .tasks = regs, .fp32tofp16 = 1, .dw_group = (uint8_t)(DW ? G : 0),
         .act = jact,   /* fp16-out conv + LUT epilogue (direct only; NULL == plain conv) */
+        .deconv_sy = (uint8_t)dsy, .deconv_sx = (uint8_t)dsx,   /* 1 == off */
     };
     if ((ret = DW ? gen_conv2d_dw_fp16(&p) : gen_conv2d_fp16(&p)) != 0) {
         ROCKET_LOGE("rocket_conv2d_fp16: gen failed (%d)\n", ret);
@@ -536,6 +538,95 @@ out:
         rocket_bo_free(fd, guard);
     }
     return rc ? (ret ? ret : -1) : 0;
+}
+
+/* One direct fp16 conv job with the output extent GIVEN rather than derived from the
+ * input, stride and pad. The forward entries always derive it, and the CNA deconvolution
+ * mode (ROCKET_CNA_DECONV and its stride knobs) needs the transposed extent, which the
+ * forward arithmetic cannot produce. Internal: rocket_conv_internal.h. Stride and
+ * dilation are 1, the only values the deconvolution mode is run with. */
+int rocket_conv2d_fp16_job_extent(int fd, int IC, int IH, int IW, int OC, int OH, int OW,
+                                  int KH, int KW, int pt, int pl,
+                                  const _Float16 *in, const _Float16 *W, _Float16 *out)
+{
+    if (fd < 0) return -1;   /* the one-job CPU fallback derives its own extent */
+    return conv2d_one_job(fd, NULL, IC, IH, IW, OC, OH, OW, KH, KW, 1, 1, pt, pl, 1, 1,
+                          0, 0, NULL, in, W, out, 1, 1);
+}
+
+/* ---- the CNA deconvolution mode as a route --------------------------------------------
+ *
+ * rocket_conv_transpose2d_fp16's hardware route: one direct fp16 job per output-channel
+ * tile with the deconvolution mode on, the COMPACT input, the transposed output extent and
+ * a pad of k-1-p. Against the lowering it skips the host's s^2-larger dilated input, and
+ * it is 0.35-0.54x the lowering's wall per call at decoder shapes [HW sweep, Turing RK1,
+ * 2026-09-23, tests/deconv_extent_probe.c bench]. Pure fit check, then the run. */
+int rocket_conv2d_fp16_deconv_fits(int IC, int IH, int IW, int OC, int OH, int OW,
+                                   int KH, int KW)
+{
+    const int CBUF_BANKS = rocket_hw_current()->cbuf_banks;
+    const int IHj = IH < CONV_MIN_DATAIN_H ? CONV_MIN_DATAIN_H : IH;
+    const size_t feat = (size_t)IC * IHj * IW * sizeof(_Float16);
+    const size_t fbanks = (feat + CBUF_BANK - 1) / CBUF_BANK;
+    const size_t w16 = ((size_t)16 * IC * KH * KW * sizeof(_Float16) + CBUF_BANK - 1) / CBUF_BANK;
+
+    if (IC <= 0 || IH <= 0 || IW <= 0 || OC <= 0 || OH <= 0 || OW <= 0) return 0;
+    if (IC % 32) return 0;                                     /* whole K-groups only */
+    if (feat > CONV_FEAT_BUDGET) return 0;                     /* one pass holds the input */
+    if ((size_t)KH * KW * IC * sizeof(_Float16) > CBUF_BANK) return 0;  /* a kernel per bank */
+    if (fbanks + w16 > (size_t)CBUF_BANKS) return 0;           /* room for 16 kernels */
+    /* The geometry fields: DATA_SIZE2 is 11 bits of width, DATA_SIZE3 18 bits of pixels. */
+    if (OW > 0x7FF || OH > 0x7FF || (long)OH * OW > 0x3FFFF) return 0;
+    return 1;
+}
+
+int rocket_conv2d_fp16_deconv(int fd, rocket_conv_ctx *ctx, int IC, int IH, int IW, int OC,
+                              int OH, int OW, int KH, int KW, int sy, int sx, int pt, int pl,
+                              const _Float16 *in, const _Float16 *Wf, _Float16 *out)
+{
+    const int CBUF_BANKS = rocket_hw_current()->cbuf_banks;
+    const int dfd = ctx ? ctx->fd : fd;
+    const int OCp = ((OC + 15) / 16) * 16;       /* the fp16 weight oc group */
+    const int IHj = IH < CONV_MIN_DATAIN_H ? CONV_MIN_DATAIN_H : IH;
+    const size_t fbanks = ((size_t)IC * IHj * IW * sizeof(_Float16) + CBUF_BANK - 1) / CBUF_BANK;
+    const _Float16 *W = Wf;
+    _Float16 *Wpad = NULL, *opad = NULL, *o = out;
+    size_t wcap;
+    int oc0, OCt, ret = 0;
+
+    if (dfd < 0 || !rocket_conv2d_fp16_deconv_fits(IC, IH, IW, OC, OH, OW, KH, KW)) return -4;
+
+    /* OC not a multiple of 16: zero kernels pad the tile and the real channels are sliced
+     * off the front, as the forward path does. */
+    if (OCp != OC) {
+        Wpad = calloc((size_t)OCp * IC * KH * KW, sizeof *Wpad);
+        opad = malloc((size_t)OCp * OH * OW * sizeof *opad);
+        if (!Wpad || !opad) { free(Wpad); free(opad); return -1; }
+        memcpy(Wpad, Wf, (size_t)OC * IC * KH * KW * sizeof *Wpad);
+        W = Wpad;
+        o = opad;
+    }
+
+    /* The weight tile takes what the compact input leaves, capped at 4 banks as the
+     * forward tiler keeps it; one 16-channel tile always fits (the fit check). */
+    #define DECONV_WBANKS(oct) \
+        (((size_t)(oct) * IC * KH * KW * sizeof(_Float16) + CBUF_BANK - 1) / CBUF_BANK)
+    wcap = (size_t)CBUF_BANKS - fbanks;
+    if (wcap > 4) wcap = 4;
+    OCt = OCp;
+    while (OCt > 16 && DECONV_WBANKS(OCt) > wcap) OCt -= 16;
+    #undef DECONV_WBANKS
+
+    for (oc0 = 0; oc0 < OCp && !ret; oc0 += OCt) {
+        const int n = OCp - oc0 < OCt ? OCp - oc0 : OCt;
+        ret = conv2d_one_job(dfd, ctx, IC, IH, IW, n, OH, OW, KH, KW, 1, 1, pt, pl, 1, 1,
+                             0, 0, NULL, in, W + (size_t)oc0 * IC * KH * KW,
+                             o + (size_t)oc0 * OH * OW, sy, sx);
+    }
+    if (!ret && o != out) memcpy(out, o, (size_t)OC * OH * OW * sizeof *out);
+    free(Wpad);
+    free(opad);
+    return ret;
 }
 
 /* Spatially tile a single depthwise channel chunk of Cn channels (Cn % G == 0) whose
@@ -615,7 +706,7 @@ static int dw_spatial(int fd, rocket_conv_ctx *ctx, int Cn, int IH, int IW, int 
                 }
 
             ret = conv2d_one_job(fd, ctx, Cn, ih_sub, iw_sub, Cn, rh, cw, KH, KW,
-                                 sy, sx, 0, 0, dy, dx, 1, G, NULL, sub_in, W, sub_out);
+                                 sy, sx, 0, 0, dy, dx, 1, G, NULL, sub_in, W, sub_out, 1, 1);
             if (ret) break;
 
             for (int c = 0; c < Cn; c++)
@@ -718,7 +809,7 @@ static int conv2d_run(int fd, rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
                                  G, in_c, W_c, out_c);
             else
                 ret = conv2d_one_job(fd, ctx, Cn, IH, IW, Cn, OH, OW, KH, KW, sy, sx, pt, pl,
-                                     dy, dx, 1, G, NULL, in_c, W_c, out_c);
+                                     dy, dx, 1, G, NULL, in_c, W_c, out_c, 1, 1);
         }
         return ret;
     }
@@ -749,7 +840,7 @@ static int conv2d_run(int fd, rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
             (size_t)OC * IC * KH * KW * sizeof(_Float16) <= (size_t)4 * CBUF_BANK &&
             (size_t)IC * ih_full * iw_full * sizeof(_Float16) <= CONV_FEAT_BUDGET)
             return conv2d_one_job(fd, ctx, IC, IH, IW, OC, OH, OW, KH, KW, sy, sx, pt, pl,
-                                  dy, dx, 0, 0, act, in, W, out);
+                                  dy, dx, 0, 0, act, in, W, out, 1, 1);
     }
 
     /* feature bytes for a (rh out-rows x cw out-cols) tile's materialized sub-input */
@@ -850,7 +941,7 @@ static int conv2d_run(int fd, rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
                 /* sub-conv: both pads materialized -> pad_top=pad_left=0; output
                  * is exactly rh x cw. */
                 ret = conv2d_one_job(fd, ctx, IC, ih_sub, iw_sub, OCn, rh, cw, KH, KW,
-                                     sy, sx, 0, 0, dy, dx, 0, 0, act, sub_in, Wslice, sub_out);
+                                     sy, sx, 0, 0, dy, dx, 0, 0, act, sub_in, Wslice, sub_out, 1, 1);
                 if (ret) break;
 
                 for (int oc = 0; oc < OCn; oc++)
@@ -1183,7 +1274,7 @@ typedef struct { int oc0, OCn, r0, rh, c0, cw; } i8tile;
  * byte-for-byte conv2d_int8_one_tile + _one_job — only the per-tile submit+fence is
  * coalesced into one. The whole-BO zero (gaps + the per-tile slack bank) keeps the int8
  * feature-DMA +1-bank over-read reading zeros, exactly as the standalone job. The job's
- * tasks are separate HW kicks (CACC clears per kick), so int8 stays bit-exact. 0 / <0. */
+ * tasks are separate HW kicks, bit-identical to the per-tile path. 0 / <0. */
 static int conv2d_int8_batch_tiles(int fd, rocket_conv_ctx *ctx,
         int IC, int ICr, int IH, int IW, int OH, int OW, int KH, int KW,
         int sy, int sx, int pt, int pl, int dy, int dx,
@@ -1610,23 +1701,28 @@ int rocket_conv2d_int8_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
  * ##########################################################################*/
 
 /* =========================================================================
- * Native int8 DEPTHWISE CONV_2D (int8-OUT, on-chip requant) — the Teflon-cracked
- * path (gen_conv2d_dw_int8 int8_out=1, HW-validated bit-exact vs Mesa/Teflon by
- * replay_dw_mesa). PER-TENSOR quant only. Everything runs in Mesa's uint8-centered
- * domain: the host scatters (in_byte - 0x80) and (w_byte - 0x80) cubes, folds Mesa's
- * zero-point correction into the per-OC int32 bias cube, the NPU requants on-chip, and
- * the host reads back int8 + 0x80 (the model domain). The domain constants are pinned
- * empirically against the capture (correction = Σ_kernel(w_u8 - w_zp)*(in_zp - 0x80),
- * output = npu + 0x80). G = 64 (Mesa's int8 DW group). The CPU oracle (fd<0) computes
- * the exact int8 conv + TFLite requant (the delegate's reference path).
+ * Native int8 DEPTHWISE CONV_2D (int8-OUT, on-chip requant). The register program is
+ * Mesa's int8-output depthwise writer (gen_conv2d_dw_int8 int8_out=1, which replay_dw_mesa
+ * checks against a Teflon capture). PER-TENSOR quant, symmetric weights (w_zp == 0).
+ *
+ * Mesa's rocket driver is a uint8 driver: its formulas take a uint8 tensor u with zero
+ * point Z and program the cube as u - 0x80, the pad as Z - 0x80, the output offset as
+ * Z_out - 0x80, and fold (Z_in - 0x80) * sum(u_w - Z_w) into the bias. An int8 tensor is
+ * the uint8 tensor u = x + 0x80, Z = zp + 0x80 at the same scale, so for int8 data the
+ * cubes hold the raw int8 values, the generator takes zp + 0x80 for the pad and the output
+ * offset, the fold is in_zp * sum(w), and the output reads back raw. Handing the int8
+ * BYTES to the uint8 formulas instead (the byte flip x ^ 0x80) is not linear in x; it
+ * computes a different function, and a Teflon capture of an int8 model records that
+ * function, not the model's. G = 64 (Mesa's int8 DW group). The CPU oracle (fd<0)
+ * computes the exact int8 conv and TFLite's requant.
  * ========================================================================= */
 #define DW_INT8_G 64
 
 /* CPU reference for the int8 DW int8-out path (fd<0 fallback + a self-check oracle):
  * the exact TFLite int8 depthwise — acc = Σ(in_q - in_zp)*(w_q - w_zp) + bias_q, then
- * requant real = in_scale*w_scale*acc; q = clamp(lrintf(real/out_scale)+out_zp). NOTE
- * this is the TFLite math; Teflon's NPU int8 DW can differ from it by a few ULP on
- * saturating inputs (its requant rounding), so the HW gate is capture-replay, not this. */
+ * requant real = in_scale*w_scale*acc; q = clamp(lrintf(real/out_scale)+out_zp). The NPU
+ * requants through the OUT_CVT multiplier and shift instead, so the two can differ by one
+ * where a value sits at a rounding boundary; the accumulator is the same. */
 static void dw_int8_ref(const rocket_conv2d_desc *d, const int8_t *in, const int8_t *w,
                         const int32_t *bias, float in_scale, float w_scale, float out_scale,
                         int in_zp, int w_zp, int out_zp, int8_t *out)
@@ -1705,7 +1801,7 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
         goto out;
     }
 
-    /* input feature cube (C2=16), centered: (in_byte - 0x80). */
+    /* input feature cube (C2=16): the raw int8 values, which the CNA reads signed. */
     rocket_bo_prep(fd, in_bo, 1, 0);
     memset(in_bo->ptr, 0, in_bo->size);
     {
@@ -1714,11 +1810,11 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
             for (int ih = 0; ih < IH; ih++)
                 for (int iw = 0; iw < IW; iw++)
                     dst[feature_data(C, IHj, IW, 16, c + 1, ih + 1, iw + 1)] =
-                        (int8_t)((uint8_t)in[((size_t)c * IH + ih) * IW + iw] - 0x80u);
+                        in[((size_t)c * IH + ih) * IW + iw];
     }
     rocket_bo_fini(fd, in_bo);
 
-    /* DW weight cube (group G), centered: (w_byte - 0x80). */
+    /* DW weight cube (group G): the raw int8 values. */
     rocket_bo_prep(fd, wt_bo, 1, 0);
     memset(wt_bo->ptr, 0, wt_bo->size);
     {
@@ -1727,23 +1823,23 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
             for (int kh = 0; kh < KH; kh++)
                 for (int kw = 0; kw < KW; kw++)
                     dst[weight_conv_dw_int8(C, KH, KW, G, c + 1, kh + 1, kw + 1)] =
-                        (int8_t)((uint8_t)w[((size_t)c * KH + kh) * KW + kw] - 0x80u);
+                        w[((size_t)c * KH + kh) * KW + kw];
     }
     rocket_bo_fini(fd, wt_bo);
 
-    /* per-OC int32 bias cube: bias_q - Σ_kernel(w_u8 - w_zp)*(in_zp - 0x80) (Mesa fold). */
+    /* per-OC int32 bias cube: bias_q - in_zp * Σ_kernel(w - w_zp). The CNA pads with in_zp,
+     * so a padded tap adds in_zp * w and the fold takes it back out: it contributes 0, as
+     * TFLite's padding does. */
     rocket_bo_prep(fd, bs_bo, 1, 0);
     memset(bs_bo->ptr, 0, bs_bo->size);
     {
         int32_t *dst = bs_bo->ptr;
         for (int c = 0; c < C; c++) {
-            int32_t corr = 0;
+            int32_t sw = 0;
             for (int kh = 0; kh < KH; kh++)
-                for (int kw = 0; kw < KW; kw++) {
-                    int w_u8 = (uint8_t)w[((size_t)c * KH + kh) * KW + kw];
-                    corr += (w_u8 - w_zp) * (in_zp - 0x80);
-                }
-            dst[c] = (bias_q ? bias_q[c] : 0) - corr;
+                for (int kw = 0; kw < KW; kw++)
+                    sw += w[((size_t)c * KH + kh) * KW + kw] - w_zp;
+            dst[c] = (bias_q ? bias_q[c] : 0) - in_zp * sw;
         }
     }
     rocket_bo_fini(fd, bs_bo);
@@ -1758,7 +1854,13 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
             .output_dma = (uint32_t)out_bo->dma_address,
             .tasks = regs, .dw_group = (uint8_t)G, .int8_out = 1,
             .in_scale = in_scale, .w_scale = w_scale, .out_scale = out_scale,
-            .input_zero_point = in_zp, .output_zero_point = out_zp, .weight_zero_point = w_zp,
+            /* The generator carries Mesa's uint8 formulas (pad = Z - 0x80, offset =
+             * Z_out - 0x80, DPU_BS_OW_OP = 0x80 - Z_w), so it takes the uint8-equivalent
+             * zero points: the pad lands on in_zp, the offset on out_zp, and the CPEND
+             * operand on 0. At the 0x80 a raw w_zp of 0 would give, nearly every output
+             * is wrong [HW sweep, RK1]. */
+            .input_zero_point = in_zp + 0x80, .output_zero_point = out_zp + 0x80,
+            .weight_zero_point = w_zp + 0x80,
             .bias_dma = (uint32_t)bs_bo->dma_address,
         };
         if ((ret = gen_conv2d_dw_int8(&p)) != 0) {
@@ -1789,13 +1891,13 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
     ret = rocket_bo_prep(fd, out_bo, 0, 2000000000ULL);
     if (ret) { ROCKET_LOGE("rocket_conv2d_dw_int8: wait timeout (%d)\n", ret); goto out; }
     {
-        /* int8 output cube (C2=16), de-center back to the model domain (+0x80). */
-        uint8_t *src = out_bo->ptr;
+        /* int8 output cube (C2=16), already in the model domain. */
+        const int8_t *src = out_bo->ptr;
         for (int c = 0; c < C; c++)
             for (int oh = 0; oh < OH; oh++)
                 for (int ow = 0; ow < OW; ow++)
                     out[((size_t)c * OH + oh) * OW + ow] =
-                        (int8_t)(src[feature_data(C, OH, OW, 16, c + 1, oh + 1, ow + 1)] + 0x80u);
+                        src[feature_data(C, OH, OW, 16, c + 1, oh + 1, ow + 1)];
     }
     rocket_bo_fini(fd, out_bo);
     rc = 0;
@@ -1832,6 +1934,13 @@ static int conv2d_dw_int8_run(int fd, rocket_conv_ctx *ctx, const rocket_conv2d_
         ROCKET_LOGE("rocket_conv2d_dw_int8: channel count C=%d must be a multiple "
                 "of 16 (C2 feature-cube grain)\n", C);
         return -5;
+    }
+    /* The fold carries in_zp * sum(w); a weight zero point would add w_zp * sum(x), which
+     * depends on the input and cannot be folded. TFLite's int8 weights are symmetric. */
+    if (fd >= 0 && w_zp != 0) {
+        ROCKET_LOGE("rocket_conv2d_dw_int8: weight zero point %d; the NPU path takes "
+                "symmetric int8 weights only\n", w_zp);
+        return ROCKET_E_UNSUPPORTED;
     }
     const int OH = rocket_conv2d_oh(d), OW = rocket_conv2d_ow(d);
     const int sy = d->stride_y, sx = d->stride_x, pt = d->pad_top, pl = d->pad_left;

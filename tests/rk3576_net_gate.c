@@ -76,6 +76,8 @@
 #include "rocket_hw_profile.h"
 #include "requant_model.h"
 #include "rocket_graph_rk3576.h"
+#include "npu_matmul.h"          /* conv_params_t, precision_int8 */
+#include "npu_regcmd_rk3576.h"   /* the raw int32-output program the poison injects */
 
 /* ---- the blob ------------------------------------------------------------------ */
 enum { KIND_CONV = 0, KIND_DWCONV, KIND_AVGPOOL, KIND_SOFTMAX, KIND_ADD, KIND_MAXPOOL,
@@ -1032,6 +1034,52 @@ static void resident_free(int fd)
     CUBE_ON = 0;
 }
 
+/* ---- host fallbacks -------------------------------------------------------------- */
+/*
+ * A FALLBACK COMPUTES THE PART'S OWN ARITHMETIC ON THE HOST, so every assertion in this gate
+ * scores it exact, and a layer that never reached the part reads as one that ran. So each is
+ * recorded per layer, and main() fails a named network on any. Every layer of all five runs
+ * on the part [HW sweep, H96 MAX M9]: the pool plan splits a plane past the per-task output
+ * width by columns, and refuses only one needing more slices than a handle carries. A concat
+ * is a host copy unless it is wired, which is the control the wiring is measured against, and
+ * is not recorded.
+ */
+enum { HOSTED_POOL = 1u, HOSTED_ADD = 2u, HOSTED_CONV = 4u };
+static unsigned char *HOSTED;
+
+static void hosted(const rnet_layer *L, unsigned what)
+{
+    if (HOSTED) HOSTED[L - LAYERS] |= (unsigned char)what;
+}
+
+/* A named network may have no host layer at all: a host pool, add or convolution runs only
+ * where the part's plan or entry refused it. `asserted` is 0 for a blob named on the command
+ * line, which is reported and not held. */
+static int hosted_check(const char *net, int asserted)
+{
+    unsigned i, pools = 0, adds = 0, convs = 0;
+
+    if (!HOSTED) return 0;
+    printf("\nhost fallbacks over every pass:");
+    for (i = 0; i < H->n_layers; i++) {
+        if (!HOSTED[i]) continue;
+        printf(" %u %s%s%s", i, (HOSTED[i] & HOSTED_POOL) ? "pool" : "",
+               (HOSTED[i] & HOSTED_ADD) ? "add" : "", (HOSTED[i] & HOSTED_CONV) ? "conv" : "");
+        pools += !!(HOSTED[i] & HOSTED_POOL);
+        adds  += !!(HOSTED[i] & HOSTED_ADD);
+        convs += !!(HOSTED[i] & HOSTED_CONV);
+    }
+    printf("%s\n", pools + adds + convs ? "" : " none");
+    if (!asserted) {
+        printf("  %u pool(s), %u add(s), %u conv(s) on the host; not asserted for this blob\n",
+               pools, adds, convs);
+        return 0;
+    }
+    printf("  %s: %u pool(s), %u add(s) and %u conv(s) on the host, where it expects none -> "
+           "%s\n", net, pools, adds, convs, (pools || adds || convs) ? "FAIL" : "PASS");
+    return (pools != 0) + (adds != 0) + (convs != 0);
+}
+
 /* Run one layer. `how` is set to the path it took. `in2` is the second operand of an add
  * and NULL everywhere else. */
 static int layer_run(int fd, const rnet_layer *L, const int8_t *in, const int8_t *in2,
@@ -1103,6 +1151,7 @@ static int layer_run(int fd, const rnet_layer *L, const int8_t *in, const int8_t
             add_ref_layer(L, ws, &R);
             host_conv(&R, cat, aw, ab, out);
             *how = "host-add";
+            hosted(L, HOSTED_ADD);
             rc = ROCKET_OK;
         }
         free(cat); free(aw); free(ab);
@@ -1121,6 +1170,7 @@ static int layer_run(int fd, const rnet_layer *L, const int8_t *in, const int8_t
          * its three 35-wide branch averages. */
         if (rocket_pool_int8_rk3576_plan(&p) != ROCKET_OK) {
             *how = "host-pool";
+            hosted(L, HOSTED_POOL);
             rocket_pool_ref_int8_rk3576(&p, L->in_zp, in, out);
             return ROCKET_OK;
         }
@@ -1286,6 +1336,7 @@ static int layer_run(int fd, const rnet_layer *L, const int8_t *in, const int8_t
                (unsigned)(L - LAYERS), rc);
         host_conv(L, in, W, bias, out);
         *how = "host-fallback";
+        hosted(L, HOSTED_CONV);
     }
     free(pin); free(pw);
     return ROCKET_OK;
@@ -1827,22 +1878,74 @@ static int pass_oracle(int fd)
  * decides whether checking ONE surface is enough: a poisoned kick is a poisoned SUBMIT,
  * so every surface in it should still hold its sentinel and any of them witnesses it.
  *
- * ROCKET_RK3576_NET_POISON=1 runs one int32-output matmul before each inference. The arm
- * that makes the others mean anything is the one with the guard OFF: if the graph still
- * passes there, the poisoning never reached the kick and no PASS above it is evidence. */
+ * ROCKET_RK3576_NET_POISON=1 submits one int32-output program before each inference, and
+ * pass_chain() fails a run in which the guard never redid a kick. The injection has to be
+ * a BARE program. rocket_matmul_int8_rk3576_i32() power-cycles the part on its way out, so
+ * the next caller never meets the hazard it creates, which is right for a caller and makes
+ * it no injection at all: through it, 144 poisoned inferences tripped the guard once, where
+ * the bare program leaves the next submit empty 20 times in 20 (rk3576_poison_probe pair i32
+ * int8fc) and the guard redoes 51-57 kicks per 48 inferences [HW sweep, H96 MAX M9, rocket
+ * 1.6.0]. So this is the probe's `i32` kind: a 1x1 int32-output conv over 32x8x8, submitted,
+ * waited on, and left as it leaves the part. It raises no DPU completion, so it goes out
+ * with ROCKET_JOB_NO_DPU_DONE where the kernel takes it, as the library's own entry does.
+ *
+ * With the guard OFF (ROCKET_RK3576_I32_SENTINEL=0) the same run returns 24 of 48 scored
+ * inferences wrong, which is consistent with every kick stale: a stream that never writes
+ * again keeps the last input's answer, which two alternating inputs can only see on every
+ * other inference. */
 static int poison_once(int fd)
 {
-    enum { PM = 32, PK = 64, PN = 64 };
-    static int8_t *pa, *pb;
-    static int32_t *pc;
-    if (!pa) {
-        pa = calloc((size_t)PM * PK, 1);
-        pb = calloc((size_t)PN * PK, 1);
-        pc = calloc((size_t)PM * PN, sizeof *pc);
-        if (!pa || !pb || !pc) return -1;
-        pa[0] = 1; pb[0] = 1;
+    enum { P_C = 32, P_HW = 8 };
+    static rocket_bo in, w, b, o, r;
+    static conv_params_t p;
+    static uint64_t ops[RK3576_CONV_TASK_OPS];
+    static uint32_t in_h[4], out_h[1];
+    static int ready;
+
+    if (!ready) {
+        unsigned surf = rocket_rk3576_out_surf_elems(P_HW, P_HW, 0);
+        size_t coeff = rocket_rk3576_coeff_bytes(P_C);
+        /* Eight times the int8 surface: the writer emits four bytes an element, and a
+         * program writing past what was sized must land inside the BO, not fault. */
+        size_t obytes = (size_t)((P_C + 15) / 16) * surf * 16 * 8;
+        int32_t bias[P_C];
+        unsigned i;
+        if (rocket_bo_alloc(fd, (size_t)P_C * P_HW * P_HW, &in) < 0 ||
+            rocket_bo_alloc(fd, (size_t)P_C * P_C, &w) < 0 ||
+            rocket_bo_alloc(fd, coeff, &b) < 0 ||
+            rocket_bo_alloc(fd, obytes, &o) < 0 ||
+            rocket_bo_alloc(fd, sizeof ops, &r) < 0) return -1;
+        rocket_bo_prep(fd, &in, 1, 0); memset(in.ptr, 3, in.size); rocket_bo_fini(fd, &in);
+        rocket_bo_prep(fd, &w, 1, 0);  memset(w.ptr, 1, w.size);   rocket_bo_fini(fd, &w);
+        for (i = 0; i < P_C; i++) bias[i] = (int32_t)i + 1;
+        rocket_bo_prep(fd, &b, 1, 0);
+        rocket_rk3576_pack_coeff_prec(b.ptr, coeff, bias, P_C, precision_int8);
+        rocket_bo_fini(fd, &b);
+        p.ic = P_C; p.oc = P_C; p.ih = P_HW; p.iw = P_HW; p.oh = P_HW; p.ow = P_HW;
+        p.kh = 1; p.kw = 1; p.stride_y = 1; p.stride_x = 1;
+        p.int8_out = 1;
+        p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 64.0f;
+        p.ih_full = P_HW; p.oh_full = P_HW;
+        p.input_dma   = (uint32_t)in.dma_address;
+        p.weights_dma = (uint32_t)w.dma_address;
+        p.bias_dma    = (uint32_t)b.dma_address;
+        p.output_dma  = (uint32_t)o.dma_address;
+        p.tasks = ops;
+        if (gen_conv2d_int8_rk3576_i32out(&p) != 0) return -1;
+        rocket_bo_prep(fd, &r, 1, 0);
+        memcpy(r.ptr, ops, p.task_count * sizeof(uint64_t));
+        rocket_bo_fini(fd, &r);
+        in_h[0] = in.handle; in_h[1] = w.handle; in_h[2] = b.handle; in_h[3] = r.handle;
+        out_h[0] = o.handle;
+        ready = 1;
     }
-    return rocket_matmul_int8_rk3576_i32(fd, PM, PK, PN, pa, pb, NULL, pc);
+    if (rocket_submit_matmul_flags(fd, &r, p.task_count, in_h, 4, out_h, 1,
+                                   rocket_no_dpu_done_supported()
+                                       ? ROCKET_JOB_NO_DPU_DONE : 0u) != 0)
+        return -1;
+    if (rocket_bo_prep(fd, &o, 0, 2000000000ull) < 0) return -1;
+    rocket_bo_fini(fd, &o);
+    return ROCKET_OK;
 }
 
 static int poison_on(void)
@@ -1894,6 +1997,9 @@ static int pass_chain(int fd, int iters)
     size_t img_bytes = (size_t)H->in_c * H->in_h * H->in_w;
     int8_t *alt = NULL, *ref[2] = { NULL, NULL };
     int stale = 0;
+    /* Kicks the write guard redid, summed over the run: each chain run past its first kick
+     * is one. Under the poison it is the row's positive control (below). */
+    unsigned long redos = 0;
     if (vary_on()) {
         size_t k;
         alt    = malloc(img_bytes);
@@ -1946,6 +2052,8 @@ static int pass_chain(int fd, int iters)
                 int8_t *kdst = SKIP[last] ? SKIP[last] : bufs[slot];
                 rc = rocket_conv2d_int8_chain_run_rk3576(fd, KICK_OF[i], chain_input(i, cur),
                         CUBE_OUT[last] ? NULL : kdst);
+                if (rc == ROCKET_OK)
+                    redos += rocket_conv2d_int8_chain_kicks_rk3576(KICK_OF[i]) - 1u;
                 lt = now_ms() - lt;
                 acc[i] += lt;
                 paths[i] = "npu-kick";
@@ -2045,6 +2153,15 @@ static int pass_chain(int fd, int iters)
            iters, wall / iters,
            (double)(rocket_submit_ioctl_count() - g_sub0) / iters,
            (double)(rocket_submit_task_count()  - g_task0) / iters);
+    printf("   the write guard redid %lu kick(s)\n", redos);
+    /* THE POISON ROW'S POSITIVE CONTROL. An injection that never trips the guard leaves a
+     * row that passes whether or not the guard works, which is a row that guards nothing:
+     * either the hazard no longer reproduces or the guard stopped looking. */
+    if (poison_on() && !redos && iters > (alt ? 2 : 0)) {
+        printf("   FAIL: %d poisoned inference(s) and the guard never redid a kick, so this "
+               "run cannot say whether the guard works\n", alt ? iters - 2 : iters);
+        failed++;
+    }
     if (alt) {
         printf("   %d of %d scored inference(s) returned logits that are NOT this input's "
                "own clean answer\n", stale, iters > 2 ? iters - 2 : 0);
@@ -2951,12 +3068,12 @@ int main(int argc, char **argv)
     const char *blob = getenv("ROCKET_NET_BLOB");
     const char *net = getenv("ROCKET_NET") ? getenv("ROCKET_NET") : "v1";
     const char *mode = "all";
-    int fd, a, iters = 1, failed = 0;
+    int fd, a, iters = 1, failed = 0, named = !blob;
     char def[512];
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     for (a = 1; a < argc; a++) {
-        if (!strcmp(argv[a], "--blob") && a + 1 < argc) blob = argv[++a];
+        if (!strcmp(argv[a], "--blob") && a + 1 < argc) { blob = argv[++a]; named = 0; }
         else if (!strcmp(argv[a], "--net") && a + 1 < argc) net = argv[++a];
         else if (!strcmp(argv[a], "-v")) VERBOSE = 1;
         else if (a + 1 < argc && !strcmp(argv[a], "bench")) {
@@ -3075,6 +3192,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    HOSTED = calloc(H->n_layers, 1);
+    if (!HOSTED) {
+        printf("out of memory for the fallback record\n");
+        skip_free();
+        rocket_close(fd);
+        return 1;
+    }
     resident_init();
     if (RESIDENT_ON)
         printf("resident weights: ON — each layer's filter sums, coefficient group and "
@@ -3106,8 +3230,10 @@ int main(int argc, char **argv)
         }
         failed += pass_chain(fd, iters);
     }
+    failed += hosted_check(net, named);
 
     printf("\n%s: %d failure(s)\n", failed ? "FAIL" : "PASS", failed);
+    free(HOSTED);
     resident_free(fd);
     skip_free();
     rocket_close(fd);

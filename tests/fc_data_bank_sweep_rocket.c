@@ -33,6 +33,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static int64_t now_us(void)
 {
@@ -52,20 +53,25 @@ static void cpu_ref(const _Float16 *A, const _Float16 *B, float *R, int M, int K
         }
 }
 
-/* tolerance compare NPU fp16 output vs fp32 reference (matmul_tiled criterion) */
+/* Exact compare of the NPU fp16 output against the fp32 reference. The inputs are signed
+ * small integers (tests/test_fill.h), so every correct element is an exact fp16 integer
+ * below 2048 and any difference is a defect; a peak at or past 2048 counts as failures,
+ * because fp16 stops being exact there. The old unsigned rand()%3 and rand()%2 put the
+ * outputs near 2048 and 2560, where fp16 rounds, and the old bar (off by more than 1.0
+ * AND 2%) let a dropped k through. */
 static long check_ref(const _Float16 *C, const float *R, int M, int N,
-                      double *max_abs_o, double *max_rel_o)
+                      double *max_abs_o, double *peak_o)
 {
-    double max_abs = 0, max_rel = 0; long nbad = 0;
+    double max_abs = 0, peak = 0; long nbad = 0;
     for (size_t i = 0; i < (size_t)M*N; i++) {
         float got = (float)C[i], exp = (float)(_Float16)R[i];
-        double ad = fabs(got - exp), rd = ad / (fabs(exp) + 1e-6);
-        if (ad > max_abs) max_abs = ad;
-        if (rd > max_rel) max_rel = rd;
-        if (rd > 0.02 && ad > 1.0) nbad++;
+        double ad = fabs(got - exp);
+        if (ad > max_abs || isnan(ad)) max_abs = isnan(ad) ? INFINITY : ad;
+        if (fabs(R[i]) > peak) peak = fabs(R[i]);
+        if (!(got == exp)) nbad++;
     }
-    *max_abs_o = max_abs; *max_rel_o = max_rel;
-    return nbad;
+    *max_abs_o = max_abs; *peak_o = peak;
+    return nbad + (peak < 2048.0 ? 0 : 1);
 }
 
 int main(void)
@@ -87,20 +93,19 @@ int main(void)
     _Float16 *Cr  = malloc((size_t)M*N*sizeof(_Float16));   /* fc-unset reference */
     _Float16 *Cf  = malloc((size_t)M*N*sizeof(_Float16));   /* per-fc run */
     float    *R   = malloc((size_t)M*N*sizeof(float));
-    if (!A||!B||!Cr||!Cf||!R) { fprintf(stderr,"alloc\n"); rocket_close(fd); return 2; }
-    srand(1234);
-    for (size_t i=0;i<(size_t)M*K;i++) A[i]=(_Float16)(rand()%3);
-    for (size_t i=0;i<(size_t)N*K;i++) B[i]=(_Float16)(rand()%3);
+    if (!A||!B||!Cr||!Cf||!R) { fprintf(stderr,"alloc\n"); rocket_close(fd); return 1; }
+    tf_fill_f16_int(A, (size_t)M*K, 0xFCDB1ull, -2, 2);
+    tf_fill_f16_int(B, (size_t)N*K, 0xFCDB2ull, -2, 2);
 
     /* reference run with FC_DATA_BANK unset (== field 0) */
     unsetenv("ROCKET_FC_DATA_BANK");
-    memset(Cr,0,(size_t)M*N*sizeof(_Float16));
+    tf_sentinel_f16(Cr, (size_t)M*N);
     int ret = rocket_matmul_fp16(fd, M, K, N, A, B, Cr);
     if (ret) { fprintf(stderr,"reference matmul = %d\n", ret); rocket_close(fd); return 1; }
     cpu_ref(A,B,R,M,K,N);
-    double ma, mr; long nb = check_ref(Cr,R,M,N,&ma,&mr);
-    printf("  reference (fc unset): max_abs=%.3f max_rel=%.4f nbad=%ld -> %s\n",
-           ma, mr, nb, nb? "CORRECTNESS-FAIL":"correct");
+    double ma, pk; long nb = check_ref(Cr,R,M,N,&ma,&pk);
+    printf("  reference (fc unset): max_abs=%.3f max|ref|=%.0f nbad=%ld -> %s\n",
+           ma, pk, nb, nb? "CORRECTNESS-FAIL":"correct (exact)");
     if (nb) fail = 1;
 
     /* Contract this gate enforces (the don't-care assertions): fc=0 (the field our
@@ -116,7 +121,7 @@ int main(void)
         char v[4]; snprintf(v,sizeof v,"%d",fc); setenv("ROCKET_FC_DATA_BANK",v,1);
         int err=0; int64_t best=0;
         for (int rep=0; rep<5; rep++) {
-            memset(Cf,0,obytes);
+            tf_sentinel_f16(Cf, (size_t)M*N);
             int64_t t0=now_us();
             int r = rocket_matmul_fp16(fd, M, K, N, A, B, Cf);
             int64_t us=now_us()-t0;
@@ -151,20 +156,19 @@ int main(void)
     _Float16 *C2=malloc((size_t)M2*N2*sizeof(_Float16));
     float    *R2=malloc((size_t)M2*N2*sizeof(float));
     if (A2&&B2&&C2&&R2) {
-        srand(99);
-        for (size_t i=0;i<(size_t)M2*K2;i++) A2[i]=(_Float16)(rand()%2);
-        for (size_t i=0;i<(size_t)N2*K2;i++) B2[i]=(_Float16)(rand()%2);
-        memset(C2,0,(size_t)M2*N2*sizeof(_Float16));
+        tf_fill_f16_int(A2, (size_t)M2*K2, 0xFCDB3ull, -1, 1);
+        tf_fill_f16_int(B2, (size_t)N2*K2, 0xFCDB4ull, -1, 1);
+        tf_sentinel_f16(C2, (size_t)M2*N2);
         int64_t t0=now_us();
         int r=rocket_matmul_fp16(fd,M2,K2,N2,A2,B2,C2);
         int64_t us=now_us()-t0;
         if (r) { printf("  large-K matmul = %d -> FAIL\n", r); fail=1; }
         else {
             cpu_ref(A2,B2,R2,M2,K2,N2);
-            double a2,r2; long nb2=check_ref(C2,R2,M2,N2,&a2,&r2);
+            double a2,p2; long nb2=check_ref(C2,R2,M2,N2,&a2,&p2);
             double gflops = 2.0*M2*K2*N2/((double)us*1e3);
-            printf("  result: max_abs=%.3f max_rel=%.4f nbad=%ld  %lld us  %.1f GFLOP/s -> %s\n",
-                   a2,r2,nb2,(long long)us,gflops, nb2?"FAIL":"PASS");
+            printf("  result: max_abs=%.3f max|ref|=%.0f nbad=%ld  %lld us  %.1f GFLOP/s -> %s\n",
+                   a2,p2,nb2,(long long)us,gflops, nb2?"FAIL":"PASS (exact)");
             if (nb2) fail=1;
         }
     }

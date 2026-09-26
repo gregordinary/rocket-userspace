@@ -2,7 +2,13 @@
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * rocket_conv_transpose.c — transposed convolution (ConvTranspose2d / "deconvolution")
- * on the rocket NPU, lowered onto the validated forward CONV_2D engine.
+ * on the rocket NPU.
+ *
+ * Two routes, chosen per descriptor by rocket_conv_transpose2d_route(). A direct conv at
+ * power-of-two strides whose compact input fits one CBUF pass runs on the CNA's hardware
+ * deconvolution mode (rocket_conv2d_fp16_deconv, rocket_conv.c): the part dilates the
+ * input itself, the output extent is programmed as the transposed one, and the pad is
+ * k-1-p. Everything else is lowered onto the validated forward CONV_2D engine, as below.
  *
  * ConvTranspose is the transpose (gradient) of a strided conv: every input pixel
  * scatter-adds a kernel-weighted copy into a larger output. The standard identity is
@@ -27,14 +33,16 @@
  * The forward conv is the HW-validated rocket_conv2d_fp16 (auto-tiled over OC/OH/OW),
  * so the transpose inherits it bit-for-bit. The only NPU-specific work is host-side
  * (dilate the input, flip the weights); the cost scales with the *upsampled* size
- * because the inserted zeros are still MAC'd — correctness-first. A sub-pixel /
- * stride^2 decomposition (s^2 small dense convs, no zero-MACs) is the perf follow-on.
+ * because the inserted zeros are still MAC'd. The hardware route above is 0.35-0.54x
+ * this lowering's wall per call at decoder shapes.
  */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "rocket_conv.h"
+#include "rocket_conv_internal.h"
+#include "rocket_hw_profile.h"
 
 /* ============================================================================
  * SECTION — Lowering + plan (forward-conv descriptor, validation)
@@ -70,7 +78,8 @@ static void lower_desc(const rocket_conv_transpose2d_desc *d, rocket_conv2d_desc
     fwd->depthwise = d->depthwise;
 }
 
-int rocket_conv_transpose2d_plan(const rocket_conv_transpose2d_desc *d)
+/* The descriptor checks shared by both routes. 0 or a negative reason. Pure. */
+static int desc_valid(const rocket_conv_transpose2d_desc *d)
 {
     if (!d) return -1;
     if (d->ic <= 0 || d->ih <= 0 || d->iw <= 0 || d->oc <= 0 || d->kh <= 0 || d->kw <= 0)
@@ -86,11 +95,45 @@ int rocket_conv_transpose2d_plan(const rocket_conv_transpose2d_desc *d)
     if (d->pad_left > d->dil_x * (d->kw - 1)) return -2;
     if (rocket_conv_transpose2d_oh(d) <= 0 || rocket_conv_transpose2d_ow(d) <= 0)
         return -3;
+    return 0;
+}
+
+static int pow2_stride(int s) { return s == 1 || s == 2 || s == 4 || s == 8; }
+
+/* The hardware route's own conditions, beyond desc_valid(). The CNA deconvolution mode
+ * dilates by a power-of-two stride only, has no depthwise or dilated form measured, and
+ * its pad field (k-1-p) has an undecoded anomaly at 12-15 when s = 2. */
+static int deconv_eligible(const rocket_conv_transpose2d_desc *d)
+{
+    const char *e = getenv("ROCKET_CONV_TRANSPOSE_HW");
+    if (e && *e == '0') return 0;
+    if (strcmp(rocket_hw_current()->name, "rk3588") != 0) return 0;
+    if (d->depthwise || d->dil_y != 1 || d->dil_x != 1) return 0;
+    if (!pow2_stride(d->stride_y) || !pow2_stride(d->stride_x)) return 0;
+    if (d->stride_y == 1 && d->stride_x == 1) return 0;     /* nothing to dilate */
+    if (d->opad_y >= d->stride_y || d->opad_x >= d->stride_x) return 0;
+    if (d->kh - 1 - d->pad_top > 11 || d->kw - 1 - d->pad_left > 11) return 0;
+    return rocket_conv2d_fp16_deconv_fits(d->ic, d->ih, d->iw, d->oc,
+                                          rocket_conv_transpose2d_oh(d),
+                                          rocket_conv_transpose2d_ow(d), d->kh, d->kw);
+}
+
+int rocket_conv_transpose2d_route(const rocket_conv_transpose2d_desc *d)
+{
+    int r = desc_valid(d);
+    if (r) return r;
+    if (deconv_eligible(d)) return ROCKET_CONV_TRANSPOSE_DECONV;
 
     rocket_conv2d_desc fwd; int IHd, IWd, ly, lx;
     lower_desc(d, &fwd, &IHd, &IWd, &ly, &lx);
-    int r = rocket_conv2d_plan(&fwd);             /* propagate CBUF-fit / alignment */
-    return r ? (r == -4 ? -4 : r) : 0;
+    r = rocket_conv2d_plan(&fwd);                 /* propagate CBUF-fit / alignment */
+    return r ? (r == -4 ? -4 : r) : ROCKET_CONV_TRANSPOSE_LOWERED;
+}
+
+int rocket_conv_transpose2d_plan(const rocket_conv_transpose2d_desc *d)
+{
+    int r = rocket_conv_transpose2d_route(d);
+    return r < 0 ? r : 0;
 }
 
 /* ============================================================================
@@ -147,21 +190,24 @@ static int transpose_run(int fd, rocket_conv_ctx *ctx,
                          const rocket_conv_transpose2d_desc *d,
                          const _Float16 *in, const _Float16 *W, _Float16 *out)
 {
-    int pr = rocket_conv_transpose2d_plan(d);
-    if (pr) return pr;
+    const int route = rocket_conv_transpose2d_route(d);
+    if (route < 0) return route;
 
     const int IC = d->ic, IH = d->ih, IW = d->iw, OC = d->oc, KH = d->kh, KW = d->kw;
     rocket_conv2d_desc fwd; int IHd, IWd, ly, lx;
     lower_desc(d, &fwd, &IHd, &IWd, &ly, &lx);
 
     const int DW = d->depthwise;
+    const int deconv = route == ROCKET_CONV_TRANSPOSE_DECONV;
     size_t wf_n = DW ? (size_t)IC * KH * KW : (size_t)OC * IC * KH * KW;
-    _Float16 *xd = calloc((size_t)IC * IHd * IWd, sizeof(_Float16));   /* dilated+padded in */
+    /* The hardware route reads the compact input as it is, so only the lowering builds
+     * the dilated+padded one. */
+    _Float16 *xd = deconv ? NULL : calloc((size_t)IC * IHd * IWd, sizeof(_Float16));
     _Float16 *wf = malloc(wf_n * sizeof(_Float16));                    /* rot180 (+W^T direct) */
-    if (!xd || !wf) { free(xd); free(wf); return -5; }
+    if ((!deconv && !xd) || !wf) { free(xd); free(wf); return -5; }
 
     /* scatter the input onto the stride lattice inside the leading border */
-    for (int ic = 0; ic < IC; ic++)
+    for (int ic = 0; ic < IC && !deconv; ic++)
         for (int ih = 0; ih < IH; ih++)
             for (int iw = 0; iw < IW; iw++) {
                 int r = ly + ih * d->stride_y;
@@ -186,7 +232,17 @@ static int transpose_run(int fd, rocket_conv_ctx *ctx,
                             W[(((size_t)ic * OC + oc) * KH + (KH - 1 - kh)) * KW + (KW - 1 - kw)];
     }
 
-    int rc = ctx ? rocket_conv2d_fp16_ctx(ctx, &fwd, xd, wf, out)
+    int rc;
+    if (deconv)
+        /* The pad on the dilated surface is k-1-p, which puts row 0 of the result at row
+         * 0 of the transposed conv; the output extent is the transposed one. */
+        rc = rocket_conv2d_fp16_deconv(fd, ctx, IC, IH, IW, OC,
+                                       rocket_conv_transpose2d_oh(d),
+                                       rocket_conv_transpose2d_ow(d), KH, KW,
+                                       d->stride_y, d->stride_x,
+                                       KH - 1 - d->pad_top, KW - 1 - d->pad_left, in, wf, out);
+    else
+        rc = ctx ? rocket_conv2d_fp16_ctx(ctx, &fwd, xd, wf, out)
                  : rocket_conv2d_fp16(fd, &fwd, xd, wf, out);
     free(xd);
     free(wf);

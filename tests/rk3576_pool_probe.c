@@ -1047,6 +1047,82 @@ static int avg_pre_submit(int fd, int which)
     return 0;
 }
 
+/* THE CHECK'S POSITIVE CONTROL. `avg` below asserts that no wrong surface escapes the
+ * library's divisor check, and at its own cells the lag shows on about 1% of calls, so a run
+ * in which it never showed passes whether or not the check works. This cell is the one the
+ * standalone context fires hardest: 288x35x35 lags on 92-98% of calls with the check off.
+ * Twenty calls with the check off must show the hazard, which says the check has something
+ * to catch. Twenty with it on must show none, and must have been redone at least once, which
+ * says the check caught it. A redo is a submit past the call's own count, read from the
+ * submit counter against the check-off calls, which cannot redo for the lag. */
+static int avg_control(int fd)
+{
+    enum { N = 20 };
+    rocket_pool_desc d;
+    size_t in_n, out_n, k;
+    int8_t *in, *out, *mdl;
+    unsigned it, lagged = 0, wrong_on = 0, redone = 0, ow, oh;
+    uint64_t base = UINT64_MAX;
+    const char *prev = getenv("ROCKET_RK3576_POOL_LAGCHECK");
+    char *saved = prev ? strdup(prev) : NULL;
+    int fails = 0;
+
+    memset(&d, 0, sizeof d);
+    d.c = 288; d.ih = d.iw = 35;
+    d.kh = d.kw = 3; d.stride_y = d.stride_x = 1;
+    d.pad_top = d.pad_left = 1; d.pad_bottom = d.pad_right = 1;
+    d.method = POOL_METHOD_AVG;
+    d.avg_exclude_pad = 1;
+    oh = (unsigned)rocket_pool_oh(&d); ow = (unsigned)rocket_pool_ow(&d);
+    in_n = (size_t)d.c * d.ih * d.iw;
+    out_n = (size_t)d.c * oh * ow;
+    in = malloc(in_n); out = malloc(out_n); mdl = malloc(out_n);
+    if (!in || !out || !mdl) { printf("   out of memory\n"); free(in); free(out); free(mdl);
+                               free(saved); return 1; }
+    for (k = 0; k < in_n; k++)
+        in[k] = (int8_t)(((k * 37u + (k >> 6) * 101u) % 40u) - 128u);
+    avg_model(&d, in, mdl, AVGM_LIB);
+
+    setenv("ROCKET_RK3576_POOL_LAGCHECK", "0", 1);
+    for (it = 0; it < N; it++) {
+        uint64_t s0 = rocket_submit_ioctl_count(), ds;
+        memset(out, 0x5A, out_n);
+        if (rocket_pool_int8_rk3576(fd, &d, 0, in, out) != ROCKET_OK) { fails++; continue; }
+        ds = rocket_submit_ioctl_count() - s0;
+        if (ds < base) base = ds;
+        if (memcmp(out, mdl, out_n)) lagged++;
+        sleep_ms(5);
+    }
+    if (saved) setenv("ROCKET_RK3576_POOL_LAGCHECK", saved, 1);
+    else unsetenv("ROCKET_RK3576_POOL_LAGCHECK");
+    for (it = 0; it < N; it++) {
+        uint64_t s0 = rocket_submit_ioctl_count();
+        memset(out, 0x5A, out_n);
+        if (rocket_pool_int8_rk3576(fd, &d, 0, in, out) != ROCKET_OK) { fails++; continue; }
+        if (rocket_submit_ioctl_count() - s0 > base) redone++;
+        if (memcmp(out, mdl, out_n)) wrong_on++;
+        sleep_ms(5);
+    }
+    printf("avg control: c%d %dx%d, the lag on %u of %d calls with the check off; with it on, "
+           "%u of %d calls redone (a call is %llu submit(s)) and %u wrong\n",
+           d.c, d.iw, d.ih, lagged, N, redone, N, (unsigned long long)base, wrong_on);
+    if (!lagged) {
+        printf("   FAIL: the hazard never showed with the check off, so the check had nothing "
+               "to catch\n");
+        fails++;
+    }
+    if (!redone) {
+        printf("   FAIL: the check never redid a call\n");
+        fails++;
+    }
+    if (wrong_on) {
+        printf("   FAIL: %u wrong surface(s) escaped the check\n", wrong_on);
+        fails++;
+    }
+    free(in); free(out); free(mdl); free(saved);
+    return fails;
+}
+
 static int avg_hazard(int fd)
 {
     /* Inception V3's own padded averages: 3x3 stride 1 SAME at three planes, with the
@@ -1072,6 +1148,7 @@ static int avg_hazard(int fd)
     unsigned ci, it;
     int excl, pre, fails = 0;
 
+    fails += avg_control(fd);
     printf("avg: a padded 3x3 s1 average, %u iterations a cell, the same input every\n"
            "     time. A failing iteration is scored against every divisor model.\n",
            iters);

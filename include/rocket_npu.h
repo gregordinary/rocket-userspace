@@ -401,6 +401,25 @@ uint64_t rocket_submit_ioctl_count(void);
 uint64_t rocket_submit_task_count(void);
 void     rocket_submit_counters_reset(void);
 
+/* How many fenced waits this process made (rocket_bo_prep and rocket_bo_prep_ranges with
+ * timeout_ns > 0), how many reached the slow-wait mark, and the longest, in microseconds.
+ *
+ * The `rocket` driver retires a job that runs 500 ms: it resets the core and signals the
+ * job's fence, and PREP_BO then returns 0 exactly as it does for a job that completed.
+ * So a hung job reads as a slow wait over whatever the output BO held before, and a gate
+ * that compares that BO against a reference can pass on it. A wait at or past the mark
+ * (ROCKET_SLOW_WAIT_MS, default 450) also logs a warning naming the BO.
+ *
+ * A heuristic in one direction only. A wait past the mark can also be one that covered
+ * other jobs queued ahead of it, and a caller that waited late can see a retired job end
+ * under the mark, so zero is not proof that nothing timed out: the kernel log's
+ * "NPU job timed out" line is. Counted by the builtin provider; an external provider that
+ * does not report its waits leaves all three at zero. Process-wide, atomic. */
+uint64_t rocket_fence_wait_count(void);
+uint64_t rocket_fence_wait_slow_count(void);
+uint64_t rocket_fence_wait_max_us(void);
+void     rocket_fence_wait_counters_reset(void);
+
 
 #ifdef __cplusplus
 }

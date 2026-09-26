@@ -84,8 +84,9 @@
  *   the board is running the source you think it is before reading anything into it.
  *
  * Usage: rk3576_chain_len [sweep | uniform N | mixed N | geom N | wide N]  (default: sweep)
- * Exit:  0 the question is answered, 1 the instrument could not run it, 2 no NPU / wrong
- *        chip.
+ * Exit:  the sweep is a probe: 0 when it ran, whatever length it stopped at. A single
+ *        length is an assertion: 0 bit-exact, 1 a difference or a length the instrument
+ *        could not build. 2 no NPU / wrong chip.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -436,7 +437,7 @@ int main(int argc, char **argv)
             rocket_close(fd);
             return 1;
         }
-        rc = run_len(fd, m, n, 1) < 0 ? 1 : 0;
+        rc = run_len(fd, m, n, 1) != 0 ? 1 : 0;   /* a difference fails, as a refusal does */
     }
     rocket_close(fd);
     return rc;

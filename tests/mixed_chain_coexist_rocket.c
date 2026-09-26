@@ -6,8 +6,7 @@
  * Runs, in ONE process and on ONE fd with ROCKET_BATCH_SUBMIT=1, a CHAINED fp16
  * tiled matmul (multi-task, lays its regcmds contiguously and sets
  * DRM_ROCKET_JOB_BATCHED) immediately followed by a GAPPED int8 tiled matmul
- * (multi-task, but the integer datapath forces the stock per-task layout and
- * leaves the flag clear — int32 CACC clears per kick, so chaining garbles it).
+ * (multi-task, laid out per task by the library, which leaves the flag clear).
  *
  * This is the case the OLD global rocket_batch_submit module param could not
  * express: with the global param on, the kernel forced TASK_NUMBER=N on EVERY
@@ -15,8 +14,13 @@
  * and produced garbage (or timed out). With the per-job flag the int8 job runs
  * gapped (correct) while the fp16 job runs chained (correct) back to back.
  *
- * PASS iff BOTH verify bit-exact. Requires the kernel master param
- * rocket_batch_submit=1 (the patched default) and the per-job-flag kernel.
+ * PASS iff BOTH verify bit-exact AND the fp16 arm actually ran chained. A kernel that
+ * does not honor the per-job flag makes the library fall back to the stock per-task
+ * path, and both arms then pass while testing nothing about coexistence, so the gate
+ * checks that chaining is enabled and that each fp16 arm carried more tasks than
+ * submits (a chained multi-tile matmul is one submit; the stock path is one per tile).
+ * A kernel without the batched-submit flag is a SKIP (exit 2). Requires the kernel
+ * master param rocket_batch_submit=1 (the patched default) and the per-job-flag kernel.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -26,6 +30,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "rocket_chain.h"   /* rkt_chain_enabled: whether the fp16 path will chain */
 
 #ifndef __fp16
 #define __fp16 _Float16
@@ -46,8 +51,19 @@ static int run_fp16_chained(int fd, int M, int K, int N)
     for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (__fp16)((rand() / (double)RAND_MAX) - 0.5);
     for (size_t i = 0; i < (size_t)N * K; i++) B[i] = (__fp16)((rand() / (double)RAND_MAX) - 0.5);
 
+    uint64_t sub0 = rocket_submit_ioctl_count(), task0 = rocket_submit_task_count();
     int ret = rocket_matmul_fp16(fd, M, K, N, A, B, C);
+    uint64_t subs = rocket_submit_ioctl_count() - sub0;
+    uint64_t tasks = rocket_submit_task_count() - task0;
     if (ret) { fprintf(stderr, "  fp16: rocket_matmul_fp16 = %d\n", ret); goto out; }
+    printf("  fp16 C[%d,%d]: %llu task(s) in %llu submit(s)\n", M, N,
+           (unsigned long long)tasks, (unsigned long long)subs);
+    if (subs == 0 || tasks <= subs) {
+        printf("  fp16 C[%d,%d]: every submit carried one task, so the job did NOT chain -> "
+               "FAIL\n", M, N);
+        ret = -1;
+        goto out;
+    }
 
     /* cosine vs fp64 reference */
     double dot = 0, na = 0, nb = 0, maxabs = 0;
@@ -115,9 +131,21 @@ int main(void)
     if (fd < 0) { printf("no NPU (%d) -> SKIP\n", fd); return 2; }
 
     printf("mixed chained-fp16 + gapped-int8 coexistence (one process, one fd)\n");
+    if (!rocket_batched_submit_supported()) {
+        printf("the kernel does not honor DRM_ROCKET_JOB_BATCHED, so nothing here can chain "
+               "-> SKIP\n");
+        rocket_close(fd);
+        return 2;
+    }
     /* Force the chained layout on for this process; the int8 path forces gapped
-     * internally regardless, so this is the exact mixed-workload case. */
+     * internally regardless, so this is the exact mixed-workload case. The library reads
+     * the variable once, at its first chained submit, which has not happened yet. */
     setenv("ROCKET_BATCH_SUBMIT", "1", 1);
+    if (!rkt_chain_enabled()) {
+        printf("ROCKET_BATCH_SUBMIT=1 did not enable chaining -> FAIL\n");
+        rocket_close(fd);
+        return 1;
+    }
 
     int r1 = run_fp16_chained(fd, 512, 1024, 1024);   /* multi-tile => chained */
     int r2 = run_int8_gapped (fd, 512, 1280, 512);    /* multi-tile => gapped  */

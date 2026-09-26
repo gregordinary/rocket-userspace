@@ -37,9 +37,11 @@
  * This is a PROBE and reports; it asserts nothing about the pool's arithmetic, which
  * rk3576_pool_probe already gates.
  *
- * Usage: rk3576_chain_pool [iterations]     (default 8)
+ * Usage: rk3576_chain_pool [gate] [iterations]     (default 8)
  * Exit:  0 the question is answered either way, 1 the probe could not run it,
- *        2 no NPU or the wrong chip.
+ *        2 no NPU or the wrong chip. With `gate` the answer is asserted: 0 only when both
+ *        consumers were correct in every iteration at every geometry, and each could tell
+ *        its written input from an unwritten one. 1 otherwise.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -71,6 +73,10 @@ static const struct { unsigned w, c; } CASES[] = {
     { 110u, 32u },
 };
 #define N_CASES ((int)(sizeof CASES / sizeof CASES[0]))
+
+/* Columns that could not tell a written input from an unwritten one. Such a column scores
+ * "correct" whether or not the chain ordered anything, so a gate run fails on any. */
+static int g_blind;
 
 static unsigned round4(unsigned v) { return (v + 3u) & ~3u; }
 
@@ -427,12 +433,16 @@ static int run_case(int fd, unsigned plane, unsigned c, int iters,
         /* Both discriminators, said once. A reference equal to its stale twin scores
          * "correct" for the wrong reason. */
         if (it == 0) {
-            if (!memcmp(yref, ystale, y_bytes))
+            if (!memcmp(yref, ystale, y_bytes)) {
                 printf("       NOTE: the pool's written and unwritten inputs give the SAME "
                        "output here, so its column cannot distinguish them\n");
-            if (!memcmp(zref, zstale, z_bytes))
+                g_blind++;
+            }
+            if (!memcmp(zref, zstale, z_bytes)) {
                 printf("       NOTE: the last conv's written and unwritten inputs give the "
                        "SAME output here, so its column cannot distinguish them\n");
+                g_blind++;
+            }
         }
     }
 
@@ -454,7 +464,8 @@ static int run_case(int fd, unsigned plane, unsigned c, int iters,
 
 int main(int argc, char **argv)
 {
-    int fd, iters = argc > 1 ? atoi(argv[1]) : 8;
+    const int gate = argc > 1 && !strcmp(argv[1], "gate");
+    int fd, iters = argc > 1 + gate ? atoi(argv[1 + gate]) : 8;
     int i, asked = 0, skipped = 0, tot_pool = 0, tot_conv = 0;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -523,5 +534,13 @@ int main(int argc, char **argv)
         printf("   (%d geometr(ies) could not be asked and are NOT counted)\n", skipped);
 
     rocket_close(fd);
+    if (gate) {
+        const int ok = !skipped && !g_blind &&
+                       tot_pool == asked * iters && tot_conv == asked * iters;
+        printf("GATE: %s\n", ok ? "PASS, both consumers correct in every iteration at every "
+                                  "geometry, and every column could tell stale from fresh"
+                                : "FAIL");
+        return ok ? 0 : 1;
+    }
     return 0;
 }

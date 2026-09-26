@@ -41,13 +41,16 @@ int main(int argc, char **argv){
     rocket_fa_ctx *c=rocket_fa_ctx_create(nth);
     if(!c){printf("ctx create failed\n");return 1;}
     const char *ch=getenv("ROCKET_FA_CHAIN"); ch=ch?ch:"0";
-    for(int i=0;i<8;i++) rocket_flash_attn_fp16_ctx(c,T,n_kv,dh,dh,nh,nkvh,scale,softcap,Q,K,V,M,O); /* warm */
+    /* Every call's rc is checked: a call that fails fast would otherwise time as a win. */
+    int errs=0;
+    for(int i=0;i<8;i++) errs += rocket_flash_attn_fp16_ctx(c,T,n_kv,dh,dh,nh,nkvh,scale,softcap,Q,K,V,M,O)!=0; /* warm */
     double best=1e30, sum=0;
     for(int i=0;i<iters;i++){ double t0=now_ms();
-        rocket_flash_attn_fp16_ctx(c,T,n_kv,dh,dh,nh,nkvh,scale,softcap,Q,K,V,M,O);
+        errs += rocket_flash_attn_fp16_ctx(c,T,n_kv,dh,dh,nh,nkvh,scale,softcap,Q,K,V,M,O)!=0;
         double dt=now_ms()-t0; sum+=dt; if(dt<best)best=dt; }
+    if(errs){ printf("%d call(s) failed: the timing below is not a measurement\n",errs); }
     printf("T=%d n_kv=%d nth=%d chain=%s : mean=%.3f ms  best=%.3f ms  (%d iters)\n",
            T,n_kv,nth,ch,sum/iters,best,iters);
     rocket_fa_ctx_free(c); rocket_close(fd);
-    free(Q);free(K);free(V);free(M);free(O); return 0;
+    free(Q);free(K);free(V);free(M);free(O); return errs ? 1 : 0;
 }

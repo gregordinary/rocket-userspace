@@ -9,17 +9,17 @@
  * ship one full task then tiny delta tasks — fewer regcmd words + fewer PC register
  * writes per task. Sibling of the "CBUF persists across tasks" finding.
  *
- * CONCLUSION (2026-06-22, RK3588, DETERMINISTIC): delta-regcmd is NOT usable.
- *   - A 6-8 op delta task leaves the output UNTOUCHED (compute does not fire) — every
- *     run, both S_POINTER=0 and 0xE.
- *   - It only "passes" when a FULL job ran immediately before (even in a separate
- *     process): the NPU register file is NOT cleared between jobs/processes, so a delta
- *     inherits a prior FULL job's leftover config. That is unsafe to exploit (depends on
- *     unpredictable global state across 3 cores / multiple fds), not within-job chaining.
- *   - So each task must carry its FULL self-contained regcmd. The safe regcmd
- *     optimization is to cache + patch the full regcmd per tile; no gen cost).
- *   NPU fact learned: the register file persists globally (not reset on job/process
- *   boundaries).
+ * WHAT THIS PROBE CAN AND CANNOT SEE. Its delta is task 1, one task after the full one,
+ * and every block ping-pongs one register group per task (the generator arms the DPU and
+ * DPU_RDMA, the kernel the CNA and CORE). So the delta lands in the group this job never
+ * wrote, and computes nothing, or whatever a previous job left there. A pass here after a
+ * full 2-task job is that job's second group, not persistence within this one. Its
+ * S_POINTER=0 arm patches the DPU pointer alone and clears neither pointer, so no arm puts
+ * the delta in a group its own job wrote.
+ *
+ * regcmd_delta_probe measures the question this was written for: a delta that lands in its
+ * own job's group computes exactly, which as shipped is the group written two tasks back
+ * [HW sweep, RK1, 2026-09-25]. Keep this one as the reproduction of the one-task-after arm.
  *
  * Ping-pong register groups: every task starts with `DPU_S_POINTER = 0xE`
  * (POINTER_PP_MODE | EXECUTER_PP_EN | POINTER_PP_EN) = NVDLA dual-register-group

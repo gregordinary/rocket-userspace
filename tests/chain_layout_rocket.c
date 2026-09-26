@@ -190,12 +190,10 @@ int main(void) {
     }
 
     /* int8 / int4 share gen_matmul_task's trailer, so the chained LAYOUT holds for
-     * them too (validated below). NOTE: layout-valid does NOT mean execution-safe —
-     * the integer datapath is HW-blocked from chaining (the int32 CACC clears
-     * per-kick not per-task, so chained integer tasks garble; the resident int8/int4
-     * paths force gapped, see rocket_prepacked_int8.c). This check guards the layout
-     * math only, used by any FUTURE integer-chain attempt that first cracks the CACC
-     * clear. fp16 is the only dtype that chains end-to-end today. */
+     * them too (validated below). This check guards the layout math only. Execution is
+     * tests/int8_chain_probe's: independent int8 tasks chain bit-exactly on the RK3588,
+     * and int4's int16 writer has not been run chained. The resident int8/int4 paths
+     * still submit gapped (rocket_prepacked_int8.c says why). */
     printf("\n");
     check_dtype("int8", 1, 64, 256, 64,  4, 64, 64,  128, 256, 32);
     check_dtype("int4", 2, 64, 256, 64,  4, 64, 64,  128, 256, 32);

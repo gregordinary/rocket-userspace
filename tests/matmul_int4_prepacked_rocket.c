@@ -18,6 +18,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static int8_t rand_i4(void) { return (int8_t)(rand() % 7 - 3); }
 
@@ -81,10 +82,15 @@ int main(int argc, char **argv) {
         if (cmp_exact(tag, Cr, Co, Csz)) fails++;
     }
     /* reuse w0 */
-    if (!oracle(M, K, N, A, B[0], Co)) {
-        memset(Cr, 0, Csz*sizeof(int32_t));
-        if (!rocket_matmul_int4_prepacked(ctx, M, K, N, A, Cr, rw[0]))
-            if (cmp_exact("reuse-w0", Cr, Co, Csz)) fails++;
+    /* An error on either call is a failure: skipping the comparison would pass a reuse
+     * path that cannot run at all. */
+    if (oracle(M, K, N, A, B[0], Co)) {
+        printf("  [reuse-w0] the one-shot oracle failed -> FAIL\n"); fails++;
+    } else {
+        tf_sentinel_bytes(Cr, Csz*sizeof(int32_t));   /* a skipped write never compares equal */
+        if (rocket_matmul_int4_prepacked(ctx, M, K, N, A, Cr, rw[0])) {
+            printf("  [reuse-w0] the resident call failed -> FAIL\n"); fails++;
+        } else if (cmp_exact("reuse-w0", Cr, Co, Csz)) fails++;
     }
 
     for (int w = 0; w < W; w++) rocket_i4_weights_free(ctx, rw[w]);

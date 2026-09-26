@@ -45,10 +45,15 @@
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
 #include "rocket_matmul_internal.h"
+#include "test_fill.h"
 
-static _Float16 x_of(size_t i) { return (_Float16)(((int)((i * 7) % 13) - 6) * 0.05f); }
-static _Float16 w1_of(size_t i){ return (_Float16)(((int)((i * 5) % 11) - 5) * 0.04f); }
-static _Float16 w2_of(size_t i){ return (_Float16)(((int)((i * 3) % 9 ) - 4) * 0.06f); }
+/* Hashed fills on the same value grids (tests/test_fill.h). The old ones were periodic
+ * in the flattened index: W2 took three values, and at the default 64x128 -> 64 -> 96
+ * the chain's output depended only on (m mod 13, j mod 3), so a row or column mixup
+ * inside those classes computed the same surface. */
+static _Float16 x_of(size_t i) { return (_Float16)(tf_int(0x51, i, -6, 6) * 0.05f); }
+static _Float16 w1_of(size_t i){ return (_Float16)(tf_int(0x52, i, -5, 5) * 0.04f); }
+static _Float16 w2_of(size_t i){ return (_Float16)(tf_int(0x53, i, -4, 4) * 0.06f); }
 
 /* cosine similarity of an fp16 result vs an fp64 reference. Skips any non-finite
  * lane (an fp16 overflow->inf would otherwise NaN the whole score) and reports the
@@ -196,5 +201,5 @@ int main(int argc, char **argv) {
     free(X); free(W1); free(W2); free(C1ref); free(Dref); free(C1); free(Dref_npu);
     free(C1chk); free(packedB); free(Dchain);
     rocket_close(fd);
-    return pass ? 0 : 3;
+    return pass ? 0 : 1;
 }

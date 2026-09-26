@@ -33,9 +33,10 @@
  * equal here at 1x1 stride 1. So this probe asks the hardware question in the shape the
  * refactor would actually take, not in a proxy.
  *
- * Usage: rk3576_chain_raw [iterations]     (default 8)
+ * Usage: rk3576_chain_raw [gate] [iterations]     (default 8)
  * Exit:  0 the question is answered either way, 1 the probe could not run it,
- *        2 no NPU or the wrong chip.
+ *        2 no NPU or the wrong chip. With `gate` the answer is asserted: 0 only when every
+ *        iteration at every plane read the fresh surface, 1 otherwise.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -335,7 +336,8 @@ static int run_plane(int fd, int iters, int *verdict_fresh, int *verdict_stale)
 
 int main(int argc, char **argv)
 {
-    int fd, iters = argc > 1 ? atoi(argv[1]) : 8;
+    const int gate = argc > 1 && !strcmp(argv[1], "gate");
+    int fd, iters = argc > 1 + gate ? atoi(argv[1 + gate]) : 8;
     int i, tot_fresh = 0, tot_stale = 0, planes_asked = 0, planes_skipped = 0;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -400,5 +402,13 @@ int main(int argc, char **argv)
         printf("   (%d plane(s) could not be asked and are NOT counted)\n", planes_skipped);
 
     rocket_close(fd);
+    if (gate) {
+        /* The shipping cross-layer chain rests on this answer, so the gate asserts it at
+         * every plane: a skipped plane is a question the gate did not ask. */
+        const int ok = !planes_skipped && tot_fresh == planes_asked * iters;
+        printf("GATE: %s\n", ok ? "PASS, every iteration at every plane read the fresh surface"
+                                : "FAIL");
+        return ok ? 0 : 1;
+    }
     return 0;
 }

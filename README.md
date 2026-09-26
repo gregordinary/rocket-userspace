@@ -151,8 +151,8 @@ bit-exactly, direct at int8 and fp16 and depthwise at int8. So does an int8 matm
 Three of that matmul's properties are the RK3588's inverted, and a caller porting between
 the two must expect all three:
 
-- int8 is the matmul precision here. One int8 task contracts up to 4608 input channels,
-  where one fp16 task contracts sixteen.
+- int8 is the default matmul precision here. One int8 task contracts up to 4608 input
+  channels, where an fp16 convolution task contracts sixteen.
 - The M axis carries no constraint at all, so `M=1` is simply correct.
 - The output is int8 through the DPU's requant rather than raw int32.
 
@@ -161,6 +161,19 @@ reads the DPU's raw 32-bit accumulator and sums the partials on the host. It is 
 any K, and costs a quarter of the int8 path's MACs per submit. That writer delivers only the
 first eight output channels of every thirty-two, and the way round it is to program four
 times as many.
+
+`rocket_matmul_fp16_rk3576()` is the fp16 matmul, with fp32 output. It is a different register
+program from the fp16 convolution, and it contracts the whole of K in one task. It accepts K up
+to 6144, N up to 8192 and M up to 2048. One task holds as many rows as fit the CBUF, 85 at
+K 1536, so a larger M runs as several tasks in one submit. It is exact against a CPU reference
+up to 2048×1536×256 (`tests/rk3576_mm_fp16_gate`). Unlike the int32 writer, its output does not
+leave the next submit writing nothing.
+
+`rocket_matmul_fp16_rk3576_wbo()` keeps the weight resident in a handle. Against the int8 entry
+with resident weights it costs 0.86-0.94x at most shapes up to M 16. At a prefill's M it costs
+about 2x: 2.0-2.1x at 512×1536×1536, and 1.8-2.6x across N at M 512 and K 1536. At K 6144 the two
+tie, because the int8 entry slows there. On the device alone this program contracts at about
+half the int8 program's rate (`tests/rk3576_mm_fp16_cost`, 786 MHz, warm).
 
 The rest of the op library still emits the RK3588 encoding. On this part the matmul entries
 refuse rather than submit a program the hardware will not run.

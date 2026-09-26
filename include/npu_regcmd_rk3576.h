@@ -1132,6 +1132,58 @@ int64_t rocket_rk3576_ew_params(double gain,
                                 uint16_t *ew_scale, uint8_t *ew_shift,
                                 uint16_t *out_scale, uint8_t *out_shift);
 
+/* ---- the matmul-form fp16 program ----------------------------------------------
+ *
+ * One task computes C[m][n] = sum_k A[m][k] * B[n][k] with fp16 operands and an fp32
+ * output, contracting the whole of K. It is a different program from the
+ * fp16 convolution above, which contracts sixteen input channels a task: this one
+ * reads the activation row-major, [m][k], with CNA 0x1090 = k/8 and bit 29 of CNA
+ * 0x100C set, and takes the w4a16 output stage (CORE 0x3018 = 0x10000200).
+ *
+ * It is charsiu's program (gahingwoo/charsiu `524e10a`, charsiu_emit_job with no
+ * CHARSIU_* environment set), transcribed word for word: 148 words in charsiu's order,
+ * 23 of them closed forms of (m, k, n) and five of them buffer addresses. The host
+ * half of tests/rk3576_mm_fp16_gate.c holds the stream, the coefficient buffer and the
+ * weight permutation to charsiu's own output at every gated shape.
+ *
+ * The buffers the program reads:
+ *   - the activation, row-major fp16, m*k*2 bytes plus a 4 KiB tail;
+ *   - the weights, [n/16][k/32][n%16][k%32] with two-byte elements, k*n*2 bytes;
+ *   - the coefficient buffer, rocket_rk3576_mm_fp16_coef_bytes(n), which depends on n
+ *     alone and can be built once per n;
+ *   - the output, m rows of n fp32 values, row-major, plus a 4 KiB tail.
+ *
+ * ONE TASK carries at most rocket_rk3576_mm_fp16_task_rows(k) rows: its input surface,
+ * k/32 CBUF entries a row, must fit the 4096-entry data window, and a task past it
+ * computes a wrong surface on every row rather than failing. k runs to 6144 and n to 8192
+ * (n%16). rocket_rk3576_mm_fp16_task_ok() is that envelope and gen_matmul_fp16_rk3576()
+ * refuses a task outside it; rocket_rk3576_mm_fp16_shape_ok() is the matmul entry's,
+ * which tiles M over tasks. Each bound was measured on the part; the evidence is beside
+ * the definitions in npu_regcmd_rk3576.c. */
+#define RK3576_MM_FP16_OPS 148
+
+unsigned rocket_rk3576_mm_fp16_task_rows(unsigned k);   /* 0 for a k no task takes */
+int rocket_rk3576_mm_fp16_task_ok(unsigned m, unsigned k, unsigned n);
+int rocket_rk3576_mm_fp16_shape_ok(unsigned m, unsigned k, unsigned n);
+int gen_matmul_fp16_rk3576(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                           uint32_t in_dma, uint32_t weight_dma, uint32_t out_dma,
+                           uint32_t coef_dma);
+/* The same stream with no envelope check, for probes that map where the envelope can
+ * go. It refuses only what the closed forms cannot express: m 0, k under 32 or off a
+ * multiple of 32, n under 16 or off a multiple of 16. Past charsiu's swept range (m 32,
+ * k 4096, n 1024) every shape word is the closed form extrapolated, not a transcription. */
+int gen_matmul_fp16_rk3576_unchecked(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                                     uint32_t in_dma, uint32_t weight_dma,
+                                     uint32_t out_dma, uint32_t coef_dma);
+size_t rocket_rk3576_mm_fp16_in_bytes(unsigned m, unsigned k);
+size_t rocket_rk3576_mm_fp16_weight_bytes(unsigned k, unsigned n);
+size_t rocket_rk3576_mm_fp16_out_bytes(unsigned m, unsigned n);
+size_t rocket_rk3576_mm_fp16_coef_bytes(unsigned n);
+/* B is n rows of k fp16 bit patterns; the pack is a permutation of them. */
+int rocket_rk3576_mm_fp16_pack_weights(void *dst, size_t dst_bytes, const uint16_t *B,
+                                       unsigned k, unsigned n);
+int rocket_rk3576_mm_fp16_pack_coef(void *dst, size_t dst_bytes, unsigned n);
+
 #ifdef __cplusplus
 }
 #endif

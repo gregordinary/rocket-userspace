@@ -36,7 +36,8 @@ static int64_t now_us(void) {
 static int8_t rand_i8(void) { return (int8_t)(rand() % 256 - 128); }
 
 int main(int argc, char **argv) {
-    int M = 128, K = 1024, N = 1024;
+    /* K != N: with K == N a field that swapped the two would compute a plausible surface */
+    int M = 128, K = 1024, N = 768;
     if (argc == 4) { M = atoi(argv[1]); K = atoi(argv[2]); N = atoi(argv[3]); }
     else if (argc != 1) { printf("usage: %s [M K N]\n", argv[0]); return -1; }
 

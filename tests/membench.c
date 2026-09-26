@@ -69,8 +69,10 @@ int main(void) {
     printf("write (memset): %6.1f GB/s\n", (double)bytes * iters / (dt * 1e-3) / 1e9);
 
     /* 4. readback de-tile: contiguous vs feat_idx-gathered fp16->fp32 accumulate.
-     * Representative output tile M x N, repeated to build comparable volume. */
-    const int M = 256, N = 4096, reps = 100;
+     * Representative output tile M x N, repeated to build comparable volume. The source
+     * is 16 MiB so every rep streams it from DRAM, as a real readback of a fresh BO does:
+     * at 256 x 4096 it was 2 MiB and sat in the 3 MB L3 across the reps. */
+    const int M = 2048, N = 4096, reps = 12;
     const size_t tn = (size_t)M * N;
     f16   *src = malloc(tn * sizeof(f16));
     float *acc = malloc(tn * sizeof(float));

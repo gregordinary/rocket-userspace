@@ -92,10 +92,46 @@ static const int dims[] = {
 };
 #define NDIM ((int)(sizeof dims / sizeof dims[0]))
 
+/* Every refusal below is `continue`d as honest, so a planner that refused EVERY shape
+ * would pass the sweep with nothing checked. This shape is the anchor: a real prefill
+ * GEMM that every dense planner, and the group-wise one at a 128 group, must plan under
+ * every knob setting the sweep visits. */
+#define ANCHOR_M 512
+#define ANCHOR_K 4096
+#define ANCHOR_N 4096
+#define ANCHOR_GROUP 128
+
+static void require_anchor(const char *tag, int strict_cap)
+{
+    for (size_t d = 0; d < sizeof dense / sizeof dense[0]; d++) {
+        int Mt = -1, Kt = -1, Nt = -1;
+        int rc = dense[d].fn(ANCHOR_M, ANCHOR_K, ANCHOR_N, &Mt, &Kt, &Nt);
+        checked++;
+        if (rc < 0)
+            fail("the anchor shape was REFUSED", dense[d].name, tag,
+                 ANCHOR_M, ANCHOR_K, ANCHOR_N, rc, Mt, Kt, Nt);
+        else
+            check_plan(dense[d].name, tag, ANCHOR_M, ANCHOR_K, ANCHOR_N, 0, dense[d].nalign,
+                       dense[d].kalign, strict_cap, rc, Mt, Kt, Nt);
+    }
+    int Mt = -1, Kt = -1, Nt = -1;
+    int rc = rocket_matmul_plan_int8_gw(ANCHOR_M, ANCHOR_K, ANCHOR_N, ANCHOR_GROUP,
+                                        &Mt, &Kt, &Nt);
+    checked++;
+    if (rc < 0)
+        fail("the anchor shape was REFUSED", "int8gw", tag,
+             ANCHOR_M, ANCHOR_K, ANCHOR_N, rc, Mt, Kt, Nt);
+    else
+        check_plan("int8gw", tag, ANCHOR_M, ANCHOR_K, ANCHOR_N, ANCHOR_GROUP, 32, 32,
+                   strict_cap, rc, Mt, Kt, Nt);
+}
+
 /* `strict_cap`: hold the plan to the profile's max_tile. Off when an MM_MT / MM_NT
  * override is in force — see invariant 2b. */
 static void sweep(const char *tag, int strict_cap)
 {
+    long accepted = 0;
+    require_anchor(tag, strict_cap);
     for (size_t d = 0; d < sizeof dense / sizeof dense[0]; d++)
         for (int a = 0; a < NDIM; a++)
             for (int b = 0; b < NDIM; b++)
@@ -111,6 +147,7 @@ static void sweep(const char *tag, int strict_cap)
                         continue;
                     }
                     if (rc < 0) continue;                     /* an honest refusal */
+                    accepted++;
                     check_plan(dense[d].name, tag, M, K, N, 0, dense[d].nalign,
                                dense[d].kalign, strict_cap, rc, Mt, Kt, Nt);
                 }
@@ -131,9 +168,13 @@ static void sweep(const char *tag, int strict_cap)
                         continue;
                     }
                     if (rc < 0) continue;
+                    accepted++;
                     check_plan("int8gw", tag, M, K, N, grp, 32, 32,
                                strict_cap, rc, Mt, Kt, Nt);
                 }
+    if (accepted == 0)
+        fail("no shape planned: every invariant above went unchecked", "all", tag,
+             0, 0, 0, -1, -1, -1, -1);
 }
 
 int main(void)

@@ -17,6 +17,11 @@
  * host cost, and enough to catch any tiling/layout/accum bug. PASS = normalized
  * error (max_abs / max|ref| over the sample) < tol and no nonfinite.
  *
+ * The sample stride is coprime to M*N (tests/test_fill.h), so the samples land on every
+ * column. It used to be MN/samples, which is 256 at 512x4096 and put every sample on
+ * one of 16 columns. The tolerance is 1e-5: the part measures ~8.5e-8 at 512x3840x4096,
+ * and one dropped K term reads ~3e-3, which the old 0.01 let through.
+ *
  * Usage: matmul_bf16_tiled_rocket <M> <K> <N>   (K%32, N%16, M%4||1)
  *   ladder: 256 384 256 | 512 3840 4096 | 512 15360 3840
  */
@@ -30,6 +35,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "test_fill.h"
 
 static int64_t now_us(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -50,7 +56,7 @@ static inline float bf16rt(float f) {
 int main(int argc, char **argv) {
     if (argc != 4) { printf("usage: %s <M> <K> <N>  (try 512 3840 4096)\n", argv[0]); return -1; }
     int M = atoi(argv[1]), K = atoi(argv[2]), N = atoi(argv[3]);
-    const float tol     = (float)env_dbl("ROCKET_BF16_TOL", 0.01);
+    const float tol     = (float)env_dbl("ROCKET_BF16_TOL", 1e-5);
     const float mag     = (float)env_dbl("ROCKET_BF16_MAG", 10.0);
     const int   samples = env_int("ROCKET_BF16_SAMPLES", 8192);
 
@@ -75,13 +81,14 @@ int main(int argc, char **argv) {
     int ret = rocket_matmul_bf16(fd, M, K, N, A, B, C);
     double ms = (now_us() - t0) / 1000.0;
     rocket_close(fd);
-    if (ret) { fprintf(stderr, "rocket_matmul_bf16 failed (%d)\n", ret); free(A); free(B); free(C); return ret; }
+    if (ret) { fprintf(stderr, "rocket_matmul_bf16 failed (%d)\n", ret); free(A); free(B); free(C); return 1; }
     double gops = 2.0 * (double)M * N * K / (ms / 1000.0) / 1e9;
     printf("rocket_matmul_bf16 = 0  (%.2f ms, %.1f GOP/s)\n", ms, gops);
 
     /* sample-based verification: exact double dot product on demand. */
     size_t MN = (size_t)M * N;
-    size_t stride = MN > (size_t)samples ? MN / (size_t)samples : 1;
+    size_t stride = MN > (size_t)samples
+                  ? (size_t)tf_coprime_stride((int)MN, (int)(MN / (size_t)samples)) : 1;
     int checked = 0, nonfin = 0, shown = 0;
     double max_abs = 0.0, max_ref = 0.0, max_rel = 0.0;
     for (size_t idx = 0; idx < MN; idx += stride) {
