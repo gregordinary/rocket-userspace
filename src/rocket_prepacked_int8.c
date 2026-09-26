@@ -12,13 +12,12 @@
  * 11GB whole-model footprint fits across the 5 worker fds' 4GB IOVA windows.
  *
  * The COMPUTE core is int8's own (it is not fp16's rkw_run wearing a cast: the operand
- * types, the BO geometry and the accumulator all differ, and int8 cannot use the NPU-side
- * K-accum ping-pong at all — the DPU EW operand DMA is <=16-bit). Everything AROUND it
+ * types, the BO geometry and the accumulator all differ, and int8 has no NPU-side
+ * K-accum ping-pong at all, since no integer EW add is implemented). Everything AROUND it
  * — the pool shape, the slot cache, the fence deadline, the column split and the
  * spawn/join — is rocket_fanout.h's, shared with fp16/int4/bf16. The compute mirrors
- * rocket_matmul_int8's host-int64 K-accum branch (int8 NPU K-accum is HW-dead:
- * the DPU EW operand DMA is <=16-bit, so int32 partials can't accumulate on-chip;
- * they are summed on the host in int64, which is integer-EXACT -> bit-identical
+ * rocket_matmul_int8's host-int64 K-accum branch (no int8 NPU K-accum is
+ * implemented: int32 partials are summed on the host in int64, which is integer-EXACT -> bit-identical
  * to the one-shot path and to the int64 CPU reference).
  *
  * TWO MODES, one compute core (rki_thread), selected by the weight's `group`:
@@ -31,8 +30,8 @@
  *               NATIVELY quantized weight needs — a GGUF MXFP4/Q8_0/Q4_K block carries
  *               one scale per K-block, and the NPU cannot apply a K-blocked scale
  *               on-chip (at the output stage K is fully contracted). The integer partials
- *               are already read back to the host at every K-tile boundary (on-device
- *               integer K-accum is HW-dead), so the block scale rides along a readback
+ *               are already read back to the host at every K-tile boundary (no on-device
+ *               integer K-accum is implemented), so the block scale rides along a readback
  *               that is being paid for regardless: it fuses into the accumulate loop and
  *               measures +0.6% over the per-channel mode. Resident-int8 + group-wise is
  *               the combination that deletes the per-micro-batch host dequant for a
@@ -530,7 +529,7 @@ static void *rki_thread(void *a)
     if ((t->ret = rocket_bo_fini(fd, &w->in_all)) != 0) return NULL;
     if (prof) t_packA = rki_now_ms() - t0;
 
-    /* ---- batched tile compute: host K-accumulation (int8 NPU K-accum is HW-dead).
+    /* ---- batched tile compute: host K-accumulation (no int8 NPU K-accum is implemented).
      * Accumulate over this worker's N-slice into acc[M, nsub] (per-channel: int64,
      * integer-EXACT) or facc[M, nsub] (group-wise: fp32, each tile's int32 partial
      * pre-scaled by its quant group's a_scale*b_scale). */

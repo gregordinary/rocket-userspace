@@ -334,8 +334,7 @@ instruction-bound.
 
 Quantization does not speed prefill at this operating point. Resident int8 and int4 tie the
 ~460 GOP/s floor, where the NPU runs at ~15% of fp16 MAC peak. In-model resident int8
-prefill is 0.60x fp16, because its int32 readback cannot be K-accumulated: the DPU eltwise
-operand DMA is <=16-bit. So int8 and int4 buy RAM and model-fit rather than throughput.
+prefill is 0.60x fp16, because its int32 readback is not K-accumulated on the NPU. So int8 and int4 buy RAM and model-fit rather than throughput.
 Treat that as bottleneck-conditional rather than a permanent property. The full per-dtype
 detail is in the [datatype matrix](API.md#datatype-matrix).
 
@@ -346,10 +345,11 @@ int4, and within fp16 tolerance otherwise. The conv and op library each carry a 
 against an fp64 oracle reference, and [API.md](API.md#tests) holds the full catalog. The
 envelope:
 
-- **Integer on-NPU K-accumulation is impossible** on this hardware. The conv accumulator
-  reduces K only within one CBUF-resident tile. The only cross-tile adder, the DPU
-  eltwise, has a <=16-bit operand DMA that int32 partials cannot fit, so integer K-partials
-  accumulate on the host. fp16 partials do fit, and that is the on-NPU K-accum win.
+- **Integer K-partials accumulate on the host.** The conv accumulator reduces K only within
+  one CBUF-resident tile. The only cross-tile adder is the DPU eltwise, which accumulates fp16
+  partials on the NPU, and that is the on-NPU K-accum win. The library has no integer mode for
+  it. Whether the eltwise adds int32 on this hardware is unestablished, and an integer mode
+  would not speed prefill, which is not readback-bound.
 - **Quantization does not accelerate prefill.** int8 and int4 are for RAM rather than speed.
 - **Decode (M=1 GEMV) stays on the CPU**, ~82x slower on the NPU.
 - **Host layout packing is irreducible.** The NPU has no on-chip row-major-to-tiled

@@ -194,8 +194,8 @@ static void mm_prof_i8_dump(void) {
  * greedy output. Opt OUT with ROCKET_KACC=0 or ROCKET_NO_KACC (both select the
  * byte-identical CPU-accum mm_compute oracle). Read once and cached.
  *
- * fp16 ONLY. int8/int4 on-device K-accum is a hard HW dead end (the DPU eltwise
- * operand DMA is ≤16-bit; int32 partials don't fit) — those dtype paths live in
+ * fp16 ONLY. No int8/int4 on-device K-accum is implemented (an integer DPU-EW add is
+ * unestablished and would not move the prefill wall) — those dtype paths live in
  * separate translation units and never consult this knob. Don't inherit it. */
 static int kacc_on(void) {
     static _Atomic int v = -1;
@@ -1803,8 +1803,9 @@ int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
      * the same kick count. accumulate=0 (ki=0) and accumulate=1 (ki>0) emit the
      * same regcmd op count (the gen_matmul_task accumulate branches are
      * op-count-symmetric), so the uniform chained stride is valid across the ki
-     * boundary. fp16 EW-add accumulation is immune to the int8 CACC-clear failure
-     * that makes integer chaining HW-dead. */
+     * boundary. fp16 EW-add accumulation carries each partial through DRAM, so it does
+     * not depend on the CACC across tasks (independent int8 tasks chain bit-exactly
+     * too). */
     int chain_mode = kacc_chain_on();              /* 0 off, 1 adaptive, 2 force-all */
     int chain_engage = (nKt > 1 && nKt <= BATCH) &&
                        (chain_mode == 2 || (chain_mode == 1 && nKt * 3 <= BATCH));
@@ -2574,7 +2575,7 @@ int rocket_matmul_fp16_batch(int fd, int M, int K, int N, int nbatch,
  * one scale per K-block, and the NPU cannot apply a K-blocked scale on-chip: at the
  * output stage K is fully contracted, so nothing in the DPU is indexed by a K-block,
  * for any dtype. But the integer partials ALREADY leave the chip at every K-tile
- * boundary — on-device integer K-accum is HW-dead (see rocket_matmul_int8 above) —
+ * boundary — no on-device integer K-accum is implemented (see rocket_matmul_int8 above) —
  * so the block scale is free at a boundary that is already being paid for. Keep each
  * K-tile inside one quant group, multiply its int32 partial by that group's scale,
  * accumulate in fp32 on the host. The NPU-side work is identical to
@@ -2852,10 +2853,11 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
     tA = now_ms() - tA;
 
     /* ---- batched tile compute: host int64 K-accumulation (bit-exact oracle).
-     * NPU-side int8 K-accum (the DPU-EW int32 add) is HW-DEAD: the EW operand DMA
-     * is <=16-bit, so int32 partials read back as garbage (a true add of two int32
-     * tiles returned an fp16 inf/NaN bit pattern). Sum the partials on the host.
-     * Do not reattempt. ---- */
+     * NPU-side int8 K-accum (the DPU-EW int32 add) is not implemented. The recorded
+     * probe returned an fp16 inf/NaN bit pattern for a true add of two int32 tiles,
+     * but it left the precision triple at fp16, so the EW's integer mode is
+     * unestablished. It would not move the prefill wall either, which is not
+     * readback. Sum the partials on the host. ---- */
     rocket_task_desc *tasks = malloc(BATCH * sizeof(*tasks));
     uint64_t npu_regs[256] = {0};
     int64_t *acc = NULL;
@@ -2966,8 +2968,9 @@ free_bos:
  * (vs 16); weight layout (N/64,K/32,64,32) [weight_int4, N-group 64 vs int8's 32];
  * output is int16 (2 B, cube C2=8) NOT int32. K-partials are read back as int16
  * and host-summed in int64 -> int32 C. int8's int32-out quirk size_e=7 carries to
- * int16 (HW-confirmed). NPU K-accum (DPU-EW) is deferred (int16 output IS <=16-bit
- * so it is FEASIBLE here, unlike int8 — a later perf lever); this is the host-accum
+ * int16 (HW-confirmed). NPU K-accum (DPU-EW) is deferred (int16 partials stay within
+ * fp32's exact-integer range, so a float-path EW add could be bit-exact — moot while
+ * prefill is not readback-bound); this is the host-accum
  * oracle. Encodings live in gen_matmul_int4 (npu_regcmd.c).
  *
  * Each K-tile's int16 output SATURATES if |Kt-partial| > 32767; the host can't
@@ -3310,8 +3313,8 @@ free_bos:
  * iteration registers were swept exhaustively; only the SATURATING int16-output
  * transposed primitive iterates, N<=32 — see matmul_int16_rocket). The
  * full-precision int16 matmul is rocket_matmul_int16_exact (int8 byte-decomposition,
- * below). NPU K-accum (DPU-EW) is DEAD for int16 too (int32 partials exceed the EW's
- * <=16-bit operand DMA, exactly like int8).
+ * below). No NPU K-accum (DPU-EW) is implemented for int16 either, exactly as for
+ * int8.
  * ==========================================================================*/
 
 

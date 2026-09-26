@@ -56,7 +56,7 @@
 static void elem_bytes(const char *dt, double *ein, double *eout, int *kacc_ok)
 {
     if      (!strcmp(dt,"fp16")) { *ein=2;   *eout=2; *kacc_ok=1; } /* fp16 K-accum on NPU */
-    else if (!strcmp(dt,"int8")) { *ein=1;   *eout=4; *kacc_ok=0; } /* int32 out, EW-accum HW-dead */
+    else if (!strcmp(dt,"int8")) { *ein=1;   *eout=4; *kacc_ok=0; } /* int32 out, no NPU EW-accum */
     else if (!strcmp(dt,"int4")) { *ein=0.5; *eout=2; *kacc_ok=0; } /* int16 out, host-accum */
     else if (!strcmp(dt,"bf16")) { *ein=2;   *eout=4; *kacc_ok=0; } /* fp32 out, host-accum */
     else if (!strcmp(dt,"tf32")) { *ein=4;   *eout=4; *kacc_ok=0; }

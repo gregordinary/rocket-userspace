@@ -23,7 +23,8 @@
  * (N/16,K/32,16,32), 4-byte fp32 output cube C2=4) — identical index math to the fp16
  * input path, differing only in the bf16 truncation on the scatter, the fp32 output
  * cube, and gen_matmul_bf16 (precision 3). K-partials accumulate on the HOST in double
- * (no NPU K-accum: the DPU eltwise operand is <=16-bit and the bf16 output is fp32).
+ * (no NPU K-accum: the bf16 output is fp32, and an fp32 EW add is validated only for
+ * the fp16 KACC variant).
  *
  * The streaming output is bit-identical to single-fd rocket_matmul_bf16 at nthreads=1
  * (one worker, nsub==N => identical tiling and host-accum order); at nthreads>1 it is

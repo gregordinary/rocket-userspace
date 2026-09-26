@@ -825,8 +825,8 @@ int rocket_matmul_fp16_stream_fused(rocket_stream *s, int M, int K,
  *
  * Same int8 convention as rocket_matmul_int8: A/B are PRE-QUANTIZED int8 (the
  * backend owns the per-row/per-channel scales + any Hadamard rotation), C is the
- * RAW int32 accumulation (host int64 K-accum — int8 NPU K-accum is HW-dead, the
- * EW operand DMA is <=16-bit). Alignment: K%32, N%32, M%4==0 (resident paths do
+ * RAW int32 accumulation (host int64 K-accum; no NPU integer K-accum is
+ * implemented). Alignment: K%32, N%32, M%4==0 (resident paths do
  * NOT pad M==1 — pad single vectors to 4 caller-side); the per-worker
  * N-slice is rounded to a multiple of 32. The _prepacked call's M MAY DIFFER
  * from the _pack M: the weight is planned at the canonical tile M (MAX_TILE),

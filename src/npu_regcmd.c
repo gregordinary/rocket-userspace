@@ -886,7 +886,8 @@ int gen_ew_mul_fp16(ew_mul_params_t *p)
  * applies per-row activation + per-channel weight scales on dequant. K-tiling
  * accumulates the int32 partials on the HOST (each tile is a plain, non-
  * accumulating int8->int32 matmul), so every production caller keeps
- * ew_accumulate=0. (accumulate=1 arms an int32 EW add that is HW-DEAD — see the
+ * ew_accumulate=0. (accumulate=1 arms an int32 EW add that does not compute as
+ * programmed — see the
  * ew_accumulate block below; it survives only as the
  * matmul_accum_int8_rocket.c sweep harness and is never taken in production.)
  *
@@ -1012,8 +1013,9 @@ int gen_matmul_int8(matmul_params_t *params)
    core_desc.dataout_channel = cna_desc.weight_kernels -1;
 
    /* ROCKET_INT8_FP32_OUT: emit the int8 conv's accumulator as fp32 instead of raw
-    * int32. The int32-integer DPU-EW add is HW-unsupported (the EW is a float-only
-    * unit), so the only remaining NPU K-accum route is fp32-EW — which requires the
+    * int32. An int32 DPU-EW add is not implemented: the recorded probes never set the
+    * precision triple, so its support is unestablished. This knob is the fp32-EW route,
+    * which requires the
     * int8 conv to CAST its int32 MAC accumulator to fp32 on output. When set we set
     * out_precision=float32, leaving the int8 INPUT side (CNA C2=16, weight k-group
     * 32) untouched. Default unset = the raw-int32 path.
@@ -1120,14 +1122,16 @@ int gen_matmul_int8(matmul_params_t *params)
     * (MRDMA/ERDMA-disabled) path, which matches the host-int64 oracle and is
     * MRDMA-trap-safe. This is the ONLY path production callers ever take.
     *
-    * accumulate=1 arms the int32 EW add below. This is HW-DEAD: the DPU EW
-    * operand DMA is <=16-bit, so EDATA_SIZE=3 (32-bit) reads the int32 operand back
-    * as garbage (a true add of two int32 tiles returned an fp16 inf/NaN bit pattern,
-    * NOT the integer sum). It is NOT bit-exact and must never be used in production —
+    * accumulate=1 arms the int32 EW add below, and as programmed it computes
+    * garbage: EDATA_SIZE=3 (32-bit) with the precision triple left at fp16 adds the
+    * int32 bit patterns as float (a true add of two int32 tiles returned an fp16
+    * inf/NaN bit pattern, NOT the integer sum). It is NOT bit-exact and must never be used in production —
     * rocket_matmul_int8 does not reach it. The encoding + env knobs (ROCKET_INT8_*)
     * are retained ONLY as the sweep harness driven by the standalone classifier
     * tests/matmul_accum_int8_rocket.c, kept per the note for any future EW attempt.
-    * Integer K-accumulation is HW-dead — do not reattempt. The geometry mirrors
+    * A reattempt must set the whole precision triple to int32 (DPU 0x4010 and
+    * RDMA_FEATURE_MODE_CFG), which these knobs never touch, and it would not move the
+    * prefill wall, which is not readback. The geometry mirrors
     * fp16 (one atom = 16 bytes for both:
     * 8 fp16 x 2B == 4 int32 x 4B; C2=8 vs C2=4) only so the classifier can sweep it:
     *   EW_CFG     EDATA_SIZE 2(16b)->3(32b): 0x108202C0 -> 0x10C202C0
@@ -1362,8 +1366,9 @@ int gen_matmul_int4(matmul_params_t *params)
    dpu_desc.channel_wdma = core_desc.dataout_channel;
 
    /* Plain-conv path (no NPU K-accum): MRDMA/ERDMA disabled, MRDMA-trap-safe
-    * control flow. int4's int16 output IS <=16-bit, so DPU-EW K-accum is FEASIBLE
-    * here later (unlike int8) — deferred to the tiling step; the single-task path
+    * control flow. int4's int16 partials stay within fp32's exact-integer range, so a
+    * float-path DPU-EW K-accum could be bit-exact here — deferred to the tiling step,
+    * and moot while prefill is not readback-bound; the single-task path
     * does one K-pass, no accumulation. */
    dpu_desc.ew_accumulate = 0;
    {
@@ -1401,8 +1406,8 @@ int gen_matmul_int4(matmul_params_t *params)
  *   - int8 for the INTEGER-OUTPUT handling: int16xint16 accumulates in the 48-bit
  *     CACC and writes int32; output cube C2=4, size_e=7 (the integer-output quirk,
  *     HW-confirmed for int8's int32 AND int4's int16 — almost certainly int16's
- *     int32 too), surf*8, host int64 K-accum (DPU-EW is DEAD: int32 partials
- *     exceed the EW's <=16-bit operand DMA, like int8 — do NOT attempt EW K-accum).
+ *     int32 too), surf*8, host int64 K-accum (no DPU-EW integer K-accum is
+ *     implemented, as for int8).
  *
  * PRIME HYPOTHESIS (sweep each on HW with a small shape):
  *   precision in/proc = precision_int16 = 1 (UNCONFIRMED on this path — recall
@@ -1592,9 +1597,8 @@ int gen_matmul_int16(matmul_params_t *params)
    dpu_desc.size_c_wdma  = (uint16_t)(size_c & 0x7FF);
 
    /* Plain-conv path (no NPU K-accum): MRDMA/ERDMA disabled, MRDMA-trap-safe
-    * control flow. int16's int32 output exceeds the DPU-EW's
-    * <=16-bit operand DMA (like int8's int32), so DPU-EW K-accum is DEAD here —
-    * K-partials are summed on the HOST in int64. The block below is populated but
+    * control flow. No DPU-EW integer K-accum is implemented (as for int8's int32),
+    * so K-partials are summed on the HOST in int64. The block below is populated but
     * inert (ew_accumulate=0). */
    dpu_desc.ew_accumulate = 0;
    {
@@ -1657,8 +1661,8 @@ int gen_matmul_int16(matmul_params_t *params)
  * Plain-conv path only (ew_accumulate=0): MRDMA/ERDMA disabled — byte-identical EW
  * emission to the fp16 plain path (gen_matmul_task only reads the EW operand fields
  * when ew_accumulate=1). bf16 K-partials, if ever tiled, sum on the HOST in fp32
- * (do NOT attempt NPU bf16 EW K-accum without separate validation; the EW operand
- * DMA is <=16-bit, the same wall int8/int16 int32-accum hit). */
+ * (do NOT attempt NPU bf16 EW K-accum without separate validation: its fp32 partials
+ * need the 32-bit EW operand read, validated only for the fp16 KACC variant). */
 int gen_matmul_bf16(matmul_params_t *params)
 {
     if (rk3588_encoding_only("gen_matmul_bf16")) return -1;
@@ -1856,7 +1860,8 @@ int gen_matmul_bf16(matmul_params_t *params)
  *
  * Plain-conv path only (ew_accumulate=0): MRDMA/ERDMA disabled, byte-identical EW
  * emission to the fp16/bf16 plain path. tf32 K-partials, if ever tiled, sum on the
- * HOST in fp32 (do NOT attempt NPU EW K-accum; the EW operand DMA is <=16-bit). */
+ * HOST in fp32 (do NOT attempt NPU EW K-accum: an fp32 EW add is validated only for
+ * the fp16 KACC variant). */
 int gen_matmul_tf32(matmul_params_t *params)
 {
     if (rk3588_encoding_only("gen_matmul_tf32")) return -1;

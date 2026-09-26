@@ -11,7 +11,7 @@
  * group-wise mode against its own dtype rather than against a different one.
  *
  * It comes out at ~0.6%. The scales ride a readback the integer datapath is already forced
- * to pay (on-device integer K-accum is HW-dead, so every K-tile partial crosses to the host
+ * to pay (no on-device integer K-accum is implemented, so every K-tile partial crosses to the host
  * regardless), and the multiply-add fuses into an accumulate loop that is already there and
  * already memory-bound. Keep it that way: applying the scales in a SEPARATE pass over the
  * int32 output would turn a rounding error into a real cost.
