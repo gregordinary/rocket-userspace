@@ -142,7 +142,7 @@ static void sleep_ms(int ms)
 }
 
 /* The requant the emitter programs, in the caller's terms: scale/shift are derived
- * from the conv scale exactly as the vendor (QNNPACK) does and the DPU rounds to
+ * from the conv scale by the emitter's own derivation (npu_out_cvt_pair) and the DPU rounds to
  * nearest with ties to EVEN, so the model has to do the same integer arithmetic
  * rather than a float multiply. tests/requant_model.h carries the rule. */
 static int model_requant(int64_t acc, float scale)

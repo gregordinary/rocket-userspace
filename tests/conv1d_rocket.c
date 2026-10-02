@@ -2,11 +2,12 @@
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * conv1d_rocket.c — HW gate for the Whisper-encoder conv1d front-end (rocket_conv1d_fp16),
- * a width-only 1D conv over time lowered onto the HW-validated height-1 rocket_conv2d_fp16.
+ * a width-only 1D conv over time lowered onto the HW-validated width-1 rocket_conv2d_fp16,
+ * time on the height axis.
  *
  * Whisper's two front-end convs (KW=3, pad=1; conv1 IC=n_mels stride 1, conv2 stride 2) are
  * this op. The gate runs rocket_conv1d_fp16 on the NPU and compares to the conv2d fp32-accumulate
- * CPU oracle on the equivalent height-1 descriptor — bit-exact (the NPU narrows to fp16 exactly
+ * CPU oracle on the equivalent width-1 descriptor — bit-exact (the NPU narrows to fp16 exactly
  * as the oracle does). Covers stride 1 and 2, the Whisper IC=80/OC=512 shape (IC not %32), small
  * shapes, and an OT past one CBUF tile.
  *

@@ -70,6 +70,12 @@
  *            alone — the complement of every other sweep here, and not an empty set,
  *            since the register file is not cleared between jobs on this part.
  *   `gate`   the shape table against the measured model.
+ *   `ga54`   the whole-delta question: 0x5068, 0x5070 and 0x5074 written together with
+ *            the main feed at a second operand, and the capture replayed verbatim with
+ *            its bases patched, one and two tasks. Magnitudes, not a verdict.
+ *   `ga54b`  its follow-up: the three one at a time behind a power cycle, whether a
+ *            value left in 0x5068 stops the NEXT job's write, and the capture re-scored
+ *            with OUT_CVT_OFFSET after the shift.
  *
  * TRAPS.
  *   - A GUARD BO IS ALLOCATED FIRST in every mode. Per-fd IOVA starts at zero here, so
@@ -85,7 +91,7 @@
  *     identity skip into the convolution's own kernel. See mkadd.py.
  *
  * Usage:  rk3576_add_probe [probe|model|raw|scan|where|prim|mrdma|acc|comb|joint|span|
- *                           unwritten|gate]                              (default: gate)
+ *                           unwritten|ga54|ga54b|gate]                   (default: gate)
  * Exit:   0, 1 on a failure, 2 no NPU (skip).
  */
 #define _POSIX_C_SOURCE 200809L
@@ -1268,6 +1274,575 @@ done:
     return rc;
 }
 
+/* THE WHOLE-DELTA QUESTION, asked before any subset.
+ *
+ * `unwritten` appended one register at a time, with the MAIN FEED'S BASE (DPU_RDMA
+ * 0x5018) left at zero, and three of them (0x5068, 0x5070, 0x5074) stopped the write
+ * when written alone. A condition of two or three has no sufficient singleton, so that
+ * sweep could not have found one. This mode writes the three TOGETHER, with 0x5018
+ * pointing at a second operand B, and asks one thing per arm: does the output move when
+ * B moves?
+ *
+ * What the manufactured captures say, read from the container rather than the program:
+ * each `.rknn` carries a relocation table naming, per graph tensor, the program words the
+ * runtime patches with its address. In `bare_add_c32_16` it is `x` -> DPU_RDMA 0x5018,
+ * `x2` -> DPU_RDMA 0x5038, `y` -> DPU 0x4018, in both of its two identical program slots,
+ * and `subrev` swaps `x` and `x2`. So the vendor's FIRST operand rides the main feed.
+ * No program in any of the 127 captures writes 0x5068, 0x5070 or 0x5074. On the RK3588's
+ * map 0x5068 is RDMA_WEIGHT, the four read DMAs' arbiter weights (E/N/B/M, 8 bits each),
+ * which every RK3588-lineage emitter and the RV1106 vendor Add write as 0x01010101; 0x5070
+ * and 0x5074 are gaps there. [TRM + source-confirmed]
+ *
+ * THE UNIT is the element. Every arm runs twice over the SAME A (the EW operand, 0x5038)
+ * and two DIFFERENT non-periodic B fills (0x5018), and reports, per arm and gain:
+ *   - whether each run wrote at all (the output is stamped with a sentinel through
+ *     PREP_BO/FINI_BO), and its fenced wait, so a watchdog retirement at 500 ms reads as
+ *     a completion fact and not as a value;
+ *   - how many elements differ between the two B runs;
+ *   - how many match each model: one operand, B entering scaled by 2^14 (the vendor's
+ *     shared-scale add), and B entering raw;
+ *   - the least-squares slope of the output difference on the B difference, in output
+ *     counts per B count, which is the magnitude whatever the gain.
+ * Two gains, because a feed that enters raw is invisible where the EW operand is unity:
+ * G14 (EW 16384>>0, OUT 1>>15) sees B at 2^14 as +B/2; G0 (EW 1>>0, OUT 1>>1) sees raw B
+ * as +B/2 and saturates B at 2^14.
+ *
+ * The CONTROL is the shipped program, which programs 0x5018 already, run first and again
+ * last. A power cycle precedes every arm, because the register file is not cleared
+ * between jobs and a value one arm writes would otherwise stand in the next.
+ *
+ * Output is int8 in every arm, so nothing here widens the writer. */
+enum { GA54_C = 32, GA54_H = 6, GA54_W = 10 };
+enum { GA54_SLOT_WORDS = 128, GA54_MAX_TASKS = 2, GA54_MAX_WORDS = 104 };
+
+/* `bare_add_c32_16.rknn` (md5 c6ebbaa8), its first program slot verbatim: 89 writes and
+ * the four-word trailer, words 0x1780 onward. The second slot is byte-identical. The
+ * bases read zero here because the runtime patches them from the relocation table. */
+static const uint64_t GA54_CAPTURE[93] = {
+    0x10010000000e4004ull, 0x20010000000e5004ull, 0x100100000005400cull,
+    0x1001000000004010ull, 0x1001000000004014ull, 0x1001000000004018ull,
+    0x100100000100401cull, 0x10010000000f4020ull, 0x10010000000f4024ull,
+    0x1001000000004028ull, 0x10010000001f402cull, 0x1001001f0f004030ull,
+    0x1001000f000f4034ull, 0x1001001000124038ull, 0x100100000000403cull,
+    0x1001000000004044ull, 0x1001800000004048ull, 0x10017fffffff404cull,
+    0x1001000000004050ull, 0x1001800000004058ull, 0x10017fffffff405cull,
+    0x1001000009034060ull, 0x100180000000406cull, 0x10017fffffff4070ull,
+    0x1001800000004074ull, 0x10017fffffff4078ull, 0x10018002c0c0407cull,
+    0x1001000000014080ull, 0x100100017ffc4084ull, 0x1001800000004088ull,
+    0x10017fffffff408cull, 0x1001000000004090ull, 0x1001000000004094ull,
+    0x100100000000409cull, 0x10018000000040a4ull, 0x10017fffffff40a8ull,
+    0x1001ffffffff40acull, 0x10010001407040b0ull, 0x10010000001d40b4ull,
+    0x10010000000040b8ull, 0x10010000000040bcull, 0x10010444000040c0ull,
+    0x10010000000040c8ull, 0x10010000000040ccull, 0x10010040ffff40d0ull,
+    0x1001000000004100ull, 0x1001000000004104ull, 0x1001000000004108ull,
+    0x100100000000410cull, 0x1001000000004110ull, 0x1001000000004114ull,
+    0x1001000000004118ull, 0x100100000000411cull, 0x1001000000004120ull,
+    0x1001000000004130ull, 0x1001000000004140ull, 0x1001000000004144ull,
+    0x1001000000004148ull, 0x100100000000414cull, 0x1001000000004150ull,
+    0x1001000000004154ull, 0x1001000000004160ull, 0x1001000000004170ull,
+    0x1001000000004174ull, 0x1001000000004184ull, 0x1001000000004188ull,
+    0x100100000000418cull, 0x1001000000004190ull, 0x1001000000004194ull,
+    0x20010000000f500cull, 0x20010000000f5010ull, 0x20010000001f5014ull,
+    0x2001000000005018ull, 0x20010000001a501cull, 0x2001000000005020ull,
+    0x2001000000005024ull, 0x2001000000005028ull, 0x200100000000502cull,
+    0x2001000000005030ull, 0x2001400000445034ull, 0x2001000000005038ull,
+    0x2001000001005040ull, 0x2001000000095044ull, 0x2001000000005048ull,
+    0x200100000000504cull, 0x2001000000005064ull, 0x200100000000506cull,
+    0x2001000000005078ull, 0x200100000000507cull, 0x0000000000000000ull,
+    0x0101000000000014ull, 0x0041000000000000ull, 0x0081000000180008ull,
+};
+
+typedef struct { uint16_t reg; uint32_t val; } ga54_set;
+
+/* A value a set entry resolves at run time rather than at compile time. */
+#define GA54_IOVA_B 0xB0B0B0B0u
+
+typedef struct {
+    rocket_bo guard, a, b, o, r;
+    unsigned c, h, w;
+    size_t cube;                  /* bytes of one NC1HWC2 cube */
+    uint8_t *shadow_a, *shadow_b; /* what was loaded, whole BO, to catch a DMA write */
+} ga54_bufs;
+
+typedef struct {
+    int      rc;                  /* 0 = submitted and the fence returned           */
+    size_t   sent;                /* output bytes still the sentinel                */
+    size_t   stray;               /* bytes written PAST the cube, in the same BO    */
+    size_t   amod, bmod, gmod;    /* bytes of A, B and the IOVA-0 guard that moved  */
+    double   wait_ms;            /* the fenced wait, as the library timed it       */
+    uint64_t slow;                /* waits past the slow-wait mark                  */
+} ga54_run_stat;
+
+/* Replace a register's value where the program writes it, else insert the write before
+ * the four-word trailer, which must stay last. Returns the new word count. */
+static unsigned ga54_apply(uint64_t *ops, unsigned n, const ga54_set *set, unsigned nset,
+                           uint32_t iova_b)
+{
+    unsigned s, k;
+    for (s = 0; s < nset; s++) {
+        uint32_t v = set[s].val == GA54_IOVA_B ? iova_b : set[s].val;
+        uint16_t op = set[s].reg >= 0x5000 ? OP_REG_DPU_RDMA_ : OP_REG_DPU;
+        int found = 0;
+        for (k = 0; k + 4 < n; k++)
+            if ((uint16_t)(ops[k] & 0xFFFF) == set[s].reg &&
+                (uint16_t)(ops[k] >> 48) == op) {
+                ops[k] = NPUOP(op, v, set[s].reg);
+                found = 1;
+            }
+        if (!found && n < GA54_MAX_WORDS) {
+            memmove(&ops[n - 3], &ops[n - 4], 4 * sizeof ops[0]);
+            ops[n - 4] = NPUOP(op, v, set[s].reg);
+            n++;
+        }
+    }
+    return n;
+}
+
+/* One submit of `ntasks` copies of `prog`, over the B currently in the buffer. */
+static void ga54_submit(int fd, ga54_bufs *bf, const uint64_t *prog, unsigned n,
+                        unsigned ntasks, int8_t *out, ga54_run_stat *st)
+{
+    rocket_task_desc tasks[GA54_MAX_TASKS];
+    uint32_t in_h[4] = { bf->guard.handle, bf->a.handle, bf->b.handle, bf->r.handle };
+    uint32_t out_h[1] = { bf->o.handle };
+    unsigned surf = bf->h * bf->w, t, ci, y, x;
+    size_t i;
+
+    memset(st, 0, sizeof *st);
+    st->rc = -1;
+    rocket_bo_prep(fd, &bf->r, 1, 0);
+    memset(bf->r.ptr, 0, (size_t)GA54_SLOT_WORDS * GA54_MAX_TASKS * sizeof(uint64_t));
+    for (t = 0; t < ntasks; t++) {
+        memcpy((uint64_t *)bf->r.ptr + (size_t)t * GA54_SLOT_WORDS, prog,
+               n * sizeof(uint64_t));
+        tasks[t].regcmd = (uint32_t)bf->r.dma_address +
+                          (uint32_t)(t * GA54_SLOT_WORDS * sizeof(uint64_t));
+        tasks[t].regcmd_count = n;
+    }
+    rocket_bo_fini(fd, &bf->r);
+
+    /* The whole BO, so a write that lands past the cube is seen too. */
+    rocket_bo_prep(fd, &bf->o, 1, 0);
+    memset(bf->o.ptr, SENTINEL, bf->o.size);
+    rocket_bo_fini(fd, &bf->o);
+
+    rocket_fence_wait_counters_reset();
+    if (rocket_submit_tasks(fd, tasks, ntasks, in_h, 4, out_h, 1) != 0) return;
+    if (rocket_bo_prep(fd, &bf->o, 0, 2000000000ull) < 0) return;
+    st->rc = 0;
+    st->wait_ms = (double)rocket_fence_wait_max_us() / 1000.0;
+    st->slow = rocket_fence_wait_slow_count();
+
+    for (i = 0; i < bf->cube; i++)
+        if (((const uint8_t *)bf->o.ptr)[i] == SENTINEL) st->sent++;
+    for (; i < bf->o.size; i++)
+        if (((const uint8_t *)bf->o.ptr)[i] != SENTINEL) st->stray++;
+    for (ci = 0; ci < bf->c; ci++)
+        for (y = 0; y < bf->h; y++)
+            for (x = 0; x < bf->w; x++)
+                out[((size_t)ci * bf->h + y) * bf->w + x] =
+                    ((const int8_t *)bf->o.ptr)[cube_index(surf, bf->w, ci, y, x)];
+
+    /* A register that is a WRITE base would show here rather than in the output. */
+    rocket_bo_prep(fd, &bf->a, 0, 2000000000ull);
+    for (i = 0; i < bf->a.size; i++)
+        st->amod += ((const uint8_t *)bf->a.ptr)[i] != bf->shadow_a[i];
+    rocket_bo_fini(fd, &bf->a);
+    rocket_bo_prep(fd, &bf->b, 0, 2000000000ull);
+    for (i = 0; i < bf->b.size; i++)
+        st->bmod += ((const uint8_t *)bf->b.ptr)[i] != bf->shadow_b[i];
+    rocket_bo_fini(fd, &bf->b);
+    rocket_bo_prep(fd, &bf->guard, 0, 2000000000ull);
+    for (i = 0; i < bf->guard.size; i++)
+        st->gmod += ((const uint8_t *)bf->guard.ptr)[i] != 0;
+    rocket_bo_fini(fd, &bf->guard);
+}
+
+static void ga54_load(int fd, ga54_bufs *bf, rocket_bo *bo, const int8_t *chw)
+{
+    unsigned surf = bf->h * bf->w, ci, y, x;
+    rocket_bo_prep(fd, bo, 1, 0);
+    memset(bo->ptr, 0, bo->size);
+    for (ci = 0; ci < bf->c; ci++)
+        for (y = 0; y < bf->h; y++)
+            for (x = 0; x < bf->w; x++)
+                ((int8_t *)bo->ptr)[cube_index(surf, bf->w, ci, y, x)] =
+                    chw[((size_t)ci * bf->h + y) * bf->w + x];
+    memcpy(bo == &bf->a ? bf->shadow_a : bf->shadow_b, bo->ptr, bo->size);
+    rocket_bo_fini(fd, bo);
+}
+
+/* The part's arithmetic with a second operand added to the accumulator at weight kb:
+ * `kb` 0 is the one-operand model the shipped program is gated against, 16384 is B at
+ * the EW operand's unity scale, 1 is B raw. The part adds OUT_CVT_OFFSET AFTER the shift,
+ * in output counts: the capture replays (whose offset is -1) are 8192 of 8192 exact that
+ * way and every element off by one with it added before the scale [HW, H96, 2026-09-26].
+ * `ga54` keeps the before-the-scale placement its first run was scored under, which is
+ * exact wherever the offset is zero; `ga54b` sets g_ga54_off_post and scores after. */
+static int g_ga54_off_post;       /* ga54b: OUT_CVT_OFFSET added after the shift */
+
+static int ga54_model(int a, int b, int64_t kb, const ew_params_rk3576_t *p)
+{
+    int64_t v = (((int64_t)a + p->ew_offset) * (int64_t)p->ew_scale) >> p->ew_shift;
+    int64_t out, q, r, half = (int64_t)1 << p->out_shift;
+
+    v += kb * b;
+    if (!g_ga54_off_post) v += p->out_offset;
+    out = v * (int64_t)(int16_t)p->out_scale;
+    q = out >> p->out_shift;
+    r = out - (q << p->out_shift);
+    if (r * 2 > half) q += 1;
+    else if (r * 2 == half && (q & 1)) q += 1;
+    if (g_ga54_off_post) q += p->out_offset;
+    if (q < p->clamp_lo) q = p->clamp_lo;
+    if (q > p->clamp_hi) q = p->clamp_hi;
+    if (q < -128) q = -128;
+    if (q > 127) q = 127;
+    return (int)q;
+}
+
+/* Run one arm at one gain: two submits over B1 and B2, the same A. Prints one line of
+ * magnitudes and returns the number of elements that did not match the one-operand
+ * model in either run (the control's assertion), or -1 on a submit that never returned. */
+static long ga54_arm(int fd, ga54_bufs *bf, const char *arm, const char *gain,
+                     const uint64_t *prog, unsigned n, unsigned ntasks,
+                     const ew_params_rk3576_t *mp, const int8_t *a,
+                     const int8_t *b1, const int8_t *b2, int verbose)
+{
+    static const int64_t KB[3] = { 0, 16384, 1 };
+    size_t N = (size_t)bf->c * bf->h * bf->w, i;
+    int8_t *o1 = malloc(N), *o2 = malloc(N);
+    ga54_run_stat s1, s2;
+    size_t changed = 0, m[2][3] = { { 0 } }, fitn = 0;
+    int maxd0 = 0;
+    double sxy = 0.0, sxx = 0.0, slope;
+    unsigned k;
+    long bad0 = 0;
+
+    if (!o1 || !o2) { free(o1); free(o2); return -1; }
+    ga54_load(fd, bf, &bf->b, b1);
+    ga54_submit(fd, bf, prog, n, ntasks, o1, &s1);
+    ga54_load(fd, bf, &bf->b, b2);
+    ga54_submit(fd, bf, prog, n, ntasks, o2, &s2);
+    if (s1.rc || s2.rc) {
+        printf("  %-4s %-4s submit or fence failed (rc %d / %d)\n", arm, gain, s1.rc, s2.rc);
+        free(o1); free(o2);
+        return -1;
+    }
+
+    for (i = 0; i < N; i++) {
+        int d0;
+        if (o1[i] != o2[i]) changed++;
+        for (k = 0; k < 3; k++) {
+            if (o1[i] == ga54_model(a[i], b1[i], KB[k], mp)) m[0][k]++;
+            if (o2[i] == ga54_model(a[i], b2[i], KB[k], mp)) m[1][k]++;
+        }
+        d0 = o1[i] - ga54_model(a[i], b1[i], 0, mp);
+        if (d0 < 0) d0 = -d0;
+        if (d0 > maxd0) maxd0 = d0;
+        if (o1[i] != ga54_model(a[i], b1[i], 0, mp) ||
+            o2[i] != ga54_model(a[i], b2[i], 0, mp)) bad0++;
+        /* The slope over the elements neither run saturated or left unwritten. */
+        if (o1[i] > -128 && o1[i] < 127 && o2[i] > -128 && o2[i] < 127 &&
+            (uint8_t)o1[i] != SENTINEL && (uint8_t)o2[i] != SENTINEL) {
+            double dx = (double)b1[i] - (double)b2[i];
+            double dy = (double)o1[i] - (double)o2[i];
+            sxy += dx * dy; sxx += dx * dx; fitn++;
+        }
+    }
+    slope = sxx > 0.0 ? sxy / sxx : 0.0;
+
+    printf("  %-4s %-4s wrote %zu/%zu, %zu/%zu (stray %zu,%zu; A/B/guard moved "
+           "%zu/%zu/%zu, %zu/%zu/%zu)  wait %.2f/%.2f ms slow %llu/%llu | changed "
+           "%zu/%zu slope %+.4f (n %zu) | one-op %zu,%zu (max d %d) B@2^14 %zu,%zu  "
+           "B raw %zu,%zu\n",
+           arm, gain, bf->cube - s1.sent, bf->cube, bf->cube - s2.sent, bf->cube,
+           s1.stray, s2.stray, s1.amod, s1.bmod, s1.gmod, s2.amod, s2.bmod, s2.gmod,
+           s1.wait_ms, s2.wait_ms, (unsigned long long)s1.slow,
+           (unsigned long long)s2.slow, changed, N, slope, fitn,
+           m[0][0], m[1][0], maxd0, m[0][1], m[1][1], m[0][2], m[1][2]);
+    if (verbose)
+        for (i = 0; i < 4; i++) {
+            size_t e = i * 331 % N;
+            printf("         [%4zu] a %4d  b1 %4d b2 %4d  ->  %4d %4d   (one-op %4d, "
+                   "B@2^14 %4d %4d)\n", e, a[e], b1[e], b2[e], o1[e], o2[e],
+                   ga54_model(a[e], b1[e], 0, mp), ga54_model(a[e], b1[e], 16384, mp),
+                   ga54_model(a[e], b2[e], 16384, mp));
+        }
+    free(o1); free(o2);
+    return bad0;
+}
+
+static int mode_ga54(int fd)
+{
+    /* The whole deltas. Every arm also keeps the shipped program's main-feed fields:
+     * 0x5018 at B, DPU 0x400C bit 0 set and DPU_RDMA 0x5044 = 0x9 (MRDMA_DISABLE clear). */
+    static const ga54_set D1[] = { { 0x5068, GA54_IOVA_B }, { 0x5070, GA54_IOVA_B },
+                                   { 0x5074, GA54_IOVA_B } };
+    static const ga54_set D2[] = { { 0x5068, 0x01010101u }, { 0x5070, GA54_IOVA_B },
+                                   { 0x5074, GA54_IOVA_B } };
+    static const ga54_set D3[] = { { 0x5068, 0x01010101u }, { 0x5070, 0 }, { 0x5074, 0 } };
+    static const ga54_set D4[] = { { 0x5068, 0 }, { 0x5070, 0 }, { 0x5074, 0 } };
+    static const ga54_set D5[] = { { 0x5068, 0x01010101u },
+                                   { 0x5070, GA54_H * GA54_W }, { 0x5074, GA54_W } };
+    /* D3 plus the RV1106 vendor Add's own DPU_RDMA feature-mode word, verbatim: the
+     * ancestor's full main-feed configuration where this part's capture has 0x9. */
+    static const ga54_set D6[] = { { 0x5068, 0x01010101u }, { 0x5070, 0 }, { 0x5074, 0 },
+                                   { 0x5044, 0x00907809u } };
+    static const struct { const char *name; const ga54_set *set; unsigned n; } ARMS[] = {
+        { "C0", NULL, 0 }, { "D1", D1, 3 }, { "D2", D2, 3 }, { "D3", D3, 3 },
+        { "D4", D4, 3 }, { "D5", D5, 3 }, { "D6", D6, 4 }, { "C1", NULL, 0 },
+    };
+    static const struct { const char *name; uint16_t es; uint8_t esh, osh; } GAINS[] = {
+        { "G14", 16384, 0, 15 }, { "G0", 1, 0, 1 },
+    };
+    ga54_bufs bf;
+    size_t N = (size_t)GA54_C * GA54_H * GA54_W;
+    size_t NV = 32u * 16 * 16;
+    size_t maxn = NV > N ? NV : N;
+    int8_t *a = malloc(maxn), *b1 = malloc(maxn), *b2 = malloc(maxn);
+    uint64_t ops[GA54_MAX_WORDS];
+    unsigned i, g, n;
+    int ctl_fail = 0, rc = -1;
+    uint64_t emit_diff = 0;
+
+    memset(&bf, 0, sizeof bf);
+    if (!a || !b1 || !b2) goto done;
+    bf.shadow_a = calloc(1, 16384);
+    bf.shadow_b = calloc(1, 16384);
+    if (!bf.shadow_a || !bf.shadow_b) goto done;
+    bf.c = 32; bf.h = 16; bf.w = 16;              /* sized for the larger, capture shape */
+    bf.cube = NV;
+    /* The guard first, so nothing of ours sits at IOVA 0. */
+    if (rocket_bo_alloc(fd, 4096, &bf.guard) < 0) goto done;
+    if (rocket_bo_alloc(fd, NV, &bf.a) < 0) goto done;
+    if (rocket_bo_alloc(fd, NV, &bf.b) < 0) goto done;
+    if (rocket_bo_alloc(fd, NV, &bf.o) < 0) goto done;
+    if (rocket_bo_alloc(fd, (size_t)GA54_SLOT_WORDS * GA54_MAX_TASKS * sizeof(uint64_t),
+                        &bf.r) < 0) goto done;
+    if (bf.a.size > 16384 || bf.b.size > 16384) { printf("  operand BO too large\n"); goto done; }
+
+    printf("ga54: the three stoppers written together, with the main feed at B.\n"
+           "      guard 0x%08llx  A(0x5038) 0x%08llx  B(0x5018) 0x%08llx  out 0x%08llx\n",
+           (unsigned long long)bf.guard.dma_address, (unsigned long long)bf.a.dma_address,
+           (unsigned long long)bf.b.dma_address, (unsigned long long)bf.o.dma_address);
+    printf("      columns: bytes written run1,run2 of the cube; fenced wait; elements that\n"
+           "      differ between the B fills; slope of out on B (counts per count);\n"
+           "      elements matching each model in run1,run2.\n");
+
+    /* ---- the emitter arms, c32 6x10 ---- */
+    bf.c = GA54_C; bf.h = GA54_H; bf.w = GA54_W;
+    bf.cube = (size_t)(GA54_C / C2) * GA54_H * GA54_W * C2;
+    fill_ramp(a, N, 541);
+    fill_ramp(b1, N, 542);
+    fill_ramp(b2, N, 543);
+    ga54_load(fd, &bf, &bf.a, a);
+    printf("  shape c%u %ux%u, %zu elements\n", GA54_C, GA54_H, GA54_W, N);
+
+    for (i = 0; i < sizeof ARMS / sizeof *ARMS; i++) {
+        rocket_rk3576_power_idle();
+        for (g = 0; g < sizeof GAINS / sizeof *GAINS; g++) {
+            ew_params_rk3576_t p;
+            long bad;
+            base_params(&p, GA54_C, GA54_H, GA54_W);
+            p.ew_scale = GAINS[g].es; p.ew_shift = GAINS[g].esh;
+            p.out_scale = 1; p.out_shift = GAINS[g].osh;
+            p.src_dma = (uint32_t)bf.b.dma_address;
+            p.ew_dma = (uint32_t)bf.a.dma_address;
+            p.dst_dma = (uint32_t)bf.o.dma_address;
+            p.tasks = ops;
+            memset(ops, 0, sizeof ops);
+            if (gen_ew_int8_rk3576(&p) != 0) { printf("  generator refused\n"); goto done; }
+            n = ga54_apply(ops, p.task_count, ARMS[i].set, ARMS[i].n,
+                           (uint32_t)bf.b.dma_address);
+            bad = ga54_arm(fd, &bf, ARMS[i].name, GAINS[g].name, ops, n, 1, &p,
+                           a, b1, b2, 0);
+            if (ARMS[i].set == NULL && bad != 0) ctl_fail++;
+        }
+    }
+
+    /* ---- the capture verbatim, c32 16x16, its own converters ---- */
+    {
+        ew_params_rk3576_t p;
+        static const ga54_set BASES[] = { { 0x5018, GA54_IOVA_B }, { 0x5038, 0 },
+                                          { 0x4018, 0 } };
+        ga54_set bases[3];
+        uint64_t cap[GA54_MAX_WORDS];
+        static const struct { const char *name; unsigned ntasks; const ga54_set *set;
+                              unsigned n; } VARMS[] = {
+            { "V1", 1, NULL, 0 }, { "V2", 2, NULL, 0 }, { "V3", 2, D3, 3 },
+        };
+
+        bf.c = 32; bf.h = 16; bf.w = 16;
+        bf.cube = NV;
+        fill_ramp(a, NV, 641);
+        fill_ramp(b1, NV, 642);
+        fill_ramp(b2, NV, 643);
+        ga54_load(fd, &bf, &bf.a, a);
+
+        /* The capture's converters, read off its words: EW offset 1, scale 32764 >> 1,
+         * OUT offset -1, scale 16496 >> 29. */
+        base_params(&p, 32, 16, 16);
+        p.ew_offset = 1; p.ew_scale = 32764; p.ew_shift = 1;
+        p.out_offset = -1; p.out_scale = 16496; p.out_shift = 29;
+
+        /* Self-check: the emitter at those converters against the capture, word by word
+         * with the bases zeroed as stored. */
+        p.src_dma = 0; p.ew_dma = 0; p.dst_dma = 0;
+        p.tasks = ops;
+        memset(ops, 0, sizeof ops);
+        if (gen_ew_int8_rk3576(&p) == 0 && p.task_count == 93)
+            for (i = 0; i < 93; i++) emit_diff += ops[i] != GA54_CAPTURE[i];
+        else
+            emit_diff = 999;
+        printf("  capture c32 16x16, %zu elements; the emitter at its converters differs "
+               "from it in %llu of 93 words\n", NV, (unsigned long long)emit_diff);
+
+        memcpy(bases, BASES, sizeof bases);
+        bases[1].val = (uint32_t)bf.a.dma_address;
+        bases[2].val = (uint32_t)bf.o.dma_address;
+        for (i = 0; i < sizeof VARMS / sizeof *VARMS; i++) {
+            rocket_rk3576_power_idle();
+            memset(cap, 0, sizeof cap);
+            memcpy(cap, GA54_CAPTURE, sizeof GA54_CAPTURE);
+            n = ga54_apply(cap, 93, bases, 3, (uint32_t)bf.b.dma_address);
+            n = ga54_apply(cap, n, VARMS[i].set, VARMS[i].n, (uint32_t)bf.b.dma_address);
+            (void)ga54_arm(fd, &bf, VARMS[i].name, "cap", cap, n, VARMS[i].ntasks, &p,
+                           a, b1, b2, 1);
+        }
+    }
+
+    rocket_rk3576_power_idle();
+    printf("== controls: %d gain(s) not exact against the one-operand model ==\n", ctl_fail);
+    rc = ctl_fail || emit_diff ? 1 : 0;
+done:
+    free(a); free(b1); free(b2);
+    free(bf.shadow_a); free(bf.shadow_b);
+    if (bf.guard.ptr) rocket_bo_free(fd, &bf.guard);
+    if (bf.a.ptr) rocket_bo_free(fd, &bf.a);
+    if (bf.b.ptr) rocket_bo_free(fd, &bf.b);
+    if (bf.o.ptr) rocket_bo_free(fd, &bf.o);
+    if (bf.r.ptr) rocket_bo_free(fd, &bf.r);
+    return rc;
+}
+
+/* FOLLOW-UP, run after `ga54` and not part of its logged prediction.
+ *
+ * `ga54` found the write stopping with all three written ZERO (D4) as well as with all
+ * three at an address (D1), and NOT with 0x5068 = 0x01010101 and the other two at the
+ * same address (D2). The single-register record ran 0x5068 immediately before 0x5070 and
+ * 0x5074 with no power cycle between, and the register file is not cleared between jobs,
+ * so the value that sweep left in 0x5068 was still standing when the other two ran. This
+ * separates the three:
+ *   S1-S3  each register alone at B's address, a power cycle before each;
+ *   L      0x5068 at B's address, then the shipped program with NO power cycle between,
+ *          then a power cycle and the shipped program again — whether a value one job
+ *          leaves in 0x5068 stops the next job's write.
+ * And it re-scores the verbatim capture with OUT_CVT_OFFSET added AFTER the shift, the
+ * placement `ga54`'s uniform one-count miss points at. */
+static int mode_ga54b(int fd)
+{
+    static const ga54_set S1[] = { { 0x5070, GA54_IOVA_B } };
+    static const ga54_set S2[] = { { 0x5074, GA54_IOVA_B } };
+    static const ga54_set S3[] = { { 0x5068, GA54_IOVA_B } };
+    static const struct { const char *name; const ga54_set *set; unsigned n; int idle; }
+    STEPS[] = {
+        { "C0", NULL, 0, 1 }, { "S1", S1, 1, 1 }, { "S2", S2, 1, 1 }, { "S3", S3, 1, 1 },
+        { "C0", NULL, 0, 1 },
+        /* the leak: S3, then C0 with no cycle, then C0 behind a cycle */
+        { "L:S3", S3, 1, 1 }, { "L:C0", NULL, 0, 0 }, { "L:C0", NULL, 0, 0 },
+        { "L:C0", NULL, 0, 1 },
+    };
+    ga54_bufs bf;
+    size_t N = (size_t)GA54_C * GA54_H * GA54_W, NV = 32u * 16 * 16;
+    int8_t *a = malloc(NV), *b1 = malloc(NV), *b2 = malloc(NV);
+    uint64_t ops[GA54_MAX_WORDS];
+    unsigned i, n;
+    int rc = -1;
+
+    memset(&bf, 0, sizeof bf);
+    if (!a || !b1 || !b2) goto done;
+    bf.shadow_a = calloc(1, 16384);
+    bf.shadow_b = calloc(1, 16384);
+    if (!bf.shadow_a || !bf.shadow_b) goto done;
+    if (rocket_bo_alloc(fd, 4096, &bf.guard) < 0) goto done;
+    if (rocket_bo_alloc(fd, NV, &bf.a) < 0) goto done;
+    if (rocket_bo_alloc(fd, NV, &bf.b) < 0) goto done;
+    if (rocket_bo_alloc(fd, NV, &bf.o) < 0) goto done;
+    if (rocket_bo_alloc(fd, (size_t)GA54_SLOT_WORDS * GA54_MAX_TASKS * sizeof(uint64_t),
+                        &bf.r) < 0) goto done;
+    if (bf.a.size > 16384 || bf.b.size > 16384) goto done;
+
+    printf("ga54b: the three one at a time behind a power cycle, and the standing-value "
+           "leak.\n      guard 0x%08llx  A 0x%08llx  B 0x%08llx  out 0x%08llx\n",
+           (unsigned long long)bf.guard.dma_address, (unsigned long long)bf.a.dma_address,
+           (unsigned long long)bf.b.dma_address, (unsigned long long)bf.o.dma_address);
+
+    bf.c = GA54_C; bf.h = GA54_H; bf.w = GA54_W;
+    bf.cube = (size_t)(GA54_C / C2) * GA54_H * GA54_W * C2;
+    fill_ramp(a, N, 541);
+    fill_ramp(b1, N, 542);
+    fill_ramp(b2, N, 543);
+    ga54_load(fd, &bf, &bf.a, a);
+    /* GA54B_ONLY_V=1 skips the steps: they leave 0x5068 standing at an address, and the
+     * re-score below then measures that instead of the capture. */
+    for (i = 0; i < sizeof STEPS / sizeof *STEPS &&
+                !(getenv("GA54B_ONLY_V") && *getenv("GA54B_ONLY_V") == '1'); i++) {
+        ew_params_rk3576_t p;
+        if (STEPS[i].idle) rocket_rk3576_power_idle();
+        base_params(&p, GA54_C, GA54_H, GA54_W);
+        p.out_shift = 15;                                       /* G14 */
+        p.src_dma = (uint32_t)bf.b.dma_address;
+        p.ew_dma = (uint32_t)bf.a.dma_address;
+        p.dst_dma = (uint32_t)bf.o.dma_address;
+        p.tasks = ops;
+        memset(ops, 0, sizeof ops);
+        if (gen_ew_int8_rk3576(&p) != 0) goto done;
+        n = ga54_apply(ops, p.task_count, STEPS[i].set, STEPS[i].n,
+                       (uint32_t)bf.b.dma_address);
+        printf("  step %u %s\n", i, STEPS[i].idle ? "(behind a power cycle)"
+                                                  : "(NO power cycle before it)");
+        (void)ga54_arm(fd, &bf, STEPS[i].name, "G14", ops, n, 1, &p, a, b1, b2, 0);
+    }
+
+    /* The verbatim capture, re-scored with the offset after the shift. */
+    {
+        ew_params_rk3576_t p;
+        ga54_set bases[3] = { { 0x5018, GA54_IOVA_B }, { 0x5038, 0 }, { 0x4018, 0 } };
+        uint64_t cap[GA54_MAX_WORDS];
+        bf.c = 32; bf.h = 16; bf.w = 16;
+        bf.cube = NV;
+        fill_ramp(a, NV, 641);
+        fill_ramp(b1, NV, 642);
+        fill_ramp(b2, NV, 643);
+        ga54_load(fd, &bf, &bf.a, a);
+        base_params(&p, 32, 16, 16);
+        p.ew_offset = 1; p.ew_scale = 32764; p.ew_shift = 1;
+        p.out_offset = -1; p.out_scale = 16496; p.out_shift = 29;
+        bases[1].val = (uint32_t)bf.a.dma_address;
+        bases[2].val = (uint32_t)bf.o.dma_address;
+        rocket_rk3576_power_idle();
+        memset(cap, 0, sizeof cap);
+        memcpy(cap, GA54_CAPTURE, sizeof GA54_CAPTURE);
+        n = ga54_apply(cap, 93, bases, 3, (uint32_t)bf.b.dma_address);
+        g_ga54_off_post = 1;
+        printf("  the capture, one task, models with OUT_CVT_OFFSET after the shift\n");
+        (void)ga54_arm(fd, &bf, "V1", "post", cap, n, 1, &p, a, b1, b2, 1);
+        g_ga54_off_post = 0;
+    }
+    rocket_rk3576_power_idle();
+    rc = 0;
+done:
+    free(a); free(b1); free(b2);
+    free(bf.shadow_a); free(bf.shadow_b);
+    if (bf.guard.ptr) rocket_bo_free(fd, &bf.guard);
+    if (bf.a.ptr) rocket_bo_free(fd, &bf.a);
+    if (bf.b.ptr) rocket_bo_free(fd, &bf.b);
+    if (bf.o.ptr) rocket_bo_free(fd, &bf.o);
+    if (bf.r.ptr) rocket_bo_free(fd, &bf.r);
+    return rc;
+}
+
 typedef struct { const char *name; unsigned c, h, w; } shape;
 
 static const shape SHAPES[] = {
@@ -1349,8 +1924,10 @@ int main(int argc, char **argv)
     else if (!strcmp(mode, "joint")) rc = mode_joint(fd);
     else if (!strcmp(mode, "span"))  rc = mode_span(fd);
     else if (!strcmp(mode, "unwritten")) rc = mode_unwritten(fd);
+    else if (!strcmp(mode, "ga54"))  rc = mode_ga54(fd);
+    else if (!strcmp(mode, "ga54b")) rc = mode_ga54b(fd);
     else if (!strcmp(mode, "gate"))  rc = mode_gate(fd);
-    else { printf("usage: %s [probe|model|raw|scan|where|prim|mrdma|acc|comb|joint|span|unwritten|gate]\n",
+    else { printf("usage: %s [probe|model|raw|scan|where|prim|mrdma|acc|comb|joint|span|unwritten|ga54|ga54b|gate]\n",
                   argv[0]); rc = 1; }
 
     rocket_close(fd);

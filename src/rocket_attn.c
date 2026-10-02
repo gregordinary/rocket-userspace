@@ -428,10 +428,18 @@ typedef struct {
     _Float16 **pC;
     size_t c_ptr;                                /* allocated pointer-array length     */
 
-    /* Per-worker persistent batched-matmul contexts (one per shape: QK and AV
-     * alternate, so a shared context would re-zero every op). NULL on the stateless /
-     * single-fd paths, where the chained matmul allocates its BOs per call. */
-    rocket_mm_batch *qk, *av;
+    /* Per-worker persistent batched-matmul contexts: one per op (QK and AV alternate, so
+     * a shared context would re-zero every op) AND per size class of Tp x Kn. A context
+     * grows its BOs to the largest shape it has seen, clears the whole BO on a layout
+     * change, and syncs the whole BO around every pack; one context per op therefore made
+     * every short call after a long one pay for the long one's buffers (+54% on a
+     * 58-token encoder batch after a 726-token call, on a kernel without ranged sync).
+     * A class spans 4x in Tp x Kn, so a call pays for at most 4x its own size. Created on
+     * first use of a class; bfd < 0 on the stateless / single-fd paths, where the chained
+     * matmul allocates its BOs per call. */
+#define FA_BCLS 8
+    rocket_mm_batch *qk[FA_BCLS], *av[FA_BCLS];
+    int bfd;
 
     /* Online/tiled (long-context) running-softmax accumulators, all fp32 for stability:
      * running max fm[Tp], running denom fl[Tp], unnormalized output facc[Tp*dh]. Small
@@ -507,15 +515,27 @@ static int fa_batch_ensure(fa_scratch *s, int Gmax, int Tp, int Kn, int dh)
     return 0;
 }
 
+/* The worker's batched-matmul context for this op at (Tp,Kn): one per 4x class of Tp x Kn,
+ * created on first use. NULL when the worker has none (the per-call paths), or on a create
+ * failure, which the caller answers with the per-call chained matmul. */
+static rocket_mm_batch *fa_batch_ctx(fa_scratch *s, rocket_mm_batch **set, int Tp, int Kn)
+{
+    if (s->bfd < 0) return NULL;
+    int c = 0;
+    for (size_t e = (size_t)Tp * Kn; e > 4096 && c < FA_BCLS - 1; e >>= 2) c++;
+    if (!set[c]) set[c] = rocket_mm_batch_create(s->bfd);
+    return set[c];
+}
+
 static void fa_scratch_free(fa_scratch *s)
 {
-    rocket_mm_batch_free(s->qk);
-    rocket_mm_batch_free(s->av);
+    for (int c = 0; c < FA_BCLS; c++) { rocket_mm_batch_free(s->qk[c]); rocket_mm_batch_free(s->av[c]); }
     free(s->qh); free(s->kh); free(s->vh); free(s->sc); free(s->P); free(s->ctx);
     free(s->bqh); free(s->bkh); free(s->bsc); free(s->bP); free(s->bvh); free(s->bcx);
     free(s->pA); free(s->pB); free(s->pC);
     free(s->fm); free(s->fl); free(s->facc);
     memset(s, 0, sizeof *s);
+    s->bfd = -1;
 }
 
 /* ############################################################################
@@ -562,6 +582,102 @@ static void fa_mask_scores(_Float16 *sc, const _Float16 *mask, int n_tokens, int
             row[j] = (_Float16)fa_score((float)row[j], scale, softcap, mr ? (float)mr[j] : 0.0f);
         for (int j = n_kv; j < Kn; j++) row[j] = (_Float16)(-30000.0f);
     }
+}
+
+/* ---- fused host softmax (ROCKET_FA_FUSED_SOFTMAX, default ON) ------------------------
+ * fa_mask_scores + host_softmax_rows walk a head's [Tp,Kn] scores four times and round twice:
+ * the scaled, masked score is stored as fp16, then each exponential is stored as fp16 and read
+ * back to normalize. This does one row at a time in fp32 (score, mask, max, exp, sum, scale)
+ * and rounds to fp16 once, with a vectorized exp (Cephes range reduction and a degree-6
+ * polynomial, ~1 fp32 ulp, far below the fp16 output). A soft-cap keeps the scalar tanhf.
+ * The vector types are GCC extensions, so this is NEON on the board and SSE elsewhere. */
+typedef float    fa_f4 __attribute__((vector_size(16)));
+typedef int32_t  fa_i4 __attribute__((vector_size(16)));
+typedef _Float16 fa_h4 __attribute__((vector_size(8)));
+
+static int fa_fused_softmax(void)
+{
+    static _Atomic int v = -1;
+    if (v < 0) { const char *e = getenv("ROCKET_FA_FUSED_SOFTMAX"); v = e ? atoi(e) : 1; }
+    return v;
+}
+
+static inline fa_f4 fa_sel(fa_i4 m, fa_f4 a, fa_f4 b)   /* m ? a : b, lane-wise */
+{
+    return (fa_f4)(((fa_i4)a & m) | ((fa_i4)b & ~m));
+}
+
+static inline fa_f4 fa_vexp(fa_f4 x)
+{
+    const fa_f4 hi = { 88.3762626647949f, 88.3762626647949f, 88.3762626647949f, 88.3762626647949f };
+    const fa_f4 lo = -hi;
+    x = fa_sel(x > hi, hi, x);
+    x = fa_sel(x < lo, lo, x);
+    fa_f4 fx = x * 1.44269504088896341f + 0.5f;
+    fa_i4 n = __builtin_convertvector(fx, fa_i4);            /* truncates toward zero */
+    fa_f4 fn = __builtin_convertvector(n, fa_f4);
+    n = n + (fa_i4)(fn > fx);                                /* floor: -1 where truncation rounded up */
+    fn = __builtin_convertvector(n, fa_f4);
+    x = x - fn * 0.693359375f - fn * -2.12194440e-4f;
+    fa_f4 z = x * x;
+    fa_f4 y = x * 1.9875691500e-4f + 1.3981999507e-3f;
+    y = y * x + 8.3334519073e-3f;
+    y = y * x + 4.1665795894e-2f;
+    y = y * x + 1.6666665459e-1f;
+    y = y * x + 5.0000001201e-1f;
+    y = y * z + x + 1.0f;
+    fa_i4 e = (n + 127) << 23;
+    return y * (fa_f4)e;
+}
+
+static void fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mask, int n_tokens,
+                             int n_kv, int Tp, int Kn, float scale, float softcap)
+{
+    float stackbuf[4096];
+    float *buf = Kn <= 4096 ? stackbuf : malloc((size_t)Kn * sizeof(float));
+    if (!buf) { fa_mask_scores((_Float16 *)sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+                host_softmax_rows(Tp, Kn, sc, P); return; }
+    const fa_f4 floor4 = { -30000.f, -30000.f, -30000.f, -30000.f };
+    const int nv = softcap != 0.0f ? 0 : (n_kv & ~3);
+    for (int i = 0; i < Tp; i++) {
+        const _Float16 *row = sc + (size_t)i * Kn;
+        const _Float16 *mr = (mask && i < n_tokens) ? mask + (size_t)i * n_kv : NULL;
+        fa_f4 vmax = floor4;
+        int j = 0;
+        for (; j < nv; j += 4) {
+            fa_h4 hq; memcpy(&hq, row + j, sizeof hq);
+            fa_f4 s = __builtin_convertvector(hq, fa_f4) * scale;
+            if (mr) { fa_h4 hm; memcpy(&hm, mr + j, sizeof hm); s += __builtin_convertvector(hm, fa_f4); }
+            s = fa_sel(s < floor4, floor4, s);
+            memcpy(buf + j, &s, sizeof s);
+            vmax = fa_sel(s > vmax, s, vmax);
+        }
+        float mx = vmax[0];
+        for (int k = 1; k < 4; k++) if (vmax[k] > mx) mx = vmax[k];
+        for (; j < n_kv; j++) {
+            float s = fa_score((float)row[j], scale, softcap, mr ? (float)mr[j] : 0.0f);
+            buf[j] = s;
+            if (s > mx) mx = s;
+        }
+        for (; j < Kn; j++) buf[j] = -30000.0f;   /* pad keys */
+        const fa_f4 m4 = { mx, mx, mx, mx };
+        fa_f4 vs = { 0, 0, 0, 0 };
+        for (j = 0; j < Kn; j += 4) {             /* Kn % 32 == 0 */
+            fa_f4 s; memcpy(&s, buf + j, sizeof s);
+            fa_f4 e = fa_vexp(s - m4);
+            memcpy(buf + j, &e, sizeof e);
+            vs += e;
+        }
+        const float sum = vs[0] + vs[1] + vs[2] + vs[3];
+        const float inv = sum > 0.f ? 1.f / sum : 0.f;
+        _Float16 *op = P + (size_t)i * Kn;
+        for (j = 0; j < Kn; j += 4) {
+            fa_f4 e; memcpy(&e, buf + j, sizeof e);
+            fa_h4 h = __builtin_convertvector(e * inv, fa_h4);
+            memcpy(op + j, &h, sizeof h);
+        }
+    }
+    if (buf != stackbuf) free(buf);
 }
 
 /* gather kv head hk's value COLUMNS [j0,j0+w) into vh[dh,wp] = v_tile^T (the AV B-operand for
@@ -632,7 +748,8 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
         }
         FA_ACC(pf, gather, t0);
         t0 = FA_T0(pf);
-        rc = s->qk ? rocket_mm_batch_run(s->qk, Tp, dh, Kn, G, pA, pB, pC)
+        rocket_mm_batch *bqk = fa_batch_ctx(s, s->qk, Tp, Kn);
+        rc = bqk ? rocket_mm_batch_run(bqk, Tp, dh, Kn, G, pA, pB, pC)
                    : rocket_matmul_fp16_batch(fd, Tp, dh, Kn, G, pA, pB, pC);
         FA_ACC(pf, qk, t0);
         if (rc) break;
@@ -642,12 +759,17 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
             const int h = gh + g, hk = h / gqa;
             _Float16 *scg = sc + (size_t)g * tk, *Pg = P + (size_t)g * tk;
             t0 = FA_T0(pf);
-            fa_mask_scores(scg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
-            FA_ACC(pf, mask, t0);
-            t0 = FA_T0(pf);
-            if (host_sm) host_softmax_rows(Tp, Kn, scg, Pg);
-            else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, scg, Pg)) != 0) { FA_ACC(pf, softmax, t0); break; }
-            FA_ACC(pf, softmax, t0);
+            if (host_sm && fa_fused_softmax()) {
+                fa_softmax_fused(scg, Pg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+                FA_ACC(pf, softmax, t0);
+            } else {
+                fa_mask_scores(scg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+                FA_ACC(pf, mask, t0);
+                t0 = FA_T0(pf);
+                if (host_sm) host_softmax_rows(Tp, Kn, scg, Pg);
+                else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, scg, Pg)) != 0) { FA_ACC(pf, softmax, t0); break; }
+                FA_ACC(pf, softmax, t0);
+            }
             t0 = FA_T0(pf);
             fa_gather_v(vh + (size_t)g * kd, V + (size_t)hk * dh * n_kv, n_kv, Kn, dh);
             FA_ACC(pf, gather, t0);
@@ -655,7 +777,8 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
         }
         if (rc) break;
         t0 = FA_T0(pf);
-        rc = s->av ? rocket_mm_batch_run(s->av, Tp, Kn, dh, G, pA, pB, pC)
+        rocket_mm_batch *bav = fa_batch_ctx(s, s->av, Tp, Kn);
+        rc = bav ? rocket_mm_batch_run(bav, Tp, Kn, dh, G, pA, pB, pC)
                    : rocket_matmul_fp16_batch(fd, Tp, Kn, dh, G, pA, pB, pC);
         FA_ACC(pf, av, t0);
         if (rc) break;
@@ -872,18 +995,22 @@ static int fa_heads_range(int fd, int n_tokens, int n_kv, int head_dim, int dv,
         FA_ACC(pf, qk, t0);
         if (rc != 0) { fa_prof_merge(pf); return rc; }
 
-        /* scale + soft-cap + mask, in place; pad key columns -> -inf */
+        /* scale + soft-cap + mask + softmax over the Kn columns (pad columns -> ~0): fused
+         * on the host by default, else the in-place mask pass then the softmax */
         t0 = FA_T0(pf);
-        fa_mask_scores(sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
-        FA_ACC(pf, mask, t0);
-
-        /* P = softmax(scores) over the Kn columns (pad columns -> ~0) */
-        t0 = FA_T0(pf);
-        if (host_sm) host_softmax_rows(Tp, Kn, sc, P);
-        else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, sc, P)) != 0) {
-            FA_ACC(pf, softmax, t0); fa_prof_merge(pf); return rc;
+        if (host_sm && fa_fused_softmax()) {
+            fa_softmax_fused(sc, P, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+            FA_ACC(pf, softmax, t0);
+        } else {
+            fa_mask_scores(sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+            FA_ACC(pf, mask, t0);
+            t0 = FA_T0(pf);
+            if (host_sm) host_softmax_rows(Tp, Kn, sc, P);
+            else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, sc, P)) != 0) {
+                FA_ACC(pf, softmax, t0); fa_prof_merge(pf); return rc;
+            }
+            FA_ACC(pf, softmax, t0);
         }
-        FA_ACC(pf, softmax, t0);
 
         /* ctx[Tp,dv] = P·v_hk  (M=Tp,K=Kn,N=dv); B=vh[dv,Kn] so B[n=c][k=j]=V[c,j] */
         t0 = FA_T0(pf);
@@ -913,7 +1040,7 @@ int rocket_flash_attn_fp16(int fd, int n_tokens, int n_kv, int head_dim, int dv,
                                    scale, softcap, Q, K, V, mask, out);
         return 0;
     }
-    fa_scratch s = {0};
+    fa_scratch s = { .bfd = -1 };
     if (fa_scratch_ensure(&s, (n_tokens + 3) & ~3, (n_kv + 31) & ~31, head_dim, dv)) {
         fa_scratch_free(&s); return ROCKET_E_NOMEM;
     }
@@ -959,7 +1086,7 @@ static void *fa_mt_worker(void *a)
     int fd = w->own_fd ? rocket_open() : w->fd;
     if (fd < 0) { w->ret = fd; return NULL; }
 
-    fa_scratch local = {0};
+    fa_scratch local = { .bfd = -1 };
     fa_scratch *s = w->s;
     if (!s) {                            /* stateless: this worker's own per-call scratch */
         if (fa_scratch_ensure(&local, (w->n_tokens + 3) & ~3, (w->n_kv + 31) & ~31, w->head_dim, w->dv)) {
@@ -1038,7 +1165,7 @@ int rocket_flash_attn_fp16_mt(int fd, int n_tokens, int n_kv, int head_dim, int 
     if (nthreads > 8) nthreads = 8;
     if (nthreads > n_head) nthreads = n_head;       /* never more workers than heads */
     if (nthreads == 1) {
-        fa_scratch s = {0};
+        fa_scratch s = { .bfd = -1 };
         if (fa_scratch_ensure(&s, (n_tokens + 3) & ~3, (n_kv + 31) & ~31, head_dim, dv)) {
             fa_scratch_free(&s); return ROCKET_E_NOMEM;
         }
@@ -1083,13 +1210,9 @@ rocket_fa_ctx *rocket_fa_ctx_create(int nthreads)
      * re-zero every op), bound to that worker's fd. They lazily allocate their BOs on
      * first use, so this only opens the small guard/regcmd BOs when ROCKET_FA_CHAIN=1;
      * the per-call paths leave them NULL. */
-    if (fa_chain()) {
-        for (int t = 0; t < nthreads; t++) {
-            c->sc[t].qk = rocket_mm_batch_create(c->fd[t]);
-            c->sc[t].av = rocket_mm_batch_create(c->fd[t]);
-            if (!c->sc[t].qk || !c->sc[t].av) { rocket_fa_ctx_free(c); return NULL; }
-        }
-    }
+    for (int t = 0; t < 8; t++) c->sc[t].bfd = -1;
+    if (fa_chain())
+        for (int t = 0; t < nthreads; t++) c->sc[t].bfd = c->fd[t];
     return c;
 }
 

@@ -262,6 +262,10 @@ int main(int argc, char **argv)
             { .ic=256,.ih=8,.iw=256,.oc=32,.kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 }, /* very wide: forces OW (column) tiling */
             /* first layer: IC=3 (RGB), zero-padded to 32 by the driver */
             { .ic=3,.ih=16,.iw=16,.oc=16,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 }, /* RGB stem, stride2 */
+            /* a mid-network IC off the 32-channel group, padded on both sides by the entry */
+            { .ic=24,.ih=12,.iw=12,.oc=32,.kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 }, /* IC 24, 3x3 */
+            { .ic=24,.ih=10,.iw=10,.oc=16,.kh=1,.kw=1,.stride_y=1,.stride_x=1,.pad_top=0,.pad_left=0,.dil_y=1,.dil_x=1 }, /* IC 24, 1x1 */
+            { .ic=40,.ih=14,.iw=14,.oc=48,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 }, /* IC 40, past one group */
             /* depthwise (OC==IC, default group G=64; the MobileNet workhorse) */
             { .ic=64,.ih=8, .iw=8, .oc=64,.kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1,.depthwise=1 }, /* 3x3 DW same-pad */
             { .ic=64,.ih=8, .iw=12,.oc=64,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1,.depthwise=1 }, /* 3x3 DW stride2 */

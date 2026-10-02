@@ -78,6 +78,14 @@
  *   ROCKET_PP_GAP_MS   gap between A's completion and B's submit (default 0)
  *   ROCKET_PP_REPS     A/B rounds per measurement (default 20)
  *   ROCKET_PP_REGS     "0x4010=0,0x4038=0x120080,…" — the leave-one-out list for `scan`
+ *   ROCKET_PP_ASET     `pair` and `heal`: one JOINT override, "0x4010=…,0x4050=…", applied
+ *                      to A and never to the canary; `heal` minimises it in place of the
+ *                      counterpart delta. A register bundle whose members only work
+ *                      together is invisible to `scan`, which applies one at a time. For
+ *                      an int32 kind, `pair` then also reports what A's last round wrote:
+ *                      every output of these operands is the accumulator 97 + c, one value
+ *                      per channel, so the words in [97, 96 + oc] and the distinct
+ *                      channels among them say whether A still computes under the override.
  *   ROCKET_PP_RECOVER  ms of idle BEFORE each round. Without it the A,B,A,B chain wedges
  *                      permanently the first time B poisons: A is then poisoned too and
  *                      neither ever writes again, so every later cell reads zero and the
@@ -398,6 +406,59 @@ static int prog_wrote(int fd, struct prog *pr)
     return prog_wrote_t(fd, pr, NULL);
 }
 
+/* Any program's last round, as 32-bit words: how many were written and the commonest
+ * values, which is what an override that changes the element type leaves to read. */
+static void prog_word_summary(int fd, struct prog *pr)
+{
+    const uint32_t *o;
+    size_t i, n = pr->obytes / 4, written = 0;
+    uint32_t val[6] = {0};
+    size_t cnt[6] = {0};
+    int k;
+    if (rocket_bo_prep(fd, &pr->o, 0, 2000000000ull) < 0) return;
+    o = (const uint32_t *)pr->o.ptr;
+    for (i = 0; i < n; i++) {
+        uint32_t v = o[i];
+        if (v == 0xAAAAAAAAu) continue;
+        written++;
+        for (k = 0; k < 6; k++) {
+            if (cnt[k] && val[k] == v) { cnt[k]++; break; }
+            if (!cnt[k]) { val[k] = v; cnt[k] = 1; break; }
+        }
+    }
+    rocket_bo_fini(fd, &pr->o);
+    printf("  A's last output, %zu words, %zu written; first distinct values:", n, written);
+    for (k = 0; k < 6 && cnt[k]; k++) printf(" 0x%08x x%zu", val[k], cnt[k]);
+    printf("\n");
+}
+
+/* What an int32 program's last round left in its output BO. With input 3, weight 1 and
+ * bias c + 1 over 32 input channels, output channel c's accumulator is 97 + c at every
+ * pixel, so a word in [97, 96 + oc] is an accumulator and names its channel. */
+static void prog_i32_summary(int fd, struct prog *pr)
+{
+    const uint32_t *o;
+    size_t i, n = pr->obytes / 4;
+    unsigned seen[256] = {0}, oc = pr->p.oc, chans = 0, c;
+    size_t unwritten = 0, acc = 0, other = 0;
+    uint32_t first_other = 0;
+    if (oc > 256) oc = 256;
+    if (rocket_bo_prep(fd, &pr->o, 0, 2000000000ull) < 0) return;
+    o = (const uint32_t *)pr->o.ptr;
+    for (i = 0; i < n; i++) {
+        uint32_t v = o[i];
+        if (v == 0xAAAAAAAAu) { unwritten++; continue; }
+        if (v >= 97u && v < 97u + oc) { acc++; seen[v - 97u]++; continue; }
+        if (!other) first_other = v;
+        other++;
+    }
+    rocket_bo_fini(fd, &pr->o);
+    for (c = 0; c < oc; c++) chans += seen[c] ? 1u : 0u;
+    printf("  A's last output, %zu words: %zu accumulators covering %u of %u channels, "
+           "%zu other (first 0x%08x), %zu unwritten\n", n, acc, chans, oc, other,
+           first_other, unwritten);
+}
+
 /* The driver's autosuspend delay, which is what every idle here is really measured in.
  * -1 if it cannot be read. */
 static int autosuspend_ms(void)
@@ -662,9 +723,23 @@ int main(int argc, char **argv)
         if (ka < 0 || kb < 0) { printf("usage: %s %s <A> <B>\n", argv[0], mode); rc = 1; goto out; }
         if (!progs[ka].live || !progs_b[kb].live) { printf("a program is not live\n"); rc = 1; goto out; }
 
+        {
+            const char *aset = getenv("ROCKET_PP_ASET");
+            if (!strcmp(mode, "pair") && aset && *aset) {
+                setenv("ROCKET_RK3576_SET", aset, 1);
+                if (prog_emit(fd, &progs[ka]) != 0) {
+                    unsetenv("ROCKET_RK3576_SET");
+                    printf("A's emit failed under ROCKET_PP_ASET\n"); rc = 1; goto out;
+                }
+                unsetenv("ROCKET_RK3576_SET");
+                printf("\nA carries the joint override %s; the canary does not\n", aset);
+            }
+        }
         if (measure(fd, &progs[ka], &progs_b[kb], gap, reps, &na, &nb) != 0) { rc = 1; goto out; }
         printf("\nbase  %-7s -> %-7s : B wrote %d/%d, A wrote %d/%d  (gap %d ms)\n",
                KIND_NAME[ka], KIND_NAME[kb], nb, reps, na, reps, gap);
+        if (ka == PK_I32 || ka == PK_I32W) prog_i32_summary(fd, &progs[ka]);
+        else if (getenv("ROCKET_PP_ASET")) prog_word_summary(fd, &progs[ka]);
 
         if (!strcmp(mode, "scan")) {
             const char *regs = getenv("ROCKET_PP_REGS");
@@ -822,6 +897,27 @@ int main(int argc, char **argv)
             const struct regval *m = rv_find(vb, nvb, va[i].reg);
             if (m && m->val != va[i].val) { sel[nsel].reg = va[i].reg; sel[nsel].val = m->val; nsel++; }
             else if (!m && env_int("ROCKET_PP_XREG", 0)) { sel[nsel].reg = va[i].reg; sel[nsel].val = 0; nsel++; }
+        }
+        /* ROCKET_PP_ASET offers a bundle from elsewhere (another project's stage, say)
+         * in place of the counterpart delta, and minimises that instead. */
+        {
+            const char *aset = getenv("ROCKET_PP_ASET");
+            if (aset && *aset) {
+                const char *q = aset;
+                nsel = 0;
+                while (*q && nsel < MAXSPEC) {
+                    char *end;
+                    unsigned long r = strtoul(q, &end, 0), v;
+                    if (end == q || *end != '=') break;
+                    q = end + 1;
+                    v = strtoul(q, &end, 0);
+                    if (end == q) break;
+                    sel[nsel].reg = (unsigned)r; sel[nsel].val = (uint32_t)v; nsel++;
+                    q = end;
+                    while (*q == ',' || *q == ' ') q++;
+                }
+                printf("\nthe offered set is ROCKET_PP_ASET, %d registers\n", nsel);
+            }
         }
         memset(take, 1, (size_t)nsel);
         printf("\nheal %s -> %s, scoring %s. %d registers offered (the value is %s's;\n"

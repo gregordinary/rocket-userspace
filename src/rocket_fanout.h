@@ -74,7 +74,10 @@ int rocket_fanout_nstep(int N, int nthreads, int align);
  * indistinguishable from an unsupported one. A caller that sweeps M (variable prompt
  * lengths, a micro-batch tail, per-expert token counts) reaches that in normal use, and
  * a hard failure is the wrong answer when a re-alloc is available. */
-typedef struct { int M, K, N, group; } rocket_shape_key;
+/* `split` is 0 for a scratch that splits N across the workers (every path's default) and
+ * 1 for one that splits M (each worker all N over its own rows); the two lay the workers'
+ * plans out differently, so they cannot share a slot either. */
+typedef struct { int M, K, N, group, split; } rocket_shape_key;
 
 typedef struct {
     /* Build the scratch for `k`, or NULL. `owner` is the caller's context. */

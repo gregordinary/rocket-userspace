@@ -39,6 +39,11 @@ capped by that column's worst-case accumulator rather than by its field:
                           the part of the ramp's cost a signature change could cancel.
   hadamard_chanout_ramp / hadamard_chanout_ramp_ach   the same two, composed with the
                           rotation -- the pair that prices the port's real accuracy story
+  chanout_rampbs / hadamard_chanout_rampbs   the ramp the entry programs by default: the
+                          DPU shift word carries the gain, so the tile's largest scale sits
+                          at C = 32767 and the product (acc*C) is held wide and rounded
+                          half to even at the shift before the OUT_CVT. `_ramp` is the
+                          shift-0 ramp ROCKET_RK3576_MM_PC_SHIFT=0 restores.
 
 Those arms all take the per-column output scale from the accumulator they are about to
 quantize, which is an ORACLE: the entry takes `scale_n` from a caller that has A and B
@@ -127,16 +132,20 @@ INT32_MAX = 2147483647.0
 
 
 def requant_params(conv_scale):
-    """The emitter's own QNNPACK derivation, bit for bit.
-
-    src/npu_regcmd_rk3576.c:rocket_rk3576_requant_params. `shift` is the REGISTER
-    value, already pre-decremented, so the model shifts by exactly what the DPU has.
+    """The emitter's own derivation, bit for bit: npu_out_cvt_pair() in
+    include/npu_requant.h. `shift` is the REGISTER value, already pre-decremented, so
+    the model shifts by exactly what the DPU has. Bit 14 is forced before the +1, and a
+    carry out of the 15 bits is renormalized to 0x4000 at one less shift (Mesa's form,
+    which this spelled before, halved or negated one scale in 16384).
     """
     bits = int(np.float32(conv_scale).view(np.uint32))
     shift = 127 + 31 - 32 - (bits >> 23) + 16 - 1
-    m = ((bits >> 9) & 0x7FFF) + 1
-    if m < (1 << 14):
-        m |= (1 << 14)
+    m = ((1 << 14) | ((bits >> 9) & 0x3FFF)) + 1
+    if m == (1 << 15):
+        if shift:
+            m, shift = 1 << 14, shift - 1
+        else:
+            m = 0x7FFF
     if not 0 <= shift <= 62:
         # The emitter writes this into a register field. Refuse rather than compute a
         # full, plausible, wrongly scaled surface -- which is this datapath's signature
@@ -163,18 +172,56 @@ def ramp_plan(cs, sum_abs_w):
     return mul, shift, C, C * base_actual, float(cmax.max())
 
 
-def ramp_apply(acc, cs, sum_abs_w, nt, record=None):
-    """The device epilogue, per N tile: sat_i32((acc + 0) * C[n]) then the shared
-    round-half-to-even (v*MUL) >> SHIFT, then sat8. Returns the int8 surface and the
-    per-column gain the ramp delivered."""
+def ramp_plan_bs(cs, sum_abs_w):
+    """One N tile's plan on the SHIFT ramp, the entry's default.
+
+    src/rocket_conv2d_rk3576.c:rocket_rk3576_plan_perchannel_bs with every column live
+    (sum_w NULL), called from the matmul entry with in_scale = out_scale = 1, bias 0:
+    the tile's largest scale takes C = 32767; `s`, the DPU shift word, is the smallest at
+    which every column's bound*C >> s fits int32; the OUT_CVT carries G = best*2^s.
+    Returns the multiplier, the OUT_CVT shift, the BS shift, C, the delivered gain, and
+    the largest C.
+    """
+    bound = 128.0 * sum_abs_w.astype(np.float64) + 1.0
+    mhi = float(cs.max())
+    s = 0
+    while s < 48:
+        if not np.any(bound * (cs * 32767.0 / mhi + 1.0) > INT32_MAX * 2.0 ** s):
+            break
+        s += 1
+    cmax = np.clip(INT32_MAX * 2.0 ** s / bound, 1.0, 32767.0)
+    best = float((cs / cmax).max())
+    G = float(np.float32(best * 2.0 ** s))
+    mul, shift = requant_params(G)
+    realized = mul / float(1 << shift)
+    if realized < G * (1.0 - 1e-6):          # the library's halving step-over; dead now
+        G = float(np.float32(2.0 ** math.ceil(math.log2(G))))
+        mul, shift = requant_params(G)
+        realized = mul / float(1 << shift)
+    base = realized / 2.0 ** s
+    C = np.clip(np.floor(cs / base + 0.5), 1.0, 32767.0)
+    return mul, shift, s, C, C * base, float(C.max())
+
+
+def ramp_apply(acc, cs, sum_abs_w, nt, record=None, bs=False):
+    """The device epilogue, per N tile. The shift-0 ramp: sat_i32((acc + 0) * C[n]) then
+    the shared round-half-to-even (v*MUL) >> SHIFT, then sat8. The shift ramp (`bs`):
+    (acc*C[n]) held wide and rounded half to even at the BS shift, sat_i32, then the same
+    OUT_CVT. Returns the int8 surface and the per-column gain the ramp delivered.
+    float64 is exact here: acc*C < 2^42 and v*MUL < 2^46."""
     N = acc.shape[1]
     out = np.empty_like(acc)
     gain = np.empty(N, dtype=np.float64)
     for n0 in range(0, N, nt):
         sl = slice(n0, min(n0 + nt, N))
         c = cs[sl].astype(np.float64)
-        mul, shift, C, g, cmaxmax = ramp_plan(c, sum_abs_w[sl])
-        v = np.clip(acc[:, sl].astype(np.float64) * C, -2147483648.0, INT32_MAX)
+        if bs:
+            mul, shift, s, C, g, cmaxmax = ramp_plan_bs(c, sum_abs_w[sl])
+            v = np.round(acc[:, sl].astype(np.float64) * C / 2.0 ** s)
+            v = np.clip(v, -2147483648.0, INT32_MAX)
+        else:
+            mul, shift, C, g, cmaxmax = ramp_plan(c, sum_abs_w[sl])
+            v = np.clip(acc[:, sl].astype(np.float64) * C, -2147483648.0, INT32_MAX)
         out[:, sl] = np.clip(np.round(v * mul / float(1 << shift)), -128.0, 127.0)
         gain[sl] = g
         if record is not None:
@@ -233,8 +280,10 @@ class SimLinear(nn.Module):
                 base, self.scalesrc = base[:-len(sfx)], nm
         self.ach = base.endswith("_ach")
         base = base[:-4] if self.ach else base
-        self.ramp = base.endswith("_ramp")
-        base = base[:-5] if self.ramp else base
+        self.rampbs = base.endswith("_rampbs")
+        base = base[:-7] if self.rampbs else base
+        self.ramp = self.rampbs or base.endswith("_ramp")
+        base = base[:-5] if (self.ramp and not self.rampbs) else base
         self.base = base
         self.bias = lin.bias
         W = lin.weight.detach().float().numpy()
@@ -294,13 +343,13 @@ class SimLinear(nn.Module):
         true = np.abs(acc).max(axis=0).astype(np.float64)
         bnd = 128.0 * self.sum_abs_w.astype(np.float64) + 1.0
         sc1 = 127.0 / bnd
-        q1, _ = ramp_apply(acc, sc1, self.sum_abs_w, self.nt)
+        q1, _ = ramp_apply(acc, sc1, self.sum_abs_w, self.nt, bs=self.rampbs)
         # A column that reads back all-zero at the bound is one whose accumulator is below
         # half a code THERE; floor it at the code it would have taken, so the second pass
         # still has something to refine and no column is handed a zero scale.
         est1 = np.maximum(np.abs(q1).max(axis=0), 1.0) / sc1
         sc2 = 127.0 / (est1 * BOOTMARGIN)
-        q2, _ = ramp_apply(acc, sc2, self.sum_abs_w, self.nt)
+        q2, _ = ramp_apply(acc, sc2, self.sum_abs_w, self.nt, bs=self.rampbs)
         satcol = (np.abs(q2) >= 127.0).any(axis=0)
         est2 = np.maximum(np.abs(q2).max(axis=0), 1.0) / sc2
         est = np.where(satcol, est1 * BOOTMARGIN, est2)
@@ -398,7 +447,7 @@ class SimLinear(nn.Module):
             # absolute epsilon, which is what any real caller would do.
             sc, actual = self._colscale(acc)
             rec = [] if SPREAD is not None else None
-            q, gain = ramp_apply(acc, sc, self.sum_abs_w, self.nt, rec)
+            q, gain = ramp_apply(acc, sc, self.sum_abs_w, self.nt, rec, bs=self.rampbs)
             self._calstat(sc, actual, q)
             # float32 out: the plan arithmetic is float64 but the model's activations
             # are float32, and torch will not matmul a double against a float weight.

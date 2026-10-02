@@ -306,14 +306,29 @@ int  rocket_submit_matmul_flags(int fd,
  *   Requires rocket_batched_submit_supported() -- a kernel that ignores the
  *   flag runs the chained layout down the per-task path, which stalls.
  *
- * ROCKET_JOB_NO_DPU_DONE: every task in this job has a DPU output element
- *   wider than one byte, so on the RK3576 it raises no DPU completion at all
- *   and the driver's wait past PC_DONE is a blind settle rather than a
- *   deadline on a completion that is coming. The driver cannot tell the two
- *   classes apart; the caller can, because it emitted the program. ADVISORY:
- *   a completion that does arrive retires the job immediately whatever this
- *   says, so a wrong hint costs time and not correctness. Ignored by a kernel
- *   older than interface version 1.2.
+ * ROCKET_JOB_NO_DPU_DONE: this job's program raises no DPU completion, so the
+ *   driver's wait past PC_DONE is a blind settle (rocket.dpu_blind_us, 250 us)
+ *   rather than a wait for a completion that is coming. The driver cannot tell
+ *   the two classes apart; the caller can, because it emitted the program. On
+ *   the RK3576 the int32 writers raise none: without the hint each such job
+ *   waits out the driver's 125 ms backstop and the kernel logs its retirement.
+ *   So does any job the wide-output poisoning reaches, which writes nothing.
+ *   The fp16 convolution programs (the input-channel slice and the packed-image
+ *   first conv) and the one-byte int8 program DO raise one [HW sweep, H96 MAX
+ *   M9, rocket 1.6.0, tests/rk3576_drain_probe raw, 2026-09-27].
+ *
+ *   The class is a CORRECTNESS property, not only a cost. PC_DONE on a one-task
+ *   job is the kick being over, not the program, so under the hint the fence
+ *   comes at the settle whatever the program runs, and one still writing
+ *   returns with its tail unwritten. An fp16 conv at k9 over 32 channels on a
+ *   120x64 plane fenced at 0.74 ms with the last rows of every 8-channel plane
+ *   still holding the output's stamp, 10 of 10, and they landed 1.18 ms later;
+ *   without the hint it fenced at 2.05 ms with every element written, 10 of 10
+ *   [same sweep]. A completion that arrives first still retires the job at once,
+ *   so the hint is harmless only on a program that is done before the settle
+ *   ends. Set it on a program that raises none, and read that program's whole
+ *   output against a stamp: its fence says nothing about its writes. Ignored by
+ *   a kernel older than interface version 1.2.
  *
  * ROCKET_JOB_PPU_DONE: this job's last program is a PPU program (pooling),
  *   whose completion is the PPU's own bit and not the DPU's. A pool enables no
@@ -404,11 +419,13 @@ void     rocket_submit_counters_reset(void);
 /* How many fenced waits this process made (rocket_bo_prep and rocket_bo_prep_ranges with
  * timeout_ns > 0), how many reached the slow-wait mark, and the longest, in microseconds.
  *
- * The `rocket` driver retires a job that runs 500 ms: it resets the core and signals the
- * job's fence, and PREP_BO then returns 0 exactly as it does for a job that completed.
- * So a hung job reads as a slow wait over whatever the output BO held before, and a gate
- * that compares that BO against a reference can pass on it. A wait at or past the mark
- * (ROCKET_SLOW_WAIT_MS, default 450) also logs a warning naming the BO.
+ * The `rocket` driver retires a job that never completes -- at 500 ms on the RK3588, at a
+ * 125 ms backstop in the RK3576 series -- and signals the job's fence, and PREP_BO then
+ * returns 0 exactly as it does for a job that completed. So a hung job reads as a slow
+ * wait over whatever the output BO held before, and a gate that compares that BO against a
+ * reference can pass on it. A wait at or past the mark (ROCKET_SLOW_WAIT_MS, default the
+ * part profile's: 450 ms on the RK3588, 110 on the RK3576) also logs a warning naming the
+ * BO.
  *
  * A heuristic in one direction only. A wait past the mark can also be one that covered
  * other jobs queued ahead of it, and a caller that waited late can see a retired job end
@@ -419,6 +436,25 @@ uint64_t rocket_fence_wait_count(void);
 uint64_t rocket_fence_wait_slow_count(void);
 uint64_t rocket_fence_wait_max_us(void);
 void     rocket_fence_wait_counters_reset(void);
+
+/* How many RK3576 jobs this process's write guards scored as RETIRED rather than
+ * completed, split by whether the guard's own write check saw the surface written.
+ *
+ * Every RK3576 entry that stamps its output (convolution, depthwise, packed image, fp16
+ * convolution, the chained kick, the int8, int32 and fp16 matmuls, pooling) times each
+ * job from before its submit to its fence. A job at or past the driver's backstop (the
+ * hw profile's backstop_ms, 125 on the RK3576; ROCKET_RK3576_BACKSTOP_US overrides) was
+ * retired, and the entry redoes it after a power cycle exactly as it redoes a job that
+ * wrote nothing, then refuses once its attempts run out. `written` counts the retirements
+ * a write check alone would have passed, which is the class this scoring exists for:
+ * a partial surface. Each one also logs a warning naming the entry.
+ *
+ * Exact in one direction: the kick follows the submit's start, so every retirement at
+ * the backstop is counted. A job queued behind another process's can be counted too,
+ * and costs one redo. It cannot see a job the kernel retires early (a DPU grace shorter
+ * than the drain), which reads fast. Process-wide, atomic; either pointer may be NULL. */
+void rocket_rk3576_retired_counts(uint64_t *unwritten, uint64_t *written);
+void rocket_rk3576_retired_counts_reset(void);
 
 
 #ifdef __cplusplus

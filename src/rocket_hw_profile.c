@@ -56,6 +56,8 @@ const struct rocket_hw_profile rocket_hw_rk3588 = {
                      | ROCKET_DT_BIT(precision_int4)    | ROCKET_DT_BIT(precision_tf32),
 
     .default_workers = 8,
+    .slow_wait_ms    = 450,               /* under the 500 ms job watchdog */
+    .backstop_ms     = 500,               /* the job watchdog, JOB_TIMEOUT_MS */
 };
 
 /* The RK3576. Measured on an H96 MAX M9 (mainline 7.1.3) with the part's own
@@ -134,6 +136,15 @@ const struct rocket_hw_profile rocket_hw_rk3576 = {
         "not run: those refuse rather than write nothing.",
 
     .default_workers = 8,                  /* not swept on this part */
+    /* The RK3576 series retires a job that never reports completion at a 125 ms backstop
+     * ("did not report completion in 125000 us; retiring it"), so the RK3588's 450 ms mark
+     * never saw one here: the conv width probe had to lower it by hand to count the
+     * retirements it caused [HW, H96, 2026-09-26]. */
+    .slow_wait_ms    = 110,
+    /* JOB_TIMEOUT_MS / 4, counted from the kick [source-confirmed, patches rk3576/npu/0022
+     * and 0025]. The kick follows the submit ioctl's start, so a job the driver retired
+     * reads at least this long from before its submit to its fence. */
+    .backstop_ms     = 125,
 };
 
 /* Profiles that exist. A chip gets an entry only once its machine parameters are

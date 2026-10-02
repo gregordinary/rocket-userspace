@@ -4,9 +4,9 @@
  * matmul_int16_exact_rocket.c — the BIT-EXACT int16 path: int16 x int16 -> int64
  * matmul via int8 BYTE DECOMPOSITION on the PROVEN rocket_matmul_int8 path.
  *
- * The native int16 NPU conv (matmul_int16_rocket) tops out at a 16-bit (saturating)
- * transposed output (tp_org_en is an 8/16-bit output writer, not int32). For a
- * FULL-PRECISION int16xint16 product we instead decompose each int16 into two
+ * The native int16 NPU conv (matmul_int16_rocket) writes int32 that SATURATES, so a
+ * full-range product past int32 clamps. For a FULL-PRECISION int16xint16 product we
+ * instead decompose each int16 into two
  * signed bytes and run four int8 matmuls, recombining in int64. This is emulation
  * (~4x int8 cost) but bit-exact with NO saturation, and reuses only HW-validated
  * int8 kernels.

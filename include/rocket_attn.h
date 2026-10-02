@@ -76,8 +76,12 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
  * n_tokens is padded to %4 and n_kv to %32 internally; pad keys score -inf so they
  * weigh ~0. The scores are brought host-side for the mandatory additive mask, so the
  * softmax defaults to the host (the on-NPU softmax would be a pure round-trip here);
- * ROCKET_ATTN_HOST_SOFTMAX=0 forces the on-NPU softmax for comparison. fd<0 = exact host
- * reference (the test oracle). Returns 0, <0 on error.
+ * ROCKET_ATTN_HOST_SOFTMAX=0 forces the on-NPU softmax for comparison. On the materialized
+ * paths the host scale, soft-cap, mask and softmax are ONE fp32 pass per row with a
+ * vectorized exp and a single fp16 rounding (ROCKET_FA_FUSED_SOFTMAX, default on): 19% off a
+ * 639-token ModernBERT-large encoder and equal or lower error on every flash_attn_rocket case
+ * [HW 2026-09-27, RK1]. ROCKET_FA_FUSED_SOFTMAX=0 restores the separate mask pass and the
+ * two-rounding softmax. fd<0 = exact host reference (the test oracle). Returns 0, <0 on error.
  *
  * rocket_flash_attn_fp16_mt is the multi-core fan-out: the heads are independent (each
  * writes its own output slice), so they split into contiguous ranges across `nthreads`
@@ -125,7 +129,11 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
  * handler once per layer per forward). It holds the worker fds open and keeps each worker's
  * per-head scratch resident (grown to the largest shape seen), so a call pays neither the
  * fd open/close nor the per-call malloc of the 8-16 MB score matrices that, at long context,
- * cross glibc's mmap threshold and mmap+fault+munmap every call. Create once with the worker
+ * cross glibc's mmap threshold and mmap+fault+munmap every call. The chained path's resident
+ * batched-matmul contexts are kept per op AND per 4x class of Tp x Kn: a context syncs and,
+ * on a layout change, clears its whole grown BO, so one context per op made a short call
+ * after a long one pay for the long one's buffers (+54% on a 58-token batch after a
+ * 726-token call, on a kernel without ranged BO sync). Create once with the worker
  * count (clamped to [1,8]); _ctx is numerically identical to _mt and uses up to
  * min(nthreads, n_head) workers per call. Create returns NULL if a worker fd can't open (the
  * caller falls back to the _mt path). Free after the last call. Returns 0, <0 on error.

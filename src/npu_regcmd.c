@@ -34,6 +34,7 @@
 #include "npu_dpu.h"
 #include "npu_matmul.h"
 #include "npu_activation.h"
+#include "npu_requant.h"
 #include "npu_pool.h"
 #include "rocket_hw_profile.h"
 #include "rocket_log.h"     // centralized log channel
@@ -120,6 +121,38 @@ uint32_t npu_out_cvt_round_bit(unsigned requested)
     return (uint32_t)(r & 1u) << 30;
 }
 
+/* The CNA and DPU geometry fields are narrower than anything the planners bound: the
+ * CNA holds the input width and height and the output width in 11 bits each (DATA_SIZE0,
+ * DATA_SIZE2), the DMA extents in the 11 bits emitted below, and the output atomics in 18;
+ * the DPU holds each extent minus one in 13. The emitters mask every one, so a value past
+ * its field wraps and the task computes a full, plausible surface of the wrong extent (an
+ * int8 conv tile 2500 columns wide computes 452). Refuse the emission instead, as the
+ * feature_grains guard does. Returns 1 when every field fits. */
+static int geometry_fits(const npu_cna_desc *cna, const npu_dpu_desc *dpu)
+{
+  const struct { const char *name; unsigned v, max; } f[] = {
+    { "CNA datain_width",    cna->datain_width,    0x7FF },
+    { "CNA datain_height",   cna->datain_height,   0x7FF },
+    { "CNA dataout_width",   cna->dataout_width,   0x7FF },
+    { "CNA dataout_atomics", cna->dataout_atomics, 0x3FFFF },
+    { "CNA dma_width",       cna->dma_width,       0x7FF },
+    { "CNA dma_height",      cna->dma_height,      0x7FF },
+    { "DPU width",           dpu->width,           0x1FFF },
+    { "DPU height",          dpu->height,          0x1FFF },
+    { "DPU channel",         dpu->channel,         0x1FFF },
+    { "DPU width_wdma",      dpu->width_wdma,      0x1FFF },
+    { "DPU height_wdma",     dpu->height_wdma,     0x1FFF },
+    { "DPU channel_wdma",    dpu->channel_wdma,    0x1FFF },
+  };
+  for (size_t k = 0; k < sizeof(f) / sizeof(f[0]); k++)
+    if (f[k].v > f[k].max) {
+      ROCKET_LOGE("npu_regcmd: %s %u exceeds its field (max %u); the task would compute a "
+                  "wrapped extent\n", f[k].name, f[k].v, f[k].max);
+      return 0;
+    }
+  return 1;
+}
+
 /*
  * Emit the regcmd program incrementally and return the op count. Beyond the
  * CNA/CORE/DPU config, this arms RDMA_S_POINTER (early) and the DPU_RDMA block
@@ -131,6 +164,7 @@ static int gen_matmul_task(uint64_t *ops, npu_cna_desc *cna_desc,
   uint32_t value;
   int i = 0;
 
+  if (!geometry_fits(cna_desc, dpu_desc)) return -1;
   ops[i++] = NPUOP(OP_REG_DPU, 0xE, DPU_S_POINTER);
   /* Arm the DPU read-DMA single-register group right after DPU_S_POINTER. Same
    * 0xE bit pattern (POINTER_PP_MODE|EXECUTER_PP_EN|POINTER_PP_EN). */
@@ -239,15 +273,36 @@ static int gen_matmul_task(uint64_t *ops, npu_cna_desc *cna_desc,
   ops[i++] = NPUOP(OP_REG_CNA, 0x0, CNA_DCOMP_AMOUNT15);
   ops[i++] = NPUOP(OP_REG_CNA, 0x0, CNA_CVT_CON5);
   ops[i++] = NPUOP(OP_REG_CNA, 0x0, CNA_PAD_CON1);
+  /* DEBUG gating knobs (RE, tests/npu_core_diff_probe). The matmul never writes
+   * CNA_CLK_GATE (0x1090, TRM: bits 0/1/2/4 disable the feature-fetch, weight-fetch,
+   * CSC and CBUF auto clock gates) or CORE_MAC_GATING (0x300C, slcg_op_en [26:0],
+   * reset 0x07800800), and writes MISC_CFG's soft_gating [19:14] as 0. It writes the
+   * undocumented CORE 0x3030 as 0, as Mesa and the vendor programs do; ROCKET_CORE_3030
+   * writes that value instead (the lane-0 predicate search). Each knob, when
+   * set, writes its value; unset leaves the program byte-identical. Read once: this runs
+   * per task of every fp16 matmul. */
+  static int gate_read;
+  static long gate_clk = -1, gate_soft = -1, gate_mac = -1, core_3030 = 0;
+  if (!__atomic_load_n(&gate_read, __ATOMIC_ACQUIRE)) {
+    const char *e;
+    if ((e = getenv("ROCKET_CNA_CLK_GATE")))     gate_clk  = (long)(strtoul(e, NULL, 0) & 0x17);
+    if ((e = getenv("ROCKET_CORE_SOFT_GATING"))) gate_soft = (long)(strtoul(e, NULL, 0) & 0x3F);
+    if ((e = getenv("ROCKET_CORE_MAC_GATING")))  gate_mac  = (long)(strtoul(e, NULL, 0) & 0x7FFFFFF);
+    if ((e = getenv("ROCKET_CORE_3030")))        core_3030 = (long)(strtoul(e, NULL, 0) & 0xFFFFFFFF);
+    __atomic_store_n(&gate_read, 1, __ATOMIC_RELEASE);
+  }
+  if (gate_clk >= 0) ops[i++] = NPUOP(OP_REG_CNA, (uint32_t)gate_clk, CNA_CLK_GATE);
 
   value = ((core_desc->proc_precision & 0x7) << 8) | (core_desc->qd_en & 0x1);
+  if (gate_soft >= 0) value |= (uint32_t)gate_soft << 14;
   ops[i++] = NPUOP(OP_REG_CORE, value, CORE_MISC_CFG);
+  if (gate_mac >= 0) ops[i++] = NPUOP(OP_REG_CORE, (uint32_t)gate_mac, CORE_MAC_GATING);
   value = ((core_desc->dataout_height & 0xFFFF) << 16) | (core_desc->dataout_width & 0xFFFF);
   ops[i++] = NPUOP(OP_REG_CORE, value, CORE_DATAOUT_SIZE_0);
   value = core_desc->dataout_channel & 0xFFFF;
   ops[i++] = NPUOP(OP_REG_CORE, value, CORE_DATAOUT_SIZE_1);
   ops[i++] = NPUOP(OP_REG_CORE, 0x0, CORE_CLIP_TRUNCATE);
-  ops[i++] = NPUOP(OP_REG_CORE, 0x0, CORE_3030);
+  ops[i++] = NPUOP(OP_REG_CORE, (uint32_t)core_3030, CORE_3030);
 
   value = ((dpu_desc->burst_len & 0xF) << 5) | ((dpu_desc->conv_mode & 0x3) <<3) |
     ((dpu_desc->output_mode & 0x3) <<1) | (dpu_desc->flying_mode & 0x1);
@@ -1398,32 +1453,24 @@ int gen_matmul_int4(matmul_params_t *params)
 /* ============================================================================
  * gen_matmul_int16 — int16 x int16 -> int32 single-task generator.
  *
- * RK3588 documents matmul modes only for fp16/int8/int4 — there is NO documented int16xint16 matmul mode. So int16 is
- * reverse-engineered from scratch, triangulated from two analogs:
- *   - fp16 for the GEOMETRY (int16 is 2 bytes, same as fp16): feature cube C2=8,
- *     weight layout (N/16,K/32,16,32) [weight_int16 == weight_fp16 reinterpreted],
- *     N-align 16, banks_for x2, data_entries /32, data_sign=1.
- *   - int8 for the INTEGER-OUTPUT handling: int16xint16 accumulates in the 48-bit
- *     CACC and writes int32; output cube C2=4, size_e=7 (the integer-output quirk,
- *     HW-confirmed for int8's int32 AND int4's int16 — almost certainly int16's
- *     int32 too), surf*8, host int64 K-accum (no DPU-EW integer K-accum is
- *     implemented, as for int8).
+ * RKNN's matmul menu has no int16 pairing, but the silicon runs one. The program is fp16's
+ * with the precision fields at int16 (1) and the output at int32 (4):
+ *   - fp16's INPUT geometry, int16 being two bytes: feature cube C2=8, weight layout
+ *     (N/16,K/32,16,32) [weight_int16 == weight_fp16 reinterpreted], N-align 16,
+ *     data_entries /32, data_sign=1, qd_en=1.
+ *   - fp16 -> fp32's OUTPUT geometry, both writing four bytes: the [N/4,M,4] cube,
+ *     size_e=3 and surf_add = stride x 4. Bit-exact against the int64 dot product saturated
+ *     to int32 at six non-square shapes, K 32-1024, full-range operands on either side
+ *     (tests/int16_native_probe, RK1, 2026-09-26).
+ *   - NOT int8's integer-output geometry (size_e=7, surf x8): on an int16 program it writes
+ *     row 0's first sixteen channels and the task never completes. The kernel retires it at
+ *     its 500 ms watchdog and signals the fence, so the output reads as one 1x16 tile.
  *
- * PRIME HYPOTHESIS (sweep each on HW with a small shape):
- *   precision in/proc = precision_int16 = 1 (UNCONFIRMED on this path — recall
- *     int4's "obvious" 3 is wrong, 6 is right; rule out 3/7).
- *   DPU out precision = int32 = 4.
- *   size_e = 7, surf_mult = 8 (the integer-output quirk).
- *   data_entries divisor = 32 (2-byte element, like fp16).
- * Every uncertain field is env-overridable so matmul_int16_rocket can crack it on
- * HW by sweep + sentinel classification. Bake the confirmed values as defaults.
+ * int32-output SATURATION: an int16 product reaches 2^30, so two full-range products can
+ * pass int32. The accumulator is wider (>= 36 bits measured, 48 per NVDLA) and the writer
+ * clamps, so a task is exact only while the operand ranges keep |sum| < 2^31 over its K.
  *
- * int32-output SATURATION: int16xint16 <= 32767^2 ~= 1.07e9 per product, ~half
- * of int32 max — a sum of just TWO full-range products overflows int32. So a
- * bit-exact test must use SMALL int16 magnitudes; the gen is unaffected (it just
- * writes whatever the conv accumulates), but the tiling/backend must keep each
- * Kt-pass within int32. See matmul_int16_rocket for the overflow characterization.
- *
+ * The fields stay env-overridable for matmul_int16_rocket's sweeps (ROCKET_INT16_*).
  * Plain-conv path only (ew_accumulate=0, MRDMA/ERDMA disabled — MRDMA-trap-safe).
  * The single-task path does one K-pass. */
 int gen_matmul_int16(matmul_params_t *params)
@@ -1437,15 +1484,14 @@ int gen_matmul_int16(matmul_params_t *params)
    int surf_stride;
    const char *e;
 
-   /* HYPOTHESIS encodings (sweep on HW). Kept env-overridable as diagnostics.
-    *   in/proc precision = int16 = 1 (rule out 3/7 by sweep)
-    *   out precision     = int32 = 4 (int16xint16 -> int32, like int8's output)
-    *   size_e = 7 / surf*8: the integer-conv output quirk (HW-proven for int8's
-    *               int32 and int4's int16; near-certain for int16's int32 too)
+   /* Encodings, each HW-confirmed and kept env-overridable as a diagnostic:
+    *   in/proc precision = int16 = 1 (the only value 1..7 that computes int16)
+    *   out precision     = int32 = 4
+    *   size_e = 3 / surf*4: fp16 -> fp32's four-byte output geometry (int8's 7/8 hangs)
     *   data_entries /32: 2-byte element, like fp16 (int8 /64, int4 /128). */
    unsigned in_prec  = precision_int16;
    unsigned out_prec = precision_int32;
-   unsigned se = 7, sm = 8;
+   unsigned se = 3, sm = 4;
    unsigned dentries_div = 32;
    /* qd_en = 1 — HW-CONFIRMED REQUIRED for int16. Initially defaulted to 0
     * (copying int8), which on HW TRUNCATED the conv to one weight N-group
@@ -1461,16 +1507,13 @@ int gen_matmul_int16(matmul_params_t *params)
    if ((e = getenv("ROCKET_INT16_DENTRIES_DIV"))) dentries_div = (unsigned)strtoul(e, NULL, 0);
    if ((e = getenv("ROCKET_INT16_QD_EN")))        qd_en        = (unsigned)strtoul(e, NULL, 0);
    if (dentries_div == 0) dentries_div = 32;
-   /* CNA_CONV_CON2 iteration fields. On HW int16 (precision=1) emits only ONE
-    * output tile (1 row x 16 ch) regardless of M/N — int8/int4 iterate fully with
-    * the same descriptor. feature_grains (input rows/grains processed) and
-    * kernel_groups (output-channel groups) are the prime suspects for that
-    * iteration; sweep them. -1 = use the default (M+1 / 0, like fp16/int8). */
+   /* CNA_CONV_CON2 iteration fields, overridable for sweeps. -1 = the default (M+1 / 0,
+    * like fp16/int8). */
    int grains_ovr = -1, kgroups_ovr = -1;
    if ((e = getenv("ROCKET_INT16_GRAINS")))  grains_ovr  = (int)strtol(e, NULL, 0);
    if ((e = getenv("ROCKET_INT16_KGROUPS"))) kgroups_ovr = (int)strtol(e, NULL, 0);
-   /* DPU output-writer controls (the "stuck on one 1x16 tile" cluster the
-    * iteration-register sweep pointed at). All default 0 = current behaviour. */
+   /* DPU transposed-writer controls (tp_org_en and its siblings). All default 0 = the
+    * int32 writer. */
    unsigned mc_surf = 0, tp_prec = 0, tp_org = 0, size_c = 0;
    if ((e = getenv("ROCKET_INT16_MC_SURF"))) mc_surf = (unsigned)strtoul(e, NULL, 0);
    if ((e = getenv("ROCKET_INT16_TP_PREC"))) tp_prec = (unsigned)strtoul(e, NULL, 0);
@@ -1588,9 +1631,8 @@ int gen_matmul_int16(matmul_params_t *params)
    dpu_desc.height_wdma = core_desc.dataout_height;
    dpu_desc.channel_wdma = core_desc.dataout_channel;
 
-   /* DPU output-writer controls — the unswept register cluster the iteration
-    * sweep pointed at for the int16 "one 1x16 tile" truncation. Default 0 (current
-    * behaviour); sweep via ROCKET_INT16_MC_SURF / TP_PREC / TP_ORG / SIZE_C. */
+   /* DPU transposed-writer controls. Default 0, the int32 writer; set via
+    * ROCKET_INT16_MC_SURF / TP_PREC / TP_ORG / SIZE_C for the 8/16-bit transposed output. */
    dpu_desc.mc_surf_out  = mc_surf & 0x1;
    dpu_desc.tp_precision = tp_prec & 0x1;
    dpu_desc.tp_org_en    = tp_org  & 0x1;
@@ -2239,6 +2281,7 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
   uint32_t value;
   int i = 0;
 
+  if (!geometry_fits(cna_desc, dpu_desc)) return -1;
   ops[i++] = NPUOP(OP_REG_DPU, 0xE, DPU_S_POINTER);
   ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE, DPU_RDMA_S_POINTER);
 
@@ -2374,6 +2417,9 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
   ops[i++] = NPUOP(OP_REG_DPU, value, DPU_FEATURE_MODE_CFG);
   value = ((dpu_desc->out_precision & 0x7) << 29) | ((dpu_desc->in_precision & 0x7) << 26) |
     ((dpu_desc->mc_surf_out & 0x1) << 3) | (dpu_desc->proc_precision & 0x7);
+  /* BS_MUL_SHIFT_VALUE_NEG: the per-channel multiplier's shift for a NEGATIVE product */
+  if (dpu_desc->bias_en && dpu_desc->bs_mul_src)
+    value |= ((uint32_t)dpu_desc->bs_mul_shift & 0x3F) << 4;
   ops[i++] = NPUOP(OP_REG_DPU, value, DPU_DATA_FORMAT);
   ops[i++] = NPUOP(OP_REG_DPU, 0x0, DPU_OFFSET_PEND);
   ops[i++] = NPUOP(OP_REG_DPU, dpu_desc->dst_base_addr, DPU_DST_BASE_ADD);
@@ -2390,14 +2436,18 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
    * bias from BRDMA (Mesa's int8 word: BS_ALU_ALGO(2)|BS_ALU_SRC(1)|RELU/MUL bypass
    * = 0x20150). Else the all-bypass word from the bs_* fields. */
   if (dpu_desc->bias_en) {
-    value = (2u << 16) | (1u << 8) | (1u << 6) | (1u << 4);
+    /* with bs_mul_src the multiplier is live (BS_MUL_BYPASS clear) and reads C[c] */
+    value = (2u << 16) | (1u << 8) | (1u << 6) | (dpu_desc->bs_mul_src ? 0u : (1u << 4));
   } else {
     value = ((dpu_desc->bs_relu_bypass & 0x1) << 6) | ((dpu_desc->bs_mul_bypass & 0x1) << 4) |
       ((dpu_desc->bs_alu_bypass & 0x1) << 1) | (dpu_desc->bs_bypass & 0x1);
   }
   ops[i++] = NPUOP(OP_REG_DPU, value, DPU_BS_CFG);
   ops[i++] = NPUOP(OP_REG_DPU, 0x0, DPU_BS_ALU_CFG);
-  ops[i++] = NPUOP(OP_REG_DPU, 0x0, DPU_BS_MUL_CFG);
+  /* BS_MUL_SHIFT_VALUE (the non-negative product's shift) and BS_MUL_SRC */
+  value = (dpu_desc->bias_en && dpu_desc->bs_mul_src)
+        ? ((((uint32_t)dpu_desc->bs_mul_shift & 0x3F) << 8) | 1u) : 0u;
+  ops[i++] = NPUOP(OP_REG_DPU, value, DPU_BS_MUL_CFG);
   ops[i++] = NPUOP(OP_REG_DPU, 0x0, DPU_BS_RELUX_CMP_VALUE);
   value = ((dpu_desc->tp_org_en & 0x1) << 27) | ((dpu_desc->size_e_2 & 0x7) << 8) |
     ((dpu_desc->size_e_1 & 0x7) << 5) |
@@ -2510,7 +2560,10 @@ static int gen_conv2d_task(uint64_t *ops, npu_cna_desc *cna_desc,
   ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, DPU_RDMA_SRC_BASE_ADDR);
   /* int8-out bias: arm BRDMA (BRDMA_DATA_USE(1) = bit1) to fetch the per-OC int32
    * bias cube from BS_BASE_ADDR. Else BS bypassed -> no bias read (float default). */
-  ops[i++] = NPUOP(OP_REG_DPU_RDMA, dpu_desc->bias_en ? (1u << 1) : 0x0, DPU_RDMA_BRDMA_CFG);
+  /* BRDMA_DATA_USE 1 reads the int32 bias alone; 7 reads the 64-byte A/B/C group */
+  ops[i++] = NPUOP(OP_REG_DPU_RDMA,
+                   dpu_desc->bias_en ? ((dpu_desc->bs_mul_src ? 7u : 1u) << 1) : 0x0,
+                   DPU_RDMA_BRDMA_CFG);
   ops[i++] = NPUOP(OP_REG_DPU_RDMA, dpu_desc->bias_en ? dpu_desc->bias_base_addr : 0x0, DPU_RDMA_BS_BASE_ADDR);
   ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, DPU_RDMA_NRDMA_CFG);
   ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, DPU_RDMA_BN_BASE_ADDR);
@@ -2831,6 +2884,47 @@ int gen_conv2d_dw_fp16(conv_params_t *params) { return gen_conv2d_fill(params, 1
  * env-overridable (ROCKET_CONV_DW_*) for the on-HW sweep, exactly as the fp16 DW
  * crack used. The DIRECT path is the validated deliverable.
  */
+/* The int8-OUTPUT writer's epilogue, shared by the depthwise and the direct program so the
+ * two cannot disagree: QD_EN 1, DATA_FORMAT 0 (int8 out), the per-OC int32 bias (or the
+ * per-channel coefficient group) in the BS stage via BRDMA, the OUT_CVT requant, and the CNA
+ * border pad as the input zero point. The caller sets the output geometry (size_e, surf_add),
+ * which is where the two programs differ.
+ *
+ *   CNA border pad: the zero point in the uint8-centered domain, one BYTE per lane. On the
+ *     depthwise program the odd channels among the first 32 of a group read byte 1 of the
+ *     word and the rest read byte 0 [HW sweep, RK1]; Mesa writes the byte once,
+ *     sign-extended (rkt_regcmd.c: input_zero_point - 0x80). So the byte goes in every lane.
+ *   OUT_CVT triple: the pair npu_out_cvt_pair() derives from conv_scale =
+ *     in_scale*w_scale/out_scale (QNNPACK's derivation, without the carry Mesa's
+ *     rkt_regcmd.c copy drops at one mantissa pattern: see npu_requant.h);
+ *     offset = out_zp - 0x80.
+ *   Per-tensor (truncate_bits 0; Mesa's per-scale truncate hack-list is not reproduced).
+ *   CPEND: DPU_BS_OW_OP = 0x80 - weight_zero_point (uint8-centered), with OD_BYPASS clear. */
+static void int8_out_epilogue(const conv_params_t *params, npu_cna_desc *cna_desc,
+                              npu_core_desc *core_desc, npu_dpu_desc *dpu_desc)
+{
+    uint32_t pb = (((uint32_t)params->input_zero_point & 0xff) - 0x80u) & 0xffu;
+    unsigned shift, scale;
+
+    core_desc->qd_en = 1;                          /* HW-required for the requant writer */
+    cna_desc->pad_con1 = pb * 0x01010101u;
+    dpu_desc->out_precision = precision_int8;      /* DPU_DATA_FORMAT = 0 */
+    dpu_desc->od_bypass = 0;
+    dpu_desc->bs_ow_op = 0x80 - (uint32_t)params->weight_zero_point;
+
+    npu_out_cvt_pair((params->in_scale * params->w_scale) / params->out_scale, &scale, &shift);
+    dpu_desc->out_cvt_scale  = (uint16_t)scale;
+    dpu_desc->out_cvt_shift  = (uint8_t)shift;
+    dpu_desc->out_cvt_offset = (uint32_t)(params->output_zero_point - 0x80);
+
+    /* per-OC int32 bias add in the BS ALU, fetched by BRDMA; with bs_mul_perc the same cube
+     * carries the per-channel multiplier (npu_dpu_desc.bs_mul_src). */
+    dpu_desc->bias_en = 1;
+    dpu_desc->bias_base_addr = params->bias_dma;
+    dpu_desc->bs_mul_src = params->bs_mul_perc ? 1 : 0;
+    dpu_desc->bs_mul_shift = params->bs_mul_shift;
+}
+
 static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
 {
     if (rk3588_encoding_only("gen_conv2d_int8_fill")) return -1;
@@ -3026,6 +3120,20 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
    dpu_desc.height_wdma = core_desc.dataout_height;
    dpu_desc.channel_wdma = core_desc.dataout_channel;
 
+   if (!depthwise && params->int8_out) {
+     /* DIRECT int8-out: Mesa's direct program (rkt_regcmd.c, rkt_task.c) — the shared
+      * int8-out epilogue plus the direct output geometry, size_e 1 and SURF_ADD =
+      * dst_surf_stride*2 (the depthwise writer's are 3 and *4). The output is an int8
+      * NC1HWC2 cube at C2=16. ROCKET_CONV_INT8_SIZE_E / _SURF_MULT still override, for a
+      * geometry sweep. The CNA and CORE fields stay the int32-raw direct emitter's. */
+     int8_out_epilogue(params, &cna_desc, &core_desc, &dpu_desc);
+     unsigned se = 1, sm = 2;
+     if ((e = getenv("ROCKET_CONV_INT8_SIZE_E")))    se = (unsigned)strtoul(e, NULL, 0);
+     if ((e = getenv("ROCKET_CONV_INT8_SURF_MULT"))) sm = (unsigned)strtoul(e, NULL, 0);
+     dpu_desc.size_e_2 = se & 0x7; dpu_desc.size_e_1 = se & 0x7; dpu_desc.size_e_0 = se & 0x7;
+     dpu_desc.surf_add = dpu_desc.dst_surf_stride * sm;
+   }
+
    if (depthwise) {
      /* DW int8 output geometry. Two datapaths:
       *
@@ -3047,44 +3155,11 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
 
      if (params->int8_out) {
        /* int8 output + on-chip requant (== Mesa's DW int8 regcmd). */
-       core_desc.qd_en = 1;                       /* HW-required for the requant writer */
-       /* CNA border pad: the zero point in the uint8-centered domain, one BYTE per lane.
-        * The odd channels among the first 32 of a group read byte 1 of the word and the
-        * rest read byte 0 [HW sweep, RK1: a unit weight at tap (0,0) reads each channel's
-        * pad back]. Mesa writes the byte once, sign-extended (rkt_regcmd.c: input_zero_point
-        * - 0x80), which pads those 16 lanes with 0x00 or 0xFF; its two hand-coded values
-        * (0xffff8080, 0x0b0b) are the byte written twice. So the byte goes in every lane. */
-       {
-         uint32_t pb = (((uint32_t)params->input_zero_point & 0xff) - 0x80u) & 0xffu;
-         cna_desc.pad_con1 = pb * 0x01010101u;
-       }
-       dpu_desc.out_precision = precision_int8;    /* DPU_DATA_FORMAT = 0 */
-       /* int8-out writer stride: size_e=3, surf_add = dst_surf_stride*4 (NOT the
+       int8_out_epilogue(params, &cna_desc, &core_desc, &dpu_desc);
+       /* int8-out depthwise writer stride: size_e=3, surf_add = dst_surf_stride*4 (NOT the
         * int32-raw 7/8). Matches the Teflon capture (SURFACE_ADD=256=OH*OW*4). */
        dpu_desc.size_e_2 = 3; dpu_desc.size_e_1 = 3; dpu_desc.size_e_0 = 3;
        dpu_desc.surf_add = dpu_desc.dst_surf_stride * 4;
-
-       /* OUT_CVT requant triple, computed exactly as Mesa (rkt_regcmd.c):
-        *   conv_scale = in_scale*w_scale/out_scale, reinterpreted as float bits;
-        *   shift = 126 - exp + 16 - 1   (QNNPACK requantization.h derivation);
-        *   scale = ((bits>>9)&0x7fff)+1, forced to have bit14 set;
-        *   offset = out_zp - 0x80.
-        * Per-tensor only (Teflon forces per-tensor quant). truncate_bits assumed 0
-        * (Mesa's per-scale truncate hack-list is not reproduced — pick scales that
-        * land truncate=0; the gate does). */
-       union { float f; uint32_t u; } cv;
-       cv.f = (params->in_scale * params->w_scale) / params->out_scale;
-       uint32_t bits = cv.u;
-       unsigned shift = 127u + 31u - 32u - (bits >> 23) + 16u;   /* == 126 - exp + 16 */
-       unsigned scale = ((bits >> 9) & 0x7fffu) + 1u;
-       if (scale < (1u << 14)) scale |= (1u << 14);
-       dpu_desc.out_cvt_scale  = (uint16_t)scale;
-       dpu_desc.out_cvt_shift  = (uint8_t)(shift - 1u);
-       dpu_desc.out_cvt_offset = (uint32_t)(params->output_zero_point - 0x80);
-
-       /* per-OC int32 bias add in the BS ALU, fetched by BRDMA. */
-       dpu_desc.bias_en = 1;
-       dpu_desc.bias_base_addr = params->bias_dma;
      }
 
      /* Env overrides for the on-HW geometry sweep (single-variable isolation). */

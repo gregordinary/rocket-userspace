@@ -26,9 +26,11 @@
  *               route was written under is that a ~6e-8 scale drives the OUT_CVT shift
  *               out of DPU 0x40B4's six-bit field. It does not, and it cannot: the
  *               planner divides the scale it is handed by a cmax carrying the SAME
- *               accumulator bound, so the two cancel and best_base is the constant
- *               127/INT32_MAX whatever the weights are. This gate reads the number back
- *               off rocket_rk3576_plan_perchannel() rather than asserting the algebra.
+ *               accumulator bound, so the two cancel and the OUT_CVT gain stays near
+ *               127/INT32_MAX whatever the weights are (on the shift ramp to within the
+ *               factor of two one step of the DPU shift word moves it). This gate reads
+ *               the OUT_CVT shift and the DPU shift word back off the entry's own plan,
+ *               rocket_rk3576_plan_percol(), rather than asserting the algebra.
  *
  *   est/true    the bootstrap's per-column error against the exact int32 accumulator,
  *               computed here on the host because this test — unlike a frontend — has
@@ -50,6 +52,14 @@
  * that keeps the shared ramp usable. Forcing a smaller output-channel tile moves it
  * monotonically and does not close it (15.3 -> 15.0 -> 10.7% at NT 2048/256/32), which
  * is the per-tile lever the entry's header describes, measured on this route.
+ *
+ * THOSE ARE THE SHIFT-0 RAMP'S NUMBERS (ROCKET_RK3576_MM_PC_SHIFT=0), and the term they
+ * name is the ramp's: with the DPU shift word carrying the gain the tile spans 32767:1
+ * rather than the int32 headroom's few hundred, and the same M=1 cells read 2.1% and 2.4%
+ * composed (bootstrap), 31% and 7.9% with the exact colmax, against 15.3%, 18.1%, 201% and
+ * 181% on the shift-0 ramp. At M=256/512 the two ramps read within 0.02 points of each
+ * other, since there the int8 rounding is the term. [HW sweep, H96 MAX M9, rocket 1.6.0,
+ * 2026-09-27]
  *
  * WHAT A GREEN RUN HERE WOULD NOT SHOW. The operands are pseudorandom, so this says
  * nothing about a real activation distribution — and nothing about CALIBRATION, since
@@ -154,7 +164,8 @@ struct cell_result {
     double rms_rel;                 /* composed: RMS(dequant - exact)/RMS(exact) */
     double worst_rel_err;           /* the entry's own integer-ramp resolution   */
     double sat_frac;                /* fraction of the frozen surface at +-127   */
-    unsigned shift_p1, shift_frozen;
+    unsigned shift_p1, shift_frozen;   /* the OUT_CVT shift field (0x40B4)          */
+    unsigned bs_p1, bs_frozen;         /* the DPU shift word; 0 on the shift-0 ramp */
     double  base_p1;
     long    stamped;
 };
@@ -237,22 +248,22 @@ static int run_cell(int fd, int M, int K, int N, uint32_t seed,
         truemax[n] = mx > 0.0 ? mx : 1.0;
     }
 
-    /* What the emitter will actually program on pass one, read back off the planner
-     * rather than re-derived: the DPU shift field is six bits and this is the number
-     * the route was written in doubt of. */
+    /* What the emitter will actually program on pass one, read back off the entry's own
+     * plan (whichever ramp ROCKET_RK3576_MM_PC_SHIFT selects) rather than re-derived: the
+     * DPU's OUT_CVT shift field is six bits and this is the number the route was written
+     * in doubt of. The whole N as one tile, as the pass-one cells here run. */
     {
         int16_t *cm = calloc((size_t)N, sizeof *cm);
         int32_t *bz = calloc((size_t)N, sizeof *bz);
-        float base = 0.0f;
-        double e = 0.0;
+        struct rocket_rk3576_percol_plan pp;
         unsigned mul = 0, sh = 0;
         if (cm && bz &&
-            rocket_rk3576_plan_perchannel("route probe", 0, (unsigned)N, (unsigned)N,
-                                          bz, sumw, 1.0f, sc1, 1.0f, NULL,
-                                          cm, &base, &e) == 0) {
-            rocket_rk3576_requant_params(base, &mul, &sh);
+            rocket_rk3576_plan_percol(0, (unsigned)N, (unsigned)N, bz, sumw, sc1, cm,
+                                      &pp) == 0) {
+            rocket_rk3576_requant_params(pp.gain, &mul, &sh);
             out->shift_p1 = sh;
-            out->base_p1  = (double)base;
+            out->bs_p1    = pp.bs_shift;
+            out->base_p1  = (double)pp.gain;
         }
         free(cm); free(bz);
     }
@@ -296,15 +307,14 @@ static int run_cell(int fd, int M, int K, int N, uint32_t seed,
     {
         int16_t *cm = calloc((size_t)N, sizeof *cm);
         int32_t *bz = calloc((size_t)N, sizeof *bz);
-        float base = 0.0f;
-        double e = 0.0;
+        struct rocket_rk3576_percol_plan pp;
         unsigned mul = 0, sh = 0;
         if (cm && bz &&
-            rocket_rk3576_plan_perchannel("route probe", 0, (unsigned)N, (unsigned)N,
-                                          bz, sumw, 1.0f, scf, 1.0f, NULL,
-                                          cm, &base, &e) == 0) {
-            rocket_rk3576_requant_params(base, &mul, &sh);
+            rocket_rk3576_plan_percol(0, (unsigned)N, (unsigned)N, bz, sumw, scf, cm,
+                                      &pp) == 0) {
+            rocket_rk3576_requant_params(pp.gain, &mul, &sh);
             out->shift_frozen = sh;
+            out->bs_frozen    = pp.bs_shift;
         }
         free(cm); free(bz);
     }
@@ -349,10 +359,12 @@ done:
  * concession. A column's frozen colmax is a max over M accumulator rows, so at a prefill
  * M it is a tight statistic and at M=1 it is one Gaussian draw — and the entry plans ONE
  * (MUL, SHIFT) per output-channel tile, so the spread of scale_n across a tile is what
- * sets every column's C resolution. Measured on the part: 2.1-2.2% at M=256/512 against
- * 15.3-18.1% at M=1, same K, same weights. ggml-rocket does not route M below
- * rocket_min_m() (128), so the M=1 cells here are the library entry's envelope and not a
- * frontend path; they are held to a bound that a regression would still trip. */
+ * sets every column's C resolution. Measured on the part on the shift-0 ramp: 2.1-2.2% at
+ * M=256/512 against 15.3-18.1% at M=1, same K, same weights (2.1-2.4% at every M on the
+ * shift ramp). ggml-rocket does not route M below rocket_min_m() (128), so the M=1 cells
+ * here are the library entry's envelope and not a frontend path. The bound stays where the
+ * shift-0 ramp needs it, because that ramp is still an arm (MM_PC_SHIFT=0) this gate must
+ * pass under. */
 #define EST_MED_MAX      0.05
 #define RMS_REL_MAX      0.10    /* M >= 128 */
 #define RMS_REL_MAX_M1   0.25    /* M < 128, where the tile's scale spread is the term */
@@ -387,9 +399,12 @@ int main(int argc, char **argv)
     printf("rk3576 W8A8 route — the frontend's two-pass calibration, on the part\n");
     printf("  bootstrap margin %.2f, safety factor %.2f, bias NULL, no rotation\n\n",
            ROUTE_BOOTMARGIN, ROUTE_CALSAFE);
-    printf("%5s %6s %6s | %5s %5s | %9s %9s | %9s %9s | %9s %9s %8s\n",
-           "M", "K", "N", "sh_p1", "sh_fr", "p1|err|", "p1 signed", "est med",
-           "est worst", "rms rel", "ramp err", "sat");
+    printf("  ramp: %s\n", getenv("ROCKET_RK3576_MM_PC_SHIFT") &&
+           *getenv("ROCKET_RK3576_MM_PC_SHIFT") == '0'
+           ? "shift-0 (ROCKET_RK3576_MM_PC_SHIFT=0)" : "the DPU shift word carries the gain");
+    printf("%5s %6s %6s | %5s %5s %5s %5s | %9s %9s | %9s %9s | %9s %9s %8s\n",
+           "M", "K", "N", "sh_p1", "sh_fr", "bs_p1", "bs_fr", "p1|err|", "p1 signed",
+           "est med", "est worst", "rms rel", "ramp err", "sat");
     printf("--------------------------------------------------------------"
            "----------------------------------------------------\n");
 
@@ -404,9 +419,9 @@ int main(int argc, char **argv)
             if (one_M) break;
             continue;
         }
-        printf("%5d %6d %6d | %5u %5u | %8.3f%% %9.4f | %8.3f%% %8.2f%% | "
+        printf("%5d %6d %6d | %5u %5u %5u %5u | %8.3f%% %9.4f | %8.3f%% %8.2f%% | "
                "%8.3f%% %8.3f%% %7.4f%%\n",
-               M, K, N, r.shift_p1, r.shift_frozen,
+               M, K, N, r.shift_p1, r.shift_frozen, r.bs_p1, r.bs_frozen,
                100.0 * r.p1_med_abs, r.p1_med_signed,
                100.0 * r.est_med, 100.0 * r.est_worst,
                100.0 * r.rms_rel, 100.0 * r.worst_rel_err, 100.0 * r.sat_frac);
@@ -415,9 +430,11 @@ int main(int argc, char **argv)
                    "sentinel\n", r.stamped);
             fail++;
         }
-        if (r.shift_p1 > 63u || r.shift_frozen > 63u) {
-            printf("      FAIL: a programmed SHIFT is outside DPU 0x40B4's six-bit "
-                   "field (p1 %u, frozen %u)\n", r.shift_p1, r.shift_frozen);
+        if (r.shift_p1 > 63u || r.shift_frozen > 63u || r.bs_p1 > 63u ||
+            r.bs_frozen > 63u) {
+            printf("      FAIL: a programmed shift is outside its six-bit field (OUT_CVT "
+                   "p1 %u, frozen %u; BS word p1 %u, frozen %u)\n", r.shift_p1,
+                   r.shift_frozen, r.bs_p1, r.bs_frozen);
             fail++;
         }
         if (r.est_med > EST_MED_MAX) {

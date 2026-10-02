@@ -9,8 +9,9 @@
  *
  *     out = sat8( round_half_to_even(acc * MUL >> SHIFT) + offset )
  *
- * MUL and SHIFT come from the caller's fp32 scale through the vendor's (QNNPACK)
- * derivation, which is what the emitters program.
+ * MUL and SHIFT come from the caller's fp32 scale through npu_out_cvt_pair()
+ * (include/npu_requant.h), the one derivation the emitters program. So this model cannot
+ * see a defect in that derivation: tests/requant_edge_probe scores it against the float.
  *
  * THE TIE ROUNDS TO EVEN. Measured, both signs, at two shifts (tests/requant_round_probe
  * on the H96 MAX M9): the part rounds `acc*MUL >> SHIFT` half to even — 0.5 -> 0, 1.5 ->
@@ -32,19 +33,13 @@
 
 #include <stdint.h>
 
+#include "npu_requant.h"
+
 /* fp32 conv scale -> the register pair the emitters write. `shift` is the REGISTER
  * value, already pre-decremented, so the model shifts by exactly what the DPU has. */
 static inline void requant_params(float conv_scale, unsigned *mul, unsigned *shift)
 {
-    union { float f; uint32_t u; } cv;
-    uint32_t bits;
-    unsigned m;
-    cv.f = conv_scale;
-    bits = cv.u;
-    *shift = 127u + 31u - 32u - (bits >> 23) + 16u - 1u;
-    m = ((bits >> 9) & 0x7FFFu) + 1u;
-    if (m < (1u << 14)) m |= (1u << 14);
-    *mul = m;
+    npu_out_cvt_pair(conv_scale, mul, shift);
 }
 
 /* The rounder itself: `p >> shift` to nearest, ties to even, NOT saturated. This is the

@@ -51,6 +51,21 @@ static const shape_t SHAPES[] = {
 {"envelope", "narrow-deep",      64,  64,   8,   8, 1, 1, 0, 0, 0, 0, 0},
 {"envelope", "k1-s2",            32,  32,  32,  32, 1, 2, 0, 0, 0, 0, 0},
 {"envelope", "unpadded-ic32",    32,  32,  20,  20, 3, 1, 0, 0, 0, 0, 0},
+/* REAL output-channel counts that are not a multiple of 32. Both gates program
+ * rocket_rk3576_pad_oc(oc), a whole number of 32-channel groups, because a partial group
+ * computes wrong; these rows score the padding and the de-scatter of the real channels.
+ * The PROGRAMMED 16-channel atom count is therefore always even, so these rows do not
+ * reach an odd DIV_ROUND_UP(oc, 16), the count at which another RK3576 emitter clears DPU
+ * 0x4050 bit 8. That emitter programs oc verbatim; at every count this one programs, its
+ * rule gives the same 0x80011111. */
+{"envelope", "oc8-atoms1",       32,   8,  16,  16, 3, 1, 1, 0, 0, 0, 0},
+{"envelope", "oc16-atoms1",      32,  16,  16,  16, 3, 1, 1, 0, 0, 0, 0},
+{"envelope", "oc24-atoms2",      32,  24,  16,  16, 3, 1, 1, 0, 0, 0, 0},
+{"envelope", "oc48-atoms3",      32,  48,  16,  16, 3, 1, 1, 0, 0, 0, 0},
+{"envelope", "oc56-atoms4",      32,  56,  16,  16, 3, 1, 1, 0, 0, 0, 0},
+{"envelope", "oc80-atoms5",      64,  80,  16,  16, 1, 1, 0, 0, 0, 0, 0},
+{"envelope", "oc112-atoms7",     32, 112,  16,  16, 3, 2, 1, 0, 0, 0, 0},
+{"window",   "oc48-atoms3-win4", 32,  48,  16,  32, 3, 1, 1, 0,  8, 0, 0},
 
 /* ---- window: the row split, including the two planes with no single-task plan */
 {"window",   "split-forced-2",   32,  32,  32,  32, 3, 1, 1, 0, 16, 0, 0},

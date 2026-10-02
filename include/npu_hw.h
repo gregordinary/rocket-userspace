@@ -76,6 +76,7 @@
 #define CNA_DMA_CON2           0x1080 // AXI control register 2
 #define CNA_FC_DATA_SIZE0      0x1084 // Full connected data size control register0
 #define CNA_FC_DATA_SIZE1      0x1088 // Full connected data size control register1
+#define CNA_CLK_GATE           0x1090 // Clock gating control (RK3588; the RK3576 line stride sits here)
 #define CNA_DCOMP_CTRL         0x1100 // Weight decompress control register
 #define CNA_DCOMP_REGNUM       0x1104 // Weight decompress register number
 #define CNA_DCOMP_ADDR0        0x1110 // Base address of the weight
@@ -99,6 +100,7 @@
 #define CNA_PAD_CON1           0x1184 // Pad controller register1
 
 #define CORE_S_POINTER         0x3004 // Single register group pointer
+#define CORE_MAC_GATING        0x300C // MAC soft clock gating, slcg_op_en [26:0], reset 0x07800800
 #define CORE_MISC_CFG          0x3010 // Misc configuration register
 #define CORE_DATAOUT_SIZE_0    0x3014 // Feature size register 0 of output
 #define CORE_DATAOUT_SIZE_1    0x3018 // Feature size register 1 of output

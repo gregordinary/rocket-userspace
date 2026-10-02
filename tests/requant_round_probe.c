@@ -11,11 +11,11 @@
  * and floor. They differ by one count on a sparse set of elements, which is exactly the
  * size of the standing noise under int8 measurements here.
  *
- * NO GATE CAN SEE IT. The scale a caller passes becomes MUL by the vendor's (QNNPACK)
- * derivation, `MUL = ((bits>>9) & 0x7fff) + 1` with bit 14 forced, and the trailing +1
- * makes MUL ODD for every round scale, including every power of two. An odd multiplier
- * moves an exact half off the tie, always outward, so a tie never reaches the rounder.
- * The probe therefore builds its ties on purpose.
+ * NO GATE CAN SEE IT. The scale a caller passes becomes MUL by npu_out_cvt_pair()
+ * (include/npu_requant.h), QNNPACK's derivation, whose trailing +1 makes MUL ODD for every
+ * round scale, including every power of two. An odd multiplier moves an exact half off
+ * the tie, always outward, so a tie never reaches the rounder. The probe therefore builds
+ * its ties on purpose.
  *
  * BIT 30. Mesa's registers.xml names OUT_CVT_SHIFT bit 30 CVT_ROUND, and open-rknpu
  * measures it on the RV1106, whose DPU map is the RK3588's: 0 rounds a tie half to even,
@@ -24,8 +24,9 @@
  *
  * THE RK3576 ARM drives rocket_matmul_int8_rk3576 with zero operands, so the accumulator
  * IS the per-channel bias, and with a scale chosen so MUL lands on exactly 2^14 (a float
- * whose top 14 mantissa bits are all ones under an even exponent field). The requant is
- * then a plain `acc >> e`, and every odd multiple of 2^(e-1) is a tie.
+ * whose top 14 mantissa bits are all ones, where the +1 carries out and the derivation
+ * renormalizes). The requant is then a plain `acc >> e`, and every odd multiple of 2^(e-1)
+ * is a tie.
  *
  * THE RK3588 ARM uses the int8 matmul's integer convert: ROCKET_INT8_DEQ=1 with
  * CVTTYPE 0, SCALE 1 and SHIFT e puts `acc >> e` through the OUT_CVT and writes the result
@@ -53,21 +54,13 @@
 #include "rocket_matmul.h"
 #include "npu_matmul.h"
 #include "rocket_hw_profile.h"
+#include "npu_requant.h"
 
-/* The emitter's scale -> (MUL, SHIFT), copied from the encoders so the probe reports the
- * multiplier it is actually going to get rather than the one it assumes. */
+/* The emitter's scale -> (MUL, SHIFT), the encoders' own derivation, so the probe reports
+ * the multiplier it is actually going to get rather than the one it assumes. */
 static void derive(float conv_scale, unsigned *mul, unsigned *shift)
 {
-    union { float f; uint32_t u; } cv;
-    uint32_t bits;
-    unsigned s, m;
-    cv.f = conv_scale;
-    bits = cv.u;
-    s = 127u + 31u - 32u - (bits >> 23) + 16u;
-    m = ((bits >> 9) & 0x7FFFu) + 1u;
-    if (m < (1u << 14)) m |= (1u << 14);
-    *mul = m;
-    *shift = s - 1u;
+    npu_out_cvt_pair(conv_scale, mul, shift);
 }
 
 static int sat8(int64_t v)
@@ -186,13 +179,13 @@ static void set_round(int round_bit)
 #define K_DEP  32
 #define N_CH   64
 
-/* Each scale is chosen for MUL == 0x4000 exactly: significand 1.99993896484375 under an
- * even exponent field, so the top 14 mantissa bits are all ones and the +1 carries into
- * bit 14 rather than making the multiplier odd. */
+/* Each scale is chosen for MUL == 0x4000 exactly: significand 1.99993896484375, so the
+ * top 14 mantissa bits are all ones and the +1 carries out of the multiplier, which the
+ * derivation takes as 0x4000 at one less shift rather than an odd multiplier. */
 typedef struct { const char *name; float scale; } probe_scale;
 static const probe_scale SCALES[] = {
-    { "acc>>1", 0.999969482421875f },      /* 0x3f7ffe00 */
-    { "acc>>3", 0.24999237060546875f },    /* 0x3e7ffe00 */
+    { "acc>>1", 0.4999847412109375f },     /* 0x3efffe00 */
+    { "acc>>3", 0.12499618530273438f },    /* 0x3dfffe00 */
 };
 #define N_SCALES ((int)(sizeof SCALES / sizeof SCALES[0]))
 

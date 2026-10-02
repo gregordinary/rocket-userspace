@@ -218,6 +218,22 @@ int rocket_rk3576_i32_wide_word(unsigned ow, unsigned oh_full, unsigned c, unsig
  * harness, and its probes read the lane, pixel and channel maps off the part.
  */
 int gen_conv2d_fp16_rk3576(conv_params_t *params);
+/* The same input-channel slice program with a whole fp32 output stage: nine DPU words
+ * that keep the float arithmetic's two poisoning bits set and still leave the next submit
+ * clean, 80 back-to-back submits with no idle all written [HW sweep, H96 MAX M9, rocket
+ * 1.6.0]. The surface is fp32 in the plain int32 cube (rocket_rk3576_f32_cube_accumulate),
+ * exact against a CPU model at k 1 and 3. Size the output for rocket_rk3576_f32_cube_bytes().
+ * Refuses the packed-image first conv (ic <= 4), which has not run under the stage.
+ * Returns 0 or -1. */
+int gen_conv2d_fp16_rk3576_f32out(conv_params_t *params);
+/* The int8 direct program on the same whole output stage: a DENSE int32 writer. Every
+ * accumulator of the task as a raw int32 (no bias), oc*ow*oh words, poisoning nothing and
+ * raising its own DPU completion [HW sweep, H96 MAX M9, rocket 1.6.0]. oc must be a whole
+ * number of 32-channel groups and the task a whole surface (oh == oh_full): a row window's
+ * 0x40B8 is not measured. rocket_rk3576_i32_dense_word() is the map: the word index of
+ * channel c at pixel p in a surface of A pixels, or -1. */
+int gen_conv2d_int8_rk3576_i32out_dense(conv_params_t *params);
+int rocket_rk3576_i32_dense_word(unsigned A, unsigned c, unsigned p);
 int gen_conv2d_rk3576_prec(conv_params_t *params, int dw, unsigned prec);
 
 /* The channel counts to PROGRAM, given the logical ones: both round up to a multiple
@@ -484,6 +500,16 @@ int rocket_rk3576_fp16_accumulate(float *acc, const void *surface,
                                   size_t surface_bytes,
                                   unsigned oc, unsigned oh, unsigned ow);
 
+/* The fp32 surface gen_conv2d_fp16_rk3576_f32out() writes: the plain int32 cube, four
+ * fp32 lanes to a 16-byte atom, one atom per pixel, each quad of channels a plane of
+ * ow*oh atoms. _bytes sizes it for oc channels; _accumulate de-scatters it and ADDS it into
+ * a row-major [oc][oh][ow] fp32 accumulator, as rocket_rk3576_fp16_accumulate() does for
+ * the fp16 surface. [HW sweep, H96 MAX M9, tests/rk3576_fp16_fp32out_probe] */
+size_t rocket_rk3576_f32_cube_bytes(unsigned oc, unsigned oh, unsigned ow);
+int    rocket_rk3576_f32_cube_accumulate(float *acc, const void *surface,
+                                         size_t surface_bytes,
+                                         unsigned oc, unsigned oh, unsigned ow);
+
 /* CBUF budget planning.
  *
  * The RK3576's feature budget is programmable: CNA_CBUF_CON0 (0x1040) carries a
@@ -554,6 +580,14 @@ int rocket_rk3576_cbuf_f(unsigned iw, unsigned ic, unsigned ih, unsigned oc,
                          unsigned kh, unsigned kw, int dw, unsigned *f_out);
 unsigned rocket_rk3576_max_task_rows(unsigned iw, unsigned ic, unsigned oc,
                                      unsigned kh, unsigned kw, int dw);
+/* How many leading output-channel groups one direct task can drive before its weight
+ * fetch stalls, for a group weight slice of `slice_bytes` (32*ic*kh*kw) beside a feature
+ * allowance of 4096+f granules: the first g with (g*slice mod 64 KiB) + slice past the
+ * weight area, 64 KiB * floor((3072-f)/1024). 0 if the slice does not fit, UINT_MAX if no
+ * group ever
+ * stalls. A stalled job writes its leading groups, raises no completion and is retired at
+ * the driver's backstop. [HW sweep, H96 MAX M9; the mechanism is a hypothesis] */
+unsigned rocket_rk3576_weight_phase_groups(unsigned slice_bytes, unsigned f);
 int rocket_rk3576_cbuf_f_prec(unsigned iw, unsigned ic, unsigned ih, unsigned oc,
                               unsigned kh, unsigned kw, int dw, unsigned prec,
                               unsigned *f_out);
@@ -644,6 +678,13 @@ int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
 int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
                                  rocket_rk3576_row_task *out, unsigned max_tasks,
                                  unsigned *count);
+
+/* The int8 plan with a caller's row cap on top of the allowance's (0 = none). It can only
+ * shorten a window, so it cannot make a plan the allowance refuses; the int8 matmul uses it
+ * to keep each task on an allowance whose weight area holds every group of its tile. */
+int rocket_rk3576_plan_rows_cap(const conv_params_t *p, int dw, unsigned row_cap,
+                                rocket_rk3576_row_task *out, unsigned max_tasks,
+                                unsigned *count);
 
 /* ---- Emitting a windowed task that REUSES the previous task's overlap rows ----
  *
@@ -958,8 +999,9 @@ const char *rocket_rk3576_act_name(int kind);
 int rocket_rk3576_lut_build(int kind, double value_scale, double entry_scale,
                             unsigned sel, int16_t *le, int16_t *lo, lut_rk3576_t *w);
 
-/* The fp32 conv scale -> the OUT_CVT pair the emitter programs: `mul` is the uint16
- * multiplier and `shift` the REGISTER value (already pre-decremented). Exposed because
+/* The fp32 conv scale -> the OUT_CVT pair the emitter programs, npu_out_cvt_pair() in
+ * npu_requant.h: `mul` is the 15-bit multiplier (the part reads bit 15 as a sign, so it
+ * is never set) and `shift` the REGISTER value (already pre-decremented). Exposed because
  * a per-channel requant has to size its C multipliers against the gain the emitter will
  * actually program, and re-deriving it independently is how the two drift apart. */
 void rocket_rk3576_requant_params(float conv_scale, unsigned *mul, unsigned *shift);
@@ -1037,6 +1079,22 @@ int rocket_rk3576_pack_coeff_dw_prec(void *dst, size_t dst_bytes, const int32_t 
 int rocket_rk3576_pack_coeff_dw_perc(void *dst, size_t dst_bytes, const int32_t *bias,
                                      unsigned oc, const int16_t *c_term,
                                      int16_t multiplier);
+
+/*
+ * The DPU SHIFT WORD, written into the tail group a packed coefficient buffer already
+ * reserves (the one BS_BASE_ADDR1 points at), for a program of `oc` output channels on the
+ * direct (`dw` 0) or depthwise (`dw` 1) group layout. Call it AFTER the pack, which zeroes
+ * that group.
+ *
+ * The stage then computes `sat32(rne(((acc + A)*C) >> s))`: the product is held wide and
+ * the shift rounds half to even [HW sweep, H96 MAX M9, tests/rk3576_coeff_c.c shift]. The
+ * word carries one 6-bit shift per SIGN of the product, bits[5:0] for a non-negative one
+ * and bits[13:8] for a negative one, and this writes `s` into both: a single field leaves
+ * the other sign at a different scale, which an output zero point at the -128 rail hides.
+ * `s` is 0-63. Returns 0, or <0 for a buffer too small or a shift out of range.
+ */
+int rocket_rk3576_pack_bs_shift(void *dst, size_t dst_bytes, unsigned oc, int dw,
+                                unsigned s);
 
 /* ---- The DPU's elementwise stage: one cube in, requantized ---------------------
  *

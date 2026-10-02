@@ -217,7 +217,7 @@ fail:
 /* Find (or build + cache) the per-shape scratch. NULL only on an alloc failure: a full
  * cache recycles its least recently used shape rather than refusing. */
 static rk4_scratch *rk4_ctx_scratch(rocket_i4_ctx *ctx, int M, int K, int N, int group) {
-    const rocket_shape_key k = { M, K, N, group };
+    const rocket_shape_key k = { M, K, N, group, 0 };
     return rocket_slot_get(&ctx->scache, ctx, &k, &rk4_slot_ops);
 }
 

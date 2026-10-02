@@ -43,9 +43,11 @@ int rocket_reduce_factor_axis(int n, int *f, int cap)
     /* Sort ASCENDING (smallest kernel first). This keeps the running quotient large for
      * as long as possible: after pass i it equals the product of the remaining (larger)
      * factors, hence >= the largest factor. For any axis > 16 the largest factor is >= 4,
-     * so NO intermediate spatial dim is < 4 — and a PPU-WRITTEN sub-4 cube is not read
-     * back correctly by the next chained pass (NPU->NPU only; standalone sub-4 pools are
-     * fine; observed on-device, gated by reduce_mean_rocket's telescoping multi-pass). */
+     * so NO intermediate spatial dim is < 4. A chained pass reads a PPU-written 2x2 or 3x3
+     * cube correctly on the current driver (tests/ppu_sub4_chain_probe, two-pass square
+     * chains, with and without the PPU completion class), so the order is kept for the
+     * shapes that probe did not reach -- 1-wide intermediates and longer chains -- rather
+     * than for a known defect. */
     for (int i = 1; i < c; i++)
         for (int j = i; j > 0 && f[j-1] > f[j]; j--) { int t = f[j]; f[j] = f[j-1]; f[j-1] = t; }
     return c;                                  /* n==1 -> 0 (no pooling on this axis) */
@@ -63,9 +65,10 @@ int rocket_global_avgpool_plan(int C, int H, int W)
     if (nw < 0) return -5;                       /* W not 16-smooth */
     /* Equal factor count per axis => every pass pools BOTH axes (kernels >= 2) and no
      * axis is reduced to 1 ahead of the other. Combined with ascending order this keeps
-     * all intermediates >= 4 (no PPU-written sub-4 chained cube). Covers all square maps
-     * (H==W -> identical factor lists) and equal-count rectangles; the rare unequal-count
-     * case (e.g. 56x8) host-falls-back. nh==nw==0 (1x1) is the trivial identity. */
+     * all intermediates >= 4 and none 1 wide, a chained shape no probe has run. Covers
+     * all square maps (H==W -> identical factor lists) and equal-count rectangles; the
+     * rare unequal-count case (e.g. 56x8) host-falls-back. nh==nw==0 (1x1) is the
+     * trivial identity. */
     if (nh != nw) return -6;
     return 0;
 }

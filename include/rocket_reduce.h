@@ -34,9 +34,10 @@
  * factors, so every pass pools both axes and neither collapses to 1 ahead of the other.
  * (b) holds for every SQUARE map (H==W, the usual GlobalAvgPool case) and equal-count
  * rectangles. The factors are applied SMALLEST-FIRST so the running quotient stays >= 4
- * at every step — a PPU-WRITTEN intermediate cube with a spatial dim < 4 is NOT read
- * back correctly by the next chained pass (an NPU->NPU chaining quirk; standalone sub-4
- * pools work). A non-16-smooth axis
+ * at every step and no intermediate is 1 wide. A chained pass reads a PPU-written 2x2 or
+ * 3x3 cube correctly (two-pass square chains, MAX and AVG, tests/ppu_sub4_chain_probe),
+ * so the order is a margin for the 1-wide intermediates and longer chains no probe has
+ * run, not the cure of a known defect. A non-16-smooth axis
  * (prime factor 17,19,23,...) or an unequal factor count falls back to an exact host
  * reduction (still returns the correct answer). rocket_global_avgpool_plan() reports
  * which path a shape takes up front.
@@ -96,8 +97,8 @@ void rocket_global_avgpool_ref_fp16(int C, int H, int W,
  * window is 16x16-capped) — reuse rocket_global_avgpool_plan() to test a shape — but MAX/MIN
  * are IDEMPOTENT so no per-pass reciprocal is needed (max-of-block-maxes == global max), and
  * the result is EXACT (no fp16 reciprocal rounding): a decomposable shape is bit-exact vs the
- * host reduction. The sub-4 chained-intermediate quirk is method-independent, so the same
- * ascending-factor / equal-count plan keeps every intermediate >= 4. Non-decomposable shape
+ * host reduction. The same ascending-factor / equal-count plan keeps every intermediate
+ * >= 4 and none 1 wide. Non-decomposable shape
  * or fd<0 => exact host reduction. Layout/returns as rocket_global_avgpool_fp16. */
 int rocket_global_maxpool_fp16(int fd, int C, int H, int W,
                                const _Float16 *in, _Float16 *out);

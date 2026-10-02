@@ -17,6 +17,12 @@
  *      must match ITS OWN oracle (catches cross-weight scratch aliasing).
  *   3. re-run check 1's weight a 2nd time (resident reuse) -> identical (no churn).
  *
+ * C is prefilled with a sentinel before every call, so an element the path never writes
+ * fails rather than matching a zero. At a shape of at most 2^31 MACs each weight is also
+ * scored against a host int64 reference, which shares no code with either device path.
+ * A shape whose K is one tile (nKt=1, every detector 1x1 conv) takes the path that
+ * gathers each tile straight into C; a deeper K takes the int64 K-accumulation.
+ *
  * Usage: matmul_int8_prepacked_rocket [M K N [W]]   (default 512 3840 4096, W=4)
  *   Needs K%32==0, N%32==0, (M%4==0 || M==1). Try the Gemma FFN shapes:
  *     512 15360 3840   (ffn-down: deep K -> host int32 accum, nKt large)
@@ -47,6 +53,17 @@ static int oracle(int M, int K, int N, const int8_t *A, const int8_t *B, int32_t
     return ret;
 }
 
+/* host int64 reference, C[m][n] = sum_k A[m][k] * B[n][k] (B is [N][K]) */
+static void host_ref(int M, int K, int N, const int8_t *A, const int8_t *B, int32_t *C) {
+    for (int m = 0; m < M; m++)
+        for (int n = 0; n < N; n++) {
+            int64_t acc = 0;
+            for (int k = 0; k < K; k++) acc += (int64_t)A[(size_t)m * K + k] * B[(size_t)n * K + k];
+            C[(size_t)m * N + n] = (int32_t)acc;
+        }
+}
+
+#define C_SENTINEL 0xA5
 static int cmp_exact(const char *tag, const int32_t *got, const int32_t *ref, size_t n) {
     int bad = 0; long maxabs = 0;
     for (size_t i = 0; i < n; i++) {
@@ -88,7 +105,9 @@ int main(int argc, char **argv) {
     int8_t **B  = malloc(W * sizeof(*B));
     int32_t *Cr = malloc(Csz * sizeof(int32_t));   /* resident result */
     int32_t *Co = malloc(Csz * sizeof(int32_t));   /* one-shot oracle */
-    if (!A || !B || !Cr || !Co) { fprintf(stderr, "host alloc failed\n"); return -1; }
+    const int host = (double)M * K * N <= 2147483648.0;
+    int32_t *Ch = host ? malloc(Csz * sizeof(int32_t)) : NULL;   /* host int64 reference */
+    if (!A || !B || !Cr || !Co || (host && !Ch)) { fprintf(stderr, "host alloc failed\n"); return -1; }
 
     srand(20260617);
     for (size_t i = 0; i < Asz; i++) A[i] = rand_i8();
@@ -113,7 +132,7 @@ int main(int argc, char **argv) {
     /* Check 1+2: each resident weight vs its own one-shot oracle. */
     for (int w = 0; w < W; w++) {
         if (oracle(M, K, N, A, B[w], Co)) { fprintf(stderr, "oracle(%d) failed\n", w); return -1; }
-        memset(Cr, 0, Csz * sizeof(int32_t));
+        memset(Cr, C_SENTINEL, Csz * sizeof(int32_t));
         int64_t t0 = now_us();
         if (rocket_matmul_int8_prepacked(ctx, M, K, N, A, Cr, rw[w])) {
             fprintf(stderr, "rocket_matmul_int8_prepacked(%d) failed\n", w); return -1;
@@ -123,20 +142,26 @@ int main(int argc, char **argv) {
         char tag[32]; snprintf(tag, sizeof(tag), "w%d", w);
         printf("weight %d: resident %.2f ms (%.1f GOP/s)\n", w, us / 1000.0, gop / (us / 1e6));
         if (cmp_exact(tag, Cr, Co, Csz)) fails++;
+        if (Ch) {
+            host_ref(M, K, N, A, B[w], Ch);
+            snprintf(tag, sizeof(tag), "w%d-host", w);
+            if (cmp_exact(tag, Cr, Ch, Csz)) fails++;
+        }
     }
 
     /* Check 3: re-run weight 0 (resident reuse must be stable). */
     if (oracle(M, K, N, A, B[0], Co)) return -1;
-    memset(Cr, 0, Csz * sizeof(int32_t));
+    memset(Cr, C_SENTINEL, Csz * sizeof(int32_t));
     if (rocket_matmul_int8_prepacked(ctx, M, K, N, A, Cr, rw[0])) return -1;
     if (cmp_exact("reuse-w0", Cr, Co, Csz)) fails++;
 
     for (int w = 0; w < W; w++) rocket_i8_weights_free(ctx, rw[w]);
     rocket_i8_ctx_free(ctx);
 
-    printf("\n==> %s (%d/%d checks failed)\n", fails ? "FAIL" : "ALL PASS", fails, W + 1);
+    printf("\n==> %s (%d/%d checks failed)\n", fails ? "FAIL" : "ALL PASS", fails,
+           W + 1 + (host ? W : 0));
 
-    free(A); free(Cr); free(Co); free(rw);
+    free(A); free(Cr); free(Co); free(Ch); free(rw);
     for (int w = 0; w < W; w++) free(B[w]);
     free(B);
     return fails ? -1 : 0;

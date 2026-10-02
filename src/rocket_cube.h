@@ -264,4 +264,135 @@ static inline size_t wt_idx_tf32(int C, int k, int c) {      /* weight, (N/16,K/
          + (size_t)((c - 1) % 16) + (size_t)((k - 1) % 16) * 16;
 }
 
+/* ── Planes <-> one channel group of a cube ───────────────────────────────────────
+ *
+ * A conv entry's tensors are PLANES, [C][H*W], and a cube group holds G channels of every
+ * pixel side by side, so here the two ends are a transpose rather than two runs of the
+ * same order. Moved one channel at a time, each pass writes one element of every G-wide
+ * line, and a line is touched G times. These move G channels of a block of pixels at
+ * once: a 16x16 byte or 8x8 halfword transpose (a perfect shuffle, zip rows j and j+n/2,
+ * applied log2(n) times) and a four-way de-interleave for the int32 output cube, so each
+ * line of the cube is written or read once.
+ *
+ * `planes[j]` is channel j's plane for j < nc; lanes nc..G-1 of the cube are written 0
+ * on the way in and not read on the way out. `npix` pixels are moved, starting at pixel
+ * 0 of each plane and of the group. Same bytes as the per-channel loop by construction. */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+static inline void rc_tr16x16_u8(uint8x16_t v[16])
+{
+#pragma GCC unroll 4
+    for (int st = 0; st < 4; st++) {
+        uint8x16_t n[16];
+#pragma GCC unroll 8
+        for (int j = 0; j < 8; j++) {
+            n[2 * j]     = vzip1q_u8(v[j], v[j + 8]);
+            n[2 * j + 1] = vzip2q_u8(v[j], v[j + 8]);
+        }
+#pragma GCC unroll 16
+        for (int j = 0; j < 16; j++) v[j] = n[j];
+    }
+}
+static inline void rc_tr8x8_u16(uint16x8_t v[8])
+{
+#pragma GCC unroll 3
+    for (int st = 0; st < 3; st++) {
+        uint16x8_t n[8];
+#pragma GCC unroll 4
+        for (int j = 0; j < 4; j++) {
+            n[2 * j]     = vzip1q_u16(v[j], v[j + 4]);
+            n[2 * j + 1] = vzip2q_u16(v[j], v[j + 4]);
+        }
+#pragma GCC unroll 8
+        for (int j = 0; j < 8; j++) v[j] = n[j];
+    }
+}
+#endif
+
+/* planes (bytes) -> a G=16 byte cube group: dst[p*16 + j] = planes[j][p]. */
+static inline void rc_planes_to_group16_u8(uint8_t *restrict dst, const uint8_t *const *planes,
+                                           int nc, size_t npix)
+{
+    size_t p = 0;
+#if defined(__aarch64__)
+    for (; p + 16 <= npix; p += 16) {
+        uint8x16_t v[16];
+        for (int j = 0; j < 16; j++) v[j] = j < nc ? vld1q_u8(planes[j] + p) : vdupq_n_u8(0);
+        rc_tr16x16_u8(v);
+        for (int k = 0; k < 16; k++) vst1q_u8(dst + (p + k) * 16, v[k]);
+    }
+#endif
+    for (; p < npix; p++)
+        for (int j = 0; j < 16; j++) dst[p * 16 + j] = j < nc ? planes[j][p] : 0;
+}
+
+/* a G=16 byte cube group -> planes: planes[j][p] = src[p*16 + j], j < nc. */
+static inline void rc_group16_to_planes_u8(uint8_t *const *planes, int nc,
+                                           const uint8_t *restrict src, size_t npix)
+{
+    size_t p = 0;
+#if defined(__aarch64__)
+    for (; p + 16 <= npix; p += 16) {
+        uint8x16_t v[16];
+        for (int k = 0; k < 16; k++) v[k] = vld1q_u8(src + (p + k) * 16);
+        rc_tr16x16_u8(v);
+        for (int j = 0; j < nc; j++) vst1q_u8(planes[j] + p, v[j]);
+    }
+#endif
+    for (; p < npix; p++)
+        for (int j = 0; j < nc; j++) planes[j][p] = src[p * 16 + j];
+}
+
+/* planes (halfwords) -> a G=8 halfword cube group: dst[p*8 + j] = planes[j][p]. */
+static inline void rc_planes_to_group8_u16(uint16_t *restrict dst, const uint16_t *const *planes,
+                                           int nc, size_t npix)
+{
+    size_t p = 0;
+#if defined(__aarch64__)
+    for (; p + 8 <= npix; p += 8) {
+        uint16x8_t v[8];
+        for (int j = 0; j < 8; j++) v[j] = j < nc ? vld1q_u16(planes[j] + p) : vdupq_n_u16(0);
+        rc_tr8x8_u16(v);
+        for (int k = 0; k < 8; k++) vst1q_u16(dst + (p + k) * 8, v[k]);
+    }
+#endif
+    for (; p < npix; p++)
+        for (int j = 0; j < 8; j++) dst[p * 8 + j] = j < nc ? planes[j][p] : 0;
+}
+
+/* a G=8 halfword cube group -> planes: planes[j][p] = src[p*8 + j], j < nc. */
+static inline void rc_group8_to_planes_u16(uint16_t *const *planes, int nc,
+                                           const uint16_t *restrict src, size_t npix)
+{
+    size_t p = 0;
+#if defined(__aarch64__)
+    for (; p + 8 <= npix; p += 8) {
+        uint16x8_t v[8];
+        for (int k = 0; k < 8; k++) v[k] = vld1q_u16(src + (p + k) * 8);
+        rc_tr8x8_u16(v);
+        for (int j = 0; j < nc; j++) vst1q_u16(planes[j] + p, v[j]);
+    }
+#endif
+    for (; p < npix; p++)
+        for (int j = 0; j < nc; j++) planes[j][p] = src[p * 8 + j];
+}
+
+/* a G=4 int32 cube group -> planes: planes[j][p] = src[p*4 + j], j < nc. */
+static inline void rc_group4_to_planes_i32(int32_t *const *planes, int nc,
+                                           const int32_t *restrict src, size_t npix)
+{
+    size_t p = 0;
+#if defined(__aarch64__)
+    for (; p + 4 <= npix; p += 4) {
+        int32x4x4_t v = vld4q_s32(src + p * 4);
+        if (nc > 0) vst1q_s32(planes[0] + p, v.val[0]);
+        if (nc > 1) vst1q_s32(planes[1] + p, v.val[1]);
+        if (nc > 2) vst1q_s32(planes[2] + p, v.val[2]);
+        if (nc > 3) vst1q_s32(planes[3] + p, v.val[3]);
+    }
+#endif
+    for (; p < npix; p++)
+        for (int j = 0; j < nc; j++) planes[j][p] = src[p * 4 + j];
+}
+
 #endif /* ROCKET_CUBE_H */

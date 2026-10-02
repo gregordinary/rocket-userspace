@@ -176,6 +176,23 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
  *     1024 channels to 32 in one step at K > 4992, which multiplies the submit count by
  *     32 at M=512 N=2048 with nothing refusing and nothing computing wrong. A caller
  *     picking a K for speed should stay at or below 4608.
+ *   - A JOB CAN STALL at a fixed output channel of its tile, and the plan keeps every
+ *     job clear of it. Group g of a job completes only if its weight slice (32*K bytes),
+ *     at its 64 KiB phase from the weight base, ends inside the CBUF weight area the
+ *     task's feature allowance leaves, in whole 64 KiB units (192 KiB at F=0, 128 KiB at
+ *     F=1024) — rocket_rk3576_weight_phase_groups(). Past it the job writes nothing more,
+ *     raises no completion and is retired at the driver's backstop, and a write check
+ *     alone passes the partial surface. That is why K 2208/2240/2272/2432 stopped at
+ *     384/320/288/160 channels on a two-row window (F=1024) and K 2304 did not.
+ *     The planner therefore shortens the row window until its allowance holds the whole
+ *     tile, or caps the tile at the groups the window holds, whichever needs fewer jobs.
+ *     Measured at M=512 N=1536: K 2144-2528 exact at 23-30 ms on the first call with no
+ *     retirement (K 2304 23.8-27.0), K 4192/4480/4576 at 672/160/128-channel tiles in
+ *     59-90 ms, K 2240 exact at M 192, 1024 and 2048 [HW sweep, rocket 1.6.0, 2026-09-27].
+ *     A stall the rule does not predict still re-plans the tile at half its width, down to
+ *     32 channels, keeping the width per K; ROCKET_RK3576_MM_NARROW=0 turns that off (the
+ *     entry then refuses there with ROCKET_E_DEVICE) and ROCKET_RK3576_MM_PHASE=0 turns
+ *     the plan off, leaving the narrowing to find the width.
  *
  * WHAT ONE PER-TENSOR OUTPUT SCALE COSTS AN LLM. `scale` is the OUTPUT's alone: A and B
  * arrive quantized, so every input-side choice is the caller's. Simulated exactly on two
@@ -226,25 +243,66 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
  * with a host-side Hadamard rotation along K. [host arithmetic, two models, 2026-08-10]
  *
  * HOW IT IS EXPRESSED, and where its accuracy therefore stops. The DPU has ONE (MUL,
- * SHIFT) per task, so the per-column part rides on the coefficient group's int16 C
- * term: the epilogue is `(acc + bias[n]) * C[n]` in saturating int32 and then the shared
- * `(v*MUL)>>SHIFT`. Column n's gain is C[n] * MUL/2^SHIFT, so its resolution is
- * 0.5/C[n] — and C is capped not by its int16 field but by that column's worst-case
- * accumulator, because `(acc + bias)*C` must not overflow int32. At a GEMM's contraction
- * depth that cap binds hard: the bound is 128*sum_k|B[n][k]|, so a K of a few thousand
- * leaves C in the low hundreds whatever the field allows. `worst_rel_err` (may be NULL)
- * reports the largest relative gain error the ramp actually delivered over all columns,
- * which is the only number that separates this from an exact per-column scale — READ IT
- * rather than assuming the 1.004x above, which was simulated with exact scales and is
- * the route's ceiling, not this entry's.
+ * SHIFT) per task, so the per-column part rides on the coefficient group's int16 C term
+ * and on the task's shift word `s`: the epilogue is `sat32(rne(((acc + bias[n]) * C[n])
+ * >> s))` and then the shared `(v*MUL)>>SHIFT`. The product is held wide and rounded half
+ * to even at `s` [HW sweep, H96 MAX M9, tests/rk3576_coeff_c.c shift], exact to 2^45.95 on
+ * both signs, next to the int32 x int16 maximum of 2^46 (the bias-heavy cell below).
+ * Column n's gain is C[n] * MUL/2^(SHIFT+s), so its resolution is 0.5/C[n]. The planner
+ * puts the tile's largest scale near C = 32767 and takes the smallest `s` at which every
+ * column's `(acc + bias)*C` fits int32 at its bound, 128*sum_k|B[n][k]| + |bias[n]|. So C
+ * spans the int16 field in every tile whatever the contraction depth, and a column
+ * resolves its scale to 0.5/C = 0.5*spread/32767 relative, where `spread` is the ratio of
+ * the tile's largest scale to that column's. A column below 1/65534 of its tile's largest
+ * scale wants a C under one and computes at the gain of C = 1 instead of its own.
  *
- * The ramp is planned PER N TILE, since the (MUL, SHIFT) is per task. A tile whose
- * columns share a scale loses nothing; a wide spread inside one tile is where the
- * resolution goes — forcing eight tiles took an 8x-spread K=1024 cell from 1.53% to
- * 0.265%. That measurement is the SORTED case and this entry does NOT sort: the columns
- * are tiled in the caller's order, so a caller whose scales are interleaved gets the
- * whole spread in every tile. Handing the columns over already grouped by scale, and
- * un-permuting the result, is the caller's lever until the entry takes a permutation.
+ * `worst_rel_err` (may be NULL) reports the largest relative gain error the ramp actually
+ * delivered over all columns, a clamped one included. It is the only number that separates
+ * this entry from an exact per-column scale, so read it rather than assume it.
+ *
+ * ROCKET_RK3576_MM_PC_SHIFT=0 restores the SHIFT-0 ramp this entry shipped with, read per
+ * call: the word at zero, so `(acc + bias)*C` saturates at int32 and C is capped at
+ * INT32_MAX over the column's bound. At a GEMM's depth that cap sits in the low hundreds,
+ * below the int16 field on every column of the projections below, and the resolution goes
+ * with it. It is the arm to A/B against.
+ *
+ * The ramp is planned PER N TILE, since the (MUL, SHIFT) and the shift word are per task,
+ * and this entry does NOT sort: the columns are tiled in the caller's order, so a caller
+ * whose scales are interleaved gets the whole spread in every tile. On the shift-0 ramp
+ * that spread cost most of the resolution (forcing eight tiles took an 8x-spread K=1024
+ * cell from 1.53% to 0.265%, the sorted case). On the shift ramp a real model's
+ * within-tile spread, 5-35x at the projections below, costs 0.006-0.05% at the worst
+ * column.
+ *
+ * WHAT THE TWO RAMPS COST A REAL GEMM. At Qwen2.5-1.5B's and SmolLM2-1.7B's own
+ * projections (M 512; K 1536 at N 256, 1536 and 8960; K 2048 at N 2048 and 8192; three
+ * layers each), with real rotated int8 operands and the route's column scale
+ * 127/(colmax*3) from the window's exact column maxima:
+ *
+ *                                   shift ramp            shift-0 ramp
+ *     column gain error, median     0.0013-0.0035%        0.10-0.33%
+ *     column gain error, worst      0.006-0.047%          0.40-3.8%
+ *     bytes off the exact requant   0.012-0.086%          1.1-7.9%
+ *     composed error over the       +0.0000-0.0001        +0.005-0.50
+ *       exact requant's (points)
+ *
+ * The composed error is RMS(C/scale - acc)/RMS(acc), which the exact per-column requant
+ * holds at 1.4-2.8% on these operands (the int8 rounding). The device surface matches the
+ * host model of each ramp on every element of the 18 GEMMs. [HW sweep, H96 MAX M9, rocket
+ * 1.6.0, tests/rk3576_mm_percol_err with tools/rk3576-w8a8-dump.py, 2026-09-27]
+ *
+ * END TO END THE DIFFERENCE IS BELOW WHAT THIS METRIC RESOLVES. Through ggml-rocket's W8A8
+ * route, `llama-perplexity --chunks 4` over Qwen2.5-1.5B reads 8.7848 on the shift ramp
+ * and 8.7433 on the shift-0 ramp, each identical to every printed digit on repeat. But a
+ * different N tile alone (ROCKET_RK3576_MM_NT=1024) moves the shift-0 arm to 8.8576 and
+ * the shift arm to 8.7625, because the frontend's bootstrap reads each column back at a
+ * couple of codes and any perturbation resamples it. The ramp's cost on this route was
+ * simulated at 0.06% of the ratio, 1/20 of that spread. [HW sweep, H96 MAX M9, 2026-09-27]
+ * Where the spread is wide the simulation does resolve it: over 32 windows of 512 tokens at
+ * oracle scales (tools/rk3576-w8a8-ppl.py), SmolLM2-1.7B's perplexity ratio to fp32 is
+ * 1.0048 at an exact per-column scale, 1.0165 on the shift-0 ramp and 1.0055 on the shift
+ * ramp. Qwen2.5-1.5B's three read 1.0028, 1.0030 and 1.0032, one noise band.
+ * [host arithmetic, 2026-09-27]
  *
  * WHERE `scale_n` COMES FROM, AND WHAT IT COSTS. This entry cannot compute it: the scale
  * a column wants is set by that column's accumulator, which is what the call produces.
@@ -259,9 +317,13 @@ int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
  * six bits of the int8 output on headroom nothing reaches. **So a caller must calibrate,
  * and must budget for what calibration costs it.** [host arithmetic, 2026-08-11]
  *
- * Measured: 0 wrong of 698368 elements against a host model of this ramp, over six
- * shapes at two column-scale spreads, including a forced eight-tile run.
- * [HW gate, H96 MAX M9, tests/rk3576_mm_requant, 2026-08-10] */
+ * Measured: 0 wrong of 1380352 elements against the host models of the two ramps, 690176
+ * each, over four shapes (K 256-2048) at three column-scale spreads (1x, 8x and 1000x,
+ * where the shift-0 ramp clamps columns and the shift ramp does not), a forced multi-tile
+ * run of up to eight tiles, and a bias-heavy cell whose `(acc + bias)*C` reaches 2^45.95 on
+ * both signs. Every shift-ramp arm puts products past 2^31 on both signs, and each arm's
+ * delivered gains match the float scale to half a unit of C.
+ * [HW gate, H96 MAX M9, rocket 1.6.0, tests/rk3576_mm_requant, 2026-09-27] */
 int rocket_matmul_int8_rk3576_perc(int fd, int M, int K, int N,
                                    const int8_t *A, const int8_t *B,
                                    const int32_t *bias, const float *scale_n,
@@ -280,12 +342,13 @@ int rocket_matmul_int8_rk3576_perc(int fd, int M, int K, int N,
  * rather than duplicating it.
  *
  * WHAT A WRONG VALUE DOES. It is not checked and it cannot be: verifying it is the pass
- * this entry exists to skip. A value that does not match B changes the per-column
- * multiplier the ramp plans, so the call returns a full, correctly sized, entirely
- * plausible surface computed at a gain the caller did not ask for — too small and the
- * output loses resolution, too large and `(acc + bias)*C` overflows int32 and the column
- * saturates. Recompute it whenever B changes, and do not derive it back from a float
- * scale: the round trip is not exact and the plan is a function of the integer.
+ * this entry exists to skip. A value that does not match B changes the plan, so the call
+ * returns a full, correctly sized, entirely plausible surface that is not the one asked
+ * for. A sum below the true one lets `(acc + bias)*C` (after the shift word, on the shift
+ * ramp) leave int32, and the column saturates. One above it costs the shift-0 ramp
+ * resolution, and on the shift ramp it can only raise the shift word. Recompute it
+ * whenever B changes, and do not derive it back from a float scale: the round trip is not
+ * exact and the plan is a function of the integer.
  *
  * Measured: bit-identical to the computing entry — supplying the sum returns the same
  * surface, and `llama-perplexity --chunks 4` over Qwen2.5-1.5B returns the same
@@ -372,14 +435,20 @@ void rocket_rk3576_bo_pool_drain(int fd);
  * K is split internally and the partials are summed on the host, so K is bounded only
  * by memory. `bias` may be NULL. Requires K%32 and N%32.
  *
- * WHAT IT COSTS. The DPU's 32-bit writer keeps the INT8 surface's byte budget whatever
- * the output element width is, so it delivers only the first eight output channels of
- * every thirty-two. This entry gets around that by programming four times the output
- * channels and scattering the real ones into the delivered slots — correct, and a
- * quarter of the int8 path's MACs per submit. Use it for the K a single task cannot
- * contract, not as the default matmul. [HW sweep, H96 MAX M9]
+ * IT RUNS ON THE DENSE WRITER: the int8 program on the whole wide output stage
+ * (gen_conv2d_int8_rk3576_i32out_dense), which writes every accumulator of a task as a raw
+ * int32 and poisons nothing. So the real output channels are programmed (rounded to 32),
+ * the tasks go back to back with no idle, and the call leaves the part clean. The matmul
+ * gate's 21 int32 shapes (M 1-4096, K 64-16384, N 32-4096) are exact, in 0.26 s together
+ * where the older writers took 6.3 s: per call 1.0 ms against 106.9 at 8x64x32, 48.1
+ * against 1163.9 at 32x1024x4096 [HW sweep, H96 MAX M9, rocket 1.6.0,
+ * tests/rk3576_matmul_gate, 2026-09-30]. The guard stays: a sentinel stamp, a per-atom
+ * scan, a retired job redone after a power cycle, and a refusal rather than a partial
+ * surface. ROCKET_RK3576_I32_DENSE=0, or ROCKET_RK3576_I32_OC_MULT=2 or =4, takes the older
+ * writers, which deliver a quarter or half of the programmed channels, poison the next
+ * submit and idle for it.
  *
- * WHAT IT CAN DO TO THE BOARD. At M=512 K=8192 N=2048 — 256 submits, a 4.5 MiB weight
+ * WHAT IT COULD DO TO THE BOARD, ON THE OLDER WRITERS. At M=512 K=8192 N=2048 — 256 submits, a 4.5 MiB weight
  * cube, the narrow writer — this entry's write guard spent its eight power cycles, the
  * call returned -4, and the part raised the driver's DMA-error WARN_ON. The NPU then
  * computed nothing in ANY process: shapes that had run clean minutes earlier came back
@@ -388,7 +457,8 @@ void rocket_rk3576_bo_pool_drain(int fd);
  * green in the gate list; M=64 K=8192 N=32 scored exact three times), and where the
  * boundary between them lies is NOT known — one shape reached the wedge and each
  * occurrence costs a reboot. rocket_matmul_int8_rk3576() therefore no longer falls onto
- * this entry at all. [HW, H96 MAX M9, one shape, 2026-08-07] */
+ * this entry at all. [HW, H96 MAX M9, one shape, 2026-08-07] That shape has not been run
+ * on the dense writer. */
 int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                                   const int8_t *A, const int8_t *B,
                                   const int32_t *bias, int32_t *C);
@@ -598,17 +668,14 @@ int rocket_matmul_int4_groupwise(int fd, int M, int K, int N,
  * with a 4 B output cube (C2=4); the bf16/tf32 paths reuse this plan. Alignment:
  * K%32, N%16, (M%4||1).
  *
- * There is no native int16 x int16 -> int32 matmul on RK3588 (the int32-output conv
- * writes a single 1x16 tile and never iterates; only the SATURATING int16-output
- * transposed primitive iterates, N<=32 — see tests/matmul_int16_rocket.c). Use
- * rocket_matmul_int16_exact (below) for a correct full-precision int16 matmul. */
+ * The single-task generator writes int16 x int16 -> int32 natively and SATURATES to
+ * int32, so no entry here exposes it; use rocket_matmul_int16_exact (below) for an
+ * int64-exact int16 matmul over full-range operands. */
 int rocket_matmul_plan_int16(int M, int K, int N, int *Mt, int *Kt, int *Nt);
 
 /* ---- bit-exact int16 x int16 -> int64 (the SUPPORTED full-precision route) -----
- * The RK3588 NPU has NO native int16 matmul output (only int8->int32 and fp16->fp32
- * have native output paths). The native int16 conv can only be driven as an
- * int16->int16 SATURATING transposed-output primitive (tp_org_en; see
- * tests/matmul_int16_rocket.c), which cannot represent a full int32/int64 product.
+ * The native int16 output saturates to int32 (bit-exact below that bound,
+ * tests/int16_native_probe), so it cannot represent a full-range int64 product.
  * For full precision, decompose each int16 into two signed bytes and run four
  * PROVEN int8 matmuls, recombining in int64: C = 65536*(Ah.Bh) + 256*(Ah.Bl +
  * Al.Bh) + Al.Bl. Bit-exact, no saturation, ~4x int8 cost (completeness, not
@@ -729,6 +796,16 @@ typedef struct rocket_weights rocket_weights;
 
 rocket_ctx     *rocket_ctx_create(int nthreads);
 void            rocket_ctx_free(rocket_ctx *ctx);
+
+/* rocket_ctx_create with flags. ROCKET_CTX_TILING_CANONICAL makes every resident weight on
+ * the ctx M-independent down to M = 4. At M < MAX_TILE the plan keeps the K and N tiling the
+ * M = MAX_TILE plan chose and sets Mt = M, instead of growing Kt into the CBUF the smaller
+ * input tile frees. The weight's layout depends only on K, N and that tiling, so one pack
+ * serves every call M, and _prepacked never returns -2 for a small M. The cost is the Kt a
+ * small M gives up: at most the K-tile count the M = MAX_TILE plan already pays. Suits a
+ * resident encoder whose sequence length varies per call. Flags 0 is rocket_ctx_create. */
+#define ROCKET_CTX_TILING_CANONICAL 0x1u
+rocket_ctx     *rocket_ctx_create_ex(int nthreads, unsigned flags);
 
 rocket_weights *rocket_weights_pack(rocket_ctx *ctx, int M, int K, int N, const _Float16 *B);
 void            rocket_weights_free(rocket_ctx *ctx, rocket_weights *w);

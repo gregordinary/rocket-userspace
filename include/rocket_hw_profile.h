@@ -93,6 +93,24 @@ struct rocket_hw_profile {
                                 * bound stays a compile-time constant in the prepacked
                                 * files. Surfaced only so a chip can prefer a different
                                 * default. */
+
+    int slow_wait_ms;          /* the default slow-wait mark (ROCKET_SLOW_WAIT_MS): a
+                                * fenced wait this long is counted and warned as a
+                                * probable retirement. It has to sit UNDER the driver's
+                                * retirement of a job that never completes -- the
+                                * RK3588's 500 ms watchdog, the RK3576 series' 125 ms
+                                * backstop -- or the counter never moves on that part.
+                                * A property of the driver each part runs, kept here
+                                * because the two differ per part. */
+
+    int backstop_ms;           /* the driver's retirement itself: how long a job may run
+                                * before the kernel gives up on it and signals its fence
+                                * as if it had completed. 500 on the RK3588 (the job
+                                * watchdog), 125 on the RK3576 (patch rk3576/npu/0025's
+                                * poll backstop, counted from the KICK). The RK3576 write
+                                * guard scores a job's submit-to-fence time against it
+                                * (ROCKET_RK3576_BACKSTOP_US overrides); see
+                                * rocket_rk3576_retired_counts(). */
 };
 
 /* The active hardware profile, detected once on first call: ROCKET_CHIP if set, else

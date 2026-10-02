@@ -192,6 +192,15 @@ double mm_pack_input_buf(const mm_plan *pl, _Float16 *dst, const _Float16 *A);
 double mm_scatter_input(const mm_plan *pl, _Float16 *dst, const _Float16 *A);
 double mm_load_input(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *packed);
 
+/* The CHANNEL-PLANES forms of the two input scatters: A is given transposed, as K planes
+ * of M rows, plane k at At + k * lda (a convolution's [C][H*W] input read as a matmul's
+ * A^T). Only the first m_live rows and k_live planes are read; every row and channel of
+ * the plan past them is written zero. Same return as their row-major siblings. */
+double mm_scatter_input_planes(const mm_plan *pl, _Float16 *dst, const _Float16 *At,
+                               size_t lda, int m_live, int k_live);
+double mm_pack_input_planes(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *At,
+                            size_t lda, int m_live, int k_live);
+
 /* This worker's resident dense output slice, grown to `elems` and NOT zeroed (the
  * compute writes every live element). NULL if the allocation failed. */
 _Float16 *mm_csub(mm_bos *b, size_t elems);
@@ -228,6 +237,18 @@ int mm_compute(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
  * mm_compute for those. Accumulates in fp16 (~0.4% drift vs the fp32 host sum). */
 int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack);
 
+/* The CHANNEL-PLANES forms of mm_compute / mm_compute_kacc: the same tiles, the same
+ * accumulation and the same values, but output column n is written as plane n of `Ct`
+ * (row m at Ct[n * ldc + m], ldc > 0) instead of row m of a row-major C. That is the
+ * layout a convolution holds its [C][H*W] tensors in, and the cube's C2=8 groups
+ * deinterleave into it directly, so a caller wanting C transposed pays no row-major pass.
+ * Every one of the plan's M rows is written in each of its N planes. Same return codes,
+ * including mm_compute_kacc's tiny-M routing sentinel. */
+int mm_compute_planes(int fd, const mm_plan *pl, mm_bos *b, _Float16 *Ct, size_t ldc,
+                      double t_pack);
+int mm_compute_kacc_planes(int fd, const mm_plan *pl, mm_bos *b, _Float16 *Ct, size_t ldc,
+                           double t_pack);
+
 /* CROSS-OP variant of mm_compute_kacc: leave the COMPLETE output cube in the caller's
  * `cube` BO instead of de-tiling it to row-major C. The result is the nMt*nNt tile
  * slots in CANONICAL order (slot (mi,ni) at offset (mi*nNt+ni)*out_slot — the same
@@ -261,5 +282,35 @@ int mm_compute_pipe(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
  * load-bearing check). `mode` is 1 (weight) or 2 (data). Returns 0 or <0. */
 int mm_compute_reuse(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
                      double t_pack, int mode);
+
+/* ============================================================================
+ * SECTION — The resident fp16 matmul in channel-planes form (rocket_prepacked.c)
+ * ==========================================================================*/
+
+struct rocket_ctx;
+struct rocket_weights;
+
+/* rocket_weights_pack with the choice of how the context's workers split the matmul.
+ * split_m 0 is rocket_weights_pack's N split (each worker a column slice, every worker
+ * reading all of A); split_m 1 gives each worker a row slice of M instead, every worker
+ * holding ALL of B resident — nthreads copies of the weight, for a matmul whose A
+ * outweighs its B, where the N split's per-call cost is each worker packing and the NPU
+ * reading the whole A. An M-split weight runs only through the planes entry below, and
+ * only at the M it was packed at. */
+struct rocket_weights *rocket_weights_pack_split(struct rocket_ctx *ctx, int M, int K, int N,
+                                                 const _Float16 *B, int split_m);
+
+/* rocket_matmul_fp16_prepacked with A and C in channel-planes form: A is K planes of M
+ * (plane k at At + k*lda; only the first m_live rows and k_live planes are read, the rest
+ * of the plan's M x K computes as zero) and C is written as N planes of M (plane n at
+ * Ct + n*M, all M rows of every plane). The same tiles, K-accumulation and values as the
+ * row-major entry, without either row-major pass. Returns 0, -1, or ROCKET_E_TILING when
+ * the weight's layout does not fit this M (re-pack). Not thread-safe, as the ctx. */
+int rocket_matmul_fp16_prepacked_planes(struct rocket_ctx *ctx, int M, int K, int N,
+                                        const _Float16 *At, size_t lda, int m_live,
+                                        int k_live, _Float16 *Ct, struct rocket_weights *w);
+
+/* The worker fd count a context was created with. */
+int rocket_ctx_nthreads(const struct rocket_ctx *ctx);
 
 #endif /* ROCKET_MATMUL_INTERNAL_H */

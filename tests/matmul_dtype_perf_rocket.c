@@ -10,8 +10,8 @@
  *
  * The headline negative result: all precisions TIE at ~460 GOP/s — the NPU
  * is DMA/dispatch-bound, not MAC-bound, so int8's 2x and int4's 4x MAC don't
- * express. (int16 has no native matmul output on this silicon and so is absent;
- * the full-precision int16 path is the int8 byte-decomposition, ~4x int8 cost.)
+ * express. (int16 is absent: its native int32 output saturates and has no tiled
+ * entry, and the full-precision int16 path is the int8 byte-decomposition, ~4x int8.)
  * The plan/tiling env knobs (ROCKET_MM_MT/NT/KT, ROCKET_N_THREADS) apply to all.
  *
  * Usage: matmul_dtype_perf_rocket [M K N [reps]]   (default 512 3840 4096, reps=5)

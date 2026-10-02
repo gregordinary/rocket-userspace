@@ -73,6 +73,7 @@
  *     carries exactly that slice's byte offset).
  */
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -81,6 +82,7 @@
 #include "npu_dpu.h"
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
+#include "npu_requant.h"
 #include "rocket_hw_profile.h"
 #include "rocket_log.h"
 
@@ -934,11 +936,26 @@ static unsigned r76_cbuf_bias(void)
  * computes bit-exactly while one group's 200 KiB slice does not — so the cube size
  * is not the constraint and ic*kh*kw is. Depthwise carries one kernel per channel,
  * and its whole coefficient set is what the register calls WEIGHT_BYTES.
- * [HW sweep, H96 MAX M9] */
+ * [HW sweep, H96 MAX M9]
+ *
+ * THE DEPTHWISE CUBE IS CHARGED AT THE FEATURE GRANULE, r76_dw_cf(), not at the raw count
+ * and not at the cube's own round-16 count. Its whole cube is resident, so the pool check
+ * below is exact against the weight-slice rule's area (rocket_rk3576_weight_phase_groups():
+ * 64 KiB at F=2048, 128 at 1024, 192 at 0, the pool's own sizes there), and it has to be
+ * charged at what the part holds. At F=2048, k3 on a 16x10 plane: dense cubes of 64224,
+ * 64512, 64800 and 65088 bytes are exact; 65376 (C 3624 and 3632) computes channels 0-47
+ * WRONG on the F=2048 row task, deterministically and with no retirement; 65664 (C 3633
+ * and 3640) raises no completion and is refused after eight retirements. The raw count
+ * admitted all four failing counts. The two 65376-byte counts are exactly the ones whose
+ * trailing 64-channel block holds three sixteens, which the feature granule rounds to four,
+ * and charged that way every failing count is 65664 bytes and every exact one is not moved;
+ * a trailing block of three sixteens at a smaller cube (C 3568) is exact, so the charge is
+ * what the evidence separates, not a mechanism. [HW sweep, H96 MAX M9, rocket 1.6.0,
+ * tests/rk3576_conv_band_probe, 2026-09-27] Charging more can only shorten a row window. */
 static inline unsigned r76_weight_resident_bytes(unsigned ic, unsigned oc,
                                                  unsigned kh, unsigned kw, int dw)
 {
-    return dw ? (oc * kh * kw * 2u) : (32u * ic * kh * kw);
+    return dw ? (r76_dw_cf(oc) * kh * kw * 2u) : (32u * ic * kh * kw);
 }
 
 static inline unsigned r76_granules(unsigned bytes)
@@ -1166,12 +1183,11 @@ static int r76_plan_cbuf(unsigned entries, unsigned ih, unsigned oc, unsigned wb
  * allowance sized for half its plane — which computes WRONG with a full surface
  * written and nothing to fault on.
  *
- * The WEIGHT side keeps the int8 form at every precision, deliberately. The float
- * cube's group is 8 output channels of 2-byte elements against the int8 cube's 32 of
- * 1 byte, so 32*ic*kh*kw is an UPPER BOUND on the float slice rather than its size,
- * and the graded group-loss table it feeds was measured on int8 only. Over-estimating
- * refuses early instead of corrupting, and it costs nothing on the shapes the fp16
- * envelope allows (ic <= 8 puts the slice under 7 KiB at k=5). */
+ * The WEIGHT side keeps the int8 form at every precision. At the fp16 path's one
+ * contraction width, a 16-channel slice, 32*ic*kh*kw is exactly the float cube's own
+ * 16-output-channel group's slice (16 x 16 x kh x kw x 2 bytes), which is the unit the
+ * weight-slice rule stages on that path (rocket_conv2d_fp16_rk3576()'s output-channel
+ * tile). The graded group-loss table it feeds was measured on int8 only. */
 int rocket_rk3576_cbuf_f_prec(unsigned iw, unsigned ic, unsigned ih, unsigned oc,
                               unsigned kh, unsigned kw, int dw, unsigned prec,
                               unsigned *f_out)
@@ -1253,12 +1269,32 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
      * task the row planner cut was a full surface with its trailing output-channel group
      * wrong. Skipping the rung rather than breaking, because the cap is not monotone in
      * the same way the pool is. */
+    /* AND A RUNG WHOSE WEIGHT AREA CANNOT HOLD EVERY GROUP AT ITS 64 KiB PHASE IS SKIPPED,
+     * like one past the slice cap: a task on it computes its leading groups, raises no
+     * completion and is retired at the backstop, every time (rocket_rk3576_weight_phase_
+     * groups()). The slice cap is the measured table and the rule is not looser than it
+     * anywhere the two were both measured, but it is tighter in three bands the table
+     * passes, each with enough groups: a slice in (64, 80] KiB at F=1024, one in (128, 144]
+     * KiB at F=0, and at F=2048 any slice that does not divide 64 KiB once the whole cube is
+     * past 192 KiB (the cube charge above keeps a smaller one off F=2048). ic 96 k5 on a
+     * 48x64 plane (75 KiB at F=1024) is exact at 160 output channels and refuses at 192 and
+     * 256; ic 480 k3 (135 KiB at F=0) is exact at 288 and refuses at 320; ic 32 k3 on a
+     * 90x128 plane (9 KiB, one task at F=2048) is exact at 224 and refuses at 704 and 1024;
+     * each refusal is eight retirements with the surface partly written. The 1x1 form stops
+     * where the rule says at F=2048 too (K 96 at 672, K 288 at 224 channels). [HW sweep, H96
+     * MAX M9, rocket 1.6.0, tests/rk3576_conv_band_probe, tests/rk3576_stallk_map,
+     * 2026-09-27] Stated for the int8 direct path, the one it was measured on. F=0 is never
+     * skipped here, which leaves a tile the F=0 area cannot hold to the caller's output-
+     * channel tile (r76_conv_oc_tile(), the int8 matmul's plan). */
     for (r = 0; r < r76_cbuf_f_nrungs; r++) {
         unsigned cand = r76_cbuf_f_rungs[r];
         if (R76_CBUF_BASE_GRANULES + cand > R76_CBUF_MAX_GRANULES) break;
         if (R76_CBUF_BASE_GRANULES + cand + wgran > R76_CBUF_POOL_GRANULES) break;
         if (!r76_rung_live(cand, wres, dw)) continue;
         if (!dw && wbytes > r76_weight_slice_cap_at(oc, cand)) continue;
+        if (cand && !dw && ic > R76_ARGB_LANES && prec == precision_int8 &&
+            rocket_rk3576_weight_phase_groups(wbytes, cand) < (oc + 31u) / 32u)
+            continue;
         f = cand;
     }
 
@@ -1269,6 +1305,60 @@ unsigned rocket_rk3576_max_task_rows(unsigned iw, unsigned ic, unsigned oc,
                                      unsigned kh, unsigned kw, int dw)
 {
     return rocket_rk3576_max_task_rows_prec(iw, ic, oc, kh, kw, dw, precision_int8);
+}
+
+/* A GROUP'S WEIGHT SLICE IS STAGED AT ITS 64 KiB PHASE, AND ONE THAT OVERRUNS THE WEIGHT
+ * AREA FROM THERE STALLS THE JOB.
+ *
+ * Output-channel group g of a direct task completes only if
+ *
+ *     (g * S  mod 64 KiB) + S  <=  R_w,     S = 32*ic*kh*kw bytes (one group's slice)
+ *                                            R_w = 64 KiB * floor((3072 - F) / 1024)
+ *
+ * with the phase counted from the weight base register, and R_w the CBUF the feature
+ * allowance F leaves the weights, in WHOLE 64 KiB units: 192 KiB at F=0, 128 at 256, 512
+ * and 1024, 64 at 2048. Equivalently, the slice may touch no more 64 KiB windows (counted
+ * from the weight base) than the area holds whole. The unit is measured, not assumed: at
+ * F=256 and F=512, whose areas are 176 and 160 KiB by the granule count, K 3328-3968 stall
+ * at 32 channels exactly where a 128 KiB area puts them and K 4096 is clean, where a linear
+ * 176 or 160 KiB area would have left 3328, 3584, 3712 and 3840 clean. The first group
+ * that breaks it never completes: the groups before it are written exact, it and every
+ * later one are not written at all, the job raises no completion and `rocket` retires it
+ * at the backstop. A slice that does not fit at phase 0 never starts.
+ *
+ * Measured on the int8 matmul's 1x1 program with a readout of the first unwritten channel
+ * per job, 206 jobs over 54 arms, every one where the rule puts it and every predicted-clean
+ * job exact: K 2080-2560 at F=1024 (stalls at 672, 384, 320, 288, 224, 192, 160, 160, 128,
+ * 128, 128 channels; clean at 2080, 2112, 2176, 2304, 2560, each exactly on the edge), K
+ * 4128-4608 at F=0 (672, 224, 192, 160, 160, 128, 128, 128; clean at 4128, 4160, 4224, 4352,
+ * 4608); at K=2240 row counts of 1-4 on three plane widths, the stall following F and not
+ * the rows; M 192-2048; and a weight base moved 1-60 KiB into its buffer, which moves
+ * nothing, so it is not the IOVA's phase. [HW sweep, H96 MAX M9, rocket 1.6.0,
+ * tests/rk3576_stallk_map, 2026-09-27] The same rule reproduces, with no fitted constant,
+ * the slice caps the table in r76_weight_slice_cap()/_at() records from convolutions: at
+ * F=0 four groups keep 4/3/3/2/2/1 at 144/145/148/152/156/162 KiB; at F=1024 the last exact
+ * slice is 96/85/80 KiB for 2/3/4 groups and at F=2048 32/21/16; and the escapes at 96 and
+ * 128 KiB (F=1024) and 32 and 64 KiB (F=2048). Why a staging position is a 64 KiB phase is
+ * not known [hypothesis: the weight write pointer into the CBUF is a 64 KiB counter, so a
+ * slice lands at its offset's low 16 bits and must end inside the area].
+ *
+ * Returns how many leading groups a task can drive (0: none, the slice does not fit), or
+ * UINT_MAX when no group ever stalls. The phases repeat every 64 KiB / gcd(S, 64 KiB) groups,
+ * so one period decides it. */
+unsigned rocket_rk3576_weight_phase_groups(unsigned slice_bytes, unsigned f)
+{
+    const unsigned wgran = R76_CBUF_POOL_GRANULES - R76_CBUF_BASE_GRANULES;
+    /* whole 64 KiB units (1024 granules) of what the allowance leaves */
+    const uint64_t rw = (uint64_t)((f < wgran ? wgran - f : 0u) / 1024u) * 65536u;
+    uint64_t period;
+    unsigned g, a = slice_bytes, b = 65536u;
+
+    if (!slice_bytes || slice_bytes > rw) return 0u;
+    while (b) { unsigned t = a % b; a = b; b = t; }    /* a = gcd(S, 64 KiB) */
+    period = 65536u / a;
+    for (g = 1; g <= period; g++)
+        if (((uint64_t)g * slice_bytes) % 65536u + slice_bytes > rw) return g;
+    return UINT_MAX;
 }
 
 /* ============================================================================
@@ -1381,9 +1471,9 @@ static unsigned r76_lay_rows(const conv_params_t *p, unsigned ih_full, unsigned 
     return n;
 }
 
-int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
-                                 rocket_rk3576_row_task *out, unsigned max_tasks,
-                                 unsigned *count)
+static int r76_plan_rows(const conv_params_t *p, int dw, unsigned prec,
+                         unsigned row_cap, rocket_rk3576_row_task *out,
+                         unsigned max_tasks, unsigned *count)
 {
     unsigned ih_full, oh_full, cap, entries, n, t;
     const char *forced;
@@ -1425,6 +1515,10 @@ int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
     /* 0x1028 packs entries*rows in a 16-bit half, which can bite before the CBUF
      * does on a narrow, very deep plane. */
     if (cap > 0xFFFFu / entries) cap = 0xFFFFu / entries;
+    /* A caller's own cap, which can only shorten the window: the int8 matmul uses it to
+     * keep a task on an allowance whose weight area holds every group of its tile (see
+     * rocket_rk3576_weight_phase_groups()). */
+    if (row_cap && row_cap < cap) cap = row_cap;
     forced = getenv("ROCKET_RK3576_MAX_ROWS");
     if (forced && *forced) {
         unsigned f = (unsigned)strtoul(forced, NULL, 0);
@@ -1487,12 +1581,26 @@ int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
     return 0;
 }
 
+int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
+                                 rocket_rk3576_row_task *out, unsigned max_tasks,
+                                 unsigned *count)
+{
+    return r76_plan_rows(p, dw, prec, 0u, out, max_tasks, count);
+}
+
 /* The int8 plan, which is what every caller before the float paths wanted. */
 int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
                             rocket_rk3576_row_task *out, unsigned max_tasks,
                             unsigned *count)
 {
-    return rocket_rk3576_plan_rows_prec(p, dw, precision_int8, out, max_tasks, count);
+    return r76_plan_rows(p, dw, precision_int8, 0u, out, max_tasks, count);
+}
+
+int rocket_rk3576_plan_rows_cap(const conv_params_t *p, int dw, unsigned row_cap,
+                                rocket_rk3576_row_task *out, unsigned max_tasks,
+                                unsigned *count)
+{
+    return r76_plan_rows(p, dw, precision_int8, row_cap, out, max_tasks, count);
 }
 
 /* ============================================================================
@@ -2234,6 +2342,25 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
         ROCKET_LOGE("rk3576 conv: a geometry term exceeds the 16-bit register half\n");
         return -1;
     }
+    /* THE FIELDS THE PART COMPUTES WITH ARE NARROWER THAN THE HALVES THEY ARE WRITTEN IN,
+     * and past each one a task returns over a full, plausible, wrong surface: a width past
+     * 8192 computes W & 0x1FFF columns, an output channel count past 8192 wraps the same
+     * way, a kernel of 33 runs as a kernel of 1, and a stride of 8 or more is masked to
+     * its low three bits. A width-wrapped job also leaves the NEXT, legal job in the same
+     * process wrong. [HW sweep, H96 MAX M9, 2026-09-26, tests/rk3576_conv_width_probe]
+     * The input channel field is wider -- the matmul form contracts K 16384 through it --
+     * so IC is not held here. Which width register is the 13-bit one is not separated
+     * (the probe always had iw == ow), so both are. A task's rows are bounded far lower
+     * by the CBUF; the row bound is a margin. The full-plane heights feed only whole-word
+     * plane strides, measured exact at 409600 elements, and are not held either. */
+    if (IW > 8192u || OW > 8192u || IH > 8192u || OH > 8192u || OC > 8192u ||
+        KH > 32u || KW > 32u || p->stride_x > 7u || p->stride_y > 7u) {
+        ROCKET_LOGE("rk3576 conv: %ux%u -> %ux%u, oc %u, kernel %ux%u, stride %ux%u is past "
+                    "a field the part computes with (13 bits of width, rows and output "
+                    "channels, 5 of kernel, 3 of stride)\n", IH, IW, OH, OW, OC, KH, KW,
+                    (unsigned)p->stride_y, (unsigned)p->stride_x);
+        return -1;
+    }
     /* A caller-supplied feature group stride only ever describes a buffer whose groups
      * sit FURTHER apart than the plane. A smaller one would make the groups overlap,
      * which is not a layout anything on this part produces, and the ARGB program has a
@@ -2454,8 +2581,8 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
 
     /* OUT_CVT requant, identical arithmetic to the RK3588 int8-out path:
      *   out_i8 = sat8( round(acc_i32 * scale >> shift) + (out_zp - 0x80) )
-     * with scale/shift derived from the fp32 conv scale exactly as the vendor
-     * (QNNPACK) does. Per-tensor only.
+     * with scale/shift derived from the fp32 conv scale by npu_out_cvt_pair(), the
+     * one derivation both parts' emitters share. Per-tensor only.
      *
      * A float output has nothing to requant: the RK3588's fp16 path leaves the
      * converter at unity and the accumulator is already in the output format. Unity
@@ -2959,6 +3086,27 @@ int rocket_rk3576_fp16_out_index(unsigned oh, unsigned ow, unsigned c,
                  + R76_FP16_FEAT_C2 * (y * ow + x) + (c % R76_FP16_FEAT_C2));
 }
 
+size_t rocket_rk3576_f32_cube_bytes(unsigned oc, unsigned oh, unsigned ow)
+{
+    return (size_t)((oc + 3u) / 4u) * 4u * oh * ow * sizeof(float);
+}
+
+int rocket_rk3576_f32_cube_accumulate(float *acc, const void *surface, size_t surface_bytes,
+                                      unsigned oc, unsigned oh, unsigned ow)
+{
+    const float *s = (const float *)surface;
+    size_t a = (size_t)oh * ow, px;
+    unsigned c;
+    if (!acc || !surface || !oc || !oh || !ow) return -1;
+    if (surface_bytes < rocket_rk3576_f32_cube_bytes(oc, oh, ow)) return -1;
+    for (c = 0; c < oc; c++) {
+        const float *plane = s + (size_t)4u * (c / 4u) * a + c % 4u;
+        float *dst = acc + (size_t)c * a;
+        for (px = 0; px < a; px++) dst[px] += plane[4u * px];
+    }
+    return 0;
+}
+
 int rocket_rk3576_fp16_accumulate(float *acc, const void *surface,
                                   size_t surface_bytes,
                                   unsigned oc, unsigned oh, unsigned ow)
@@ -3146,6 +3294,112 @@ int gen_conv2d_fp16_rk3576(conv_params_t *p)
                                  precision_float16, &R76_NO_REUSE);
 }
 
+/* THE WHOLE WIDE OUTPUT STAGE, over an already-emitted direct program.
+ *
+ * Nine DPU words: 0x4010 out 5 proc 2, 0x4030's low half 0x0310, 0x4038 0x53, 0x4044 2,
+ * 0x4050 0x00023333, OUT_CVT 0/1/0 (no requant and no bias), and 0x40B8 at three task
+ * surfaces. The first eight are the charsiu project's stage, read from vendor streams. Over
+ * the int8 program they make a dense int32 writer and over the fp16 slice program an fp32
+ * one, and neither poisons the next submit, where our own partial stages (0x4010 alone on
+ * the int32 writers, the float word on the fp16 one) do [HW sweep, H96 MAX M9, rocket
+ * 1.6.0, tests/rk3576_poison_probe pair and heal under ROCKET_PP_ASET, 2026-09-30].
+ * Three of them, 0x4010, 0x4038 and 0x4050, are the cure on their own; the rest shape what
+ * is written. A PARTIAL stage is the poisoning's own condition, so this returns -1 unless
+ * it found all nine words in the program. */
+static int r76_whole_output_stage(conv_params_t *p)
+{
+    unsigned i, found = 0, surf = (unsigned)p->ow * p->oh;
+    for (i = 0; i < p->task_count; i++) {
+        uint64_t op = p->tasks[i];
+        uint32_t v = (uint32_t)((op >> 16) & 0xFFFFFFFFu), nv;
+        if ((op >> 48) == 0) continue;
+        switch ((unsigned)(op & 0xFFFFu)) {
+        case R76_DPU_DATA_FORMAT:    nv = 0xA0000002u; break;
+        case R76_DPU_WDMA_SIZE0:     nv = (v & 0xFFFF0000u) | 0x0310u; break;
+        case R76_DPU_NOTCH_CFG:      nv = 0x00000053u; break;
+        case R76_DPU_BS_ALU_CFG:     nv = 0x00000002u; break;
+        case R76_DPU_BS_CFG:         nv = 0x00023333u; break;
+        case R76_DPU_OUT_CVT_OFFSET: nv = 0u; break;
+        case R76_DPU_OUT_CVT_SCALE:  nv = 1u; break;
+        case R76_DPU_OUT_CVT_SHIFT:  nv = 0u; break;
+        case R76_DPU_SURFACE_ADD:    nv = 3u * surf; break;
+        default: continue;
+        }
+        p->tasks[i] = (op & ~(0xFFFFFFFFull << 16)) | ((uint64_t)nv << 16);
+        found++;
+    }
+    if (found != 9u) {
+        ROCKET_LOGE("rk3576: the whole output stage found %u of its nine DPU words in the "
+                    "program, and a partial stage poisons\n", found);
+        return -1;
+    }
+    return 0;
+}
+
+/* THE fp16 SLICE PROGRAM ON THE WHOLE OUTPUT STAGE: fp32 out, and it poisons nothing.
+ *
+ * gen_conv2d_fp16_rk3576()'s own fp16 output poisons the next submit through DPU
+ * 0x4038[4] and 0x4050[17], which are its float arithmetic, so clearing them is no cure.
+ * The whole stage keeps both set and cures it. Under it the program writes every element
+ * as fp32, exact against a CPU model on random small-integer operands at k 1 and 3 (8x4,
+ * 5x3 and 12x10, oc 16 and 32), and 80 submits back to back with no idle all wrote, none
+ * retired [HW sweep, H96 MAX M9, rocket 1.6.0, tests/rk3576_fp16_fp32out_probe,
+ * 2026-09-30].
+ *
+ * THE SURFACE IS THE PLAIN INT32 CUBE, not the float cube: four fp32 lanes to a 16-byte
+ * atom, one atom per pixel, each quad of channels a plane of ow*oh atoms.
+ * rocket_rk3576_f32_cube_accumulate() reads it. The packed-image first conv (ic <= 4) has
+ * not run under the stage with non-uniform operands and is refused. */
+int gen_conv2d_fp16_rk3576_f32out(conv_params_t *p)
+{
+    if (!p) return -1;
+    if (p->ic <= 4u) {
+        ROCKET_LOGE("rk3576 fp16 conv: the fp32 output stage is measured on the "
+                    "input-channel slice program, not the packed-image first conv\n");
+        return -1;
+    }
+    if (gen_conv2d_fp16_rk3576(p) != 0) return -1;
+    return r76_whole_output_stage(p);
+}
+
+/* THE DENSE INT32 WRITER: the int8 direct program on the whole output stage.
+ *
+ * Every accumulator of the task comes back as a raw int32, with no bias added, in exactly
+ * oc*ow*oh words. It decodes as a bijection at N 32-128, M 4-120, planes 3x2 to 12x10 and
+ * K to 4096 on random operands, and it leaves int8 direct, int8 first-conv, depthwise and
+ * fp16 canaries clean 20 of 20 and chains 80 submits with no idle, none retired
+ * [HW sweep, H96 MAX M9, rocket 1.6.0, tests/rk3576_matmul_probe out32 and
+ * rk3576_poison_probe, 2026-09-30]. The map is rocket_rk3576_i32_dense_word(). oc is a
+ * whole number of 32-channel groups, the int8 program's rule: a 16-channel trailing group
+ * computes wrong past K 32. One task per call: 0x40B8 at a row WINDOW of a larger surface
+ * is not measured, so a row split runs each window as its own convolution. */
+int gen_conv2d_int8_rk3576_i32out_dense(conv_params_t *p)
+{
+    if (!p) return -1;
+    if (p->oc % 32u) {
+        ROCKET_LOGE("rk3576 dense int32 writer: oc=%u is not a whole number of 32-channel "
+                    "groups\n", p->oc);
+        return -1;
+    }
+    if (p->oh != p->oh_full) {
+        ROCKET_LOGE("rk3576 dense int32 writer: a row window (oh %u of %u) is not measured "
+                    "on this stage; run the window as its own convolution\n", p->oh,
+                    p->oh_full);
+        return -1;
+    }
+    if (gen_conv2d_int8_rk3576(p) != 0) return -1;
+    return r76_whole_output_stage(p);
+}
+
+/* atom = 8A*g + 4A*(s/A) + A*L + s%A, s = 2p + j, word = 4*atom + c%4, with A the task's
+ * pixel count, g = c/32, j = (c%32)/16 and L = (c%16)/4. */
+int rocket_rk3576_i32_dense_word(unsigned A, unsigned c, unsigned p)
+{
+    unsigned g = c / 32u, j = (c % 32u) / 16u, L = (c % 16u) / 4u, s = 2u * p + j;
+    if (!A || p >= A) return -1;
+    return (int)(4u * (8u * A * g + 4u * A * (s / A) + A * L + s % A) + c % 4u);
+}
+
 /* The unchecked entry: a program at any precision and any geometry, for bring-up
  * sweeps and for the register-fidelity gate. It does NOT apply the fp16 envelope
  * above, so an fp16 conv emitted through here past ic=8 computes wrong silently. */
@@ -3155,23 +3409,16 @@ int gen_conv2d_rk3576_prec(conv_params_t *p, int dw, unsigned prec)
 }
 
 /*
- * The fp32 conv scale -> the OUT_CVT (MUL, SHIFT) pair, the vendor's (QNNPACK)
- * derivation. `shift` comes back as the REGISTER value, already pre-decremented, so a
- * CPU model shifts by exactly what the DPU has. One copy, because a caller that has to
- * know the gain the emitter will actually program — a per-channel requant sizing its C
- * multipliers against it — must not re-derive it slightly differently.
+ * The fp32 conv scale -> the OUT_CVT (MUL, SHIFT) pair. `shift` comes back as the
+ * REGISTER value, already pre-decremented, so a CPU model shifts by exactly what the DPU
+ * has. The derivation is npu_out_cvt_pair(), shared with the RK3588 emitters and the host
+ * model, because a caller that has to know the gain the emitter will actually program —
+ * a per-channel requant sizing its C multipliers against it — must not re-derive it
+ * slightly differently. MUL never sets bit 15: this part reads 0x40B0's [15:0] signed.
  */
 void rocket_rk3576_requant_params(float conv_scale, unsigned *mul, unsigned *shift)
 {
-    union { float f; uint32_t u; } cv;
-    uint32_t bits;
-    unsigned m;
-    cv.f = conv_scale;
-    bits = cv.u;
-    *shift = 127u + 31u - 32u - (bits >> 23) + 16u - 1u;   /* == 125 - exp + 16 */
-    m = ((bits >> 9) & 0x7FFFu) + 1u;
-    if (m < (1u << 14)) m |= (1u << 14);
-    *mul = m;
+    npu_out_cvt_pair(conv_scale, mul, shift);
 }
 
 /* ============================================================================
@@ -3283,6 +3530,26 @@ int rocket_rk3576_pack_coeff_dw_perc(void *dst, size_t dst_bytes, const int32_t 
         memcpy(g + R76_COEFF_C_OFFSET_DW + (c % R76_COEFF_GROUP_OC) * 2,
                &mul, sizeof mul);
     }
+    return 0;
+}
+
+int rocket_rk3576_pack_bs_shift(void *dst, size_t dst_bytes, unsigned oc, int dw,
+                                unsigned s)
+{
+    size_t off = r76_shift_offset_p(oc, dw);
+    uint32_t word = (uint32_t)s | ((uint32_t)s << 8);
+
+    if (!dst || dst_bytes < off + sizeof word) {
+        ROCKET_LOGE("rk3576 coeff: buffer is %zu bytes, the shift word of %u output "
+                    "channels sits at %zu\n", dst_bytes, oc, off);
+        return -1;
+    }
+    if (s > 63u) {
+        ROCKET_LOGE("rk3576 coeff: a BS shift of %u does not fit the word's 6-bit fields\n",
+                    s);
+        return -1;
+    }
+    memcpy((uint8_t *)dst + off, &word, sizeof word);
     return 0;
 }
 
@@ -3487,6 +3754,15 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
         ROCKET_LOGE("gen_pool_rk3576: the kernel and stride fields are four bits — "
                     "k%ux%u s%ux%u does not fit; cascade instead\n",
                     p->kw, p->kh, p->stride_x, p->stride_y);
+        return -1;
+    }
+    /* Rows and channels past 8192 return a wrong surface from the first row or channel
+     * group past the field [HW sweep, H96 MAX M9, 2026-09-26, tests/rk3576_conv_width_probe:
+     * height 8300 wrong from row 107, channels 8208 wrong from channel 16]. Width is not
+     * held: the entry slices it into 128-wide tasks. */
+    if (ih > 8192u || oh > 8192u || c > 8192u) {
+        ROCKET_LOGE("gen_pool_rk3576: %u rows -> %u, %u channels is past the 13-bit fields "
+                    "this part pools with\n", ih, oh, c);
         return -1;
     }
     switch (p->mode) {

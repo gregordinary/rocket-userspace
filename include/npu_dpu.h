@@ -156,6 +156,15 @@ typedef struct npu_dpu_desc {
   * arms BRDMA to fetch the bias cube from bias_base_addr. */
  uint8_t  bias_en;          // BS ALU add active
  uint32_t bias_base_addr;   // 0x5020 RDMA_BS_BASE_ADDR (int32 bias BO IOVA)
+ /* With bias_en: the BS multiplier live with a PER-CHANNEL operand, read from the same
+  * BRDMA cube, which is then 64 bytes per 8 output channels (int32 A x8 at 0, int16 B x8
+  * at 32, int16 C x8 at 48) under BRDMA data use 7. The stage computes
+  * sat32(rne(((acc + A[c]) * C[c]) >> s)), the product held wide, and the shift is PER
+  * SIGN: BS_MUL_CFG[13:8] shifts a non-negative product, DATA_FORMAT[9:4] a negative one,
+  * so both carry bs_mul_shift [HW sweep, RK1, tests/dw_perc_probe.c]. 0 keeps the
+  * per-tensor bias-only word, byte-identical. */
+ uint8_t  bs_mul_src;       // 0x4048 BS_MUL_SRC, and BS_MUL_BYPASS cleared
+ uint8_t  bs_mul_shift;     // 0x4048[13:8] and 0x4010[9:4]
  /* conv->activation fusion: lut_en=0 (default) keeps the validated BN/EW/OUT_CVT
   * bypass path byte-identical. When 1, gen_conv2d_task uploads lut_ep->lut and
   * programs the BN-mul index scale + EW LUT + affine OUT_CVT so the conv result is

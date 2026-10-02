@@ -350,6 +350,15 @@ int rocket_pool_int8_rk3576_plan(const rocket_pool_desc *d)
         return ROCKET_E_UNSUPPORTED;
     if (rocket_pool_oh(d) <= 0 || rocket_pool_ow(d) <= 0)
         return ROCKET_E_SHAPE;
+    /* ROWS AND CHANNELS ARE NOT SPLIT, and the fields that carry them are 13 bits: past
+     * 8192 a task returns a wrong surface from the first row or channel group past the
+     * field [HW sweep, H96 MAX M9, tests/rk3576_conv_width_probe]. gen_pool_rk3576 refuses
+     * the same; asking here lets a frontend decline at claim time. */
+    if (d->ih > 8192 || rocket_pool_oh(d) > 8192 || d->c > 8192) {
+        ROCKET_LOGE("rocket_pool_int8_rk3576: %d rows -> %d, %d channels is past the "
+                    "13-bit fields this part pools with\n", d->ih, rocket_pool_oh(d), d->c);
+        return ROCKET_E_UNSUPPORTED;
+    }
     /* PAST THE ALLOWANCE THE PLANE IS SPLIT BY COLUMNS, so the only refusal left here is
      * a plane needing more slices than a handle carries. ROCKET_RK3576_POOL_OW_PROBE
      * forces ONE task at the caller's full width so the wall can still be READ OUT — an
@@ -1566,7 +1575,8 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
      * spends nothing but a submit and is counted separately, against its own budget. */
     for (attempt = 0; attempt < attempts; ) {
         size_t i;
-        int wrote, lag_fail;
+        int wrote, lag_fail, retired;
+        uint64_t tjob, jns;
 
         prof.attempts++;
         if (stamp) {
@@ -1586,6 +1596,7 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
          * GATED on the kernel, not sent blind: the submit ioctl REJECTS a flag word it
          * does not recognise, so an older kernel would fail the submit rather than fall
          * back to the grace period. [HW sweep, H96 MAX M9] */
+        tjob = rocket_rk3576_job_clock();
         if (rocket_submit_matmul_flags(fd, &h->rc, h->task_count, in_h, 2, out_h, 1,
                                        rocket_ppu_done_supported()
                                            ? ROCKET_JOB_PPU_DONE : 0u) != 0) {
@@ -1606,6 +1617,7 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
             rc = ROCKET_E_DEVICE;
             goto out;
         }
+        jns = rocket_rk3576_job_ns(tjob);
         R76P_ACC(prof, wait_us, tw);
         prof.surf_kib += (double)h->out_bytes / 1024.0;
         wrote = 1;
@@ -1619,6 +1631,12 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
                 }
             R76P_ACC(prof, scan_us, tw);
         }
+        /* A RETIRED JOB IS REDONE even if it wrote: one byte satisfies the scan above,
+         * and a retirement can leave a partial surface. It takes the poisoning's path, the
+         * power cycle, and skips the lag check, whose redo would spend no cycle on it. The
+         * stamp at the top of the next attempt covers the whole surface. */
+        retired = rocket_rk3576_score_retired(entry, jns, wrote);
+        if (retired) wrote = 0;
         if (wrote && nlag) {
             /* A cube join's input lives in a BO the device wrote and nothing has synced
              * for this CPU, so the read needs its own bracket. `in` is already coherent. */
@@ -1659,8 +1677,9 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
             if (lagged >= r76p_lag_attempts()) break;
             continue;
         }
-        ROCKET_LOGD("%s: the program wrote nothing on attempt %u; cycling the power "
-                    "domain and redoing it\n", entry, attempt + 1u);
+        ROCKET_LOGD("%s: the program %s on attempt %u; cycling the power domain and "
+                    "redoing it\n", entry, retired ? "was retired" : "wrote nothing",
+                    attempt + 1u);
         attempt++;
         cycled++;
         confirmed += rocket_rk3576_power_idle();
@@ -1673,8 +1692,9 @@ out:
                         "right (ROCKET_RK3576_POOL_LAG_ATTEMPTS=%u)\n",
                         entry, lagged, r76p_lag_attempts());
         else
-            ROCKET_LOGE("%s: the program wrote nothing over %u attempts (%d power cycles, "
-                        "%d of them confirmed to reach suspended)\n",
+            ROCKET_LOGE("%s: the program wrote nothing or was retired on each of %u "
+                        "attempts (%d power cycles, %d of them confirmed to reach "
+                        "suspended)\n",
                         entry, attempts, cycled, confirmed);
         return rc;
     }

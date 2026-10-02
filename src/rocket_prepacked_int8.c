@@ -236,9 +236,15 @@ static int rki_worker_alloc(int fd, rki_worker *w, int M, int tileM, int K, int 
     w->wt_slot  = (size_t)rocket_rup_sz(w->Nt, 32) * rocket_rup_sz(w->Kt, 32);   /* int8  */
     w->out_slot = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Nt, 16);   /* int32 */
 
+    /* A job batches at most I8_BATCH tiles and never more than the call has, and PREP/FINI
+     * sync a BO's whole allocation on every batch, so the output and regcmd BOs hold
+     * exactly the slots a batch can use. At I8_BATCH slots a detector 1x1 layer, a few
+     * tiles per worker, synced tens of times the bytes it wrote. */
+    const int tiles = w->nMt * w->nNt * w->nKt;
+    const size_t slots = (size_t)(tiles < I8_BATCH ? tiles : I8_BATCH);
     size_t in_sz  = (size_t)w->nMt * w->nKt * w->in_slot + I8_CBUF_BANK;
-    size_t rc_sz  = (size_t)I8_BATCH * I8_RC_STRIDE * sizeof(uint64_t);
-    size_t out_sz = (size_t)I8_BATCH * w->out_slot * sizeof(int32_t) + I8_CBUF_BANK;
+    size_t rc_sz  = slots * I8_RC_STRIDE * sizeof(uint64_t);
+    size_t out_sz = slots * w->out_slot * sizeof(int32_t) + I8_CBUF_BANK;
 
     int ret = 0;
     ret |= rocket_bo_alloc(fd, 4096,  &w->guard);    /* push allocs off IOVA 0 */
@@ -303,7 +309,7 @@ fail:
  * the key because the two modes tile K differently and cannot share a slot. */
 static rki_scratch *rki_ctx_scratch(rocket_i8_ctx *ctx, int M, int K, int N, int group)
 {
-    const rocket_shape_key k = { M, K, N, group };
+    const rocket_shape_key k = { M, K, N, group, 0 };
     return rocket_slot_get(&ctx->scache, ctx, &k, &rki_slot_ops);
 }
 
@@ -535,8 +541,13 @@ static void *rki_thread(void *a)
      * pre-scaled by its quant group's a_scale*b_scale). */
     int64_t *restrict acc  = w->acc;
     float   *restrict facc = w->facc;
-    if (gw) memset(facc, 0, (size_t)M * nsub * sizeof(float));
-    else    memset(acc,  0, (size_t)M * nsub * sizeof(int64_t));
+    /* One K-tile per-channel (every detector 1x1 conv): each output is one tile's int32,
+     * so the tile is gathered straight into C at this worker's columns. The int64 path
+     * would zero M*nsub*8 bytes, read-modify-write each element and copy the whole
+     * accumulator into C again: about 40 bytes of traffic an output against 8. */
+    const int direct = !gw && nKt == 1;
+    if (gw)          memset(facc, 0, (size_t)M * nsub * sizeof(float));
+    else if (!direct) memset(acc,  0, (size_t)M * nsub * sizeof(int64_t));
     uint64_t npu_regs[256] = {0};
     rocket_task_desc *tasks = w->tasks;
     /* Submit layout. The resident int8 path batches a job's tiles into ONE ioctl
@@ -639,6 +650,13 @@ static void *rki_thread(void *a)
                             MM_CUBE_GATHER(int32_t, 4, out_idx_i8, slot,
                                            w->bMtile[j], w->bNtile[j], MM_ACC_);
 #undef MM_ACC_
+                        } else if (direct) {
+                            int32_t *restrict cj = t->C + (size_t)w->bm0[j] * N
+                                                 + (size_t)(w->n0 + w->bn0[j]);
+#define MM_ACC_(h_, nn_, v_) (cj[(size_t)((h_) - 1) * N + ((nn_) - 1)] = (v_))
+                            MM_CUBE_GATHER(int32_t, 4, out_idx_i8, slot,
+                                           w->bMtile[j], w->bNtile[j], MM_ACC_);
+#undef MM_ACC_
                         } else {
 #define MM_ACC_(h_, nn_, v_) \
     (acc[(size_t)(w->bm0[j] + (h_) - 1) * nsub + (w->bn0[j] + (nn_) - 1)] += (int64_t)(v_))
@@ -655,9 +673,9 @@ static void *rki_thread(void *a)
         }
     }
 
-    /* scatter this worker's column slice into the full output. */
+    /* scatter this worker's column slice into the full output (the direct path wrote it). */
     if (prof) t0 = rki_now_ms();
-    for (int m = 0; m < M; m++)
+    for (int m = 0; !direct && m < M; m++)
         for (int n = 0; n < nsub; n++) {
             if (gw) t->Cf[(size_t)m * N + (w->n0 + n)] = facc[(size_t)m * nsub + n];
             else    t->C [(size_t)m * N + (w->n0 + n)] = (int32_t)acc[(size_t)m * nsub + n];

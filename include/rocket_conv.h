@@ -149,7 +149,13 @@ static inline int rocket_conv2d_trail_x(const rocket_conv2d_desc *d)
 }
 
 /* Validate a descriptor against the supported set (alignment + single-tile CBUF
- * fit). Returns 0 if runnable, <0 (negated reason) otherwise. Pure, no hardware. */
+ * fit). Returns 0 if runnable, <0 (negated reason) otherwise. Pure, no hardware.
+ *
+ * Every RK3588 conv task is at most 1022 input rows by 2047 columns: the CNA holds a
+ * task's input width in 11 bits and its row count plus one in 10, and a wrapped field
+ * computes a plausible wrong surface. The tilers split any larger plane into bands under
+ * both, so only a kernel whose own dilated extent passes one of them is refused (-4).
+ * tests/conv_width_gate scores planes past each limit. */
 int rocket_conv2d_plan(const rocket_conv2d_desc *d);
 
 /* Run the conv on the NPU. `fd` is an open rocket device (rocket_open()). in / W /
@@ -159,7 +165,8 @@ int rocket_conv2d_fp16(int fd, const rocket_conv2d_desc *d,
 
 /* ---- conv1d (the Whisper encoder front-end: width-only 1D conv over time) -------
  * 1D convolution over the time axis, lowered onto the HW-validated rocket_conv2d_fp16
- * as a HEIGHT-1 conv (IH=KH=OH=1, the time axis on the width/IW axis):
+ * as a WIDTH-1 conv (IW=KW=OW=1, the time axis on the height/IH axis, which the tiler
+ * splits into row bands of at most 1022 input rows):
  *
  *   in  [IC][IT]            (IC channels, IT time steps)
  *   W   [OC][IC][KW]        (OC filters, kernel width KW)
@@ -170,7 +177,7 @@ int rocket_conv2d_fp16(int fd, const rocket_conv2d_desc *d,
  * Whisper's two front-end convs are this op (KW=3, pad=1; conv1 stride 1, conv2 stride 2),
  * each followed by GELU (use the conv->act epilogue for the GELU, not the standalone op).
  * Pure descriptor wrapper — inherits conv2d's bit-exactness, alignment, and tiling. The
- * matching CPU oracle is rocket_conv2d_ref_fp16 on the same height-1 descriptor. Returns 0,
+ * matching CPU oracle is rocket_conv2d_ref_fp16 on the same width-1 descriptor. Returns 0,
  * negative on error. */
 int rocket_conv1d_fp16(int fd, int ic, int it, int oc, int kw, int stride, int pad,
                        const _Float16 *in, const _Float16 *W, _Float16 *out);
@@ -180,9 +187,10 @@ int rocket_conv1d_fp16(int fd, int ic, int it, int oc, int kw, int stride, int p
  * + an IOVA guard) on EVERY call — and per TILE for a tiled conv. For a delegate
  * running many convs (each possibly tiled) per inference, that per-call alloc/free
  * dominates the small-conv cost. A rocket_conv_ctx caches those BOs on a BORROWED
- * fd and grows each to the largest tile it has seen, so repeat calls reuse them
- * instead of re-allocating. Every job still memsets + refills its BOs, so reuse is
- * bit-identical to a fresh allocation (the resident matmul path uses the same trick).
+ * fd, one per power-of-two size class from 64 KiB for each role, so repeat calls reuse
+ * them instead of re-allocating, and a job never syncs more than twice the bytes it
+ * uses (a job syncs its BOs whole). Every job still memsets + refills its BOs, so reuse
+ * is bit-identical to a fresh allocation (the resident matmul path uses the same trick).
  *
  *   ctx = rocket_conv_ctx_create(fd);            // borrows fd (does NOT close it)
  *   ... per inference, any supported conv shape:
@@ -192,7 +200,8 @@ int rocket_conv1d_fp16(int fd, int ic, int it, int oc, int kw, int stride, int p
  * The fd is BORROWED: the ctx never opens or closes it (the caller owns it). fd < 0
  * is accepted and inert — conv2d_one_job takes the CPU oracle before touching any BO,
  * so a ctx wrapping fd<0 just threads through to the oracle (one code path on/off
- * device). One ctx may serve convs of different shapes; the pool grows to the max. */
+ * device). One ctx may serve convs of different shapes; each role holds at most about
+ * twice its largest job's bytes over its classes. */
 typedef struct rocket_conv_ctx rocket_conv_ctx;
 
 rocket_conv_ctx *rocket_conv_ctx_create(int fd);
@@ -256,6 +265,83 @@ void              rocket_conv_pool_free(rocket_conv_pool *pool);
 int rocket_conv2d_int8_mt(rocket_conv_pool *pool, const rocket_conv2d_desc *d,
                           const int8_t *in, const int8_t *W, int32_t *out);
 
+/* ---- native int8 DIRECT CONV_2D (int8-OUT, on-chip requant), RK3588 ----------------
+ * TFLite's quantized direct conv with PER-TENSOR quant, requantized on chip to int8, so no
+ * int32 accumulator is read back and no host requant runs. The register program is Mesa's
+ * direct int8-output writer: the CNA and CORE program of rocket_conv2d_int8, then the
+ * folded per-OC bias in the DPU's BS stage, CPEND for the weight zero point, and the
+ * OUT_CVT multiplier and shift.
+ *
+ * What it computes: acc = bias + sum (x - in_zp)(w - w_zp), a padded tap contributing
+ * nothing, then out = sat8(rne(acc * MUL >> SHIFT) + out_zp) with MUL and SHIFT the OUT_CVT
+ * pair derived from in_scale*w_scale/out_scale (a 15-bit multiplier, ties to even). The
+ * accumulator is TFLite's exactly; the requant is the OUT_CVT's, so an output can differ
+ * from TFLite's by one where it sits at a rounding boundary. ANY weight zero point in the
+ * int8 range: the DPU's CPEND operand adds -w_zp times each window's input sum on chip,
+ * border pad included. Measured on the RK1 (tests/conv_i8out_probe.c, and
+ * tests/conv2d_int8_q_rocket.c against a host model of that arithmetic).
+ *
+ * Layouts and alignment as rocket_conv2d_int8: in [IC][IH][IW], W [OC][IC][KH][KW], out
+ * [OC][OH][OW], all int8 in the model's int8 domain; bias [OC] int32 or NULL. A uint8 tensor
+ * maps on by subtracting 128 from its values and its zero point, and adding it back to the
+ * output. OC is zero-padded to 32 and IC to 32 inside: a program whose OC ends part way
+ * through a 32-kernel group does not complete on this writer (the job outlasts the driver's
+ * watchdog and that group is left unwritten), so every job runs whole groups. It takes the
+ * same shapes as rocket_conv2d_int8 and the same tiles, from one shared planner; spatial
+ * tiles materialize their halo as in_zp on the real channels.
+ *
+ * rocket_conv2d_int8_q_plan() is the pure shape check (ROCKET_OK, ROCKET_E_SHAPE, or
+ * ROCKET_E_UNSUPPORTED off the RK3588). The entries return 0, or a negative status:
+ * ROCKET_E_UNSUPPORTED for a zero point outside int8, a requant scale the OUT_CVT cannot
+ * program, a folded bias outside int32, or another part. */
+int rocket_conv2d_int8_q_plan(const rocket_conv2d_desc *d);
+int rocket_conv2d_int8_q(int fd, const rocket_conv2d_desc *d,
+                         const int8_t *in, const int8_t *W, const int32_t *bias,
+                         float in_scale, float w_scale, float out_scale,
+                         int in_zp, int w_zp, int out_zp, int8_t *out);
+int rocket_conv2d_int8_q_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
+                             const int8_t *in, const int8_t *W, const int32_t *bias,
+                             float in_scale, float w_scale, float out_scale,
+                             int in_zp, int w_zp, int out_zp, int8_t *out);
+int rocket_conv2d_int8_q_mt(rocket_conv_pool *pool, const rocket_conv2d_desc *d,
+                            const int8_t *in, const int8_t *W, const int32_t *bias,
+                            float in_scale, float w_scale, float out_scale,
+                            int in_zp, int w_zp, int out_zp, int8_t *out);
+
+/* ---- PER-CHANNEL int8 DIRECT CONV_2D (per-axis weight scales, int8-out), RK3588 ----------
+ * TFLite's int8 direct conv with a per-output-channel weight scale, the quantization TFLite
+ * gives a conv filter by default. Same program, layouts, tiles and zero-point handling as
+ * rocket_conv2d_int8_q; `w_scale` is [OC], and the filter is symmetric (a per-axis
+ * quantization has no weight zero point).
+ *
+ * The requant is split across two stages of the DPU, as in rocket_conv2d_dw_int8_perc: the
+ * BS stage multiplies channel c's biased accumulator by an int16 C[c] and shifts, and the
+ * OUT_CVT applies one gain per job: sat8(rne(sat32(rne(acc*C[c] >> s)) * MUL >> SHIFT) +
+ * out_zp). The channels are sorted by scale and cut into jobs where a channel's C would fall
+ * under ROCKET_DW_PERC_MIN_C (default 2048, a gain within 2^-12), and every job runs whole
+ * 32-kernel groups; the jobs' tiles fan out across a pool together. So an output can differ
+ * from TFLite's by one where it sits near a rounding boundary, and a layer whose scales
+ * spread past 16x runs as more jobs. A channel with an all-zero filter is written by the
+ * host with TFLite's arithmetic.
+ *
+ * rocket_conv2d_int8_q_perc_plan() is the pure shape check (the same answer as
+ * rocket_conv2d_int8_q_plan). The entries return 0, or a negative rocket_status:
+ * ROCKET_E_UNSUPPORTED for a zero point outside int8, a job gain the OUT_CVT cannot program,
+ * a folded bias outside int32, or another part. */
+int rocket_conv2d_int8_q_perc_plan(const rocket_conv2d_desc *d);
+int rocket_conv2d_int8_q_perc(int fd, const rocket_conv2d_desc *d,
+                              const int8_t *in, const int8_t *W, const int32_t *bias,
+                              float in_scale, const float *w_scale, float out_scale,
+                              int in_zp, int out_zp, int8_t *out);
+int rocket_conv2d_int8_q_perc_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
+                                  const int8_t *in, const int8_t *W, const int32_t *bias,
+                                  float in_scale, const float *w_scale, float out_scale,
+                                  int in_zp, int out_zp, int8_t *out);
+int rocket_conv2d_int8_q_perc_mt(rocket_conv_pool *pool, const rocket_conv2d_desc *d,
+                                 const int8_t *in, const int8_t *W, const int32_t *bias,
+                                 float in_scale, const float *w_scale, float out_scale,
+                                 int in_zp, int out_zp, int8_t *out);
+
 /* CPU int64-accumulate -> int32 reference for the native int8 DIRECT/depthwise conv
  * (the golden oracle; also the fd<0 host fallback). The accumulate is int64 (a
  * 7x7x512 conv sums past int32) with an int32 store. Pure host, no hardware. */
@@ -272,14 +358,27 @@ void rocket_conv2d_ref_int8(const rocket_conv2d_desc *d,
  * ends of the int8 range, and within one of TFLite's reference kernels on 11 of 4096
  * outputs of a real model.
  *
- * PER-TENSOR quant and symmetric weights (w_zp == 0, as TFLite's int8 weights are); any
- * other w_zp returns ROCKET_E_UNSUPPORTED on the NPU path. A per-channel depthwise filter
- * must stay on the dequant->fp16-DW->requant path until the BS_MUL per-OC requant lands.
- * The caller passes the raw model tensors: in/w/out are int8 (model domain, [C][IH][IW] /
- * [C][KH][KW] / [C][OH][OW]); bias is the TFLite int32 bias [C] (may be NULL = no bias);
- * the scales and zero points are per-tensor, and the driver folds the input zero point
- * into the bias. Single CBUF pass (no DW spatial tiling on this path); channel-tiles like
- * the fp16 DW path. Returns 0, negative on error. */
+ * PER-TENSOR quant, and any weight zero point in the int8 range. The input zero point
+ * folds into the bias. A weight zero point cannot fold, because it adds -w_zp times each
+ * window's input sum. The DPU's CPEND operand (DPU_BS_OW_OP) adds exactly that term on
+ * chip, border pad included, so an asymmetric per-tensor filter computes the same function
+ * [HW sweep, RK1, tests/cpend_wzp_probe.c and tests/conv_dw_int8_runtime.c]. A uint8
+ * tensor maps onto this entry by subtracting 128 from its values and its zero point. A
+ * per-channel depthwise filter stays on the dequant->fp16-DW->requant path until a
+ * per-channel requant lands. The caller passes the raw model tensors: in/w/out are int8
+ * (model domain, [C][IH][IW] / [C][KH][KW] / [C][OH][OW]); bias is the TFLite int32 bias
+ * [C] (may be NULL = no bias); the scales and zero points are per-tensor. It channel-tiles
+ * like the fp16 DW path, and a plane whose one 64-channel group is past a CBUF pass runs in
+ * row (and if needed column) bands whose halo is materialized as the input zero point, which
+ * is what the hardware pad writes, so the bands compute the same bytes. Returns 0, negative
+ * on error.
+ *
+ * rocket_conv2d_dw_int8_plan() is the pure shape check behind it: ROCKET_OK when the
+ * entry's NPU path takes `d`, ROCKET_E_SHAPE when it refuses the geometry, and
+ * ROCKET_E_UNSUPPORTED on a part with no program for it. It opens no device, so a frontend
+ * can claim a node with it rather than copying the limits. On the RK3576 it answers
+ * through rocket_conv2d_int8_plan_rk3576(). */
+int rocket_conv2d_dw_int8_plan(const rocket_conv2d_desc *d);
 int rocket_conv2d_dw_int8(int fd, const rocket_conv2d_desc *d,
                           const int8_t *in, const int8_t *w, const int32_t *bias,
                           float in_scale, float w_scale, float out_scale,
@@ -288,6 +387,37 @@ int rocket_conv2d_dw_int8_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
                               const int8_t *in, const int8_t *w, const int32_t *bias,
                               float in_scale, float w_scale, float out_scale,
                               int in_zp, int w_zp, int out_zp, int8_t *out);
+
+/* ---- PER-CHANNEL int8 depthwise (per-axis weight scales), RK3588 ----------------------
+ * TFLite's int8 depthwise with a per-output-channel weight scale, the quantization TFLite
+ * gives a depthwise filter by default. Same layouts, zero points and fused-pad handling as
+ * rocket_conv2d_dw_int8, and the same shape envelope (rocket_conv2d_dw_int8_perc_plan() is
+ * the pure check, RK3588 only); `w_scale` is [C], and the filter is symmetric (a per-axis
+ * quantization has no weight zero point).
+ *
+ * The requant is split across two stages of the DPU. The BS stage multiplies channel c's
+ * accumulator by an int16 C[c] read from the bias cube and shifts, and the OUT_CVT applies
+ * one base gain per job: sat8(rne(sat32(rne(acc*C[c] >> s)) * MUL >> SHIFT) + out_zp), the
+ * product held wide and both shifts rounding half to even [HW sweep, RK1,
+ * tests/dw_perc_probe.c]. The job's largest channel sits at C = 32767, so channel c resolves
+ * its gain to 0.5/C[c]: within one count of TFLite where a value sits near a rounding
+ * boundary, like the per-tensor entry, and not bit-exact.
+ *
+ * Channels are sorted by scale and cut into jobs by count and by SCALE CLASS: a job ends
+ * where a channel's C would fall under ROCKET_DW_PERC_MIN_C (default 2048, a gain within
+ * 2^-12), so a layer whose scales spread wide runs as more jobs rather than losing
+ * resolution. A channel whose filter is all zero (a pruned channel) has the bias for its
+ * accumulator at every output, so the host writes its plane as that one value. Returns 0, or
+ * a negative rocket_status; ROCKET_E_UNSUPPORTED off the RK3588. */
+int rocket_conv2d_dw_int8_perc_plan(const rocket_conv2d_desc *d);
+int rocket_conv2d_dw_int8_perc(int fd, const rocket_conv2d_desc *d,
+                               const int8_t *in, const int8_t *w, const int32_t *bias,
+                               float in_scale, const float *w_scale, float out_scale,
+                               int in_zp, int out_zp, int8_t *out);
+int rocket_conv2d_dw_int8_perc_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
+                                   const int8_t *in, const int8_t *w, const int32_t *bias,
+                                   float in_scale, const float *w_scale, float out_scale,
+                                   int in_zp, int out_zp, int8_t *out);
 
 /* ---- transposed convolution (ConvTranspose2d / "deconvolution") -------------
  * The transpose of a strided conv: each input pixel scatter-adds a kernel-weighted
@@ -380,6 +510,82 @@ int rocket_conv_transpose2d_fp16_ctx(rocket_conv_ctx *ctx,
 void rocket_conv_transpose2d_ref_fp16(const rocket_conv_transpose2d_desc *d,
                                       const _Float16 *in, const _Float16 *W, _Float16 *out);
 
+/* ---- the resident-weight transposed conv (col2im over the resident fp16 matmul) -------
+ * The entry for a model that runs the same ConvTranspose repeatedly. It is one GEMM and a
+ * host scatter-add: the input read as IC planes of IH*IW pixels times the weight as it is
+ * stored, [IC][OC*KH*KW], gives every tap of every input pixel,
+ *
+ *   P[(oc,kh,kw)][ih*IW + iw] = sum_ic in[ic][ih][iw] * W[ic][oc][kh][kw],
+ *
+ * with no inserted zeros and no im2col, and each tap's plane then adds into the output at
+ * the offset the tap puts it. The GEMM is the resident fp16 matmul (rocket_matmul.h's
+ * rocket_ctx), its weight transposed and packed ONCE into the handle, fanned across the
+ * context's worker fds (split along M, each worker holding the whole weight, where the
+ * input outweighs the weight; along N otherwise; ROCKET_CT_SPLIT=m|n forces one), and run
+ * with the input and P in channel-planes form, so neither side takes a host transpose.
+ *
+ *   ctx = rocket_ctx_create(3);
+ *   w   = rocket_conv_transpose2d_weights_pack(ctx, &desc, W, bias);   // bias may be NULL
+ *   ... per call:
+ *       rocket_conv_transpose2d_fp16_prepacked(ctx, w, in, out);
+ *   rocket_conv_transpose2d_weights_free(ctx, w);                     // before the ctx
+ *   rocket_ctx_free(ctx);
+ *
+ * Layouts are rocket_conv_transpose2d_fp16's (in [IC][IH][IW], W [IC][OC][KH][KW], out
+ * [OC][OH][OW]); `bias` is [OC] and is added before the one fp16 rounding. The handle
+ * copies what it needs at pack time and never reads W or bias again: a changed weight is
+ * a new pack, and nothing is cached by pointer, so a handle cannot serve a stale weight.
+ * It holds the descriptor, the resident weight (context worker count x the weight's
+ * bytes under the M split, 1x under the N split) and a host buffer of P,
+ * OC*KH*KW*IH*IW fp16 values. It is tied to the context it was packed on. Not thread-safe,
+ * as the context.
+ *
+ * ACCURACY. Each P element is an fp32 sum of exact fp16 products, rounded to fp16 once per
+ * K tile of the matmul (one or two tiles at IC <= 1024); the scatter-add sums the
+ * ceil(KH/sy)*ceil(KW/sx) planes that reach an output pixel, and the bias, in fp32 and
+ * rounds once. So an output is within a few fp16 roundings of its own magnitude sum
+ * (mag = sum over taps of |x*w|, plus |bias|) of the exact result. Measured at pix2pix's
+ * eight and SAM's two layers with real-valued data and a bias, against an fp64 scatter
+ * reference: worst |err| / mag 2^-13.9 to 2^-11.1 per layer (the 2^-11.1 at SAM's k2 s2,
+ * where the partial and the biased sum each round once), under a gated 2^-9; with integer
+ * data whose partials and sums stay below 2048, bit-exact to rocket_conv_transpose2d_ref_fp16
+ * at 20 sweep shapes (stride 1-4 per axis, output_padding, dilation 2, 1x3 to 4x4 kernels,
+ * IC 3, a cropping pad) and all ten layers, under both worker splits and ROCKET_KACC=0
+ * [HW sweep, RK1 at 600 MHz, rocket 1.3.0, 2026-09-27, tests/conv_transpose_resident.c].
+ *
+ * COST. Per call, warm medians over five rotated interleaved passes, the weight packed once
+ * outside the timing, a three-worker context: pix2pix's layers up1-up8 0.94, 1.80, 1.95,
+ * 2.54, 4.47, 5.30, 9.16 and 3.18 ms, SAM's two upscalers 2.95 and 5.05 ms (with their
+ * bias), which is 0.11-0.58x ONNX Runtime 1.27.0's 2-thread per-node time for the same
+ * layers on the same board (paired within each pass; the thinnest margin is up1, 0.58x,
+ * 8 MB of weight read for 4 MMAC) and 0.02-0.29x rocket_conv_transpose2d_fp16_ctx's, which
+ * refuses up2-up5 [HW sweep, mainline RK1 at 600 MHz, rocket 1.3.0, governor performance,
+ * taskset -c 4-7 against ORT on 6-7, 2026-09-27, tests/ct_model_bench.c]. The GEMM is
+ * 69-87% of the call at up4-up8 and SAM, and the single-threaded scatter-add the rest
+ * (2.7 ms at up7, 1.6 at SAM's second upscaler).
+ *
+ * REFUSALS (_prepacked_plan, pure): ROCKET_E_SHAPE for an invalid descriptor, -3 for an
+ * empty output, ROCKET_E_UNSUPPORTED for a DEPTHWISE transpose (no GEMM; the one-shot
+ * rocket_conv_transpose2d_fp16 runs it) and on any part but the RK3588, and -4 when
+ * IH*IW or OC*KH*KW passes 2^24 or P would pass 64 MiB. A pad past the kernel's reach
+ * (a cropping transpose) and any output_padding are accepted: the scatter-add only bounds
+ * them. A plan of 0 runs; what can still fail at run time is an allocation.
+ *
+ * _pack returns NULL on a refused descriptor or a failed allocation; _prepacked returns 0,
+ * or <0 with the matmul's or the arguments' reason. */
+typedef struct rocket_conv_transpose2d_weights rocket_conv_transpose2d_weights;
+struct rocket_ctx;
+
+int rocket_conv_transpose2d_prepacked_plan(const rocket_conv_transpose2d_desc *d);
+rocket_conv_transpose2d_weights *
+rocket_conv_transpose2d_weights_pack(struct rocket_ctx *ctx, const rocket_conv_transpose2d_desc *d,
+                                     const _Float16 *W, const _Float16 *bias);
+int rocket_conv_transpose2d_fp16_prepacked(struct rocket_ctx *ctx,
+                                           rocket_conv_transpose2d_weights *w,
+                                           const _Float16 *in, _Float16 *out);
+void rocket_conv_transpose2d_weights_free(struct rocket_ctx *ctx,
+                                          rocket_conv_transpose2d_weights *w);
+
 /* ---- RK3576: the per-chip convolution entries ------------------------------
  * The RK3576 NPU is the same IP family and runs through the same uAPI, but its
  * CNA/CORE/DPU blocks use a different geometry-register encoding at the same block
@@ -423,7 +629,11 @@ void rocket_conv_transpose2d_ref_fp16(const rocket_conv_transpose2d_desc *d,
  * Refused rather than approximated: dilation (no RK3576 shape has been run through the
  * rate fields), and a shape whose resident weight slice does not fit even one
  * output-channel group, which needs an input-channel split that the on-chip requant
- * forecloses.
+ * forecloses. Also refused, at claim time as well: an input or output width past 8192, a
+ * depthwise channel count past 8192, a kernel past 32 on either axis and a stride past 7.
+ * Those are the widths of the fields the part computes with, and past each one a task
+ * returns a full, wrong surface [HW sweep, H96, tests/rk3576_conv_width_probe]. Nothing
+ * here tiles the width.
  *
  * Bit-exact against a CPU model over tests/rk3576_conv_lib_gate.c. [HW sweep, H96 MAX M9] */
 int rocket_conv2d_int8_rk3576(int fd, const rocket_conv2d_desc *d,
@@ -517,49 +727,54 @@ int rocket_conv2d_int8_act_rk3576(int fd, const rocket_conv2d_desc *d,
  * and no submit. Pure, so a frontend can ask it while deciding what to CLAIM, where a
  * refusal costs one node the framework runs itself rather than the whole model.
  *
- * A tile is one task and a task carries one OUT_CVT shift, so a channel reaches its own
- * scale through the int16 C in its coefficient group and nothing else. The base gain is
- * already the smallest the tile admits, so a channel whose scale sits below HALF the base
- * wants a C under one and the field's floor is one: it then computes at the BASE's gain
- * instead of its own — wrong by a factor, not by a count, on a surface that is still full,
- * correctly sized and entirely plausible.
+ * A tile is one task, and a task carries one OUT_CVT gain and one DPU shift word, so a
+ * channel reaches its own scale through the int16 C in its coefficient group. The BS stage
+ * computes sat32(rne(((acc + A)*C) >> s)) with the product held wide [HW sweep, H96 MAX M9],
+ * so the planner puts the task's largest LIVE scale at C = 32767, every other live channel
+ * in proportion, and takes the smallest s at which every live product fits int32 at its
+ * accumulator bound. A live channel resolves its gain to 0.5/C relative, and the ramp
+ * spans 32767:1 in every task whatever the fan-in.
  *
- * That clamp is the boundary, and it is the ramp's own rather than a chosen threshold:
- * above it C is an integer and the resolution is 0.5/C, which is what the tile search
- * spends submits to improve; below it there is no C to choose. Measured through a
- * frontend on EfficientDet-Lite0, which carries clamped channels in 7 layers of 182:
- * computing them anyway scores mAP 0.2395 against the CPU's 0.2823, where refusing them
- * scores 0.2809.
+ * A CHANNEL WHOSE OUTPUT CANNOT VARY IS PROGRAMMED AS ITS BYTE. For any int8 input its
+ * accumulator stays in [A - 128*pos - 127*neg, A + 127*pos + 128*neg] over its positive and
+ * negative weight sums. Where the exact per-axis output is one byte over that whole range,
+ * with 0.01 of a count to spare from a rounding boundary or past the rail, the channel's A
+ * and C are chosen against the part's own arithmetic so that it writes that byte, and it
+ * takes no part in the ramp. An all-zero filter is one; so is a dead channel whose bias
+ * drives its whole range past the rail. That is what a pruned or dead channel looks like
+ * after quantization, a scale four to five orders below its neighbours, and those are the
+ * channels that clamped the shift-0 ramp below.
  *
- * BUT A CLAMP IS ONLY A DEFECT WHERE IT REACHES THE SURFACE, and that is asked rather than
- * assumed. A channel whose filter is entirely ZERO reaches exactly one accumulator — the
- * zero-point fold — at every output position, so whether the wrong gain changes its byte
- * is decidable exactly; where both gains drive that fold past the same saturation rail by
- * more than a count, the surface is identical and the layer is ACCEPTED. That is what a
- * pruned channel looks like after quantization (an all-zero filter quantizes against an
- * all-zero tensor, so its scale sits at the quantizer's floor while its bias keeps the
- * layer's magnitude), and it is 3 of EfficientDet-Lite0's 7 refusals — its stem included.
- * A LIVE channel is refused without asking: its accumulator ranges over the whole filter's
- * reach and a gain wrong by a factor is wrong somewhere in it.
+ * The refusal is a LIVE channel below 1/65534 of its task's largest live scale: its C
+ * would round to zero, the field's floor is one, and it would compute at the wrong gain on
+ * a full, correctly sized, entirely plausible surface. ROCKET_RK3576_PC_ALLOW_CLAMP=1
+ * computes anyway. The pack and run entries refuse on the same prediction, so a claim made
+ * here cannot fail there.
  *
- * Accepting them is worth +0.0023 mAP over refusing (0.2826 against 0.2809, CPU 0.2823,
- * 500 val2017 images) and 16.5 ms of a 99.3 ms inference: a refused layer is a host
- * fallback, and in this graph it also SPLITS the partition it sits in, so accepting turns
- * EfficientDet-Lite0's head from a 12-layer plus a 28-layer partition into one 43-layer
- * partition and takes the delegate from 1.23x to 1.47x of CPU TFLite. `ROCKET_RK3576_PC_INERT`
- * is the knob: on by default, `0` refuses every clamped channel, `dw` accepts only on the
- * depthwise path (90.3 ms, the middle of the three).
+ * Measured through tflite-rocket on EfficientDet-Lite0's 182 per-axis layers: none refused
+ * (the shift-0 ramp refuses 4, all depthwise at 20x20 and 10x10), every direct layer in ONE
+ * output-channel tile (the shift-0 ramp cuts 11 layers into 133 tiles, which are also not
+ * cube producers), worst predicted live gain error 0.61% (median 0.008%), 345 channels
+ * over 28 layers programmed as their byte, BS shifts 0-7. Warm wall 55.5 ms against the
+ * shift-0 ramp's 83.6, 0.661x paired over eight rotated passes, the same as every
+ * per-axis layer claimed and untiled with the gains ignored (1.003x). mAP@[.5:.95] over
+ * 500 val2017 images 0.2818 against the CPU's 0.2823 and the shift-0 ramp's 0.2826, a
+ * difference inside what one count of drift does to an NMS-ordered list [HW sweep, H96 MAX
+ * M9, walls with both clusters on `performance`, 2026-09-27].
  *
- * The pack and run entries refuse on the same prediction, so a claim made here cannot fail
- * there. DEPTHWISE is where it bites: one task whatever the channel count, so no tile
- * lever at all. ROCKET_RK3576_PC_ALLOW_CLAMP=1 computes anyway.
+ * `ROCKET_RK3576_PC_SHIFT=0` restores the shift-0 ramp exactly: the shift word at zero, C
+ * capped at INT32_MAX / max|acc + A| where the product saturates, no constant channels, and
+ * a clamped channel refused unless ROCKET_RK3576_PC_INERT (on by default; `0` refuses every
+ * clamp; `dw` accepts only on the depthwise path) finds it an all-zero filter whose fold
+ * sits past the same rail under both gains. PC_INERT is read in that mode only.
  *
- * Returns ROCKET_OK, ROCKET_E_UNSUPPORTED where a channel's gain is off the ramp AND its
- * clamp reaches the surface, or ROCKET_E_SHAPE for a descriptor this path does not take.
- * `oc_tile` and `max_rel_err` may be NULL; both are filled even when the answer is a
- * refusal. The error is the GAIN's, over every clamped channel including the inert ones,
- * so an ACCEPTED layer can report one above 100%; it is a REPORTED quantity at every
- * accepted shape, not an asserted one. [HW sweep, H96 MAX M9] */
+ * Returns ROCKET_OK, ROCKET_E_UNSUPPORTED where a live channel's gain is off the ramp, or
+ * ROCKET_E_SHAPE for a descriptor this path does not take. `oc_tile` and `max_rel_err` may
+ * be NULL; both are filled even when the answer is a refusal. The error is the worst live
+ * channel's relative gain error (on the shift-0 ramp it also counts clamped all-zero
+ * filters, so an accepted layer can report one above 100%); it is a REPORTED quantity at
+ * every accepted shape, not an asserted one. [HW sweep, H96 MAX M9,
+ * tests/rk3576_perchannel_gate.c] */
 /* WHETHER THE INT8 CONVOLUTION PATH TAKES THIS GEOMETRY AT ALL — from the descriptor
  * alone, with no weights, no fd and no submit. Pure, so a frontend can ask it while
  * deciding what to CLAIM: a refusal costs one node the framework runs itself, where the
@@ -600,8 +815,9 @@ int rocket_conv2d_int8_perchannel_plan_rk3576(const rocket_conv2d_desc *d,
  * task and a task carries one OUT_CVT shift, so the C ramp inside a tile spans only
  * that tile's range of scales. The channels are sorted by scale first, so halving the
  * tile roughly halves the spread the ramp must cover. Measured at ic=128 oc=128 with a
- * 100x spread: 26.6 counts of deviation from an exact per-axis requant in one tile,
- * 2.7 at 64 channels, 1.0 at 32. The planner takes the LARGEST tile whose PREDICTED
+ * 100x spread on the shift-0 ramp: 26.6 counts of deviation from an exact per-axis
+ * requant in one tile, 2.7 at 64 channels, 1.0 at 32. Under the BS shift the same shape
+ * is 0.6 counts in one tile. The planner takes the LARGEST tile whose PREDICTED
  * worst-case gain error meets ROCKET_RK3576_PC_MAX_ERR (default 1%), so a layer that
  * does not need the split does not pay for it. ROCKET_RK3576_PC_OC_TILE forces one.
  *
@@ -1079,9 +1295,34 @@ unsigned rocket_conv2d_int8_chain_max_programs_rk3576(void);
 
 /* fp16 -> fp16 through the input-channel split: one fp16 task on this part contracts
  * exactly sixteen input channels, so an arbitrary count is ic/16 submits summed on the
- * host. A plane whose 16-channel slice still overflows the CBUF is refused — composing
+ * host. Each of those runs its output channels in tiles of at most 32, since one float
+ * program writes no more, and of 16 where the weight-slice rule binds (a 16-channel
+ * group's slice past 32 KiB on a plane that needs the F=2048 allowance, e.g. k9 and
+ * k11). A plane whose 16-channel slice still overflows the CBUF is refused — composing
  * the split with the row window is not wired — and the depthwise fp16 cube is not
- * decoded, so desc.depthwise is refused too. */
+ * decoded, so desc.depthwise is refused too. Four or fewer input channels take the
+ * packed-image first conv instead: one program per row window and 32 output channels.
+ *
+ * It returns with every element written. Each program raises the DPU's own completion
+ * and goes out without ROCKET_JOB_NO_DPU_DONE, so the driver waits for it; under that
+ * hint the fence was the 250 us settle and a program still writing came back with its
+ * last rows unwritten and rc 0, 18 of 18 calls at k9 and k11 over 32 channels on 120x64
+ * and at k9 over two slices [HW sweep, H96 MAX M9, rocket 1.6.0,
+ * tests/rk3576_drain_probe gate, 2026-09-27]. On a kernel whose wait for that completion
+ * is a deadline (interface below 1.6, or rocket.dpu_grace_us set) a program that
+ * outruns the deadline still returns short, silently.
+ *
+ * THE SLICE PROGRAMS WRITE fp32 THROUGH A WHOLE OUTPUT STAGE, AND POISON NOTHING. The
+ * program's own fp16 output poisons the next submit; the fp32 stage
+ * (gen_conv2d_fp16_rk3576_f32out) does not, so the programs of a call go back to back and
+ * the call leaves the part clean. The slices sum as fp32 partials and round once, to the
+ * fp16 result. k9 and k11 over 32 channels on 120x64 run 9.5-9.9 ms a call and k9 over
+ * two slices 15.1 ms, every element exact, where the fp16 writer's power cycle per program
+ * (about 105 ms at the stock 50 ms autosuspend, one more on exit) made them 115-227 ms. At
+ * 28x28 k3, ic 128 into oc 256 is 64 programs in 47 ms [HW sweep, H96 MAX M9, rocket
+ * 1.6.0, tests/rk3576_drain_probe gate and rk3576_fp16_split_cost, 2026-09-30].
+ * ROCKET_RK3576_FP16_F32OUT=0 restores the fp16 writer and its cycles. The packed-image
+ * first conv (ic <= 4) has not run under the stage and still cycles per program. */
 int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
                               const _Float16 *in, const _Float16 *W, _Float16 *out);
 

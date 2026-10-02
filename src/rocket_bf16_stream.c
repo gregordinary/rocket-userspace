@@ -446,7 +446,7 @@ fail:
  * cache recycles its least recently used shape rather than refusing. */
 static bfs_scratch *bfs_ctx_scratch(rocket_bf16_stream *s, int M, int K, int N)
 {
-    const rocket_shape_key k = { M, K, N, 0 };
+    const rocket_shape_key k = { M, K, N, 0, 0 };
     return rocket_slot_get(&s->scache, s, &k, &bfs_slot_ops);
 }
 

@@ -2,10 +2,10 @@
 
 ## AI disclosure
 
-Except for the prior work it builds on, rocket-userspace was developed by AI, primarily
-Claude Code (Opus 4.8). Human involvement was mostly limited to setting project goals and
-providing hardware access. This is a side project for curiosity's sake, and it comes with no
-guarantee of quality, accuracy, or update frequency.
+Except for the prior work it builds on, rocket-userspace was developed by AI, primarily Claude.
+Human involvement was mostly limited to setting project goals and providing hardware access. This
+is a side project for curiosity's sake, and it comes with no guarantee of quality, accuracy, or
+update frequency.
 
 ## About rocket-userspace
 
@@ -30,6 +30,7 @@ is GEMV-bound and ~82x slower at M=1.
 
 - **Matmul**: tiled, K-accumulating, fanned across the 3 NPU cores, weights resident. Runs
   in fp16, int8, int4, bf16 and tf32, plus bit-exact int16 via int8 byte-decomposition.
+  A single int16 task writes int32 natively, saturating.
 - **Convolution**: general `CONV_2D` with depthwise, transpose and resize.
 - **Pooling and reductions**: Max and Average pool, spatial and feature-axis reductions,
   cumsum.
@@ -39,6 +40,8 @@ is GEMV-bound and ~82x slower at M=1.
 - **Transformer and Whisper primitives**: RMSNorm, LayerNorm, softmax, gated FFN,
   multi-head self-attention, and a full encoder block. That is enough to run a
   Whisper/transformer encoder block end to end on the NPU.
+- **Resident encoders**: whole models with their weights packed once, for SigLIP, SAM and
+  ModernBERT. The ModernBERT encoder takes a batch of variable-length sequences.
 
 The complete function reference, every entry point per dtype and op, is in [API.md](API.md).
 

@@ -174,6 +174,11 @@ g conv_lib_gate              -- rk3576_conv_lib_gate
 # alternating inputs through one held handle, each against its own transient answer.
 g conv_lib_resident          ROCKET_LG_RESIDENT=1 -- rk3576_conv_lib_gate
 g conv_sym                   -- rk3576_conv_sym all
+# The fp16 convolution returns drained: back-to-back calls at the shapes whose programs run
+# longest, two alternating inputs, every element against an exact host sum. A job fenced
+# before its DPU finished writing leaves its last rows unwritten, and the write guard, which
+# asks whether a task wrote anything, cannot see that.
+g fp16_drain                 -- rk3576_drain_probe gate
 g refusal_gate               -- rk3576_refusal_gate
 g matmul_gate                -- rk3576_matmul_gate
 # The matmul-form fp16 program, one job for the whole of K: its host half holds the
@@ -186,6 +191,9 @@ g mm_fp16_gate               -- rk3576_mm_fp16_gate
 g mm_requant                 -- rk3576_mm_requant
 # The tie rule, which no gate's own scales reach: bit 30 clear rounds half to even.
 g requant_round             -- requant_round_probe
+# The derivation's carry edge against the FLOAT scale, which the models cannot see: they
+# share the derivation. A regression puts a scale in 32768 at half its value.
+g requant_edge              -- requant_edge_probe
 # The W8A8 route COMPOSED: the frontend's two-pass calibration, its frozen scale and the
 # de-quantize, driven end to end on the part. Every other number on that route is host
 # arithmetic over a simulator, and this is the only row where the part supplies the
@@ -275,9 +283,9 @@ g net_guard_perkick_v1       "${NETENV[@]}" ROCKET_NET=v1 ROCKET_RK3576_GUARD_PE
     ROCKET_RK3576_NET_VARY=1 ROCKET_RK3576_NET_POISON=1 -- rk3576_net_gate bench 50
 
 echo
-# Every full-list row is unskippable today, so the full list must pass all 66. A filter
+# Every full-list row is unskippable today, so the full list must pass all 69. A filter
 # lowers the minimum to the rows it selected.
-FULL_ROWS=66
+FULL_ROWS=69
 min=$need
 [ -z "$FILTER" ] && [ "$min" -lt "$FULL_ROWS" ] && min=$FULL_ROWS
 echo "pass=$pass skip=$skip fail=$fail   minimum pass=$min   ($(($(date +%s) - t0)) s)"

@@ -473,6 +473,13 @@ int main(int argc, char **argv)
             { .ic=3,.ih=64,.iw=64,.oc=32,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 },    /* RGB stem, tiled */
             { .ic=32,.ih=40,.iw=40,.oc=48,.kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 },   /* OC=48 pad + tile */
             { .ic=128,.ih=28,.iw=28,.oc=64,.kh=1,.kw=1,.stride_y=1,.stride_x=1,.pad_top=0,.pad_left=0,.dil_y=1,.dil_x=1 },  /* 1x1 big (matmul) */
+            /* A mid-network IC that is not a multiple of the 32-channel group: the entry
+             * pads it on the weight side and the input side alike. Mesa's rocket driver
+             * shipped this wrong (weights at the real IC, the task at the aligned IC), which
+             * corrupts every output channel; IC 3 alone could not see it. */
+            { .ic=24,.ih=12,.iw=12,.oc=32,.kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 },   /* IC 24, 3x3 */
+            { .ic=24,.ih=10,.iw=10,.oc=32,.kh=1,.kw=1,.stride_y=1,.stride_x=1,.pad_top=0,.pad_left=0,.dil_y=1,.dil_x=1 },   /* IC 24, 1x1 */
+            { .ic=40,.ih=14,.iw=14,.oc=64,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1 },   /* IC 40, past one group */
         };
         for (size_t i = 0; i < sizeof(big)/sizeof(big[0]); i++) {
             fail |= run_tiled_runtime(fd, &big[i]);

@@ -493,6 +493,33 @@ static inline void detile_store_f16(_Float16 *restrict C, int N,
     }
 }
 
+/* The CHANNEL-PLANES sibling of detile_store_f16: output column n lands in plane n of
+ * `Ct`, row m at Ct[n * ldc + m] (a conv's [C][H*W] layout, which is C transposed). The
+ * cube is C2=8, so eight columns of Mtile rows are one rc_group8_to_planes_u16 deinterleave
+ * straight into eight planes, with no row-major pass between. Ntile is a multiple of 8
+ * (N%16), and every plane is written for all Mtile rows of the tile. */
+static inline void detile_planes_f16(_Float16 *restrict Ct, size_t ldc,
+                                     const _Float16 *restrict slot,
+                                     int m0, int n0, int Mtile, int Ntile) {
+    for (int g = 0; g < Ntile / 8; g++) {
+        uint16_t *pl[8];
+        for (int j = 0; j < 8; j++)
+            pl[j] = (uint16_t *)(Ct + (size_t)(n0 + g * 8 + j) * ldc + m0);
+        rc_group8_to_planes_u16(pl, 8, (const uint16_t *)(slot + (size_t)g * Mtile * 8),
+                                (size_t)Mtile);
+    }
+}
+
+/* narrow_f32_to_f16's planes form: acc is [M][N] row-major fp32, Ct gets plane n at stride
+ * ldc. Only the CPU-accumulate fallback takes it (tiny M, or ROCKET_KACC=0), so it is a
+ * plain loop. */
+static void narrow_f32_to_planes(_Float16 *restrict Ct, size_t ldc, const float *restrict acc,
+                                 int M, int N) {
+    for (int m = 0; m < M; m++)
+        for (int n = 0; n < N; n++)
+            Ct[(size_t)n * ldc + m] = (_Float16)acc[(size_t)m * N + n];
+}
+
 /* packA scatter — the INVERSE of detile_store_f16: one row-major A[m0.., k0..] tile ->
  * NPU input cube. For a fixed row h, group g=(c-1)/8 is 8 CONTIGUOUS fp16 in the
  * row-major source (arow[g*8 .. +7]) AND 8 CONTIGUOUS fp16 in the cube at
@@ -1190,6 +1217,60 @@ double mm_scatter_input(const mm_plan *pl, _Float16 *dst, const _Float16 *A)
     return now_ms() - ts;
 }
 
+/* The CHANNEL-PLANES form of the input scatter: A is given transposed, as K planes of M
+ * (a conv's [C][H*W] input), plane k at At + k * lda. Each tile's cube group of eight
+ * channels is one rc_planes_to_group8_u16 interleave from eight planes, with no row-major
+ * pass between. Only the first m_live rows and k_live planes exist in `At`; every lane of
+ * every tile past them is WRITTEN zero rather than left, so a slot another layout filled
+ * cannot leak into a padded row or channel. */
+static void feat_scatter_planes_into(const mm_plan *pl, _Float16 *restrict dst,
+                                     const _Float16 *restrict At, size_t lda,
+                                     int m_live, int k_live)
+{
+    for (int mi = 0; mi < pl->nMt; mi++) {
+        const int m0 = mi * pl->Mt, Mtile = (pl->M - m0 < pl->Mt) ? (pl->M - m0) : pl->Mt;
+        int rows = m_live - m0;
+        if (rows < 0) rows = 0;
+        if (rows > Mtile) rows = Mtile;
+        for (int ki = 0; ki < pl->nKt; ki++) {
+            const int k0 = ki * pl->Kt, Ktile = (pl->K - k0 < pl->Kt) ? (pl->K - k0) : pl->Kt;
+            _Float16 *slot = dst + (size_t)(mi * pl->nKt + ki) * pl->in_slot;
+            for (int g = 0; g < (Ktile + 7) / 8; g++) {
+                const int c0 = k0 + g * 8;
+                int nc = k_live - c0;
+                if (nc < 0) nc = 0;
+                if (nc > 8) nc = 8;
+                uint16_t *d = (uint16_t *)(slot + (size_t)g * Mtile * 8);
+                const uint16_t *pl8[8];
+                for (int j = 0; j < nc; j++)
+                    pl8[j] = (const uint16_t *)(At + (size_t)(c0 + j) * lda + m0);
+                rc_planes_to_group8_u16(d, pl8, nc, (size_t)rows);
+                if (rows < Mtile)
+                    memset(d + (size_t)rows * 8, 0, (size_t)(Mtile - rows) * 8 * sizeof(uint16_t));
+            }
+        }
+    }
+}
+
+double mm_scatter_input_planes(const mm_plan *pl, _Float16 *dst, const _Float16 *At,
+                               size_t lda, int m_live, int k_live)
+{
+    double ts = now_ms();
+    feat_scatter_planes_into(pl, dst, At, lda, m_live, k_live);
+    return now_ms() - ts;
+}
+
+double mm_pack_input_planes(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *At,
+                            size_t lda, int m_live, int k_live)
+{
+    double ts = now_ms();
+    if (rocket_bo_prep(fd, &b->in_all, 1, 0) != 0) return -1.0;
+    if (!b->prezeroed) memset(b->in_all.ptr, 0, b->in_all.size);
+    feat_scatter_planes_into(pl, (_Float16 *)b->in_all.ptr, At, lda, m_live, k_live);
+    rocket_bo_fini(fd, &b->in_all);
+    return now_ms() - ts;
+}
+
 /* Load a pre-scattered canonical buffer into this worker's in_all BO (memcpy +
  * cache flush) — replaces the per-worker scatter when plans agree. */
 double mm_load_input(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *packed)
@@ -1206,7 +1287,8 @@ double mm_load_input(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *packe
  *          (and their readback / de-tile gather)
  * ##########################################################################*/
 
-int mm_compute(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
+static int mm_compute_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, size_t ldc_planes,
+                         double t_pack)
 {
     const int M = pl->M, K = pl->K, N = pl->N;
     const int Mt = pl->Mt, Kt = pl->Kt, Nt = pl->Nt;
@@ -1331,12 +1413,25 @@ int mm_compute(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
         pthread_mutex_unlock(&g_prof_mu);
     }
 
-    narrow_f32_to_f16(C, acc, (size_t)M * N);
+    if (ldc_planes) narrow_f32_to_planes(C, ldc_planes, acc, M, N);
+    else            narrow_f32_to_f16(C, acc, (size_t)M * N);
 
 done:
     /* Scratch (acc/tasks/bm0/.../boff) is resident in mm_bos — freed in
      * mm_bos_free, not here. */
     return ret;
+}
+
+int mm_compute(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
+{
+    return mm_compute_to(fd, pl, b, C, 0, t_pack);
+}
+
+int mm_compute_planes(int fd, const mm_plan *pl, mm_bos *b, _Float16 *Ct, size_t ldc,
+                      double t_pack)
+{
+    if (!ldc) return -1;
+    return mm_compute_to(fd, pl, b, Ct, ldc, t_pack);
 }
 
 /* ============================================================================
@@ -1715,7 +1810,8 @@ done:
  * BOs stay bounded. The EW geometry needs Mtile>=12 (MAX(.,12) floor) — true for
  * all real prefill tiles (Mt=256); a tiny padded last M-tile would be off, so we
  * fall back to CPU-accum for any plan whose last M-tile is <12. ==========*/
-int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
+static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
+                              size_t ldc_planes, double t_pack)
 {
     const int N = pl->N;
     const int Mt = pl->Mt, Kt = pl->Kt, Nt = pl->Nt;
@@ -1896,7 +1992,8 @@ int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
                 int m0 = mi * Mt, Mtile = (pl->M - m0 < Mt) ? (pl->M - m0) : Mt;
                 int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
                 _Float16 *slot = ob + (size_t)gi * out_slot;
-                detile_store_f16(C, N, slot, m0, n0, Mtile, Ntile);
+                if (ldc_planes) detile_planes_f16(C, ldc_planes, slot, m0, n0, Mtile, Ntile);
+                else            detile_store_f16(C, N, slot, m0, n0, Mtile, Ntile);
             }
             rocket_bo_fini(fd, fin);
             t_read += now_ms() - ts;
@@ -1990,7 +2087,8 @@ int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
             int m0 = mi * Mt, Mtile = (pl->M - m0 < Mt) ? (pl->M - m0) : Mt;
             int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
             _Float16 *slot = ob + (size_t)gi * out_slot;
-            detile_store_f16(C, N, slot, m0, n0, Mtile, Ntile);
+            if (ldc_planes) detile_planes_f16(C, ldc_planes, slot, m0, n0, Mtile, Ntile);
+            else            detile_store_f16(C, N, slot, m0, n0, Mtile, Ntile);
         }
         rocket_bo_fini(fd, fin);
         t_read += now_ms() - ts;
@@ -2011,6 +2109,18 @@ done:
     if (pong_local.handle) rocket_bo_free(fd, &pong_local);
     /* tasks/bmi/bni are resident in mm_bos — freed in mm_bos_free. */
     return ret;
+}
+
+int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
+{
+    return mm_compute_kacc_to(fd, pl, b, C, 0, t_pack);
+}
+
+int mm_compute_kacc_planes(int fd, const mm_plan *pl, mm_bos *b, _Float16 *Ct, size_t ldc,
+                           double t_pack)
+{
+    if (!ldc) return -1;
+    return mm_compute_kacc_to(fd, pl, b, Ct, ldc, t_pack);
 }
 
 /* Cross-op KACC compute: same NPU-side fp16 K-accumulation as mm_compute_kacc, but the
@@ -3308,13 +3418,11 @@ free_bos:
  * and tf32 tiled paths below reuse this plan and these index helpers — they share
  * the 2-byte input geometry and the C2=4 output de-tile, differing only in dtype.
  *
- * There is NO native int16 x int16 -> int32 matmul on RK3588: the int32-output conv
- * writes a single 1x16 output tile and never iterates over M-rows or N-groups (the
- * iteration registers were swept exhaustively; only the SATURATING int16-output
- * transposed primitive iterates, N<=32 — see matmul_int16_rocket). The
- * full-precision int16 matmul is rocket_matmul_int16_exact (int8 byte-decomposition,
- * below). No NPU K-accum (DPU-EW) is implemented for int16 either, exactly as for
- * int8.
+ * The single-task generator gen_matmul_int16 writes int16 x int16 -> int32 natively,
+ * SATURATING to int32, so it is exact only while |sum| < 2^31 per task (see
+ * tests/int16_native_probe). No tiled native entry exists. The int64-exact int16 matmul
+ * is rocket_matmul_int16_exact (int8 byte-decomposition, below). No NPU K-accum (DPU-EW)
+ * is implemented for int16 either, exactly as for int8.
  * ==========================================================================*/
 
 
@@ -3324,13 +3432,10 @@ int rocket_matmul_plan_int16(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 }
 
 /* ---- bit-exact int16 x int16 -> int64 via int8 byte-decomposition -------------
- * The RK3588 NPU has NO native int16 matmul (the documented matmul modes are
- * int8->int32 and fp16->fp32 only). The native int16 conv path can be
- * coaxed into an int16->int16 (SATURATING) transposed-output primitive via
- * tp_org_en (see matmul_int16_rocket / out_idx_i16_tp), but that cannot give a
- * full-precision int32/int64 product. This routine is the full-precision route:
- * decompose each int16 into two signed bytes and run FOUR proven int8 matmuls,
- * recombining in int64 (no saturation). ~4x int8 cost; completeness, not speed.
+ * Neither native int16 writer holds a full-range product: the int32 output saturates, and
+ * the transposed one (tp_org_en) keeps the low 16 bits. So an int64-exact product over
+ * full-range operands takes this route: decompose each int16 into two signed bytes and run FOUR proven int8
+ * matmuls, recombining in int64 (no saturation). ~4x int8 cost; completeness, not speed.
  *
  * Balanced signed split x = xh*256 + xl, xh,xl in [-128,127] (round-to-nearest):
  *   xl = ((x+128)&0xFF)-128;  xh = (x-xl)>>8.  Avoids the unsigned-low-byte
@@ -3343,7 +3448,7 @@ int rocket_matmul_int16_exact(int fd, int M, int K, int N,
                               const int16_t *A, const int16_t *B, int64_t *C)
 {
     /* int16_exact decomposes into FOUR int8 matmuls, so its hardware requirement is
-     * int8 (not a native int16 output, which RK3588 lacks). Gate on int8. */
+     * int8, not the native int16 output. Gate on int8. */
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
         return ROCKET_E_UNSUPPORTED;
     if (M == 1)   /* height-1 GEMV broken on HW; pad to 4 rows, return row 0 */

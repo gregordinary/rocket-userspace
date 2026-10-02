@@ -9,9 +9,14 @@
  * equal to it, so the gate has two halves and they answer different questions.
  *
  *   BIT-EXACT — against a CPU model of what the CHIP computes:
- *       out = sat8( rhe( sat32((acc + A[oc]) * C[oc]) * MUL >> SHIFT ) + out_zp )
- *   with the same (MUL, SHIFT) and the same C ramp the library planned. A failure here
- *   is a defect in the emitter, the packing or the planner. This is the gate.
+ *       out = sat8( rhe( sat32(rhe(((acc + A[oc]) * C[oc]) >> BS)) * MUL >> SHIFT ) + out_zp )
+ *   with the same (MUL, SHIFT), the same BS shift and the same C ramp the library planned
+ *   (perchannel_model.h, a second spelling of the planner). A channel the planner programs
+ *   as a CONSTANT is held to the exact per-axis byte instead, and its distance from an
+ *   exact per-axis requant is asserted, not reported. A failure here is a defect in the
+ *   emitter, the packing or the planner. This is the gate. `ROCKET_RK3576_PC_SHIFT=0` runs
+ *   it against the shift-0 ramp (BS = 0, no constants), each cell's refusal following the
+ *   ramp in force.
  *
  *   ACCURACY — against an exact per-axis float reference, the thing a model actually
  *   wants. This is REPORTED, not asserted: how far the two sit apart is a property of
@@ -63,7 +68,14 @@ typedef struct {
      * these cells come in a pair that differs only in `dead_bias`. */
     unsigned dead;
     int32_t  dead_bias;
-    int      expect_refuse;   /* the clamp reaches the surface: assert the entry refuses */
+    int      expect_refuse;   /* the SHIFT-0 ramp refuses: its clamp reaches the surface */
+    int      refuse_bs;       /* the SHIFT ramp refuses: a LIVE channel below C's floor */
+    /* The pruned channels' filters: 0 is all zero, k > 0 draws them from [-k, k] with at
+     * least one non-zero tap, a LIVE channel whose output still cannot vary. */
+    int      dead_w;
+    /* Zero points, when set: the defaults are -7 and 11. An output zero point at the -128
+     * rail hides the negative half of the product, so the new cells sit off it. */
+    int      zp_set, in_zp, out_zp;
 } pc_shape;
 
 static const pc_shape SHAPES[] = {
@@ -123,6 +135,32 @@ static const pc_shape SHAPES[] = {
     { "pc-narrow4",   4,  64,  16, 16,  3, 1, 1,   100.0f,  0 },
     { "pc-narrow1",   1,  32,  16, 16,  3, 1, 1,    10.0f,  0 },
     { "pc-stem",      3,  32, 320,320,  3, 2, 1,   100.0f,  0 },
+    /* THE SHIFT RAMP'S OWN CELLS. Each is one the shift-0 ramp REFUSES and the shift ramp
+     * computes, except the last, which both refuse — the boundary is a live channel below
+     * 1/65534 of its task's largest scale, and the cell is what says the new ramp still
+     * refuses at it. `pruned-live` above is the direct form of the first. Every zero point
+     * is off the rail.
+     *
+     *   dw-pruned-live   the depthwise form: four all-zero filters whose bias lands on an
+     *                    INTERIOR byte, so the constant is written, not saturated;
+     *   dw-deadlive-rail pruned channels whose filters are NOT zero (taps in [-2, 2]) and
+     *                    whose bias drives the whole reachable range past the rail: a live
+     *                    filter, a constant output, the shape EfficientDet-Lite0's refused
+     *                    depthwise layers carry;
+     *   dw-deadlive-mid  the same with the range inside one interior byte;
+     *   deep-live-1000x  a direct task of 32 whose fan-in caps the shift-0 C near 113, so a
+     *                    1000x live spread clamps; under the shift C reaches 32767;
+     *   dw-oc40 / oc40   a channel count that is not a multiple of the 16- or 32-channel
+     *                    group, which moves the shift word's offset in both layouts;
+     *   dw-70000x        a live channel below the field's floor even at C = 32767. */
+    /* name            ic   oc  iw  ih  k  s pad  spread    dw dead dead_bias  rf rb dw_ zp in  out */
+    { "dw-pruned-live",   64,  64, 16, 16, 3, 1, 1, 100.0f,   1, 4,  100000000, 1, 0, 0, 1,  5, -40 },
+    { "dw-deadlive-rail", 64,  64, 16, 16, 3, 1, 1, 100.0f,   1, 6, -500000000, 1, 0, 2, 1, -100, 20 },
+    { "dw-deadlive-mid",  64,  64, 16, 16, 3, 1, 1, 100.0f,   1, 6,  -50000000, 1, 0, 2, 1, -100, 20 },
+    { "deep-live-1000x", 256,  32,  8,  8, 3, 1, 1, 1000.0f,  0, 0,          0, 1, 0, 0, 1,  3, -25 },
+    { "dw-oc40",          40,  40, 12, 12, 3, 1, 1, 100.0f,   1, 0,          0, 0, 0, 0, 1, -20, 60 },
+    { "oc40",             32,  40, 12, 12, 3, 1, 1, 100.0f,   0, 0,          0, 0, 0, 0, 1,  9, -90 },
+    { "dw-70000x",        64,  64, 16, 16, 3, 1, 1, 70000.0f, 1, 0,          0, 1, 1, 0, 1, 12, 33 },
 };
 #define N_SHAPES ((int)(sizeof SHAPES / sizeof *SHAPES))
 
@@ -151,13 +189,6 @@ static void sort_by_scale(unsigned *perm, unsigned oc, const float *w_scale)
     }
 }
 
-static int32_t sat32(int64_t v)
-{
-    if (v >  (int64_t)INT32_MAX) return INT32_MAX;
-    if (v <  (int64_t)INT32_MIN) return INT32_MIN;
-    return (int32_t)v;
-}
-
 static int run_shape(int fd, const pc_shape *s, int verbose)
 {
     unsigned ic = s->ic, oc = s->oc, iw = s->iw, ih = s->ih, k = s->k;
@@ -182,7 +213,13 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
     unsigned *tile_shift = malloc(oc * sizeof *tile_shift);
     rocket_conv2d_desc d = {0};
     const float in_scale = 0.021f, out_scale = 0.037f;
-    const int in_zp = -7, out_zp = 11;
+    const int in_zp = s->zp_set ? s->in_zp : -7, out_zp = s->zp_set ? s->out_zp : 11;
+    const char *pcs = getenv("ROCKET_RK3576_PC_SHIFT");
+    const int bs_mode = !(pcs && *pcs == '0');
+    const int want_refuse = bs_mode ? s->refuse_bs : s->expect_refuse;
+    int *cst = malloc(oc * sizeof *cst);
+    unsigned *tile_bs = malloc(oc * sizeof *tile_bs);
+    unsigned bs_lo = 64, bs_hi = 0, nconst = 0;
     unsigned mul, shift, c, i, y, x, ky, kx;
     unsigned oc_tile = 0;
     unsigned seed = 0x2545F491u ^ (ic * 31 + oc * 17 + iw * 7 + k);
@@ -190,7 +227,8 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
     double ref_worst = 0.0, ref_sum = 0.0, dead_worst = 0.0;
 
     if (!in || !W || !got || !want || !bias || !A || !sum_w || !sum_abs_w ||
-        !w_scale || !C || !Aslot || !perm || !slot_of || !tile_mul || !tile_shift) {
+        !w_scale || !C || !Aslot || !perm || !slot_of || !tile_mul || !tile_shift ||
+        !cst || !tile_bs) {
         fail = 1; goto done;
     }
 
@@ -217,6 +255,15 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
         size_t base = dw ? (size_t)c * k * k : (size_t)c * ic * k * k;
         size_t n_w  = dw ? (size_t)k * k : (size_t)ic * k * k;
         memset(W + base, 0, n_w);
+        if (s->dead_w) {
+            size_t t;
+            for (t = 0; t < n_w; t++) {
+                seed = seed * 1103515245u + 12345u;
+                W[base + t] = (int8_t)((int)((seed >> 16) % (2u * s->dead_w + 1u)) -
+                                       s->dead_w);
+            }
+            W[base] = (int8_t)s->dead_w;          /* never an all-zero filter */
+        }
         w_scale[c] = 1e-6f;
         bias[c] = s->dead_bias;
     }
@@ -247,14 +294,14 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
      * nothing else — there is no surface to score, and one computed anyway would be the
      * defect this refuses. The pair's other half is what says the refusal is not simply
      * refusing everything with a clamp in it. */
-    if (s->expect_refuse) {
+    if (want_refuse) {
         rc = rocket_conv2d_int8_perchannel_rk3576(fd, &d, in, W, bias, in_scale,
                                                   w_scale, out_scale, in_zp, out_zp, got);
         fail = (rc != ROCKET_E_UNSUPPORTED);
-        printf("  %-4s %-11s ic=%-4u oc=%-4u %2ux%-2u k%u s%u  %u pruned channel(s) whose "
-               "clamp reaches the surface: returned %d, wanted %d\n",
-               fail ? "FAIL" : "PASS", s->name, ic, oc, iw, ih, k, st, s->dead,
-               rc, ROCKET_E_UNSUPPORTED);
+        printf("  %-4s %-11s ic=%-4u oc=%-4u %2ux%-2u k%u s%u  a channel whose clamp "
+               "reaches the surface (%s ramp): returned %d, wanted %d\n",
+               fail ? "FAIL" : "PASS", s->name, ic, oc, iw, ih, k, st,
+               bs_mode ? "shift" : "shift-0", rc, ROCKET_E_UNSUPPORTED);
         goto done;
     }
 
@@ -308,13 +355,22 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
         slot_of[cc] = i;
     }
     for (i = 0; i < oc; i += oc_tile) {
-        unsigned n = oc - i < oc_tile ? oc - i : oc_tile, j;
-        plan_c(i, n, perm, sum_abs_w, Aslot, in_scale, w_scale, out_scale,
-               C, &mul, &shift);
-        /* one OUT_CVT pair per tile, recorded against the channels it covers */
+        unsigned n = oc - i < oc_tile ? oc - i : oc_tile, j, bs = 0;
+        if (bs_mode)
+            nconst += plan_c_bs(i, n, perm, sum_w, sum_abs_w, Aslot, in_scale, w_scale,
+                                out_scale, out_zp, C, cst, &mul, &shift, &bs);
+        else {
+            plan_c(i, n, perm, sum_abs_w, Aslot, in_scale, w_scale, out_scale,
+                   C, &mul, &shift);
+            for (j = 0; j < n; j++) cst[i + j] = PC_MODEL_LIVE;
+        }
+        if (bs < bs_lo) bs_lo = bs;
+        if (bs > bs_hi) bs_hi = bs;
+        /* one OUT_CVT pair and one shift word per tile, recorded against its channels */
         for (j = 0; j < n; j++) {
             tile_mul[perm[i + j]]   = mul;
             tile_shift[perm[i + j]] = shift;
+            tile_bs[perm[i + j]]    = bs;
         }
     }
 
@@ -323,7 +379,6 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
             for (x = 0; x < ow; x++) {
                 int64_t acc = 0;
                 double  ref;
-                int32_t v;
                 int m;
                 for (i = dw ? c : 0; i < (dw ? c + 1 : ic); i++)
                     for (ky = 0; ky < k; ky++)
@@ -341,9 +396,11 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
                         }
                 acc -= (int64_t)in_zp * sum_w[c];
                 acc += bias[c];
-                v = sat32(acc * (int64_t)C[slot_of[c]]);
-                m = requant_sat8(requant_round_shift((int64_t)v * (int64_t)tile_mul[c],
-                                                     tile_shift[c]) + out_zp);
+                /* A constant channel is held to its exact byte; a live one to the part's
+                 * epilogue, the BS shift's rounding included. */
+                if (cst[slot_of[c]] != PC_MODEL_LIVE) m = cst[slot_of[c]];
+                else m = epilogue_bs(acc, C[slot_of[c]], tile_bs[c], tile_mul[c],
+                                     tile_shift[c], out_zp);
                 want[((size_t)c * oh + y) * ow + x] = (int8_t)m;
 
                 /* and what an exact per-axis requant would have produced */
@@ -359,7 +416,8 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
                      * ASSERTED and not reported: that is the whole claim the layer was
                      * accepted on, and it is the one number a bit-exact comparison
                      * against the chip's own arithmetic cannot make. */
-                    if (s->dead && c >= oc - s->dead && e > dead_worst) dead_worst = e;
+                    if (((s->dead && c >= oc - s->dead) ||
+                         cst[slot_of[c]] != PC_MODEL_LIVE) && e > dead_worst) dead_worst = e;
                 }
             }
         }
@@ -372,14 +430,17 @@ static int run_shape(int fd, const pc_shape *s, int verbose)
         else if (diff > worst) worst = diff;
     }
     if (exact != (int)out_n) fail = 1;
-    if (s->dead && dead_worst > 0.5) fail = 1;
+    if (dead_worst > 0.5) fail = 1;
 
     printf("  %-4s %-11s ic=%-4u oc=%-4u %2ux%-2u k%u s%u  %7d/%-7zu  "
            "C[%d..%d] tile=%-4u vs exact per-axis: max %.1f mean %.2f",
            fail ? "FAIL" : "PASS", s->name, ic, oc, iw, ih, k, st,
            exact, out_n, C[0], C[oc - 1], oc_tile,
            ref_worst, ref_sum / (double)out_n);
-    if (s->dead)
+    if (bs_mode)
+        printf("  [BS shift %u..%u, %u constant channel(s), exact-per-axis distance on "
+               "them %.2f]", bs_lo, bs_hi, nconst, dead_worst);
+    else if (s->dead)
         printf("  [%u pruned, clamp inert, exact-per-axis distance on them %.1f]",
                s->dead, dead_worst);
     printf("\n");
@@ -396,6 +457,7 @@ done:
     free(in); free(W); free(got); free(want); free(bias); free(A);
     free(sum_w); free(sum_abs_w); free(w_scale); free(C);
     free(Aslot); free(perm); free(slot_of); free(tile_mul); free(tile_shift);
+    free(cst); free(tile_bs);
     return fail;
 }
 

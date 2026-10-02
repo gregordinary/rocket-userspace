@@ -51,7 +51,8 @@ int rocket_fanout_nstep(int N, int nthreads, int align)
 
 static int key_eq(const rocket_shape_key *a, const rocket_shape_key *b)
 {
-    return a->M == b->M && a->K == b->K && a->N == b->N && a->group == b->group;
+    return a->M == b->M && a->K == b->K && a->N == b->N && a->group == b->group &&
+           a->split == b->split;
 }
 
 void *rocket_slot_get(rocket_slot_cache *c, void *owner,

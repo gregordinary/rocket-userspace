@@ -153,9 +153,12 @@ typedef struct {
    * validated int32-raw datapath (qd_en=0, size_e=7/surf*8, int32 output, host
    * requant). int8_out=1 switches to Mesa's int8-output writer: QD_EN=1, int8 out
    * (DATA_FORMAT=0), size_e=3/surf*4, per-OC int32 bias add (BS ALU), and the
-   * OUT_CVT requant computed from the quant scales below — bit-exact to the TFLite
-   * int8 kernel, no int32 readback. Currently wired for the DEPTHWISE branch (the
-   * Teflon-cracked path); direct int8-out is a follow-on A/B. */
+   * OUT_CVT requant computed from the quant scales below, and CPEND (DPU_BS_OW_OP)
+   * carrying the weight zero point — no int32 readback. Both branches: depthwise at
+   * size_e 3 / SURF_ADD x4, DIRECT at size_e 1 / SURF_ADD x2 (Mesa's direct program),
+   * each bit-exact against a host model on the RK1 (tests/conv_i8out_probe.c for the
+   * direct one). The direct program must run whole 32-kernel groups: at an OC that ends
+   * part way through one, the job outlasts the watchdog and that group is unwritten. */
   uint8_t   int8_out;
   float     in_scale;            /* input  quant scale (per-tensor) */
   float     w_scale;             /* weight quant scale (per-tensor; Teflon forces this) */
@@ -164,6 +167,12 @@ typedef struct {
   int32_t   output_zero_point;   /* OUT_CVT_OFFSET = output_zero_point - 0x80 */
   int32_t   weight_zero_point;   /* DPU_BS_OW_OP = 0x80 - weight_zero_point */
   uint32_t  bias_dma;            /* IOVA of the int32 per-OC bias cube (BRDMA reads it) */
+  /* int8_out depthwise only: bias_dma addresses the per-channel coefficient cube (64
+   * bytes per 8 channels: int32 A, int16 B, int16 C) and the BS stage multiplies by C[c]
+   * then shifts by bs_mul_shift, so the OUT_CVT carries one base gain for the job and C
+   * the per-channel ratio to it. See npu_dpu_desc.bs_mul_src. 0 = per-tensor. */
+  uint8_t   bs_mul_perc;
+  uint8_t   bs_mul_shift;
   /* conv->activation fusion (fp16 path). NULL (default) = plain conv, byte-identical
    * regcmd. Non-NULL fuses f(x) into the conv's DPU epilogue (BN-mul -> EW LUT ->
    * affine OUT_CVT). REQUIRES the fp16-out writer (set fp32tofp16=1) — the LUT result

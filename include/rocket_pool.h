@@ -118,6 +118,10 @@ void rocket_pool_ref_int8(const rocket_pool_desc *d, const int8_t *in, int8_t *o
  * descriptor, from the reciprocal the emitter will program and the worst-case int8
  * window sum, without running anything.
  *
+ * The plane is split by columns; rows and channels are not, and past 8192 of either the
+ * part's fields wrap and a task returns a wrong surface, so plan refuses them
+ * [HW sweep, H96 MAX M9, tests/rk3576_conv_width_probe].
+ *
  * Bit-exact against rocket_pool_ref_int8_rk3576() over tests/rk3576_pool_probe.c.
  * [HW sweep, H96 MAX M9] */
 int rocket_pool_int8_rk3576_plan(const rocket_pool_desc *d);

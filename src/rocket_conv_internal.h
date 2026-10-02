@@ -43,6 +43,27 @@ int rocket_conv2d_fp16_deconv(int fd, rocket_conv_ctx *ctx, int IC, int IH, int 
                               int OH, int OW, int KH, int KW, int sy, int sx, int pt, int pl,
                               const _Float16 *in, const _Float16 *Wf, _Float16 *out);
 
+/* The plan rocket_conv2d_dw_int8_perc() runs, per channel and pure: `cmul[c]` the BS
+ * multiplier, `shift[c]` and `cvt[c]` the BS shift and the OUT_CVT scale of the job channel
+ * c lands in, and `host[c]` 1 where the host writes the channel instead. Each array is [C].
+ * 0, ROCKET_E_SHAPE for a descriptor the entry refuses, or ROCKET_E_UNSUPPORTED when an
+ * accumulator bound is past what the shift absorbs. For a gate that models the device
+ * arithmetic from the plan the entry used. */
+int rocket_conv2d_dw_int8_perc_plan_channels(const rocket_conv2d_desc *d, const int8_t *w,
+                                             const int32_t *bias, float in_scale,
+                                             const float *w_scale, float out_scale, int in_zp,
+                                             int16_t *cmul, uint8_t *shift, float *cvt,
+                                             uint8_t *host);
+
+/* The same for rocket_conv2d_int8_q_perc(): each array is [OC], one filter of IC*KH*KW taps
+ * per output channel of `W` [OC][IC][KH][KW]. 0, ROCKET_E_SHAPE, ROCKET_E_NOMEM, or
+ * ROCKET_E_UNSUPPORTED when an accumulator bound is past what the shift absorbs. */
+int rocket_conv2d_int8_q_perc_plan_channels(const rocket_conv2d_desc *d, const int8_t *W,
+                                            const int32_t *bias, float in_scale,
+                                            const float *w_scale, float out_scale, int in_zp,
+                                            int16_t *cmul, uint8_t *shift, float *cvt,
+                                            uint8_t *host);
+
 #ifdef __cplusplus
 }
 #endif

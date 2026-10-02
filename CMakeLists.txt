@@ -143,6 +143,7 @@ set(ROCKETNPU_SOURCES
     src/rocket_encoder.c      # one Whisper encoder block (LN -> MHA -> residual -> LN -> MLP -> residual)
     src/rocket_siglip_encoder.c # SigLIP-B/16 vision encoder (patch-embed + pos + 12x block + post-LN)
     src/rocket_sam_encoder.c  # SAM ViT-Det image encoder (windowed + global attn + decomposed rel-pos + conv neck)
+    src/rocket_modernbert_encoder.c # ModernBERT text encoder (RoPE, global/sliding attn, GeGLU) + a pre-norm post stack
     src/rocket_activation.c   # elementwise fp16 activation via the DPU LUT block
     src/rocket_matmul_mt.c    # multicore fan-out (per-core worker fds)
     src/rocket_bf16_stream.c  # fast bf16 matmul: multicore fan-out + streaming resident scratch
@@ -249,6 +250,7 @@ set(ROCKETNPU_PUBLIC_HEADERS
     include/rocket_encoder.h   # rocket_encoder_block_fp16 (one Whisper encoder block)
     include/rocket_siglip.h    # rocket_siglip_encode (SigLIP-B/16 vision encoder end to end)
     include/rocket_sam.h       # rocket_sam_encode (SAM ViT-Det image encoder end to end)
+    include/rocket_modernbert.h # rocket_modernbert_encode (ModernBERT text encoder, variable-length batch)
     include/rocket_activation.h # rocket_activation_fp16 (DPU LUT elementwise)
     include/npu_matmul.h       # matmul_params_t + gen_matmul_fp16 / gen_conv2d_* (low-level)
     include/npu_pool.h         # pool_params_t + gen_pool_fp16 (low-level PPU pooling)
@@ -317,6 +319,13 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_int8_tiled_rocket # tiled int8 (M/N tiles + host K-accum)
             mixed_chain_coexist_rocket # GATE: chained-fp16 + gapped-int8 in one process (per-job batched flag)
             int8_chain_probe       # probe: does a chained batch of int8 matmul tasks compute?
+            int16_native_probe     # probe: does int16 x int16 write a full int32 surface? two output geometries
+            rowmajor_matmul_probe  # probe: one fp16 matmul task reading A and writing C row-major (GROUP_LINE_OFF + strides)
+            rowmajor_tile_probe    # probe: the row-major form at a tiled path's shapes -- K slice, N tile, int8, fp16 out, K-accumulation
+            rowmajor_kacc_chain_probe # probe: the row-major form in one chained fp16 KACC kick with DATA_REUSE, against the cube program
+            fa_replay_probe        # probe: replay one flash-attention op from its dumped tiles and count how often it differs from itself
+            fa_core_matmul_probe   # probe: one head's real AV operands on every NPU core at once; a per-core difference reads as a count (the core from a trace)
+            npu_core_diff_probe    # probe: fp16 -> fp32 tiles written per run, one core per process (RKNPU_CORE_MASK), and a diff of two cores' runs
             matmul_int8_prepacked_rocket # resident int8 weights (bit-exact vs one-shot)
             matmul_int8_crossm_rocket # resident int8 weight reused across M, no re-pack (warmup-M serves prefill-M)
             matmul_int8_groupwise_rocket # group-wise int8 (per-K-group scales, fp32 K-accum) — the native-quant primitive
@@ -337,8 +346,14 @@ if(ROCKETNPU_BUILD_TESTS)
             elu_rocket             # ELU/SELU on the symmetric shifted single-table (kink on the middle sample)
             bytes_moved_rocket     # analytical DRAM-traffic model (pure; planner cross-check + readback floor)
             conv2d_fp16_rocket     # general fp16 CONV_2D: cube-layout self-check + HW oracle
-            conv1d_rocket          # Whisper conv1d front-end (height-1 conv2d lowering) bit-exact
+            conv1d_rocket          # Whisper conv1d front-end (width-1 conv2d lowering, time on height) bit-exact
+            conv_width_gate        # GATE: no conv tile passes the CNA's 11-bit width/height fields (int8 + fp16, wide and tall)
+            conv_pad_field_gate    # GATE: no conv pad past 15 reaches the CNA's 4-bit PAD_CON0 fields (one-pass fp16/int8/depthwise/dilated)
             conv_transpose_rocket  # ConvTranspose2d: lowering self-check + HW oracle (vs scatter ref)
+            conv_transpose_resident # the resident-weight ConvTranspose (col2im over the resident matmul) vs the scatter ref
+            ct_model_bench         # bench: the ConvTranspose entry's per-call time at pix2pix's and SAM's shapes
+            conv_model_bench       # bench: a forward conv's per-call time by route (direct entry, im2col over the resident matmul) at pix2pix's encoder shapes
+            ct_route_probe         # probe: price the candidate ConvTranspose routes (col2im / sub-pixel matmul, sub-pixel conv) at the same shapes
             deconv_mode_probe      # RK3588 board: is CNA_CONV_CON1 bit 16 (DECONV) a live hardware mode?
             deconv_geometry_probe  # RK3588 board: WHERE the DECONV mode scatters, via an impulse response
             deconv_arith_probe     # RK3588 board: does DECONV compute a real transposed conv (dense, vs oracle)?
@@ -348,6 +363,13 @@ if(ROCKETNPU_BUILD_TESTS)
             pool_fp16_rocket       # on-NPU MaxPool/AvgPool (PPU): cube self-check + HW oracle
             pool_int8_rocket       # on-NPU int8/uint8 MaxPool/AvgPool (PPU C2=16): cube self-check + HW oracle
             reduce_mean_rocket     # on-NPU GlobalAvgPool/Mean: multi-pass decomposition + HW oracle
+            ppu_sub4_chain_probe   # probe: does a pooling pass read a sub-4 cube the PPU just wrote?
+            cpend_wzp_probe        # probe: DPU_BS_OW_OP (CPEND) as an asymmetric weight zero point; a partial 64-ch DW group
+            dw_perc_probe          # probe: the int8-out depthwise BS stage with a per-channel multiplier from BRDMA (per-axis requant)
+            conv_i8out_probe       # probe: the DIRECT int8 conv on Mesa's int8-out writer; CPEND and the per-channel BS multiplier on it
+            dw_int8_cost_probe     # probe: where the int8 depthwise entry's per-call time goes (the call, its scalar pack, a blocked one)
+            conv_pack_cost_probe   # probe: the fp16 conv's and the int8 direct conv's per-element pack against the whole call
+            softmax_exp_bench      # bench, CPU only: expf's share of the FA handler's host softmax loop, and a NEON exp's
             reduce_feature_rocket  # feature-axis reduce (ones-matmul): sum/mean over H per row vs fp64 oracle
             cumsum_rocket          # on-NPU prefix sum (triangular ones-matmul): incl/excl/reverse vs fp64 oracle
             rmsnorm_rocket         # on-NPU RMSNorm + per-row broadcast scale vs fp64 oracle
@@ -362,9 +384,13 @@ if(ROCKETNPU_BUILD_TESTS)
             encoder_block_rocket   # one full Whisper encoder block (LN+MHA+residual+LN+MLP) vs fp64 oracle (cos-sim)
             siglip_rocket          # full SigLIP-B/16 vision encoder vs fp32 HF oracle (per-layer cos-sim) + bench
             sam_rocket             # full SAM ViT-Det image encoder vs fp32 HF ref (per-layer cos-sim) + host-ref self-check + bench
+            modernbert_rocket      # resident ModernBERT encoder + post stack vs ONNX Runtime fp32 taps (per-layer cos-sim) + bench
             conv2d_int8_rocket     # native int8 CONV_2D: cube self-check + int32 single-job HW gate
+            conv2d_int8_q_rocket   # native int8 direct CONV_2D, int8-OUT writer (on-chip requant, CPEND): bit-exact vs a host model
+            conv2d_int8_q_perc_rocket # PER-CHANNEL int8 direct CONV_2D (BS multiplier), int8-out: bit-exact vs its device model, within one of TFLite
             replay_dw_mesa         # our int8 DW register program over Teflon's captured BOs vs mesa-output
             conv_dw_int8_runtime   # int8 DW int8-out RUNTIME vs TFLite's reference kernels + an exact host model
+            conv_dw_int8_perc_runtime # PER-CHANNEL int8 DW (BS multiplier): bit-exact vs its device model, within one of TFLite
             matmul_correctness_matrix_rocket # cosine-sim layout/readback gate (realistic inputs)
             matmul_tiled_rocket    # tiled matmul + profiling/sweep knobs
             fc_data_bank_sweep_rocket # RE: CNA_CBUF_CON0 FC_DATA_BANK[10:8] sweep + large-K probe
@@ -372,6 +398,7 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_batch_rocket    # batched same-shape matmul (one job/group) bit-exact vs per-item (attn QK/AV chaining)
             matmul_prepacked_rocket # pack-weights-once path vs mt vs CPU ref
             matmul_prepacked_crossm_rocket # resident weight reused across compatible M (no re-pack)
+            matmul_prepacked_canonical_rocket # ROCKET_CTX_TILING_CANONICAL: one resident weight at every M, 4 to 640
             scratch_cache_gate     # GATE: the per-shape scratch cache recycles instead of refusing
             matmul_stream_vs_prepacked_rocket # per-call packB cost (stream vs resident)
             iova_ceiling_rocket    # NPU 32-bit IOVA window size + per-fd vs shared
@@ -380,6 +407,8 @@ if(ROCKETNPU_BUILD_TESTS)
             crossop_chain_rocket   # cross-op chaining: feed one matmul's output BO straight into the next's input
             replay_dump            # replay a dumped in-context failing matmul
             matmul_kacc_chain_rocket # cross-ki KACC chaining: chained == unchained byte-exact + CPU ref
+            reuse_follower_rocket  # the job after a reuse chain, and a LUT job after another LUT job
+            ew_int_probe           # DPU eltwise with the whole integer precision bundle
             matmul_kacc_chain_bench # cross-ki KACC chaining warm-loop perf probe (hand-run, not a gate)
             matmul_accum_rocket    # DPU eltwise K-accum experiment (fp16)
             matmul_accum_int8_rocket # isolate int32 DPU eltwise-add for int8 K-accum
@@ -400,6 +429,7 @@ if(ROCKETNPU_BUILD_TESTS)
             chain_layout_rocket    # host-only GATE: batched-submit contiguous layout + trailer link (no HW)
             chain_verify_gate      # host-only GATE: rkt_chain_verify catches a wrong next_count (no HW)
             matmul_plan_gate       # host-only GATE: the shared matmul tiling policy's invariants (no HW)
+            cube_transpose_gate    # host-only GATE: the plane <-> cube-group transposes vs the per-channel loop (no HW)
             regcmd_rk3576_gate     # host-only GATE: RK3576 conv regcmd vs the vendor capture (no HW)
             rk3576_first_light     # RK3576 board: does the RK3576 emitter make the NPU compute?
             rk3576_conv_gate       # RK3576 board GATE: the int8 conv envelope + row windows + depthwise
@@ -417,6 +447,7 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_mm_corr         # RK3576 board: does an arbitrary matmul shape lose surface, and how often?
             rk3576_mm_requant      # RK3576 board GATE: the matmul entry's requant vs the host models of it
             rk3576_w8a8_route      # RK3576 board GATE: the W8A8 two-pass calibration route, composed on the part
+            rk3576_mm_percol_err   # RK3576 board: the per-column matmul's two ramps on real operand dumps, and per call
             rk3576_fc_vendor       # RK3576 board: submit a vendor capture VERBATIM — does it write?
             rk3576_cost_table      # RK3576 board: what the library entries cost, against a CPU reference
             rk3576_stem_cost       # RK3576 board: is a conv's execution its MACs or its feature DMA?
@@ -453,8 +484,15 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_row_pitch       # RK3576 board: will the PPU read a plane whose ROWS sit further apart than its windows consume?
             rk3576_conv_pitch      # RK3576 board: and will the CNA? a readout of what 0x1090 does
             rk3576_conv_sym        # RK3576 board: the symmetry audit on the CNA — non-square strides, and a rung fitted at kh == kw
+            rk3576_conv_width_probe # RK3576 board: can a conv entry reach the encoder with an extent past its field?
+            rk3576_retire_probe    # RK3576 board: does every write guard score a job's completion, not only its writes?
+            rk3576_stallk_map      # RK3576 board: where a stalled int8 matmul job stops, per row task, and what moves it
+            rk3576_conv_band_probe # RK3576 board: does a direct int8 conv stall where the weight-slice phase rule says?
+            rk3576_drain_probe     # RK3576 board: which programs raise the DPU's completion; GATE: the fp16 conv returns drained
+            rk3576_fp16_fp32out_probe # RK3576 board: the fp16 direct program under the whole wide output stage (fp32 out)
             rk3576_rowplan         # RK3576 host: the row window the planner chooses for one layer, and what it stages
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
+            requant_edge_probe     # board: does the OUT_CVT program the float scale at the derivation's carry edge?
             pool_int8_native_probe # board: does the PPU pool natively in int8? (the precision PAIR, as a map)
             hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure
             membench               # DRAM bandwidth + NPU readback de-tile microbench
@@ -495,11 +533,16 @@ if(ROCKETNPU_BUILD_TESTS)
     # own wide-output poison guard (rocket_rk3576_power_idle) around their submits, both
     # being DPU-only programs and so victims of it; the bf16 stream gate reads the fan-out's
     # N split (rocket_fanout_nstep) to decide when its multicore paths must be bit-exact;
-    # the fp16 envelope probe power-cycles before its second run of a shape that was not exact
+    # the fp16 envelope probe power-cycles before its second run of a shape that was not exact;
+    # the conv width probe reads the library's output stamp to count elements never written;
+    # the cube transpose gate checks rocket_cube.h's plane moves against the per-channel loop;
+    # the per-channel depthwise and direct gates model the device from the plan the entry used
     foreach(t prototype_shared_scratch_rocket crossop_chain_rocket rk3576_cbuf_base
               rk3576_lut_probe rk3576_add_probe rk3576_mm_requant rk3576_w8a8_route
               pool_int8_native_probe deconv_extent_probe matmul_bf16_stream_rocket
-              replay_dump rk3576_mm_fp16_envelope rk3576_mm_bf16_probe)
+              replay_dump rk3576_mm_fp16_envelope rk3576_mm_bf16_probe
+              rk3576_conv_width_probe cube_transpose_gate rk3576_stallk_map
+              conv_dw_int8_perc_runtime conv2d_int8_q_perc_rocket conv_model_bench)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
@@ -597,6 +640,7 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_host_test(chain_layout_rocket)
     rocket_host_test(chain_verify_gate)
     rocket_host_test(matmul_plan_gate SKIP_OFF_PART)    # the RK3588 planners; skips elsewhere
+    rocket_host_test(cube_transpose_gate)
     rocket_host_test(regcmd_rk3576_gate)                # forces ROCKET_CHIP=rk3576 itself
 
     # --- the DPU LUT and elementwise ops -----------------------------------------
@@ -662,7 +706,13 @@ if(ROCKETNPU_BUILD_TESTS)
 
     # --- conv, pooling, reduce, norms, attention ---------------------------------
     rocket_npu_test(conv1d_rocket)
+    rocket_npu_test(conv_width_gate)
+    rocket_npu_test(conv_pad_field_gate)
     rocket_npu_test(conv_transpose_rocket)
+    rocket_npu_test(conv_transpose_resident)
+    # The same gate on the matmul's CPU-accumulate path and its planes narrow.
+    rocket_npu_test(conv_transpose_resident_nokacc COMMAND conv_transpose_resident
+                    ENVIRONMENT "ROCKET_KACC=0")
     rocket_npu_test(resize_rocket)
     rocket_npu_test(pool_fp16_rocket)
     rocket_npu_test(pool_int8_rocket)
@@ -703,17 +753,31 @@ if(ROCKETNPU_BUILD_TESTS)
     else()
         rocket_npu_test(sam_rocket TIMEOUT 900)
     endif()
+    set(ROCKETNPU_MODERNBERT_ARTIFACTS "" CACHE PATH "ModernBERT gate artifacts (tools/modernbert_extract.py: mb_weights.f16 + *.case)")
+    if(ROCKETNPU_MODERNBERT_ARTIFACTS)
+        rocket_npu_test(modernbert_rocket COMMAND modernbert_rocket ${ROCKETNPU_MODERNBERT_ARTIFACTS} TIMEOUT 900)
+    else()
+        rocket_npu_test(modernbert_rocket TIMEOUT 900)
+    endif()
     rocket_npu_test(conv2d_int8_rocket)
+    rocket_npu_test(conv2d_int8_q_rocket)
+    rocket_npu_test(conv2d_int8_q_rocket_batch COMMAND conv2d_int8_q_rocket ENVIRONMENT ROCKET_CONV_BATCH=1)
+    rocket_npu_test(conv2d_int8_q_perc_rocket)
+    rocket_npu_test(conv2d_int8_q_perc_rocket_batch COMMAND conv2d_int8_q_perc_rocket ENVIRONMENT ROCKET_CONV_BATCH=1)
 
     # --- the matmul family --------------------------------------------------------
     rocket_npu_test(matmul_tiled_rocket)
     rocket_npu_test(fc_data_bank_sweep_rocket)
     rocket_npu_test(matmul_kacc_chain_rocket)
+    rocket_npu_test(reuse_follower_rocket)
+    rocket_npu_test(reuse_follower_rocket_weight COMMAND reuse_follower_rocket ENVIRONMENT ROCKET_REUSE=1)
+    rocket_npu_test(reuse_follower_rocket_data COMMAND reuse_follower_rocket ENVIRONMENT ROCKET_REUSE=2)
     rocket_npu_test(matmul_mt_rocket)
     rocket_npu_test(matmul_batch_rocket)
     rocket_npu_test(matmul_fp32out_rocket COMMAND matmul_fp32out_rocket 64 4096 512)
     rocket_npu_test(matmul_int8_dequant_rocket)
     rocket_npu_test(matmul_prepacked_crossm_rocket)
+    rocket_npu_test(matmul_prepacked_canonical_rocket TIMEOUT 600)
     # Every row is verified (FULL_ROWS=1), and K != N in every registration: with K == N a
     # field that swapped the two would compute a plausible surface.
     rocket_npu_test(matmul_correctness_matrix_rocket
@@ -744,6 +808,11 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_npu_test(matmul_bf16_stream_rocket COMMAND matmul_bf16_stream_rocket 512 3840 4096 4)
     rocket_npu_test(matmul_tf32_tiled_rocket COMMAND matmul_tf32_tiled_rocket 512 3840 4096)
     rocket_npu_test(matmul_int8_prepacked_rocket)
+    # One K-tile shapes from the detectors' 1x1 convs (MobileDet, SSD MobileNet v2,
+    # EfficientDet-Lite0): the path that gathers each tile straight into C.
+    rocket_npu_test(matmul_int8_prepacked_k1_md COMMAND matmul_int8_prepacked_rocket 400 96 768 2)
+    rocket_npu_test(matmul_int8_prepacked_k1_ssd COMMAND matmul_int8_prepacked_rocket 1444 32 192 2)
+    rocket_npu_test(matmul_int8_prepacked_k1_eff COMMAND matmul_int8_prepacked_rocket 25600 32 96 2)
     rocket_npu_test(matmul_int8_crossm_rocket)
     rocket_npu_test(matmul_int8_groupwise_rocket)
     rocket_npu_test(matmul_int8_prepacked_gw_rocket)
@@ -765,11 +834,16 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_npu_test(matmul_int4_prepacked_gw_rocket)
     rocket_npu_test(matmul_int4_crossm_rocket)
     rocket_npu_test(matmul_int16_exact_rocket COMMAND matmul_int16_exact_rocket 512 3840 4096)
+    rocket_npu_test(matmul_int16_rocket COMMAND matmul_int16_rocket 36 512 112)
     rocket_npu_test(replay_dw_mesa)
     rocket_npu_test(conv_dw_int8_runtime)
+    rocket_npu_test(conv_dw_int8_perc_runtime)
     # The OUT_CVT tie rule, which no scale a caller passes can reach: it builds its ties
     # on purpose and asserts half to even at bit 30 clear, half away from zero set.
     rocket_npu_test(requant_round_probe)
+    # The OUT_CVT derivation against the FLOAT scale, which no model-based gate can do: the
+    # models share the derivation. Host sweep of every mantissa, then edge scales on the part.
+    rocket_npu_test(requant_edge_probe)
 
     # --- the uAPI -------------------------------------------------------------------
     # The mainline-uAPI gates only exist in a builtin-provider build (see the foreach

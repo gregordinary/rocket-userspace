@@ -59,6 +59,34 @@ int rocket_rk3576_sentinel_on(void);
 
 #define ROCKET_RK3576_SENTINEL_BYTE 0xA5u
 
+/* WHETHER A JOB COMPLETED, NOT ONLY WHETHER IT WROTE.
+ *
+ * The driver retires a job that runs past its backstop (125 ms from the kick here) and
+ * signals its fence exactly as it signals a completed one, so PREP_BO returns 0 either
+ * way. A retired job can leave a PARTIAL surface: depthwise at 8224 channels wrote 146 of
+ * 131584 elements and the entry returned 0, because a guard that asks "did each task
+ * write something" is satisfied by one byte [HW, H96, 2026-09-26]. So every guard site
+ * also scores the job's completion, by its time from BEFORE the submit ioctl to its
+ * fence. The kick follows the submit's start, so a retired job reads at least the
+ * backstop; a healthy one reads under it, because the backstop bounds it too. A job
+ * queued behind another process's reads long and is redone, which is conservative.
+ *
+ * What this cannot see: a job the kernel retires EARLY, which is `dpu_grace_us` shorter
+ * than a drain and reads fast, and a partial write by a job that
+ * completed. A caller that does host work between its submit and its wait still reads a
+ * retirement, since it only adds to the time.
+ *
+ * rocket_rk3576_job_clock() is taken just before the submit; rocket_rk3576_job_ns()
+ * reads the elapsed time just after the wait returns; rocket_rk3576_past_backstop() is
+ * the pure test; rocket_rk3576_score_retired() counts and logs one retirement (with
+ * whether the site's write guard saw the surface written) and returns the same test.
+ * ROCKET_RK3576_BACKSTOP_US overrides the profile's backstop, which is how a probe makes
+ * every job read as retired to prove each site consults it. */
+uint64_t rocket_rk3576_job_clock(void);
+uint64_t rocket_rk3576_job_ns(uint64_t t0);
+int      rocket_rk3576_past_backstop(uint64_t elapsed_ns);
+int      rocket_rk3576_score_retired(const char *entry, uint64_t elapsed_ns, int wrote);
+
 /* The per-output-channel requant plan, shared by the convolution and the matmul.
  *
  * The DPU's epilogue is `(acc + A[oc]) * C[oc]` in saturating int32 followed by ONE
@@ -88,6 +116,46 @@ int rocket_rk3576_plan_perchannel(const char *entry, unsigned oc0, unsigned tile
                                   const float *w_scale, float out_scale,
                                   const unsigned *perm,
                                   int16_t *C, float *base_scale, double *max_rel_err);
+
+/* THE SAME RAMP WITH THE BS SHIFT WORD CARRYING THE GAIN (the convolution's per-axis path
+ * and the matmul's per-column entry; see the definition for the rule). Beside what the form
+ * above returns it reports the shift the task's word must carry and the channels it
+ * programmed as a CONSTANT, and it REWRITES those channels' `A` (in/out, per slot, the fold
+ * on entry). `sum_w` is needed as well as `sum_abs_w` because a channel's reachable
+ * accumulator is signed; NULL plans every channel live and leaves `A` alone, which is how
+ * the matmul calls it. */
+struct rocket_rk3576_pc_plan {
+    unsigned bs_shift;      /* the shift word's value, both sign fields                  */
+    float    base_scale;    /* the OUT_CVT gain the task programs                        */
+    double   max_rel_err;   /* worst live channel's relative gain error                  */
+    unsigned n_const;       /* channels programmed as their constant byte                */
+    unsigned n_clamp;       /* live channels whose C fell below the field's floor        */
+};
+int rocket_rk3576_plan_perchannel_bs(const char *entry, unsigned oc0, unsigned tile_oc,
+                                     unsigned ocreg, int32_t *A, const int64_t *sum_w,
+                                     const int64_t *sum_abs_w, float in_scale,
+                                     const float *w_scale, float out_scale, int out_zp,
+                                     const unsigned *perm, int16_t *C,
+                                     struct rocket_rk3576_pc_plan *pl);
+
+/* The matmul's per-column plan of one N tile [n0, n0 + tile_n), padded to `nreg`, from the
+ * ramp ROCKET_RK3576_MM_PC_SHIFT selects (read per call): the shift ramp by default, the
+ * shift-0 ramp at 0. `scale_n` and `sum_abs_w` are indexed over the whole N, `tile_bias`
+ * and `C` by slot. What rocket_matmul_int8_rk3576_perc*() programs, exported so a gate can
+ * read the plan back rather than re-derive it; a model that must stay independent of the
+ * planner (tests/perchannel_model.h) must not call it. Returns 0, or -1 as the planners do. */
+struct rocket_rk3576_percol_plan {
+    int      shift_ramp;    /* 1 when the shift word carries the gain                   */
+    unsigned bs_shift;      /* the shift word, both sign fields; 0 on the shift-0 ramp  */
+    float    gain;          /* the OUT_CVT gain the task programs                       */
+    double   max_rel_err;   /* worst column's relative gain error                       */
+    unsigned n_clamp;       /* columns whose C fell below the field's floor of one (the
+                             * shift ramp only; the shift-0 ramp leaves it 0)            */
+};
+int rocket_rk3576_plan_percol(unsigned n0, unsigned tile_n, unsigned nreg,
+                              int32_t *tile_bias, const int64_t *sum_abs_w,
+                              const float *scale_n, int16_t *C,
+                              struct rocket_rk3576_percol_plan *pl);
 
 /* Where in the CBUF a task stages, as a granule offset added to the window base and
  * the fetch base together — a bring-up knob, zero for every shipped path.

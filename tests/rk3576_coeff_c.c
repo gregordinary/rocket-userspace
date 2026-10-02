@@ -22,10 +22,11 @@
  * product the host chose. The requant is left at unity, so the surface IS the BS
  * stage's output.
  *
- * Usage:  rk3576_coeff_c [order|perchan|range|clamp|product|shift|all]   (default: all)
- *         `all` is the gate: order, perchan, range, clamp. `product` is a
- *         characterisation — its inexact cells ARE the decoded saturation. `shift`
- *         reads the product under a nonzero DPU shift word.
+ * Usage:  rk3576_coeff_c [order|perchan|range|clamp|product|shift|shiftsign|all]
+ *         (default: all). `all` is the gate: order, perchan, range, clamp, shift and
+ *         shiftsign. `product` is a characterisation — its inexact cells ARE the decoded
+ *         saturation. `shift` reads the product under a nonzero DPU shift word, and
+ *         `shiftsign` the word's split by the sign of the product.
  * Exit:   0 every question answered consistently, 1 a disagreement, 2 no NPU (skip).
  */
 #define _POSIX_C_SOURCE 200809L
@@ -570,6 +571,52 @@ static int probe_shift(int fd)
     return bad ? -1 : 0;
 }
 
+/* --------------------------------------------------------------------------
+ * shiftsign: are the shift word's two fields split by the sign of the PRODUCT under a
+ * nonzero multiplier, as they are with C = 1?
+ *
+ * The per-axis ramp writes the same shift into both fields, so a field it does not know
+ * about would be a silent scale on one sign's outputs. C = 2^14 and the fields 14 and 12
+ * in each order, over (acc + A) from -32 to +30 across the 32 channels: the sign-split
+ * model gives (acc + A) on one sign and 4*(acc + A) on the other, which a single shared
+ * field cannot. The requant is unity at a zero output offset, so every value is in range
+ * and none sits on a rail.
+ * ------------------------------------------------------------------------ */
+static int probe_shiftsign(int fd)
+{
+    static const uint32_t WORD[2] = { 14u | (12u << 8), 12u | (14u << 8) };
+    const unsigned OC = 32;
+    int32_t bias[32];
+    int16_t cmul[32];
+    int got[32];
+    unsigned w, c;
+    int bad = 0;
+
+    for (c = 0; c < OC; c++) { bias[c] = -100 + 2 * ((int)c - 16); cmul[c] = 16384; }
+    for (w = 0; w < 2; w++) {
+        unsigned sp = WORD[w] & 0x3Fu, sn = (WORD[w] >> 8) & 0x3Fu;
+        int split = 0, pos_only = 0, neg_only = 0;
+        g_shift_word = WORD[w];
+        if (run_one(fd, OC, 10, 10, bias, cmul, got) != 0) { bad++; continue; }
+        for (c = 0; c < OC; c++) {
+            int x = 100 + bias[c];                       /* acc + A, acc = 10*10 */
+            int e_split = x >= 0 ? x << (14 - sp) : x * (1 << (14 - sn));
+            int e_pos   = x * (1 << (14 - sp));
+            int e_neg   = x * (1 << (14 - sn));
+            split    += got[c] == e_split;
+            pos_only += got[c] == e_pos;
+            neg_only += got[c] == e_neg;
+        }
+        printf("shiftsign: word 0x%04X (non-negative >> %u, negative >> %u), C = 16384, "
+               "acc+A -32..+30: sign-split model %d/%u, bits[5:0] for both %d/%u, "
+               "bits[13:8] for both %d/%u\n", (unsigned)WORD[w], sp, sn, split, OC,
+               pos_only, OC, neg_only, OC);
+        if (split != (int)OC) bad++;
+    }
+    g_shift_word = 0;
+    return bad ? -1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "all";
@@ -596,10 +643,13 @@ int main(int argc, char **argv)
         (void)probe_product(fd);
     if (!strcmp(mode, "all") || !strcmp(mode, "clamp"))
         if (probe_clamp(fd) != 0) fail = 1;
-    /* NOT in `all` either: `shift` is a characterisation of the shift word, not a
-     * property the shipping ramp relies on. */
-    if (!strcmp(mode, "shift"))
+    /* IN `all` since the per-axis convolution's ramp carries its gain in the shift word:
+     * the wide product, multiply-then-shift and the tie rule are now properties the
+     * shipping path relies on, and so is the split by sign. */
+    if (!strcmp(mode, "all") || !strcmp(mode, "shift"))
         if (probe_shift(fd) != 0) fail = 1;
+    if (!strcmp(mode, "all") || !strcmp(mode, "shiftsign"))
+        if (probe_shiftsign(fd) != 0) fail = 1;
 
     rocket_close(fd);
     printf("rk3576_coeff_c: %s\n", fail ? "a question came back inconsistent" : "ok");
