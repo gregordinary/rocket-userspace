@@ -443,7 +443,7 @@ int main(int argc, char **argv)
            ca_victim.M, ca_victim.N);
     if (!instrumented)
         printf("NOTE: stock module — the overlap column is absent, so a clean row is NOT\n"
-               "evidence until re-run against ~/rocketoot_conc.\n");
+               "evidence until re-run on a module that exports stat_overlap.\n");
 
     ca_prob_free(&pv);
     return 0;

@@ -98,7 +98,7 @@ for p in $(seq 1 "$PASSES"); do
       sig=$(echo "$out" | grep '^rep .*wrong' | sed 's/^rep [0-9]*: //' | tr '\n' ';')
       echo "PASS $p GRACE $g ${sum:-NO_SUMMARY}"
       [ -n "$sig" ] && echo "PASS $p GRACE $g   sig: $sig"
-      # Rule 84's second half, which this script was not honouring: a redirected echo
+      # A cell that can wedge the device must fsync its result before the next one: a redirected echo
       # reaches the page cache and stops there, so an ungraceful power cycle loses it. Two
       # runs died with an empty log for exactly this reason. sync costs milliseconds.
       sync

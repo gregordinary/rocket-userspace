@@ -56,7 +56,7 @@ may be composed with any `chanout` base:
          forward, so the statistics are the ones a real calibration would see, and the
          scored pass CLIPS wherever a window exceeds what calibration saw -- which the
          device does too, in sat8.
-  _calshuf  the information-free control for `_cal` (rule 96). It applies exactly the
+  _calshuf  the information-free control for `_cal`. It applies exactly the
          multiset of per-column perturbations `_cal` applies, to a fixed random
          permutation of the columns -- same magnitude, same distribution, nothing about
          WHICH column needed the headroom. If it costs as much as `_cal`, `_cal`'s
@@ -394,7 +394,7 @@ class SimLinear(nn.Module):
             frozen = np.maximum(self.cal_colmax, 1e-30) * CALSAFE
             if self.scalesrc in ("cal", "calboot"):
                 return 127.0 / frozen, actual
-            # The information-free control (rule 96). `_cal` multiplies the oracle scale
+            # The information-free control. `_cal` multiplies the oracle scale
             # by d[n] = actual[n]/frozen[n]; this applies exactly that multiset of
             # per-column perturbations to the WRONG columns, so it has the same
             # magnitude and the same distribution and carries nothing about which

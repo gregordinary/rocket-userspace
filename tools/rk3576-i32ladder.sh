@@ -4,7 +4,7 @@
 # A cell in this class can take the device down across processes, so: nothing shares a
 # process, the log is flushed to disk before the next cell starts, and the walk STOPS at
 # the first cell that puts a WARNING in dmesg. Everything after such a cell in the same
-# boot is contaminated (rule 85) and this script refuses to produce it.
+# boot is contaminated by the state that cell left, and this script refuses to produce it.
 #
 # THE STOP CONDITION IS NOT SUFFICIENT. Run 2026-08-06 on the H96 MAX M9 at the shipped
 # 1.5.0 module, this ladder took the WHOLE BOARD down — unreachable on the network, not

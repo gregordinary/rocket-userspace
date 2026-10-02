@@ -146,8 +146,8 @@ static long g_rt_moved;   /* tiles or scales whose pair the round trip moved */
  * THE PLAN IS ALSO SCORED AGAINST THE FLOAT, not only the surface against the plan: every
  * unclamped column's delivered gain C*MUL/2^(SHIFT+bs) must sit within half a unit of C of
  * its own scale, which is a statement about the float and shares nothing with the planner
- * (see WAYS-OF-WORKING, "a host model that calls the library's derivation agrees with the
- * part at the wrong value"). And the entry's own `worst_rel_err` must equal the model's,
+ * (a host model that calls the library's derivation agrees with the part even when both
+ * are at the wrong value). And the entry's own `worst_rel_err` must equal the model's,
  * which is the plan compared rather than only the surface it happens to produce.
  *
  * The tile boundary matters and is not visible in a total: the (MUL, SHIFT) is per N

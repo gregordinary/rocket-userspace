@@ -1,4 +1,4 @@
-/* ONE cell of the int32 K-split ladder, one per PROCESS (rule 84).
+/* ONE cell of the int32 K-split ladder, one per PROCESS, since a cell can wedge the device.
  *
  * Calls rocket_matmul_int8_rk3576_i32() directly — the route the int8 entry falls onto
  * once no single-task plan exists — scores the surface against an exact CPU int32 GEMM,

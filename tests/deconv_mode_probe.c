@@ -23,7 +23,7 @@
  *   identical   -> the bit is inert on this program. Either it is not implemented, or it
  *                  needs a companion field this probe does not write. A negative that
  *                  costs one run and is worth having in writing.
- *   different   -> the mode is live, and the next session has a lead worth an encoder:
+ *   different   -> the mode is live, and is a lead worth an encoder that settles
  *                  what layout it wants the kernel in, what output geometry it produces,
  *                  and whether the stride fields are `s` or `s-1`.
  *
@@ -157,7 +157,7 @@ int main(void)
                 printf("     field %d: %4d of %d elements differ (first at %zu: %g -> %g), "
                        "%d zero\n", f, nd, (int)n_out, first,
                        (double)base[first], (double)got[first], z);
-                /* Channel 0's plane, so the next session can see whether the surface has
+                /* Channel 0's plane, so a reader can see whether the surface has
                  * the sparse structure a scatter into a dilated grid would leave. */
                 if (verbose)
                     for (y = 0; y < oh; y++) {
