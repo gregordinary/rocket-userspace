@@ -19,7 +19,8 @@
  *      hashed data and zero points at both ends of the int8 range, including asymmetric
  *      weight zero points, which the DPU's CPEND operand carries, and pads past
  *      CNA_PAD_CON0's 4-bit field on planes that fit one pass (pads 16, 17 and a dilated
- *      "same" conv at 16 read 10416-17501 elements wrong on the library before 96d8e32).
+ *      "same" conv at 16 read 10416-17501 elements wrong on the library before a pad
+ *      past 15 took the tiler).
  *
  * Teflon's captured output is NOT an oracle for this entry. Mesa's rocket driver is a
  * uint8 driver, and the capture ran an int8 model through it: it records Mesa's uint8

@@ -17,7 +17,7 @@
  * filters (a pruned channel), channels scaled far below the rest (the host's), a layer that
  * runs as several jobs (so the scale sort matters), a plane past one CBUF pass (bands), a
  * partial 64-channel group, and pads past CNA_PAD_CON0's 4-bit field on planes that fit one
- * pass (pads 16 and 17 read 9694 and 14132 elements wrong on the library before 96d8e32). The output is prefilled with a sentinel, so a channel no path
+ * pass (pads 16 and 17 read 9694 and 14132 elements wrong on the library before a pad past 15 took the tiler). The output is prefilled with a sentinel, so a channel no path
  * writes cannot pass. Every output zero point sits inside the range: at -128 every negative
  * value saturates to the same byte, and a program that shifts negative products wrongly
  * (the BS shift is per sign) passes there.

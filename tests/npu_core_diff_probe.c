@@ -56,7 +56,7 @@
  * core against a stored control.
  *
  * Note: perm tiles are seeded by the distribution's index, and perm moved from index 3 to 4
- * when the int8 control was added (7545e47); runs made before it need that seed to be
+ * when the int8 control was added; runs made before it need that seed to be
  * regenerated.
  *
  * Usage:
