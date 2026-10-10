@@ -83,6 +83,15 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
  * [HW 2026-09-27, RK1]. ROCKET_FA_FUSED_SOFTMAX=0 restores the separate mask pass and the
  * two-rounding softmax. fd<0 = exact host reference (the test oracle). Returns 0, <0 on error.
  *
+ * THE SCORE SURFACE IS fp16 AND SATURATES. A score past 65504 (scale·q·k, before the
+ * soft-cap) is written as ±65504, not as inf, so the keys past it tie and the softmax
+ * returns a full, finite, wrong surface [HW sweep 2026-10-09, RK3588 600 MHz]. Every path
+ * (fused, separate mask pass, on-NPU softmax, online-tiled) checks the raw scores in its host
+ * mask pass and returns ROCKET_E_RANGE when a real key reached the limit; `out` is then not
+ * valid, and a caller holding the operands at higher precision recomputes. Folding the scale
+ * into Q before the call moves the limit from a raw q·k of 65504 to a scaled one. The same
+ * contract holds for the _mt and _ctx entries below.
+ *
  * rocket_flash_attn_fp16_mt is the multi-core fan-out: the heads are independent (each
  * writes its own output slice), so they split into contiguous ranges across `nthreads`
  * worker fds — one drm scheduling entity per fd, so the kernel dispatches the ranges

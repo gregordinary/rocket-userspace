@@ -77,7 +77,7 @@ int rocket_matmul_fp16_mt(int M, int K, int N,
         if (n0 >= N) break;                 /* fewer slices than threads if N small */
         int n1 = n0 + Nstep; if (n1 > N) n1 = N;
         args[nt] = (mt_arg){ M, K, N, n0, n1 - n0, A, B, C, 0, nt, base };
-        if (pthread_create(&th[nt], NULL, mt_worker, &args[nt]) == 0)
+        if (rocket_thread_create_pinned(&th[nt], mt_worker, &args[nt], nt, base) == 0)
             joinable[nt] = 1;
         /* else: leave joinable[nt]=0 and run it inline AFTER the spawn loop — running
          * it inline HERE would block the loop on its ~8s NPU wait and serialize every

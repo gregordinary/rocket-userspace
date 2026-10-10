@@ -28,6 +28,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
 #define ROCKET_HAVE_NEON 1
@@ -270,7 +271,8 @@ static int asym_on(void) {
  * −21% HW-confirmed; correct (coherent greedy, VERIFY nonfinite=0).
  * Returns: -1 AUTO, 0 off, 1 WEIGHT, 2 DATA. */
 static int reuse_policy(void) {
-    static int p = -2;
+    static _Atomic int cached = -2;
+    int p = atomic_load_explicit(&cached, memory_order_relaxed);
     if (p == -2) {
         const char *e = getenv("ROCKET_REUSE");
         if (e) {
@@ -279,6 +281,7 @@ static int reuse_policy(void) {
         } else {
             p = kacc_on() ? -1 : 0;   /* AUTO rides with KACC */
         }
+        atomic_store_explicit(&cached, p, memory_order_relaxed);
     }
     return p;
 }
@@ -586,13 +589,6 @@ static inline void wt_scatter_tile(_Float16 *restrict slot, const _Float16 *rest
         wt_scatter_row(slot, brow, k, Ktile);
     }
 }
-
-/* Upper bound on a single matmul dimension. The tile-count math below (M+Mt-1 etc.,
- * with Mt/Nt <= MAX_TILE and Kt <= 16384) is computed in signed int, so a dimension
- * within a tile of INT_MAX would overflow BEFORE the nm*nn*nk product guard catches it.
- * This cap sits far above any real matmul dim (~64x the largest model vocab/FFN) and far
- * below that overflow edge, so it only rejects pathological/adversarial inputs. */
-#define ROCKET_MM_DIM_MAX (1 << 24)
 
 /* ── One tiling policy, parameterised by the datatype's geometry ────────────────
  *

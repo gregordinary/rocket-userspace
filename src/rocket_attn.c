@@ -572,16 +572,32 @@ static void fa_gather_v(_Float16 *vh, const _Float16 *Vh, int n_kv, int Kn, int 
 }
 
 /* scale + soft-cap + additive mask, in place on sc[Tp,Kn]; pad key columns -> -inf. */
-static void fa_mask_scores(_Float16 *sc, const _Float16 *mask, int n_tokens, int n_kv,
-                           int Tp, int Kn, float scale, float softcap)
+/* THE SCORE SURFACE SATURATES. The QK contraction accumulates in fp32 and the DPU writes
+ * the scores as fp16; a score past 65504 is written as +-65504, not as inf [HW sweep
+ * 2026-10-09, RK3588: an overflowed surface reads 0 non-finite values]. So every key past the
+ * limit ties, the softmax spreads its weight across them, and the result is a full, finite,
+ * wrong surface that nothing downstream can tell from a right one. Each host pass over the
+ * raw scores therefore reports whether a real key reached the limit (a magnitude of 65504 or
+ * more, or a non-finite value), and the head range returns ROCKET_E_RANGE for it: the caller
+ * holds the operands at full precision and recomputes. A score of exactly 65504 that did not
+ * overflow is reported too, which costs a recompute and never a wrong answer. */
+#define FA_SAT 65504.0f
+
+static int fa_mask_scores(_Float16 *sc, const _Float16 *mask, int n_tokens, int n_kv,
+                          int Tp, int Kn, float scale, float softcap)
 {
+    int sat = 0;
     for (int i = 0; i < Tp; i++) {
         _Float16 *row = sc + (size_t)i * Kn;
         const _Float16 *mr = (mask && i < n_tokens) ? mask + (size_t)i * n_kv : NULL;
-        for (int j = 0; j < n_kv; j++)
-            row[j] = (_Float16)fa_score((float)row[j], scale, softcap, mr ? (float)mr[j] : 0.0f);
+        for (int j = 0; j < n_kv; j++) {
+            const float raw = (float)row[j];
+            sat |= !(fabsf(raw) < FA_SAT);
+            row[j] = (_Float16)fa_score(raw, scale, softcap, mr ? (float)mr[j] : 0.0f);
+        }
         for (int j = n_kv; j < Kn; j++) row[j] = (_Float16)(-30000.0f);
     }
+    return sat;
 }
 
 /* ---- fused host softmax (ROCKET_FA_FUSED_SOFTMAX, default ON) ------------------------
@@ -630,14 +646,20 @@ static inline fa_f4 fa_vexp(fa_f4 x)
     return y * (fa_f4)e;
 }
 
-static void fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mask, int n_tokens,
-                             int n_kv, int Tp, int Kn, float scale, float softcap)
+/* Returns whether a real key's raw score reached the saturation limit (see FA_SAT). */
+static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mask, int n_tokens,
+                            int n_kv, int Tp, int Kn, float scale, float softcap)
 {
     float stackbuf[4096];
     float *buf = Kn <= 4096 ? stackbuf : malloc((size_t)Kn * sizeof(float));
-    if (!buf) { fa_mask_scores((_Float16 *)sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
-                host_softmax_rows(Tp, Kn, sc, P); return; }
+    if (!buf) { const int s = fa_mask_scores((_Float16 *)sc, mask, n_tokens, n_kv, Tp, Kn,
+                                             scale, softcap);
+                host_softmax_rows(Tp, Kn, sc, P); return s; }
     const fa_f4 floor4 = { -30000.f, -30000.f, -30000.f, -30000.f };
+    const fa_f4 sat4   = { FA_SAT, FA_SAT, FA_SAT, FA_SAT };
+    const fa_f4 zero4  = { 0.f, 0.f, 0.f, 0.f };
+    fa_i4 satv = { 0, 0, 0, 0 };
+    int sat = 0;
     const int nv = softcap != 0.0f ? 0 : (n_kv & ~3);
     for (int i = 0; i < Tp; i++) {
         const _Float16 *row = sc + (size_t)i * Kn;
@@ -646,7 +668,9 @@ static void fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *ma
         int j = 0;
         for (; j < nv; j += 4) {
             fa_h4 hq; memcpy(&hq, row + j, sizeof hq);
-            fa_f4 s = __builtin_convertvector(hq, fa_f4) * scale;
+            const fa_f4 raw = __builtin_convertvector(hq, fa_f4);
+            satv |= ~(fa_i4)(fa_sel(raw < zero4, -raw, raw) < sat4);   /* |raw| >= limit, or NaN */
+            fa_f4 s = raw * scale;
             if (mr) { fa_h4 hm; memcpy(&hm, mr + j, sizeof hm); s += __builtin_convertvector(hm, fa_f4); }
             s = fa_sel(s < floor4, floor4, s);
             memcpy(buf + j, &s, sizeof s);
@@ -655,7 +679,9 @@ static void fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *ma
         float mx = vmax[0];
         for (int k = 1; k < 4; k++) if (vmax[k] > mx) mx = vmax[k];
         for (; j < n_kv; j++) {
-            float s = fa_score((float)row[j], scale, softcap, mr ? (float)mr[j] : 0.0f);
+            const float raw = (float)row[j];
+            sat |= !(fabsf(raw) < FA_SAT);
+            float s = fa_score(raw, scale, softcap, mr ? (float)mr[j] : 0.0f);
             buf[j] = s;
             if (s > mx) mx = s;
         }
@@ -678,6 +704,7 @@ static void fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *ma
         }
     }
     if (buf != stackbuf) free(buf);
+    return sat || satv[0] || satv[1] || satv[2] || satv[3];
 }
 
 /* gather kv head hk's value COLUMNS [j0,j0+w) into vh[dh,wp] = v_tile^T (the AV B-operand for
@@ -691,17 +718,23 @@ static void fa_gather_v_tile(_Float16 *vh, const _Float16 *Vh, int j0, int w, in
 }
 
 /* scale + soft-cap + additive mask for ONE key tile [j0,j0+w) into sc[Tp,wp]; pad columns
- * w..wp -> -inf. mask is the full [n_tokens,n_kv] additive mask (row i, key j0+jj). */
-static void fa_mask_scores_tile(_Float16 *sc, const _Float16 *mask, int n_tokens, int n_kv,
-                                int j0, int w, int Tp, int wp, float scale, float softcap)
+ * w..wp -> -inf. mask is the full [n_tokens,n_kv] additive mask (row i, key j0+jj). Returns
+ * whether a real key's raw score reached the saturation limit (see FA_SAT). */
+static int fa_mask_scores_tile(_Float16 *sc, const _Float16 *mask, int n_tokens, int n_kv,
+                               int j0, int w, int Tp, int wp, float scale, float softcap)
 {
+    int sat = 0;
     for (int i = 0; i < Tp; i++) {
         _Float16 *row = sc + (size_t)i * wp;
         const _Float16 *mr = (mask && i < n_tokens) ? mask + (size_t)i * n_kv + j0 : NULL;
-        for (int jj = 0; jj < w; jj++)
-            row[jj] = (_Float16)fa_score((float)row[jj], scale, softcap, mr ? (float)mr[jj] : 0.0f);
+        for (int jj = 0; jj < w; jj++) {
+            const float raw = (float)row[jj];
+            sat |= !(fabsf(raw) < FA_SAT);
+            row[jj] = (_Float16)fa_score(raw, scale, softcap, mr ? (float)mr[jj] : 0.0f);
+        }
         for (int jj = w; jj < wp; jj++) row[jj] = (_Float16)(-30000.0f);
     }
+    return sat;
 }
 
 /* ---- chained-batch head range (ROCKET_FA_CHAIN=1) -------------------------------
@@ -759,17 +792,19 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
             const int h = gh + g, hk = h / gqa;
             _Float16 *scg = sc + (size_t)g * tk, *Pg = P + (size_t)g * tk;
             t0 = FA_T0(pf);
+            int sat;
             if (host_sm && fa_fused_softmax()) {
-                fa_softmax_fused(scg, Pg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+                sat = fa_softmax_fused(scg, Pg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
                 FA_ACC(pf, softmax, t0);
             } else {
-                fa_mask_scores(scg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+                sat = fa_mask_scores(scg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
                 FA_ACC(pf, mask, t0);
                 t0 = FA_T0(pf);
                 if (host_sm) host_softmax_rows(Tp, Kn, scg, Pg);
                 else if ((rc = rocket_softmax_fp16(fd, Tp, Kn, scg, Pg)) != 0) { FA_ACC(pf, softmax, t0); break; }
                 FA_ACC(pf, softmax, t0);
             }
+            if (sat) { rc = ROCKET_E_RANGE; break; }   /* see FA_SAT */
             t0 = FA_T0(pf);
             fa_gather_v(vh + (size_t)g * kd, V + (size_t)hk * dh * n_kv, n_kv, Kn, dh);
             FA_ACC(pf, gather, t0);
@@ -850,8 +885,9 @@ static int fa_heads_range_tiled(int fd, int n_tokens, int n_kv, int head_dim,
             FA_ACC(pf, qk, t0);
             if (rc != 0) return rc;
             t0 = FA_T0(pf);
-            fa_mask_scores_tile(sc, mask, n_tokens, n_kv, j0, w, Tp, wp, scale, softcap);
+            const int sat = fa_mask_scores_tile(sc, mask, n_tokens, n_kv, j0, w, Tp, wp, scale, softcap);
             FA_ACC(pf, mask, t0);
+            if (sat) return ROCKET_E_RANGE;   /* see FA_SAT */
 
             /* fold the tile into the running softmax -> P[Tp,wp] (fp16, feeds the AV matmul) */
             t0 = FA_T0(pf);
@@ -998,11 +1034,12 @@ static int fa_heads_range(int fd, int n_tokens, int n_kv, int head_dim, int dv,
         /* scale + soft-cap + mask + softmax over the Kn columns (pad columns -> ~0): fused
          * on the host by default, else the in-place mask pass then the softmax */
         t0 = FA_T0(pf);
+        int sat;
         if (host_sm && fa_fused_softmax()) {
-            fa_softmax_fused(sc, P, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+            sat = fa_softmax_fused(sc, P, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
             FA_ACC(pf, softmax, t0);
         } else {
-            fa_mask_scores(sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+            sat = fa_mask_scores(sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
             FA_ACC(pf, mask, t0);
             t0 = FA_T0(pf);
             if (host_sm) host_softmax_rows(Tp, Kn, sc, P);
@@ -1011,6 +1048,7 @@ static int fa_heads_range(int fd, int n_tokens, int n_kv, int head_dim, int dv,
             }
             FA_ACC(pf, softmax, t0);
         }
+        if (sat) { fa_prof_merge(pf); return ROCKET_E_RANGE; }   /* see FA_SAT */
 
         /* ctx[Tp,dv] = P·v_hk  (M=Tp,K=Kn,N=dv); B=vh[dv,Kn] so B[n=c][k=j]=V[c,j] */
         t0 = FA_T0(pf);
@@ -1131,7 +1169,7 @@ static int fa_fan_heads(const int *fds, fa_scratch *scratch, int nt,
             .Q = Q, .K = K, .V = V, .mask = mask, .out = out,
             .h0 = h0, .h1 = h0 + cnt, .host_sm = host_sm, .idx = n,
             .core_base = core_base, .ret = 0 };
-        if (pthread_create(&th[n], NULL, fa_mt_worker, &args[n]) == 0)
+        if (rocket_thread_create_pinned(&th[n], fa_mt_worker, &args[n], n, core_base) == 0)
             joinable[n] = 1;
         h0 += cnt;
         n++;

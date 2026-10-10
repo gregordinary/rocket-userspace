@@ -24,6 +24,7 @@
  */
 
 #include <assert.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,6 +154,29 @@ static int geometry_fits(const npu_cna_desc *cna, const npu_dpu_desc *dpu)
   return 1;
 }
 
+/* DEBUG gating knobs (RE, tests/npu_core_diff_probe). The matmul never writes
+ * CNA_CLK_GATE (0x1090, TRM: bits 0/1/2/4 disable the feature-fetch, weight-fetch,
+ * CSC and CBUF auto clock gates) or CORE_MAC_GATING (0x300C, slcg_op_en [26:0],
+ * reset 0x07800800), and writes MISC_CFG's soft_gating [19:14] as 0. It writes the
+ * undocumented CORE 0x3030 as 0, as Mesa and the vendor programs do; ROCKET_CORE_3030
+ * writes that value instead (the lane-0 predicate search). Each knob, when
+ * set, writes its value; unset leaves the program byte-identical.
+ *
+ * Read once, through pthread_once: gen_matmul_task runs per task of every fp16 matmul,
+ * on the fan-out's worker threads as well as the caller's, and the four values have to
+ * be published together. */
+static pthread_once_t g_gate_once = PTHREAD_ONCE_INIT;
+static long g_gate_clk = -1, g_gate_soft = -1, g_gate_mac = -1, g_core_3030 = 0;
+
+static void gate_knobs_read(void)
+{
+  const char *e;
+  if ((e = getenv("ROCKET_CNA_CLK_GATE")))     g_gate_clk  = (long)(strtoul(e, NULL, 0) & 0x17);
+  if ((e = getenv("ROCKET_CORE_SOFT_GATING"))) g_gate_soft = (long)(strtoul(e, NULL, 0) & 0x3F);
+  if ((e = getenv("ROCKET_CORE_MAC_GATING")))  g_gate_mac  = (long)(strtoul(e, NULL, 0) & 0x7FFFFFF);
+  if ((e = getenv("ROCKET_CORE_3030")))        g_core_3030 = (long)(strtoul(e, NULL, 0) & 0xFFFFFFFF);
+}
+
 /*
  * Emit the regcmd program incrementally and return the op count. Beyond the
  * CNA/CORE/DPU config, this arms RDMA_S_POINTER (early) and the DPU_RDMA block
@@ -273,36 +297,20 @@ static int gen_matmul_task(uint64_t *ops, npu_cna_desc *cna_desc,
   ops[i++] = NPUOP(OP_REG_CNA, 0x0, CNA_DCOMP_AMOUNT15);
   ops[i++] = NPUOP(OP_REG_CNA, 0x0, CNA_CVT_CON5);
   ops[i++] = NPUOP(OP_REG_CNA, 0x0, CNA_PAD_CON1);
-  /* DEBUG gating knobs (RE, tests/npu_core_diff_probe). The matmul never writes
-   * CNA_CLK_GATE (0x1090, TRM: bits 0/1/2/4 disable the feature-fetch, weight-fetch,
-   * CSC and CBUF auto clock gates) or CORE_MAC_GATING (0x300C, slcg_op_en [26:0],
-   * reset 0x07800800), and writes MISC_CFG's soft_gating [19:14] as 0. It writes the
-   * undocumented CORE 0x3030 as 0, as Mesa and the vendor programs do; ROCKET_CORE_3030
-   * writes that value instead (the lane-0 predicate search). Each knob, when
-   * set, writes its value; unset leaves the program byte-identical. Read once: this runs
-   * per task of every fp16 matmul. */
-  static int gate_read;
-  static long gate_clk = -1, gate_soft = -1, gate_mac = -1, core_3030 = 0;
-  if (!__atomic_load_n(&gate_read, __ATOMIC_ACQUIRE)) {
-    const char *e;
-    if ((e = getenv("ROCKET_CNA_CLK_GATE")))     gate_clk  = (long)(strtoul(e, NULL, 0) & 0x17);
-    if ((e = getenv("ROCKET_CORE_SOFT_GATING"))) gate_soft = (long)(strtoul(e, NULL, 0) & 0x3F);
-    if ((e = getenv("ROCKET_CORE_MAC_GATING")))  gate_mac  = (long)(strtoul(e, NULL, 0) & 0x7FFFFFF);
-    if ((e = getenv("ROCKET_CORE_3030")))        core_3030 = (long)(strtoul(e, NULL, 0) & 0xFFFFFFFF);
-    __atomic_store_n(&gate_read, 1, __ATOMIC_RELEASE);
-  }
-  if (gate_clk >= 0) ops[i++] = NPUOP(OP_REG_CNA, (uint32_t)gate_clk, CNA_CLK_GATE);
+  /* The DEBUG gating knobs; see g_gate_once above. */
+  pthread_once(&g_gate_once, gate_knobs_read);
+  if (g_gate_clk >= 0) ops[i++] = NPUOP(OP_REG_CNA, (uint32_t)g_gate_clk, CNA_CLK_GATE);
 
   value = ((core_desc->proc_precision & 0x7) << 8) | (core_desc->qd_en & 0x1);
-  if (gate_soft >= 0) value |= (uint32_t)gate_soft << 14;
+  if (g_gate_soft >= 0) value |= (uint32_t)g_gate_soft << 14;
   ops[i++] = NPUOP(OP_REG_CORE, value, CORE_MISC_CFG);
-  if (gate_mac >= 0) ops[i++] = NPUOP(OP_REG_CORE, (uint32_t)gate_mac, CORE_MAC_GATING);
+  if (g_gate_mac >= 0) ops[i++] = NPUOP(OP_REG_CORE, (uint32_t)g_gate_mac, CORE_MAC_GATING);
   value = ((core_desc->dataout_height & 0xFFFF) << 16) | (core_desc->dataout_width & 0xFFFF);
   ops[i++] = NPUOP(OP_REG_CORE, value, CORE_DATAOUT_SIZE_0);
   value = core_desc->dataout_channel & 0xFFFF;
   ops[i++] = NPUOP(OP_REG_CORE, value, CORE_DATAOUT_SIZE_1);
   ops[i++] = NPUOP(OP_REG_CORE, 0x0, CORE_CLIP_TRUNCATE);
-  ops[i++] = NPUOP(OP_REG_CORE, (uint32_t)core_3030, CORE_3030);
+  ops[i++] = NPUOP(OP_REG_CORE, (uint32_t)g_core_3030, CORE_3030);
 
   value = ((dpu_desc->burst_len & 0xF) << 5) | ((dpu_desc->conv_mode & 0x3) <<3) |
     ((dpu_desc->output_mode & 0x3) <<1) | (dpu_desc->flying_mode & 0x1);

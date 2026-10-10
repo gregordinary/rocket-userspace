@@ -47,6 +47,7 @@
  * ROCKET_RK3576_POOL_PROF=1 logs one line per call, at ROCKET_LOG_INFO.
  */
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -1075,24 +1076,28 @@ static unsigned r76p_lag_attempts(void)
  * instrument cannot induce at all. ROCKET_RK3576_POOL_LAG_TAIL=0 scores every group. */
 static int r76p_lag_tail(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_POOL_LAG_TAIL");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 1;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 1;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* Whether to count how many scored elements could tell the two divisors apart — an RE
  * readout that doubles the rounding work, so it is off unless asked for. */
 static int r76p_lag_discr(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_POOL_LAG_DISCR");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 0;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 0;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* Whether this descriptor has any position at all where the lag could show. A pool with
@@ -1458,6 +1463,11 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
     int rc, cycled = 0, confirmed = 0;
     struct r76p_lag_pos *lagpos = NULL;
     unsigned nlag = 0, lagged = 0;
+    /* Whether osurf's read bracket is open. Every CPU look at the surface — the write
+     * scan, the lag check and the de-scatter — happens inside one PREP_BO/FINI_BO pair,
+     * and every path out of the loop leaves with this clear except the one that keeps
+     * the bracket for the de-scatter. */
+    int oprep = 0;
 
     if (!h) return ROCKET_E_SHAPE;
     if (!out && !h->cube_out) return ROCKET_E_SHAPE;
@@ -1597,26 +1607,27 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
          * does not recognise, so an older kernel would fail the submit rather than fall
          * back to the grace period. [HW sweep, H96 MAX M9] */
         tjob = rocket_rk3576_job_clock();
+        /* No bracket is open here: the stamp's bracket closed before the submit, and a
+         * previous attempt's read bracket closed before it looped, so a submit that fails
+         * leaves nothing to close. */
         if (rocket_submit_matmul_flags(fd, &h->rc, h->task_count, in_h, 2, out_h, 1,
                                        rocket_ppu_done_supported()
                                            ? ROCKET_JOB_PPU_DONE : 0u) != 0) {
             ROCKET_LOGE("%s: submit failed\n", entry);
-            /* The stamp opened a PREP/FINI bracket on osurf above and this exit is inside
-             * it. Close it before leaving: this file's own hazard note is that a CPU write
-             * to an output BO outside the bracket races the DPU's DMA, and an error path is
-             * not exempt — the caller is failing out, but the BO outlives the call. */
-            if (stamp) rocket_bo_fini(fd, osurf);
             rc = ROCKET_E_DEVICE;
             goto out;
         }
         R76P_ACC(prof, submit_us, t0);
         t0 = R76P_T(prof);
         tw = R76P_T(prof);
+        /* A wait that fails opens no bracket — the convention every entry here follows
+         * (rocket_op_submit_one among them) — so its exit has nothing to close either. */
         if (rocket_bo_prep(fd, osurf, 0, 2000000000ull) < 0) {
             ROCKET_LOGE("%s: PREP_BO on the output timed out\n", entry);
             rc = ROCKET_E_DEVICE;
             goto out;
         }
+        oprep = 1;
         jns = rocket_rk3576_job_ns(tjob);
         R76P_ACC(prof, wait_us, tw);
         prof.surf_kib += (double)h->out_bytes / 1024.0;
@@ -1664,13 +1675,19 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
                             "redoing the submit\n", entry, attempt + 1u);
             }
         }
-        if (stamp) {
-            tw = R76P_T(prof);
-            rocket_bo_fini(fd, osurf);
-            R76P_ACC(prof, fini_us, tw);
+        /* A SURFACE THAT PASSED KEEPS ITS BRACKET for the de-scatter below, which reads the
+         * same bytes; it is closed there, once. One that did not pass closes it here, before
+         * the redo's stamp opens a write bracket and its submit hands the BO to the device. */
+        if (wrote && !lag_fail) {
+            R76P_ACC(prof, read_us, t0);
+            rc = ROCKET_OK;
+            break;
         }
+        tw = R76P_T(prof);
+        rocket_bo_fini(fd, osurf);
+        oprep = 0;
+        R76P_ACC(prof, fini_us, tw);
         R76P_ACC(prof, read_us, t0);
-        if (wrote && !lag_fail) { rc = ROCKET_OK; break; }
         if (lag_fail) {
             /* Not the poisoning: no power cycle, just redo — and out of its OWN budget,
              * since a lag redo costs a submit where a poisoning redo costs a power cycle. */
@@ -1687,6 +1704,9 @@ int rocket_pool_int8_prepacked_rk3576(int fd, rocket_pool_int8_rk3576_handle *h,
 out:
     free(lagpos);
     if (rc != ROCKET_OK) {
+        /* Every failing path above closes the bracket before it leaves; this keeps one
+         * added later from leaking it. */
+        if (oprep) rocket_bo_fini(fd, osurf);
         if (lagged)
             ROCKET_LOGE("%s: the divisor lagged on %u redo(s) and the surface was never "
                         "right (ROCKET_RK3576_POOL_LAG_ATTEMPTS=%u)\n",
@@ -1702,7 +1722,10 @@ out:
         ROCKET_LOGD("%s: the divisor lag cost %u redo(s)\n", entry, lagged);
 
     /* CUBE OUT: the surface stays where the PPU wrote it and the next layer's CNA reads
-     * it, so there is nothing to de-scatter. The fence was already waited on above. */
+     * it, so there is nothing to de-scatter. The fence was already waited on above.
+     *
+     * Either way the read bracket the passing attempt opened is still open here, and the
+     * de-scatter reads inside it; the FINI_BO after it is that bracket's only close. */
     t0 = R76P_T(prof);
     if (!h->cube_out) {
         const int8_t *o = (const int8_t *)osurf->ptr + ooff;
@@ -1733,6 +1756,12 @@ out:
         }
     }
     R76P_ACC(prof, descat_us, t0);
+    if (oprep) {
+        tw = R76P_T(prof);
+        rocket_bo_fini(fd, osurf);
+        R76P_ACC(prof, fini_us, tw);
+        R76P_ACC(prof, read_us, tw);
+    }
 
     if (prof.on)
         ROCKET_LOGI("pool %ux%ux%u k%ux%u -> %ux%u: scatter %.0f stamp %.0f submit %.0f "

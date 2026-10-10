@@ -559,8 +559,23 @@ int rocket_bo_fini_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
  */
 static int rocket_bound_core_count(void) { return rocket_sysfs_bound_core_count(); }
 
-/* fds this library currently has open, so the guard fires on the SECOND one. */
+/* fds this library currently has open, so the guard fires on the SECOND one.
+ *
+ * The guard RESERVES the first slot rather than reading the count and adding to it later:
+ * a load followed by a separate increment lets two concurrent opens both read zero and
+ * both pass, which is the two-fds-in-flight state the guard exists to refuse. Every fd
+ * this returns holds exactly one count, and rocket_close() gives back exactly one. */
 static atomic_int rocket_open_fds = 0;
+
+/* Return one fd's count. Never below zero: a close of an fd this library did not open
+ * must not take a count some other fd holds into the negative, where the next guarded
+ * open would see a slot that is not free and refuse. */
+static void rocket_open_fds_release(void)
+{
+    int n = atomic_load(&rocket_open_fds);
+    while (n > 0 && !atomic_compare_exchange_weak(&rocket_open_fds, &n, n - 1))
+        ;
+}
 
 int rocket_open(void)
 {
@@ -594,6 +609,7 @@ int rocket_open(void)
      * on a path (single-task generator, dump tools) that never reads ctx->hw. */
     const struct rocket_hw_profile *hw = rocket_hw_current();
 
+    int guarded = 0;
     if (hw && strcmp(hw->name, "rk3576") == 0 && rocket_bound_core_count() > 1) {
         const char *allow = getenv("ROCKET_RK3576_ALLOW_MULTI_FD");
         static atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -605,7 +621,13 @@ int rocket_open(void)
                         "(echo <dev> > /sys/bus/platform/drivers/rocket/unbind) or set "
                         "status=\"disabled\" on its DT node.\n",
                         rocket_bound_core_count());
-        if (atomic_load(&rocket_open_fds) > 0 && !(allow && *allow && *allow != '0')) {
+        guarded = !(allow && *allow && *allow != '0');
+    }
+
+    if (guarded) {
+        /* Only the open that moves the count from zero to one gets the fd. */
+        int expected = 0;
+        if (!atomic_compare_exchange_strong(&rocket_open_fds, &expected, 1)) {
             ROCKET_LOGE("rk3576: refusing a second device fd while %d cores are bound — "
                         "two fds is what puts two jobs in flight at once. Serialize your "
                         "submits and set ROCKET_RK3576_ALLOW_MULTI_FD=1 to override.\n",
@@ -613,9 +635,10 @@ int rocket_open(void)
             close(fd);
             return -EBUSY;
         }
+    } else {
+        /* Unguarded: any other part, one bound core, or the explicit override. */
+        atomic_fetch_add(&rocket_open_fds, 1);
     }
-
-    atomic_fetch_add(&rocket_open_fds, 1);
     return fd;
 }
 
@@ -628,7 +651,7 @@ void rocket_close(int fd)
      * ROCKET_RK3576_BO_POOL is on. */
     rocket_rk3576_bo_pool_drain(fd);
     close(fd);
-    if (atomic_load(&rocket_open_fds) > 0) atomic_fetch_sub(&rocket_open_fds, 1);
+    rocket_open_fds_release();   /* after the close: the slot is free once the fd is gone */
 }
 
 /* ============================================================================

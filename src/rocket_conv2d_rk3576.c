@@ -57,6 +57,7 @@
  *   writer is where that shape belongs.
  */
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -283,12 +284,14 @@ struct r76_task_extent {
 
 static int r76_guard_narrow(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_GUARD_NARROW");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 0;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 0;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* An RE escape: a named environment flag that lets a probe ask past a decoded bound.
@@ -384,13 +387,15 @@ static int r76_int8_prof_on(void)
  * r76_task_wrote_late() below. */
 static int r76_drain_us(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_DRAIN_US");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) : 0;
-        if (cached < 0) cached = 0;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) : 0;
+        if (c < 0) c = 0;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* How many times to redo a row task that wrote nothing. ROCKET_RK3576_TASK_ATTEMPTS.
@@ -405,13 +410,15 @@ static int r76_drain_us(void)
  * nothing on a task that succeeds. [HW sweep, H96 MAX M9] */
 static unsigned r76_task_attempts(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_TASK_ATTEMPTS");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) : 8;
-        if (cached < 1) cached = 1;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) : 8;
+        if (c < 1) c = 1;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return (unsigned)cached;
+    return (unsigned)c;
 }
 
 /* Ask the surface again after a settle. A job the driver retires on PC_DONE plus a blind
@@ -517,8 +524,9 @@ static int r76_task_wrote_late(int fd, struct r76_conv_bos *b,
  * [HW sweep, H96 MAX M9] */
 static int r76_batch_on(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_BATCH_TASKS");
         int asked = (e && *e);
         int want = asked ? (*e != '0') : 1;
@@ -534,9 +542,10 @@ static int r76_batch_on(void)
                             "~439 us per extra row window.\n");
             want = 0;
         }
-        cached = want;
+        c = want;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* The row tasks one chained job may carry. Every plan on this part is bounded by the
@@ -4197,15 +4206,17 @@ void rocket_conv2d_int8_weights_free_rk3576(int fd,
 
 static unsigned r76_chain_task_cap(void)
 {
-    static unsigned cached = 0;
-    if (!cached) {
+    static _Atomic unsigned cached = 0;
+    unsigned c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (!c) {
         const char *e = getenv("ROCKET_RK3576_CHAIN_MAX_TASKS");
         long v = (e && *e) ? strtol(e, NULL, 0) : 0;
         unsigned def = rocket_batch_completion_tracked() ? R76_MAX_CHAIN_TASKS
                                                          : R76_CHAIN_TASKS_LEGACY;
-        cached = (v >= 2 && v <= (long)R76_MAX_CHAIN_TASKS) ? (unsigned)v : def;
+        c = (v >= 2 && v <= (long)R76_MAX_CHAIN_TASKS) ? (unsigned)v : def;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* One layer's place in the stream: where its programs start, and what to check afterwards.
@@ -4459,10 +4470,12 @@ unsigned rocket_conv2d_int8_chain_max_programs_rk3576(void)
  * run structure. ROCKET_RK3576_CHAIN_POOL_LAG=1 puts one back for an RE arm. */
 static int r76_chain_pool_lag_refused(const rocket_chain_node_rk3576 *nd)
 {
-    static int allow = -1;
+    static _Atomic int cached = -1;
+    int allow = atomic_load_explicit(&cached, memory_order_relaxed);
     if (allow < 0) {
         const char *e = getenv("ROCKET_RK3576_CHAIN_POOL_LAG");
         allow = (e && *e && *e != '0');
+        atomic_store_explicit(&cached, allow, memory_order_relaxed);
     }
     return !allow && rocket_pool_int8_rk3576_lag_can_show(nd->pool);
 }
@@ -5031,12 +5044,14 @@ unsigned rocket_conv2d_int8_chain_kicks_rk3576(const rocket_conv2d_int8_chain_rk
  * int32 matmul writer) [HW sweep, H96 MAX M9]. */
 static int r76_guard_per_kick(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_GUARD_PER_KICK");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 0;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 0;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* WHAT A KICK IS MADE OF. A cross-layer kick charges a whole run of layers to one call, so

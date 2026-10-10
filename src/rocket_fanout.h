@@ -141,7 +141,9 @@ static inline int rocket_wsig_eq(const rocket_wsig *a, const rocket_wsig *b)
  * which on a timeout is ~8 s.
  *
  * The worker itself must pin with rocket_pin_worker_based() and a base its spawner
- * read: the rotation base is __thread, so a fresh worker always reads 0. */
+ * read: the rotation base is __thread, so a fresh worker always reads 0. Worker t is
+ * created on the core its own pin with index t and the calling thread's base selects,
+ * so the callers' workers must use exactly that index and base. */
 void rocket_fanout_run(int n, void *args, size_t stride, void *(*fn)(void *));
 
 #endif /* ROCKET_FANOUT_H */

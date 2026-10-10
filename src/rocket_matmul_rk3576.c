@@ -44,6 +44,7 @@
  * path, and the requant moves to the host.
  */
 #include <dirent.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -59,6 +60,7 @@
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
 #include "rocket_rk3576_internal.h"
+#include "rocket_matmul_internal.h"   /* ROCKET_MM_DIM_MAX, the envelope every planner shares */
 
 #define C2 16
 
@@ -102,9 +104,13 @@ int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, i
  * ==========================================================================*/
 static int r76_mm_profile(void)
 {
-    static int v = -1;
-    if (v < 0) v = getenv("ROCKET_MM_PROFILE") != NULL;
-    return v;
+    static _Atomic int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        c = getenv("ROCKET_MM_PROFILE") != NULL;
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return c;
 }
 
 static pthread_mutex_t g_prof_r76_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -212,15 +218,51 @@ static void r76_mm_plane(unsigned M, unsigned K, unsigned *iw_out, unsigned *ih_
         }
     }
 
+    /* THE BOUND IS IN THE LOOP CONDITION, NOT BEHIND THE DIVISIBILITY TEST. Behind it, the
+     * budget is consulted only at a divisor of M, so a prime M would walk every width up to
+     * M itself before the search ends. The width chosen does not depend on where the bound
+     * sits: the candidates are the divisors of M no wider than the budget with a whole
+     * number of granules, and the widest of them wins. */
     if (!budget_px) budget_px = 1;
-    for (iw = 1; iw <= M; iw++) {
+    for (iw = 1; iw <= M && iw <= budget_px; iw++) {
         if (M % iw) continue;
-        if (iw > budget_px) break;
         if ((iw * K) % 64u) continue;
         best = iw;
     }
     *iw_out = best;
     *ih_out = M / best;
+}
+
+/* THE PLANE'S HEIGHT IS A 16-BIT FIELD. conv_params_t carries ih and ih_full as uint16_t,
+ * and the entries narrow the plane into them, so a taller plane would be programmed as its
+ * height modulo 65536: the row tasks cover that many rows, the DDR group stride comes from
+ * the narrowed height, and the de-scatter reads M rows of a surface laid out for fewer — a
+ * full, plausible, wrong result. A prime M past 65535 is the plain case: its only plane is
+ * one pixel wide. */
+#define R76_MM_PLANE_H_MAX 0xFFFFu
+
+/* The int8 matmul's dimension envelope, shared by the planner and the entries: each
+ * dimension inside ROCKET_MM_DIM_MAX, the RK3588 planners' bound, and a plane short enough
+ * for the register fields it is written into. ROCKET_OK with the plane in `*iw_out` and
+ * `*ih_out` (either may be NULL), or ROCKET_E_SHAPE with the reason logged. */
+static int r76_mm_envelope(const char *who, int M, int K, int N,
+                           unsigned *iw_out, unsigned *ih_out)
+{
+    unsigned iw, ih;
+    if (M > ROCKET_MM_DIM_MAX || K > ROCKET_MM_DIM_MAX || N > ROCKET_MM_DIM_MAX) {
+        ROCKET_LOGE("%s: M=%d K=%d N=%d — a dimension is past the %d this planner "
+                    "takes\n", who, M, K, N, ROCKET_MM_DIM_MAX);
+        return ROCKET_E_SHAPE;
+    }
+    r76_mm_plane((unsigned)M, (unsigned)K, &iw, &ih);
+    if (ih > R76_MM_PLANE_H_MAX) {
+        ROCKET_LOGE("%s: M=%d plans as a %ux%u plane, and its height is past the 16-bit "
+                    "field it is programmed into\n", who, M, iw, ih);
+        return ROCKET_E_SHAPE;
+    }
+    if (iw_out) *iw_out = iw;
+    if (ih_out) *ih_out = ih;
+    return ROCKET_OK;
 }
 
 static unsigned r76_mm_nt(void)
@@ -295,12 +337,14 @@ static unsigned r76_mm_fit_nt(unsigned iw, unsigned K, unsigned N, unsigned *row
  * ROCKET_RK3576_MM_PHASE=0 turns this off, which leaves the narrowing to find the width. */
 static int r76_mm_phase_on(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_MM_PHASE");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 1;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 1;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* The widest window of an even spread of `ih` rows under a cap of `cap`: the row planner
@@ -359,6 +403,7 @@ static void r76_mm_phase(unsigned iw, unsigned ih, unsigned K, unsigned N,
 int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *Nt)
 {
     unsigned iw, ih, nt, rows = 0, row_cap = 0;
+    uint64_t jobs;
 
     if (M <= 0 || K <= 0 || N <= 0) return ROCKET_E_SHAPE;
     if (K % 32 || N % 32) {
@@ -366,8 +411,9 @@ int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *N
                     "int8 weight cube groups each channel axis by 32)\n", K, N);
         return ROCKET_E_SHAPE;
     }
+    if (r76_mm_envelope("rk3576 matmul", M, K, N, &iw, &ih) != ROCKET_OK)
+        return ROCKET_E_SHAPE;
 
-    r76_mm_plane((unsigned)M, (unsigned)K, &iw, &ih);
     nt = r76_mm_fit_nt(iw, (unsigned)K, (unsigned)N, &rows);
     if (nt) {
         r76_mm_phase(iw, ih, (unsigned)K, (unsigned)N, &nt, &row_cap);
@@ -385,10 +431,21 @@ int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *N
         return ROCKET_E_SHAPE;
     }
 
+    /* THE JOB COUNT IS THE RETURN VALUE, and every negative int is a rocket_status. So it
+     * is counted wide and refused past INT_MAX rather than narrowed, which would hand a
+     * caller an unrelated error code for a shape that merely has very many jobs. TILING
+     * rather than SHAPE: the shape is valid and has a plan, just not one this preview can
+     * report, and the entry declines it the same way. */
+    jobs = (uint64_t)(((unsigned)N + nt - 1u) / nt) * ((ih + rows - 1u) / rows);
+    if (jobs > (uint64_t)INT_MAX) {
+        ROCKET_LOGE("rk3576 matmul: M=%d K=%d N=%d plans into %llu jobs, past the INT_MAX "
+                    "this planner can return\n", M, K, N, (unsigned long long)jobs);
+        return ROCKET_E_TILING;
+    }
     if (Mt) *Mt = (int)(rows * iw);
     if (Kt) *Kt = K;
     if (Nt) *Nt = (int)nt;
-    return (int)(((unsigned)N + nt - 1u) / nt * ((ih + rows - 1u) / rows));
+    return (int)jobs;
 }
 
 /* ============================================================================
@@ -608,12 +665,14 @@ static void r76_mm_free(int fd, struct r76_mm_bos *b)
  * it off. */
 static int r76_mm_narrow_on(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_MM_NARROW");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 1;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) != 0 : 1;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 enum { R76_NT_CAPS = 16 };
@@ -764,10 +823,16 @@ static int r76_mm_int8(int fd, int M, int K, int N,
                     "(the int8 weight cube groups each channel axis by 32)\n", M, K, N);
         return ROCKET_E_SHAPE;
     }
+    if (r76_mm_envelope("rk3576 matmul", M, K, N, NULL, NULL) != ROCKET_OK)
+        return ROCKET_E_SHAPE;
     pt0 = PROF_T0();
     {
         int ntile = 0;
-        if (rocket_matmul_plan_int8_rk3576(M, K, N, NULL, NULL, &ntile) < 0) {
+        const int jobs = rocket_matmul_plan_int8_rk3576(M, K, N, NULL, NULL, &ntile);
+        /* A plan too long to count is not the K bound below, and the K-split route would
+         * be no shorter. */
+        if (jobs == ROCKET_E_TILING) return ROCKET_E_TILING;
+        if (jobs < 0) {
             /* A K with no single-task plan can only be run by splitting it through the
              * int32 writer and requantizing on the host. That route TAKES THE DEVICE DOWN
              * at prefill scale: at M=512 K=8192 N=2048 the write guard spends its eight
@@ -1347,9 +1412,12 @@ int rocket_matmul_int8_rk3576_perc_wbo(int fd, int M, int K, int N,
  * [HW sweep, H96 MAX M9] */
 #define R76_PM_MAX_DEVS 8
 
-/* One "<dev>/power/" prefix per bound rocket device, discovered once. */
+/* One "<dev>/power/" prefix per bound rocket device, discovered once, through
+ * r76_pm_once: the table is filled entry by entry, and a second thread must not read it
+ * half-built. Every reader reaches it through r76_autosuspend_ms() first. */
 static char r76_pm_dir[R76_PM_MAX_DEVS][192];
 static int r76_pm_ndev = -1;            /* -1 unprobed */
+static pthread_once_t r76_pm_once = PTHREAD_ONCE_INIT;
 
 /* Open `<r76_pm_dir[i]><leaf>`. */
 static FILE *r76_pm_open(int i, const char *leaf, const char *mode)
@@ -1388,10 +1456,13 @@ static int r76_pm_probe(void)
     return r76_pm_ndev ? delay : -1;
 }
 
+static void r76_pm_probe_once(void) { (void)r76_pm_probe(); }
+
+/* The delay the first bound device is set to now, or -1. */
 static int r76_autosuspend_ms(void)
 {
-    if (r76_pm_ndev < 0) return r76_pm_probe();
-    if (!r76_pm_ndev) return -1;
+    pthread_once(&r76_pm_once, r76_pm_probe_once);
+    if (r76_pm_ndev <= 0) return -1;
     {
         FILE *fp = r76_pm_open(0, "autosuspend_delay_ms", "r");
         long v;
@@ -1474,48 +1545,60 @@ static int r76_pm_wait_suspended(int budget_ms)
     }
 }
 
+/* The idle sized from the autosuspend delay, and whether the kick is available: each
+ * resolved once, through pthread_once, since the guard can run on any caller's thread and
+ * the kick's probe writes sysfs. */
+static pthread_once_t r76_idle_once = PTHREAD_ONCE_INIT, r76_kick_once = PTHREAD_ONCE_INIT;
+static int r76_idle_ms = 150;
+static int r76_kick_ms = -1;      /* -1 unavailable, else the delay to restore */
+
+static void r76_idle_resolve(void)
+{
+    int d = r76_autosuspend_ms();
+    int ms = d >= 0 ? 2 * d + 5 : 150;
+    if (ms < 5) ms = 5;
+    if (ms > 300) ms = 300;
+    r76_idle_ms = ms;
+    ROCKET_LOGI("rk3576 matmul i32: the 32-bit writer's hazard is cleared by the "
+                "NPU power domain cycling, so the inter-submit idle is sized from "
+                "the driver's autosuspend delay (%d ms) at %d ms\n", d, ms);
+}
+
+/* Drive the power cycle rather than waiting for the autosuspend timer, when the sysfs
+ * delay is writable. Probed once: a process without privilege falls back to the idle and
+ * pays what it always paid. */
+static void r76_kick_resolve(void)
+{
+    int d = r76_autosuspend_ms();
+    if (d >= 0 && getenv("ROCKET_RK3576_PM_KICK") &&
+        strcmp(getenv("ROCKET_RK3576_PM_KICK"), "0") == 0) {
+        /* explicitly off */
+    } else if (d >= 0 && r76_pm_write_delay(d ? d : R76_PM_DELAY_DEFAULT_MS)) {
+        /* A zero here is an earlier kick that was killed mid-window, not a policy —
+         * heal it rather than adopting it as the value to restore. */
+        r76_kick_ms = d ? d : R76_PM_DELAY_DEFAULT_MS;
+        ROCKET_LOGI("rk3576: the power-domain cycle the wide-output guard waits for is "
+                    "driven directly on all %d bound core(s) (autosuspend delay %d ms "
+                    "is writable), so the guard costs one cycle rather than the "
+                    "timer's worst case\n", r76_pm_ndev, r76_kick_ms);
+    }
+}
+
 int rocket_rk3576_power_idle(void)
 {
-    static int cached = -2;
-    static int kick = -2;          /* -2 unprobed, -1 unavailable, else the delay to restore */
     const char *g = getenv("ROCKET_RK3576_MM_GAP_MS");
-    int gms;
+    int gms, kick;
     struct timespec ts;
 
     if (g && *g) {
         gms = (int)strtol(g, NULL, 0);
     } else {
-        if (cached == -2) {
-            int d = r76_autosuspend_ms();
-            cached = d >= 0 ? 2 * d + 5 : 150;
-            if (cached < 5) cached = 5;
-            if (cached > 300) cached = 300;
-            ROCKET_LOGI("rk3576 matmul i32: the 32-bit writer's hazard is cleared by the "
-                        "NPU power domain cycling, so the inter-submit idle is sized from "
-                        "the driver's autosuspend delay (%d ms) at %d ms\n", d, cached);
-        }
-        gms = cached;
+        pthread_once(&r76_idle_once, r76_idle_resolve);
+        gms = r76_idle_ms;
     }
 
-    /* Drive the power cycle rather than waiting for the autosuspend timer, when the
-     * sysfs delay is writable. Probed once: a process without privilege falls back to
-     * the idle below and pays what it always paid. */
-    if (kick == -2) {
-        int d = r76_autosuspend_ms();
-        kick = -1;
-        if (d >= 0 && getenv("ROCKET_RK3576_PM_KICK") &&
-            strcmp(getenv("ROCKET_RK3576_PM_KICK"), "0") == 0) {
-            /* explicitly off */
-        } else if (d >= 0 && r76_pm_write_delay(d ? d : R76_PM_DELAY_DEFAULT_MS)) {
-            /* A zero here is an earlier kick that was killed mid-window, not a policy —
-             * heal it rather than adopting it as the value to restore. */
-            kick = d ? d : R76_PM_DELAY_DEFAULT_MS;
-            ROCKET_LOGI("rk3576: the power-domain cycle the wide-output guard waits for is "
-                        "driven directly on all %d bound core(s) (autosuspend delay %d ms "
-                        "is writable), so the guard costs one cycle rather than the "
-                        "timer's worst case\n", r76_pm_ndev, kick);
-        }
-    }
+    pthread_once(&r76_kick_once, r76_kick_resolve);
+    kick = r76_kick_ms;
     if (kick >= 0) {
         if (r76_pm_write_delay(0)) {
             int done = r76_pm_wait_suspended(gms);
@@ -1945,6 +2028,12 @@ static unsigned r76_i32_plan(unsigned M, unsigned K, unsigned N, unsigned mult,
     for (ks = K < cap ? K : cap; ks >= 32u; ks = (ks / 2u / 32u) * 32u) {
         unsigned iw, ih, nt;
         r76_mm_plane(M, ks, &iw, &ih);
+        /* A plane too tall for its 16-bit field (R76_MM_PLANE_H_MAX) is no plan at this
+         * slice; a shallower slice has a larger budget and may cut a wider one. */
+        if (ih > R76_MM_PLANE_H_MAX) {
+            if (ks <= 32u) break;
+            continue;
+        }
         nt = r76_mm_fit_nt_mult(iw, ks, N, mult, NULL);
         if (nt) {
             *iw_out = iw; *ih_out = ih; *nt_out = nt;
@@ -2308,6 +2397,11 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
 
     memset(&r76_i32_stats, 0, sizeof r76_i32_stats);
     if (fd < 0 || !A || !B || !C || M <= 0 || K <= 0 || N <= 0) return ROCKET_E_SHAPE;
+    if (M > ROCKET_MM_DIM_MAX || K > ROCKET_MM_DIM_MAX || N > ROCKET_MM_DIM_MAX) {
+        ROCKET_LOGE("rk3576 matmul i32: M=%d K=%d N=%d — a dimension is past the %d this "
+                    "planner takes\n", M, K, N, ROCKET_MM_DIM_MAX);
+        return ROCKET_E_SHAPE;
+    }
     if (strcmp(hw->name, "rk3576") != 0) {
         ROCKET_LOGE("rocket_matmul_int8_rk3576_i32: this is the RK3576 encoding and the "
                     "active profile is %s\n", hw->name);

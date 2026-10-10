@@ -14,6 +14,8 @@
 #ifndef ROCKET_AFFINITY_H
 #define ROCKET_AFFINITY_H
 
+#include <pthread.h>
+
 /* Pin the CALLING thread (a matmul worker) to a "big" CPU. `worker_idx` selects
  * which big core via round-robin (worker_idx % n_big), so the N workers spread
  * across the big cluster instead of stacking on one core.
@@ -43,5 +45,15 @@ void rocket_pin_worker(int worker_idx);
  * across the big cluster instead of every pool's worker 0 stacking on one core.
  * (See rocket_affinity_set_base in rocket_npu.h for who sets the base.) */
 void rocket_pin_worker_based(int worker_idx, int core_base);
+
+/* pthread_create, with the thread starting on the core rocket_pin_worker_based(worker_idx,
+ * core_base) selects. A thread inherits its creator's CPU mask, so a worker created by a caller
+ * pinned to one core starts on that core and has to run there before it can move itself away:
+ * every spawn round from such a caller queues on one core. Created on its own core, the worker's
+ * own pin is a no-op. Falls back to a plain pthread_create when pinning is disabled, when
+ * ROCKET_PIN_AT_CREATE=0, or when the affinity cannot be applied. Returns pthread_create's
+ * result. */
+int rocket_thread_create_pinned(pthread_t *th, void *(*fn)(void *), void *arg,
+                                int worker_idx, int core_base);
 
 #endif /* ROCKET_AFFINITY_H */

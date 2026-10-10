@@ -696,7 +696,7 @@ static int ctx_layer(rocket_sam_ctx *c, int l, _Float16 *x, attn_scratch *s)
                                     .qkv = s->qkv, .cc = cc, .Rh = m->Rh[l], .Rw = m->Rw[l],
                                     .S = S, .S2 = S2, .d = d, .dh = dh, .nh = nh,
                                     .scale = scale, .ip = s->ip, .jp = s->jp, .rc = 0 };
-            if (nw > 1 && pthread_create(&th[w], NULL, sam_attn_worker, &wa[w]) == 0) started[w] = 1;
+            if (nw > 1 && rocket_thread_create_pinned(&th[w], sam_attn_worker, &wa[w], w, core_base) == 0) started[w] = 1;
             else sam_attn_worker(&wa[w]);   /* nw==1 or spawn failed: run inline */
         }
         int aok = 1;

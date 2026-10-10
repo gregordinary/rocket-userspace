@@ -56,6 +56,19 @@
 /* Scatter a row-major [r0.., c0..] tile into a FEATURE cube of granule G.
  * CVT converts one source element (MM_ID where the types already match). */
 #define MM_ID(x) (x)
+
+/* A scatter's group copy writes a BO mapping from host memory, so no iteration's store
+ * reaches a later iteration's load. GCC at -O2 cannot prove that from a block-scope
+ * restrict and will not version the loop for it, so without the marker a 32-byte int8
+ * weight run or a 16-byte int8 feature run compiles to one byte load and store at a time. */
+#if defined(__clang__)
+#define MM_NO_OVERLAP _Pragma("clang loop vectorize(assume_safety)")
+#elif defined(__GNUC__)
+#define MM_NO_OVERLAP _Pragma("GCC ivdep")
+#else
+#define MM_NO_OVERLAP
+#endif
+
 #define MM_CUBE_SCATTER(DT, ST, G, IDX, slot, src, sstride, r0, c0, ROWS, COLS, CVT)     \
     do {                                                                                 \
         const int mmH_ = (ROWS), mmng_ = (COLS) / (G);                                   \
@@ -65,6 +78,7 @@
             for (int mmg_ = 0; mmg_ < mmng_; mmg_++) {                                   \
                 DT *restrict mmdg_ = mmd_ + (size_t)mmg_ * (size_t)mmH_ * (G);           \
                 const ST *restrict mmsg_ = mms_ + (size_t)mmg_ * (G);                    \
+                MM_NO_OVERLAP                                                            \
                 for (int mmj_ = 0; mmj_ < (G); mmj_++) mmdg_[mmj_] = CVT(mmsg_[mmj_]);   \
             }                                                                            \
             for (int mmc_ = mmng_ * (G) + 1; mmc_ <= (COLS); mmc_++)   /* COLS%G tail */ \
@@ -72,22 +86,31 @@
         }                                                                                \
     } while (0)
 
+/* Scatter ONE source row into a WEIGHT cube of granule (KG, NG): `srow` is the row's first
+ * element of this K-tile, `k` its 1-based row within the tile's N extent, KT the tile's K. */
+#define MM_WT_SCATTER_ROW(DT, ST, KG, NG, IDX, slot, srow, k, KT, CVT)                   \
+    do {                                                                                 \
+        const int mmrC_ = (KT), mmrng_ = (KT) / (KG), mmrk_ = (k);                       \
+        const ST *mmrs_ = (srow);                                                        \
+        DT *mmrd_ = (DT *)(slot) + (size_t)((mmrk_ - 1) / (NG)) * (NG) * (size_t)mmrC_   \
+                                 + (size_t)((mmrk_ - 1) % (NG)) * (KG);                  \
+        for (int mmrg_ = 0; mmrg_ < mmrng_; mmrg_++) {                                   \
+            DT *restrict mmrdg_ = mmrd_ + (size_t)mmrg_ * (KG) * (NG);                   \
+            const ST *restrict mmrsg_ = mmrs_ + (size_t)mmrg_ * (KG);                    \
+            MM_NO_OVERLAP                                                                \
+            for (int mmrj_ = 0; mmrj_ < (KG); mmrj_++) mmrdg_[mmrj_] = CVT(mmrsg_[mmrj_]); \
+        }                                                                                \
+        for (int mmrc_ = mmrng_ * (KG) + 1; mmrc_ <= mmrC_; mmrc_++)  /* KT%KG tail */   \
+            ((DT *)(slot))[IDX(mmrC_, mmrk_, mmrc_)] = CVT(mmrs_[mmrc_ - 1]);            \
+    } while (0)
+
 /* Scatter a row-major [n0.., k0..] tile into a WEIGHT cube of granule (KG, NG). */
 #define MM_WT_SCATTER(DT, ST, KG, NG, IDX, slot, src, sstride, n0, k0, NT, KT, CVT)      \
     do {                                                                                 \
-        const int mmC_ = (KT), mmng_ = (KT) / (KG);                                      \
-        for (int mmk_ = 1; mmk_ <= (NT); mmk_++) {                                       \
-            const ST *mms_ = (src) + (size_t)((n0) + mmk_ - 1) * (size_t)(sstride) + (k0); \
-            DT *mmd_ = (DT *)(slot) + (size_t)((mmk_ - 1) / (NG)) * (NG) * (size_t)mmC_  \
-                                    + (size_t)((mmk_ - 1) % (NG)) * (KG);                \
-            for (int mmg_ = 0; mmg_ < mmng_; mmg_++) {                                   \
-                DT *restrict mmdg_ = mmd_ + (size_t)mmg_ * (KG) * (NG);                  \
-                const ST *restrict mmsg_ = mms_ + (size_t)mmg_ * (KG);                   \
-                for (int mmj_ = 0; mmj_ < (KG); mmj_++) mmdg_[mmj_] = CVT(mmsg_[mmj_]);  \
-            }                                                                            \
-            for (int mmc_ = mmng_ * (KG) + 1; mmc_ <= (KT); mmc_++)    /* KT%KG tail */  \
-                ((DT *)(slot))[IDX(mmC_, mmk_, mmc_)] = CVT(mms_[mmc_ - 1]);             \
-        }                                                                                \
+        for (int mmk_ = 1; mmk_ <= (NT); mmk_++)                                         \
+            MM_WT_SCATTER_ROW(DT, ST, KG, NG, IDX, slot,                                 \
+                              (src) + (size_t)((n0) + mmk_ - 1) * (size_t)(sstride) + (k0), \
+                              mmk_, KT, CVT);                                            \
     } while (0)
 
 /* Scatter a row-major conv weight W[OC][IC][KH][KW] into the conv weight cube

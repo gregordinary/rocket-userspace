@@ -93,7 +93,7 @@ static void pfor(int n, int nt, void (*fn)(void *, int, int), void *arg)
         if (lo >= n) break;
         if (hi > n) hi = n;
         r[spawned] = (mb_range){ fn, arg, lo, hi, spawned, base };
-        if (pthread_create(&th[spawned], NULL, mb_thunk, &r[spawned]) == 0) spawned++;
+        if (rocket_thread_create_pinned(&th[spawned], mb_thunk, &r[spawned], spawned, base) == 0) spawned++;
         else fn(arg, lo, hi);
     }
     for (int i = 0; i < spawned; i++) pthread_join(th[i], NULL);

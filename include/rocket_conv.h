@@ -560,9 +560,15 @@ void rocket_conv_transpose2d_ref_fp16(const rocket_conv_transpose2d_desc *d,
  * layers on the same board (paired within each pass; the thinnest margin is up1, 0.58x,
  * 8 MB of weight read for 4 MMAC) and 0.02-0.29x rocket_conv_transpose2d_fp16_ctx's, which
  * refuses up2-up5 [HW sweep, mainline RK1 at 600 MHz, rocket 1.3.0, governor performance,
- * taskset -c 4-7 against ORT on 6-7, 2026-09-27, tests/ct_model_bench.c]. The GEMM is
- * 69-87% of the call at up4-up8 and SAM, and the single-threaded scatter-add the rest
- * (2.7 ms at up7, 1.6 at SAM's second upscaler).
+ * taskset -c 4-7 against ORT on 6-7, 2026-09-27, tests/ct_model_bench.c]. Those times
+ * took the scatter-add on one thread: the GEMM was 69-87% of the call at up4-up8 and SAM
+ * and the scatter the rest (2.7 ms at up7, 1.6 at SAM's second upscaler). The scatter now
+ * splits the output channels across the context's worker count of threads
+ * (ROCKET_CT_SCATTER_THREADS overrides it; one thread below 2^16 output elements), which
+ * takes it to 0.45-0.47x its one-thread time at up6 and up7, 0.56-0.57x at SAM's
+ * upscalers and 0.6-0.8x at up8 [HW sweep, RK1 at 600 MHz, governor ondemand, two passes,
+ * ROCKET_CONV_PROFILE, 2026-10-08]. Through ONNX Runtime it takes pix2pix's wall to
+ * 0.946-0.972x.
  *
  * REFUSALS (_prepacked_plan, pure): ROCKET_E_SHAPE for an invalid descriptor, -3 for an
  * empty output, ROCKET_E_UNSUPPORTED for a DEPTHWISE transpose (no GEMM; the one-shot
@@ -585,6 +591,91 @@ int rocket_conv_transpose2d_fp16_prepacked(struct rocket_ctx *ctx,
                                            const _Float16 *in, _Float16 *out);
 void rocket_conv_transpose2d_weights_free(struct rocket_ctx *ctx,
                                           rocket_conv_transpose2d_weights *w);
+
+/* ---- the resident-weight forward conv (im2col over the resident fp16 matmul) ----------
+ * The entry for a model that runs the same convolution repeatedly. It is a host unfold and
+ * one GEMM: the input unfolded into IC*KH*KW planes of the OH*OW output pixels,
+ *
+ *   A[(ic,ky,kx)][oy*OW + ox] = in[ic][oy*sy + ky*dy - pad_top][ox*sx + kx*dx - pad_left]
+ *
+ * (zero outside the input), times the weight as it is stored, [OC][IC*KH*KW], gives the
+ * output as OC planes of OH*OW pixels, which is its own layout. The GEMM is the resident
+ * fp16 matmul (rocket_matmul.h's rocket_ctx), its weight packed ONCE into the handle and
+ * fanned across the context's worker fds (split along M where the unfolded input outweighs
+ * the weight, along N otherwise; ROCKET_CONV_SPLIT=m|n forces one), with the planes
+ * interleaved straight into its input cube and its output cube de-interleaved straight
+ * into the output, so neither side takes a host transpose.
+ *
+ *   ctx = rocket_ctx_create(3);
+ *   w   = rocket_conv2d_weights_pack(ctx, &desc, W, bias);   // bias may be NULL
+ *   ... per call:
+ *       rocket_conv2d_fp16_prepacked(ctx, w, in, out);
+ *   rocket_conv2d_weights_free(ctx, w);                     // before the ctx
+ *   rocket_ctx_free(ctx);
+ *
+ * Layouts are rocket_conv2d_fp16's (in [IC][IH][IW], W [OC][IC][KH][KW], out
+ * [OC][OH][OW]); `bias` is [OC]. An explicit desc->oh / desc->ow is honoured, its trailing
+ * pad read as zeros. The unfold runs on the context's worker count of threads
+ * (ROCKET_IM2COL_THREADS overrides it), one thread below 2^17 unfolded elements; a 1x1
+ * kernel at stride 1 with no pad reads the input in place and unfolds nothing. The handle
+ * copies what it needs at pack time and never reads W or bias again: a changed weight is a
+ * new pack. It holds the descriptor, the resident weight (context worker count x the
+ * weight's bytes under the M split, 1x under the N split), the unfold buffer (IC*KH*KW x
+ * OH*OW fp16) and, when OC is not a multiple of 16 or OH*OW of 4, a staging buffer for the
+ * GEMM's padded output. It is tied to the context it was packed on. Not thread-safe, as
+ * the context.
+ *
+ * ACCURACY. Each output is an fp32 sum of exact fp16 products rounded to fp16 once per K
+ * tile of the matmul; a bias is added to that fp16 value in fp32 and the sum rounded once
+ * more. So an output is within a few fp16 roundings of its own magnitude sum (mag = sum
+ * over taps of |x*w|, plus |bias|). Measured at pix2pix's eight encoder layers and three
+ * Depth Anything v2 shapes with real-valued data and a bias, against an fp64 reference:
+ * worst |err| / mag 2^-14.8 to 2^-11.0 per layer, under a gated 2^-9; with integer data
+ * whose partials and sums stay below 2048, bit-exact to rocket_conv2d_ref_fp16 at 18 sweep
+ * shapes (stride 1-3 per axis, pads 0-3 per axis, dilation 2, an explicit extent, 1x1 in
+ * place and at stride 2, a patch embedding, 1xK and Kx1, IC 3, OC and OH*OW off their
+ * alignment) under one and three unfold threads, and at all eleven layers under both worker
+ * splits and ROCKET_KACC=0 [HW sweep, RK1 at 600 MHz, rocket 1.3.0, 2026-10-08,
+ * tests/conv_resident.c].
+ *
+ * COST. Per call, warm medians of 9 over two passes, the weight packed outside the timing, a
+ * three-worker context: pix2pix's layers c1-c8 2.29, 5.78, 4.27, 3.00, 2.71, 1.55, 1.27 and
+ * 1.10 ms, which is 0.21-0.62x ONNX Runtime 1.27.0's 4-thread per-node time on the same
+ * board at c2-c8 and 1.16x at c1 (three input channels: 50 MMAC over 16384 pixels); Depth
+ * Anything v2-small's neck at 518x518, 0.12-1.43x, losing at its 19x19 and 37x37 3x3 convs
+ * and winning 8.2x at its 3x3 stride-2 one [HW sweep, mainline RK1 at 600 MHz, governor
+ * ondemand, the CPU arm profiled at allow_spinning 0 on the A76s, 2026-10-08,
+ * tests/conv_model_bench.c]. The unfold is the host's share; a frontend adds its own
+ * conversions. rocket_conv2d_prepacked_estimate_ms() below models these times.
+ *
+ * REFUSALS (_prepacked_plan, pure): ROCKET_E_SHAPE for an invalid descriptor, -3 for an
+ * empty output, ROCKET_E_UNSUPPORTED for a DEPTHWISE conv (no GEMM; rocket_conv2d_fp16
+ * runs it) and on any part but the RK3588, and -4 when OH*OW, IC*KH*KW or OC passes 2^24,
+ * when the unfold buffer or the staging buffer would pass 64 MiB, or when the matmul's
+ * plan refuses the GEMM. A plan of 0 runs; what can still fail at run time is an
+ * allocation.
+ *
+ * _pack returns NULL on a refused descriptor or a failed allocation; _prepacked returns 0,
+ * or <0 with the matmul's or the arguments' reason. */
+typedef struct rocket_conv2d_weights rocket_conv2d_weights;
+
+int rocket_conv2d_prepacked_plan(const rocket_conv2d_desc *d);
+/* An ESTIMATE of one rocket_conv2d_fp16_prepacked call in ms, for a frontend deciding
+ * whether to claim a node; <0 where the plan refuses. Pure. A linear model in the GEMM's
+ * aligned M, K and N (a fixed term, the unfold's writes, the input, output and weight
+ * cubes, the MACs), fitted to the warm median of 21 shapes on a three-worker context:
+ * pix2pix's eight encoder layers, Depth Anything v2-small's neck at 518x518 (1x1 and 3x3,
+ * stride 1 and 2, 19x19 to 296x296) and the DINOv2 patch embedding, where it lands within
+ * 0.78-1.20x of the measured time [HW sweep, mainline RK1 at 600 MHz, rocket 1.3.0,
+ * governor ondemand, 2026-10-08, tests/conv_model_bench.c]. A model, not a measurement:
+ * another clock, worker count or governor moves every term, and a shape far outside the
+ * fit set may land outside that spread. */
+double rocket_conv2d_prepacked_estimate_ms(const rocket_conv2d_desc *d);
+rocket_conv2d_weights *rocket_conv2d_weights_pack(struct rocket_ctx *ctx, const rocket_conv2d_desc *d,
+                                                  const _Float16 *W, const _Float16 *bias);
+int rocket_conv2d_fp16_prepacked(struct rocket_ctx *ctx, rocket_conv2d_weights *w,
+                                 const _Float16 *in, _Float16 *out);
+void rocket_conv2d_weights_free(struct rocket_ctx *ctx, rocket_conv2d_weights *w);
 
 /* ---- RK3576: the per-chip convolution entries ------------------------------
  * The RK3576 NPU is the same IP family and runs through the same uAPI, but its

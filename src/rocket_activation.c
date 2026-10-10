@@ -691,7 +691,8 @@ int rocket_leaky_relu_fp16(int fd, float alpha, const _Float16 *in, _Float16 *ou
     const double S = (double)(1u << Sexp);
 
     const int np = (n + 7) & ~7;
-    static uint16_t lut[1026];
+    uint16_t lut[1026];                   /* stack-local: the table depends on alpha and R, so a
+                                             function-static buffer would race across threads */
     build_lut_leaky((double)alpha, index_scale, out_lo, S, lut);
 
     lut_act_params_t p = {0};
@@ -892,7 +893,9 @@ static int elu_run(int fd, double alpha, double lambda, const _Float16 *in, _Flo
     int Sexp = 0; while ((double)(1u << Sexp) < need) Sexp++;
     const double S = (double)(1u << Sexp);
 
-    static uint16_t lut[1026];
+    uint16_t lut[1026];                   /* stack-local: ELU and SELU share this body with
+                                             different tables, so a function-static buffer
+                                             would race across threads */
     build_lut_shifted_elu(alpha, lambda, x_lo, x_hi, out_lo, S, lut);
 
     lut_act_params_t p = {0};

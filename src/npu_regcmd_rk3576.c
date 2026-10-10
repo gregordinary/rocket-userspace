@@ -74,6 +74,7 @@
  */
 
 #include <limits.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -892,6 +893,15 @@ static void r76_cbuf_rungs_from_env(void)
     if (n) r76_cbuf_f_nrungs = n;
 }
 
+/* The rung override is read once, through pthread_once: the table is several words that a
+ * second thread must not see half-written, and every planner call on any thread reads it. */
+static pthread_once_t r76_cbuf_rungs_once = PTHREAD_ONCE_INIT;
+
+static void r76_cbuf_rungs_init(void)
+{
+    pthread_once(&r76_cbuf_rungs_once, r76_cbuf_rungs_from_env);
+}
+
 /* ---- The CBUF base, and the RE knob that moves it ----
  *
  * The low half of CNA_CBUF_ENTRIES (0x103c) and of CNA_CBUF_CON0 (0x1040) is a
@@ -1085,14 +1095,6 @@ static inline unsigned r76_weight_slice_cap_at(unsigned oc, unsigned f)
  * packed image expanded to 4 lanes, and its weight cube is folded — so the public
  * entry point below computes them the normal-path way and the ARGB emitter computes
  * its own. `wbytes` of 0 skips the weight-side guards (nothing resident to weigh). */
-static void r76_cbuf_rungs_init(void)
-{
-    static int done;
-    if (done) return;
-    done = 1;
-    r76_cbuf_rungs_from_env();
-}
-
 static int r76_plan_cbuf(unsigned entries, unsigned ih, unsigned oc, unsigned wbytes,
                          int dw, unsigned *f_out)
 {

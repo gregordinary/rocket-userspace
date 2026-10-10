@@ -50,6 +50,9 @@
 #include "rocket_hw_profile.h"
 #include "rocket_matmul.h"
 #include "rocket_matmul_internal.h"   /* the resident matmul's channel-planes form */
+#include "rocket_npu.h"
+#include "rocket_affinity.h"
+#include "rocket_fanout.h"
 #include "rocket_log.h"
 
 /* ============================================================================
@@ -300,12 +303,18 @@ int rocket_conv_transpose2d_fp16_ctx(rocket_conv_ctx *ctx,
  * exactly one phase at a constant offset, so each tap is a run of contiguous row adds;
  * one final pass interleaves the phases into the output row and narrows it to fp16. A
  * kernel equal to its stride with no pad (SAM's upscalers) puts each output pixel under
- * one tap, and that case is a straight interleave of the planes.
+ * one tap, and that case is a straight interleave of the planes. Output channels are
+ * independent, so the scatter splits them across the context's worker count of threads,
+ * each with its own phase planes.
  * ==========================================================================*/
 
 /* The intermediate P is KH*KW/(sy*sx) times the output; past this the plan refuses rather
  * than allocate it (a banded GEMM would lift the bound; nothing measured needs it). */
 #define CT_SCRATCH_MAX ((size_t)64 << 20)
+/* Below this many output elements the scatter runs on the calling thread: a thread's spawn
+ * and join cost more than its share. */
+#define CT_SCATTER_MT_MIN ((size_t)1 << 16)
+#define CT_SCATTER_MAX_THREADS 8
 
 struct rocket_conv_transpose2d_weights {
     rocket_conv_transpose2d_desc d;
@@ -315,7 +324,9 @@ struct rocket_conv_transpose2d_weights {
     struct rocket_weights *w;    /* resident B = W^T */
     int split_m;                 /* the workers split M (1) or N (0) */
     _Float16 *ct;                /* P, N planes of M */
-    float *acc;                  /* the phase planes of one output channel */
+    int nthr;                    /* scatter threads */
+    size_t acc_n;                /* one output channel's phase planes, floats */
+    float *acc;                  /* nthr sets of acc_n */
     float *bias;                 /* OC entries, or NULL */
 };
 
@@ -374,20 +385,33 @@ int rocket_conv_transpose2d_prepacked_plan(const rocket_conv_transpose2d_desc *d
 /* Which way the context's workers split the GEMM. Under the N split the calling thread
  * packs all of A once, every worker copies it into its own BO and the NPU reads it once
  * per worker; under the M split each worker packs and reads only its rows, in parallel,
- * and holds all of B. The M split is taken once every worker has at least one whole
- * max_tile of rows and the replicated weight stays within CT_SPLIT_M_WT_MAX. Against the
- * N split, per call: 0.88x at M = 1024 (pix2pix up6, where B is twice A), 0.92x at 4096
- * (up7), 0.51x at 16384 (up8), 0.70x and 0.67x at SAM's 4096 and 16384 [HW sweep, RK1,
- * three rotated passes, 2026-09-27, tests/ct_model_bench.c]; 1.2-2.5x at M <= 256
- * (pix2pix up1-up5, one pass). ROCKET_CT_SPLIT=m|n forces one. */
+ * and holds all of B, which the NPU then reads once per worker. So the N split re-reads A
+ * and the M split re-reads B. The M split is taken when every worker has at least
+ * CT_SPLIT_M_ROWS rows, B is at most CT_SPLIT_M_BA times A (N <= 4M), and the replicated
+ * weight stays within CT_SPLIT_M_WT_MAX. Against the N split, per call [HW sweep, RK1 at
+ * 600 MHz, tests/ct_model_bench.c and tests/conv_model_bench.c]:
+ *
+ *   transposed (2026-09-27, three rotated passes, pinned): 0.88x at M = 1024 (pix2pix
+ *   up6, B twice A), 0.92x at 4096 (up7), 0.51x at 16384 (up8), 0.70x and 0.67x at SAM's
+ *   4096 and 16384; 1.2-2.5x at M <= 256 (up1-up5, one pass), where B is 16x A or more.
+ *   forward (2026-10-08, governor ondemand, two calls of 9 each): 0.42-0.65x at M 256-1372
+ *   with N 64-512 (pix2pix c3 and c4, Depth Anything's neck at 19x19 and 37x37, where the
+ *   N split's per-worker A copy cost 2-4x) and 0.88-0.94x at the ViT patch embedding (M
+ *   196, N 768); 1.3-1.9x at M <= 64 with N 512 (pix2pix c5-c8, 21 rows a worker or
+ *   fewer).
+ *
+ * `env` (ROCKET_CT_SPLIT for the transposed entry, ROCKET_CONV_SPLIT for the forward one)
+ * set to m or n forces one. */
 #define CT_SPLIT_M_WT_MAX ((size_t)64 << 20)
-static int ct_split_m(struct rocket_ctx *ctx, int M, int K, int N)
+#define CT_SPLIT_M_ROWS 64
+#define CT_SPLIT_M_BA 4
+int rocket_conv_resident_split_m(struct rocket_ctx *ctx, int M, int K, int N, const char *env)
 {
-    const char *e = getenv("ROCKET_CT_SPLIT");
+    const char *e = env ? getenv(env) : NULL;
     if (e && (*e == 'm' || *e == 'M')) return 1;
     if (e && (*e == 'n' || *e == 'N')) return 0;
     const int nt = rocket_ctx_nthreads(ctx);
-    return nt > 1 && M / nt >= rocket_hw_current()->max_tile &&
+    return nt > 1 && M / nt >= CT_SPLIT_M_ROWS && (long long)N <= (long long)CT_SPLIT_M_BA * M &&
            (size_t)nt * K * N * sizeof(_Float16) <= CT_SPLIT_M_WT_MAX;
 }
 
@@ -417,7 +441,15 @@ rocket_conv_transpose2d_weights_pack(struct rocket_ctx *ctx, const rocket_conv_t
     /* B[n][ic] = W[ic][n]: the stored weight is B^T. Pack-time only. */
     _Float16 *B = calloc((size_t)h->N * h->K, sizeof *B);
     h->ct = malloc((size_t)h->N * h->M * sizeof *h->ct);
-    h->acc = malloc((size_t)d->stride_y * d->stride_x * h->QH * h->QW * sizeof *h->acc);
+    int nthr = rocket_ctx_nthreads(ctx);
+    const char *e = getenv("ROCKET_CT_SCATTER_THREADS");
+    if (e && atoi(e) >= 1) nthr = atoi(e);
+    if (nthr > CT_SCATTER_MAX_THREADS) nthr = CT_SCATTER_MAX_THREADS;
+    if (nthr > d->oc) nthr = d->oc;
+    if ((size_t)d->oc * h->OH * h->OW < CT_SCATTER_MT_MIN || nthr < 1) nthr = 1;
+    h->nthr = nthr;
+    h->acc_n = (size_t)d->stride_y * d->stride_x * h->QH * h->QW;
+    h->acc = malloc((size_t)nthr * h->acc_n * sizeof *h->acc);
     if (bias) h->bias = malloc((size_t)d->oc * sizeof *h->bias);
     if (!B || !h->ct || !h->acc || (bias && !h->bias)) goto fail;
     for (int ic = 0; ic < IC; ic++) {
@@ -426,7 +458,7 @@ rocket_conv_transpose2d_weights_pack(struct rocket_ctx *ctx, const rocket_conv_t
     }
     if (bias)
         for (int oc = 0; oc < d->oc; oc++) h->bias[oc] = (float)bias[oc];
-    h->split_m = ct_split_m(ctx, h->M, h->K, h->N);
+    h->split_m = rocket_conv_resident_split_m(ctx, h->M, h->K, h->N, "ROCKET_CT_SPLIT");
     h->w = rocket_weights_pack_split(ctx, h->M, h->K, h->N, B, h->split_m);
     if (!h->w) goto fail;
     free(B);
@@ -481,16 +513,17 @@ static inline void ct_emit_row(_Float16 *restrict o, const float *restrict a, si
     for (; pw < OW; pw++) o[pw] = (_Float16)a[(size_t)(pw % sx) * pstride + pw / sx];
 }
 
-/* The general scatter-add, one output channel at a time over its phase planes. */
-static void ct_col2im(const rocket_conv_transpose2d_weights *h, _Float16 *out)
+/* The general scatter-add of output channels [oc0, oc1), one at a time over its phase
+ * planes in `acc`. */
+static void ct_col2im(const rocket_conv_transpose2d_weights *h, _Float16 *out, int oc0, int oc1,
+                      float *acc)
 {
     const rocket_conv_transpose2d_desc *d = &h->d;
     const int IH = d->ih, IW = d->iw, KH = d->kh, KW = d->kw, sy = d->stride_y, sx = d->stride_x;
     const int OH = h->OH, OW = h->OW, QH = h->QH, QW = h->QW;
     const size_t M = (size_t)h->M, plane = (size_t)QH * QW;
-    float *acc = h->acc;
 
-    for (int oc = 0; oc < d->oc; oc++) {
+    for (int oc = oc0; oc < oc1; oc++) {
         const float b0 = h->bias ? h->bias[oc] : 0.0f;
         for (size_t i = 0; i < (size_t)sy * sx * plane; i++) acc[i] = b0;
         for (int kh = 0; kh < KH; kh++) {
@@ -530,12 +563,12 @@ static int ct_is_shuffle(const rocket_conv_transpose2d_desc *d)
            d->opad_x == 0;
 }
 
-static void ct_shuffle(const rocket_conv_transpose2d_weights *h, _Float16 *out)
+static void ct_shuffle(const rocket_conv_transpose2d_weights *h, _Float16 *out, int oc0, int oc1)
 {
     const rocket_conv_transpose2d_desc *d = &h->d;
     const int IH = d->ih, IW = d->iw, sy = d->stride_y, sx = d->stride_x, OW = h->OW;
     const size_t M = (size_t)h->M;
-    for (int oc = 0; oc < d->oc; oc++) {
+    for (int oc = oc0; oc < oc1; oc++) {
         const float b0 = h->bias ? h->bias[oc] : 0.0f;
         for (int kh = 0; kh < sy; kh++) {
             const _Float16 *P = h->ct + (size_t)(oc * sy + kh) * sx * M;
@@ -575,6 +608,43 @@ static void ct_shuffle(const rocket_conv_transpose2d_weights *h, _Float16 *out)
     }
 }
 
+typedef struct {
+    const rocket_conv_transpose2d_weights *h;
+    _Float16 *out;
+    int oc0, oc1;
+    int idx, core_base;
+} ct_scatter_arg;
+
+static void ct_scatter_range(const rocket_conv_transpose2d_weights *h, _Float16 *out, int oc0,
+                             int oc1, int idx)
+{
+    if (ct_is_shuffle(&h->d)) ct_shuffle(h, out, oc0, oc1);
+    else                      ct_col2im(h, out, oc0, oc1, h->acc + (size_t)idx * h->acc_n);
+}
+
+static void *ct_scatter_thread(void *a)
+{
+    ct_scatter_arg *t = a;
+    rocket_pin_worker_based(t->idx, t->core_base);
+    ct_scatter_range(t->h, t->out, t->oc0, t->oc1, t->idx);
+    return NULL;
+}
+
+static void ct_scatter(const rocket_conv_transpose2d_weights *h, _Float16 *out)
+{
+    const int OC = h->d.oc, nt = h->nthr;
+    if (nt <= 1) {
+        ct_scatter_range(h, out, 0, OC, 0);
+        return;
+    }
+    ct_scatter_arg args[CT_SCATTER_MAX_THREADS];
+    const int base = rocket_affinity_get_base();
+    for (int t = 0; t < nt; t++)
+        args[t] = (ct_scatter_arg){ h, out, (int)((long)OC * t / nt), (int)((long)OC * (t + 1) / nt),
+                                    t, base };
+    rocket_fanout_run(nt, args, sizeof args[0], ct_scatter_thread);
+}
+
 int rocket_conv_transpose2d_fp16_prepacked(struct rocket_ctx *ctx, rocket_conv_transpose2d_weights *h,
                                            const _Float16 *in, _Float16 *out)
 {
@@ -591,8 +661,7 @@ int rocket_conv_transpose2d_fp16_prepacked(struct rocket_ctx *ctx, rocket_conv_t
                                                 d->ic, h->ct, h->w);
     if (r) return r;
     const double t1 = prof ? ct_now_ms() : 0.0;
-    if (ct_is_shuffle(d)) ct_shuffle(h, out);
-    else                  ct_col2im(h, out);
+    ct_scatter(h, out);
     if (prof) ct_prof_add(t1 - t0, ct_now_ms() - t1);
     return 0;
 }

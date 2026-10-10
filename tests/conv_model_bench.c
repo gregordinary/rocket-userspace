@@ -14,15 +14,20 @@
  *            form with the weight packed once on a three-worker rocket_ctx (outside the
  *            timing). Its output planes are the conv's [OC][OH][OW] directly. The unfold
  *            and the GEMM are timed apart.
+ *   resident rocket_conv2d_fp16_prepacked on the same context, the library's form of the
+ *            im2col arm: its unfold threaded, the weight packed once outside the timing.
+ *
+ * Shapes past pix2pix's eight are Depth Anything v2-small's neck and head convolutions at
+ * 518x518 (those whose unfold fits the entry's 64 MiB bound) and two ViT patch embeddings.
  *
  * Each arm: one warm-up call discarded, then `reps` timed calls, median and minimum, and
  * the output scored once against rocket_conv2d_ref_fp16 as worst |err| over the element's
  * magnitude sum. Not a gate: the verdict is the table, read against the CPU's time for the
  * same layer.
  *
- * Usage: conv_model_bench [reps] [shape|-1] [arms: 1 direct, 2 im2col, 3 both] [order]
- *                         [split: -1 auto, 0 N, 1 M]
- *   `order` 1 runs the im2col arm first within each shape. Exit 2 without a device or off
+ * Usage: conv_model_bench [reps] [shape|-1] [arms: bits 1 direct, 2 im2col, 4 resident]
+ *                         [order] [split: -1 auto, 0 N, 1 M]
+ *   `order` 1 runs the arms in reverse within each shape. Exit 2 without a device or off
  *   the RK3588.
  */
 #include <math.h>
@@ -47,6 +52,21 @@ static const shape_t SH[] = {
     { "pix2pix c6 512x8x8->512",    512,   8,   8, 512, 4, 2, 1 },
     { "pix2pix c7 512x4x4->512",    512,   4,   4, 512, 4, 2, 1 },
     { "pix2pix c8 512x2x2->512",    512,   2,   2, 512, 4, 2, 1 },
+    { "DA reasm3 384x37x37 k3s2",   384,  37,  37, 384, 3, 2, 1 },
+    { "DA proj 384x37x37 1x1->384", 384,  37,  37, 384, 1, 1, 0 },
+    { "DA convs0 48x148x148->64",    48, 148, 148,  64, 3, 1, 1 },
+    { "DA convs1 96x74x74->64",      96,  74,  74,  64, 3, 1, 1 },
+    { "DA convs2 192x37x37->64",    192,  37,  37,  64, 3, 1, 1 },
+    { "DA convs3 384x19x19->64",    384,  19,  19,  64, 3, 1, 1 },
+    { "DA fuse 64x19x19 3x3",        64,  19,  19,  64, 3, 1, 1 },
+    { "DA fuse 64x37x37 3x3",        64,  37,  37,  64, 3, 1, 1 },
+    { "DA fuse 64x74x74 3x3",        64,  74,  74,  64, 3, 1, 1 },
+    { "DA fuse 64x148x148 3x3",      64, 148, 148,  64, 3, 1, 1 },
+    { "DA fproj 64x148x148 1x1",     64, 148, 148,  64, 1, 1, 0 },
+    { "DA fproj 64x296x296 1x1",     64, 296, 296,  64, 1, 1, 0 },
+    { "DA head1 64x296x296->32",     64, 296, 296,  32, 3, 1, 1 },
+    { "ViT patch 3x224 k16s16",       3, 224, 224, 768,16,16, 0 },
+    { "DINOv2 patch 3x518 k14s14",    3, 518, 518, 384,14,14, 0 },
 };
 #define NSH ((int)(sizeof SH / sizeof SH[0]))
 
@@ -126,15 +146,19 @@ int main(int argc, char **argv)
     const int order = argc > 4 ? atoi(argv[4]) : 0;
     const int force_split = argc > 5 ? atoi(argv[5]) : -1;
     const int do_score = getenv("CMB_NOSCORE") == NULL;
+    /* CMB_SLEEP_MS: an idle gap before each timed resident call, untimed, the way a model's other
+     * operators separate one layer's calls (the governor and the device's idle states see it). */
+    const int sleep_ms = getenv("CMB_SLEEP_MS") ? atoi(getenv("CMB_SLEEP_MS")) : 0;
     if (!hw || strcmp(hw->name, "rk3588")) { printf("not an RK3588; skipping\n"); return 2; }
     int fd = rocket_open();
     if (fd < 0) { printf("SKIP: no /dev/accel/accel0\n"); return 2; }
     rocket_conv_ctx *cctx = rocket_conv_ctx_create(fd);
-    rocket_ctx *mctx = (arms & 2) ? rocket_ctx_create(3) : NULL;
-    if ((arms & 2) && !mctx) { printf("rocket_ctx_create failed\n"); return 1; }
+    rocket_ctx *mctx = (arms & 6) ? rocket_ctx_create(3) : NULL;
+    if ((arms & 6) && !mctx) { printf("rocket_ctx_create failed\n"); return 1; }
     int bad = 0;
     printf("conv_model_bench: %d reps after one warm-up; direct = rocket_conv2d_fp16_ctx, "
-           "im2col = host unfold + resident planes matmul on 3 workers\n", reps);
+           "im2col = host unfold + resident planes matmul on 3 workers, resident = "
+           "rocket_conv2d_fp16_prepacked\n", reps);
     printf("  %-28s %-9s %9s %9s %9s %9s %8s %10s\n", "shape", "arm", "median", "min",
            "unfold", "gemm", "GMAC", "err/mag");
     for (int i = 0; i < NSH; i++) {
@@ -158,9 +182,31 @@ int main(int argc, char **argv)
         for (size_t j = 0; j < nw; j++)
             W[j] = (_Float16)(((double)rand() / RAND_MAX * 2.0 - 1.0) * wsc);
         const double gmac = (double)no * s->ic * s->k * s->k / 1e9;
-        for (int step = 0; step < 2; step++) {
-            const int arm = (step == 0) == (order == 0) ? 1 : 2;
+        for (int step = 0; step < 3; step++) {
+            const int arm = 1 << (order ? 2 - step : step);
             if (!(arms & arm)) continue;
+            if (arm == 4) {
+                const int plan = rocket_conv2d_prepacked_plan(&d);
+                rocket_conv2d_weights *rw = plan ? NULL : rocket_conv2d_weights_pack(mctx, &d, W, NULL);
+                if (!rw) { printf("  %-28s resident  refused or failed (%d)\n", s->name, plan); bad++; continue; }
+                int ok = rocket_conv2d_fp16_prepacked(mctx, rw, in, out) == 0;
+                for (int r = 0; ok && r < reps; r++) {
+                    if (sleep_ms > 0) {
+                        struct timespec ts = { sleep_ms / 1000, (long)(sleep_ms % 1000) * 1000000L };
+                        nanosleep(&ts, NULL);
+                    }
+                    double t0 = now_ms();
+                    if (rocket_conv2d_fp16_prepacked(mctx, rw, in, out)) { ok = 0; break; }
+                    t[r] = now_ms() - t0;
+                }
+                rocket_conv2d_weights_free(mctx, rw);
+                if (!ok) { printf("  %-28s resident  a call FAILED\n", s->name); bad++; continue; }
+                double e = do_score ? score(&d, OH, OW, in, W, out, (size_t)OH * OW, NULL) : -1;
+                qsort(t, (size_t)reps, sizeof *t, cmp_d);
+                printf("  %-28s %-9s %7.2fms %7.2fms %9s %9s %8.3f %10.3g\n", s->name, "resident",
+                       t[reps / 2], t[0], "-", "-", gmac, e);
+                continue;
+            }
             if (arm == 1) {
                 int rc = rocket_conv2d_plan(&d);
                 if (!rc) rc = rocket_conv2d_fp16_ctx(cctx, &d, in, W, out);

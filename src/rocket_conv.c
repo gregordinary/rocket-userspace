@@ -2056,7 +2056,7 @@ static int conv2d_int8_dispatch(int fd, rocket_conv_ctx *ctx, rocket_conv_pool *
                                  tiles, ntiles, batch ? cstart : w, batch ? 1 : nw,
                                  sub_in_sz, sub_out_elems, w, 0, batch, wcount, affbase, q };
             cstart += wcount;
-            if (pthread_create(&th[w], NULL, i8_worker, &args[w]) == 0) joinable[w] = 1;
+            if (rocket_thread_create_pinned(&th[w], i8_worker, &args[w], w, affbase) == 0) joinable[w] = 1;
             else i8_worker(&args[w]);            /* spawn failed -> run this slice inline */
         }
         for (int w = 0; w < nw; w++) {

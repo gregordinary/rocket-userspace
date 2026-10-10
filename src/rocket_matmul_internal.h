@@ -21,6 +21,18 @@
 #include "rocket_log.h"     // centralized log channel
 
 /* ============================================================================
+ * SECTION — the dimension envelope
+ * ==========================================================================*/
+
+/* Upper bound on a single matmul dimension, shared by every part's planner. The
+ * tile-count math (M+Mt-1 etc., with Mt/Nt <= MAX_TILE and Kt <= 16384) is computed in
+ * signed int, so a dimension within a tile of INT_MAX would overflow BEFORE the
+ * nm*nn*nk product guard catches it. This cap sits far above any real matmul dim (~64x
+ * the largest model vocab/FFN) and far below that overflow edge, so it only rejects
+ * pathological/adversarial inputs. */
+#define ROCKET_MM_DIM_MAX (1 << 24)
+
+/* ============================================================================
  * SECTION — regcmd-slot overflow guard
  * ==========================================================================*/
 

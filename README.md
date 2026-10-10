@@ -156,7 +156,7 @@ the two must expect all three:
 
 - int8 is the default matmul precision here. One int8 task contracts up to 4608 input
   channels, where an fp16 convolution task contracts sixteen.
-- The M axis carries no constraint at all, so `M=1` is simply correct.
+- The M axis carries no alignment constraint, so `M=1` is simply correct.
 - The output is int8 through the DPU's requant rather than raw int32.
 
 K past one task's contraction is split through `rocket_matmul_int8_rk3576_i32()`, which
@@ -378,7 +378,8 @@ ctest --test-dir build                               # correctness gates (skip o
 The default is `-O2`. `-DROCKETNPU_OPT_FLAGS="-O3;-mcpu=native;-DNDEBUG"` overrides it,
 though on the matmul path, which is memory-bound and gather-bound, these are flat within
 ±3%. Off-device the full build compiles on x86, with a portable `_Float16` and the NEON
-readback intrinsics `__aarch64__`-gated. `ctest` is green there with the NPU gates skipped.
+readback intrinsics `__aarch64__`-gated. The NEON microbenchmarks build only where the AArch64
+intrinsics compile. `ctest` is green there with the NPU gates skipped.
 `drm/rocket_accel.h` must be present, and CMake checks at configure time.
 
 Each file under `tests/` is a standalone executable that links the library and runs on the

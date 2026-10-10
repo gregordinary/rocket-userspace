@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 
 #include <math.h>
@@ -25,6 +26,7 @@
 #include "rocket_softmax.h"     /* rocket_softmax_fp16          */
 #include "rocket_npu.h"         /* rocket_open / rocket_close (aux fd) */
 #include "rocket_affinity.h"    /* rocket_pin_worker_based (keep host workers off the A55s) */
+#include "rocket_cube.h"        /* MM_NO_OVERLAP */
 #include "rocket_log.h"     // centralized log channel
 
 #define SIGLIP_MAGIC   0x53474C50
@@ -203,6 +205,15 @@ struct rocket_siglip_ctx {
      * stream. Unmasked (mask=NULL), n_kv_heads==n_head (plain MHA). Built unless
      * ROCKET_SIGLIP_FA=0; NULL => the single-stream per-head path. */
     rocket_fa_ctx  *fa;
+    /* Per-image host scratch, allocated zeroed once at create and reused by every encode. The
+     * zero regions it relies on are never written afterwards: the im2col tail columns
+     * [patch_dim, pdp) and the pad rows past L / ntok (host writes stop at ntok, and an NPU
+     * matmul writes row i from input row i, so a zero pad row stays zero). Allocating these per
+     * call cost a page fault per 4 KiB whenever another allocation in the process left glibc
+     * returning them to the kernel between images. */
+    _Float16 *patches, *xp, *x, *ln, *q, *k, *v, *cc, *y;
+    _Float16 *Qh, *Kh, *Vh, *Oh;        /* FA path: head-major operands */
+    _Float16 *qh, *khh, *vhT, *sc;      /* single-stream path: per-head gather + all scores */
 };
 
 /* per-layer weight pointers from the blob (same offsets as the encode loop above) */
@@ -232,17 +243,42 @@ static layer_ptrs unpack_layer(const rocket_siglip_model *m, int l)
  * ==========================================================================*/
 
 /* host elementwise (memory-bound, faster than an NPU round-trip once de-tiled) */
+
+/* The row sums run as LN_LANES independent float partial sums combined in a fixed order: GCC
+ * vectorizes that without reassociating anything, where one float (or double) accumulator stays
+ * scalar. The result does not depend on the thread or the run. */
+#define LN_LANES 8
+static float ln_sum(const _Float16 *x, int d)
+{
+    float acc[LN_LANES] = {0}, s = 0;
+    int j = 0;
+    for (; j + LN_LANES <= d; j += LN_LANES)
+        for (int k = 0; k < LN_LANES; k++) acc[k] += (float)x[j + k];
+    for (int k = 0; k < LN_LANES; k++) s += acc[k];
+    for (; j < d; j++) s += (float)x[j];
+    return s;
+}
+static float ln_sqdev(const _Float16 *x, int d, float mean)
+{
+    float acc[LN_LANES] = {0}, s = 0;
+    int j = 0;
+    for (; j + LN_LANES <= d; j += LN_LANES)
+        for (int k = 0; k < LN_LANES; k++) { float t = (float)x[j + k] - mean; acc[k] += t * t; }
+    for (int k = 0; k < LN_LANES; k++) s += acc[k];
+    for (; j < d; j++) { float t = (float)x[j] - mean; s += t * t; }
+    return s;
+}
 static void h_layernorm(int M, int d, const _Float16 *x, const _Float16 *g,
                         const _Float16 *b, float eps, _Float16 *out)
 {
     for (int i = 0; i < M; i++) {
         const _Float16 *xr = x + (size_t)i * d;
-        double mean = 0; for (int j = 0; j < d; j++) mean += (double)xr[j]; mean /= d;
-        double var = 0; for (int j = 0; j < d; j++) { double t = (double)xr[j] - mean; var += t * t; }
-        double inv = 1.0 / sqrt(var / d + eps);
+        const float mean = ln_sum(xr, d) / d;
+        const float inv = 1.f / sqrtf(ln_sqdev(xr, d, mean) / d + eps);
         _Float16 *o = out + (size_t)i * d;
+        MM_NO_OVERLAP
         for (int j = 0; j < d; j++)
-            o[j] = (_Float16)(((double)xr[j] - mean) * inv * (double)g[j] + (double)b[j]);
+            o[j] = (_Float16)(((float)xr[j] - mean) * inv * (float)g[j] + (float)b[j]);
     }
 }
 /* host parallel-for over [0,n): split into <=nt contiguous chunks (the host elementwise
@@ -283,7 +319,10 @@ static void parallel_for(int n, int nt, void (*fn)(void *, int, int), void *arg)
         if (hi > n) hi = n;
         r[spawned].fn = fn; r[spawned].arg = arg; r[spawned].lo = lo; r[spawned].hi = hi;
         r[spawned].idx = spawned; r[spawned].core_base = core_base;
-        if (pthread_create(&th[spawned], NULL, prange_thunk, &r[spawned]) == 0) spawned++;
+        const int rc = sl_pin_enabled()
+            ? rocket_thread_create_pinned(&th[spawned], prange_thunk, &r[spawned], spawned, core_base)
+            : pthread_create(&th[spawned], NULL, prange_thunk, &r[spawned]);
+        if (rc == 0) spawned++;
         else fn(arg, lo, hi);   /* spawn failed: run this chunk inline */
     }
     for (int i = 0; i < spawned; i++) pthread_join(th[i], NULL);
@@ -301,18 +340,18 @@ static inline _Float16 gelu1(_Float16 xv)
 /* fp16 GELU is a function of a 16-bit value, so all 65536 outputs fit one table. The LUT
  * is BIT-EXACT to the scalar tanhf path (it tabulates gelu1 over every fp16 bit pattern,
  * incl. inf/nan) and turns the hot per-element tanhf into a load — the host GELU is the
- * resident encode's #2 cost once attention is multicore. Built once (single-threaded entry
- * in h_gelu_tanh, before the parallel fan-out). ROCKET_SIGLIP_GELU_SCALAR=1 forces the
- * scalar path (A/B). */
+ * resident encode's #2 cost once attention is multicore. Built once, through pthread_once
+ * in h_gelu_tanh before the parallel fan-out, so two encodes on two threads neither build
+ * it twice nor read it half-built. ROCKET_SIGLIP_GELU_SCALAR=1 forces the scalar path
+ * (A/B). */
 static _Float16 g_gelu_lut[65536];
-static int      g_gelu_lut_ready;
+static pthread_once_t g_gelu_once = PTHREAD_ONCE_INIT;
 static void gelu_lut_build(void)
 {
     for (int u = 0; u < 65536; u++) {
         uint16_t bits = (uint16_t)u; _Float16 h; memcpy(&h, &bits, sizeof h);
         g_gelu_lut[u] = gelu1(h);
     }
-    g_gelu_lut_ready = 1;
 }
 static void gelu_range(void *a, int lo, int hi)
 {
@@ -330,7 +369,7 @@ static void gelu_range_scalar(void *a, int lo, int hi)
 static void h_gelu_tanh(size_t n, _Float16 *x, int nt)
 {
     if (getenv("ROCKET_SIGLIP_GELU_SCALAR")) { parallel_for((int)n, nt, gelu_range_scalar, x); return; }
-    if (!g_gelu_lut_ready) gelu_lut_build();   /* single-threaded, before the fan-out */
+    pthread_once(&g_gelu_once, gelu_lut_build);   /* before the fan-out */
     parallel_for((int)n, nt, gelu_range, x);
 }
 
@@ -343,14 +382,13 @@ static inline _Float16 quickgelu1(_Float16 xv)
     return (_Float16)(v / (1.f + expf(-1.702f * v)));
 }
 static _Float16 g_qgelu_lut[65536];
-static int      g_qgelu_lut_ready;
+static pthread_once_t g_qgelu_once = PTHREAD_ONCE_INIT;
 static void qgelu_lut_build(void)
 {
     for (int u = 0; u < 65536; u++) {
         uint16_t bits = (uint16_t)u; _Float16 h; memcpy(&h, &bits, sizeof h);
         g_qgelu_lut[u] = quickgelu1(h);
     }
-    g_qgelu_lut_ready = 1;
 }
 static void qgelu_range(void *a, int lo, int hi)
 {
@@ -368,7 +406,7 @@ static void qgelu_range_scalar(void *a, int lo, int hi)
 static void h_quick_gelu(size_t n, _Float16 *x, int nt)
 {
     if (getenv("ROCKET_SIGLIP_GELU_SCALAR")) { parallel_for((int)n, nt, qgelu_range_scalar, x); return; }
-    if (!g_qgelu_lut_ready) qgelu_lut_build();
+    pthread_once(&g_qgelu_once, qgelu_lut_build);
     parallel_for((int)n, nt, qgelu_range, x);
 }
 
@@ -381,14 +419,13 @@ static inline _Float16 erfgelu1(_Float16 xv)
     return (_Float16)(0.5f * v * (1.f + erff(v * inv_sqrt2)));
 }
 static _Float16 g_egelu_lut[65536];
-static int      g_egelu_lut_ready;
+static pthread_once_t g_egelu_once = PTHREAD_ONCE_INIT;
 static void egelu_lut_build(void)
 {
     for (int u = 0; u < 65536; u++) {
         uint16_t bits = (uint16_t)u; _Float16 h; memcpy(&h, &bits, sizeof h);
         g_egelu_lut[u] = erfgelu1(h);
     }
-    g_egelu_lut_ready = 1;
 }
 static void egelu_range(void *a, int lo, int hi)
 {
@@ -406,7 +443,7 @@ static void egelu_range_scalar(void *a, int lo, int hi)
 static void h_erf_gelu(size_t n, _Float16 *x, int nt)
 {
     if (getenv("ROCKET_SIGLIP_GELU_SCALAR")) { parallel_for((int)n, nt, egelu_range_scalar, x); return; }
-    if (!g_egelu_lut_ready) egelu_lut_build();
+    pthread_once(&g_egelu_once, egelu_lut_build);
     parallel_for((int)n, nt, egelu_range, x);
 }
 
@@ -421,7 +458,11 @@ static void h_mlp_act(const rocket_siglip_model *m, size_t n, _Float16 *x, int n
 static void h_add_bias(int M, int N, _Float16 *C, const _Float16 *b)
 {
     if (!b) return;
-    for (int i = 0; i < M; i++) { _Float16 *r = C + (size_t)i * N; for (int j = 0; j < N; j++) r[j] = (_Float16)((float)r[j] + (float)b[j]); }
+    for (int i = 0; i < M; i++) {
+        _Float16 *r = C + (size_t)i * N;
+        MM_NO_OVERLAP   /* C is scratch and b a model weight */
+        for (int j = 0; j < N; j++) r[j] = (_Float16)((float)r[j] + (float)b[j]);
+    }
 }
 /* row-wise softmax in place (host). The scores already live in host memory after the
  * stream matmul, so this beats packing 12M elements to the NPU softmax and back. */
@@ -441,8 +482,38 @@ static void sm_rows(void *a, int lo, int hi)
 }
 static void h_softmax_rows(int rows, int n, _Float16 *x, int nt)
 { sm_arg a = { x, n }; parallel_for(rows, nt, sm_rows, &a); }
+/* dst[c*ld_dst + t] = src[t*ld_src + c] for t < rows, c < cols: one head's V columns [ntok][dh]
+ * to the AV operand's [dh][ntok]. 8x8 halfword blocks write whole lines. One element at a time is
+ * a store every 2740 bytes at Depth Anything's 1370 tokens, and its cost moved 15-25 ms an image
+ * with where the process's buffers landed. */
+static void h_transpose_u16(uint16_t *dst, size_t ld_dst, const uint16_t *src, size_t ld_src,
+                            int rows, int cols)
+{
+    int t = 0;
+#if defined(__aarch64__)
+    for (; t + 8 <= rows; t += 8) {
+        int c = 0;
+        for (; c + 8 <= cols; c += 8) {
+            uint16x8_t blk[8];
+            for (int r = 0; r < 8; r++) blk[r] = vld1q_u16(src + (size_t)(t + r) * ld_src + c);
+            rc_tr8x8_u16(blk);
+            for (int k = 0; k < 8; k++) vst1q_u16(dst + (size_t)(c + k) * ld_dst + t, blk[k]);
+        }
+        for (; c < cols; c++)
+            for (int r = 0; r < 8; r++) dst[(size_t)c * ld_dst + t + r] = src[(size_t)(t + r) * ld_src + c];
+    }
+#endif
+    for (; t < rows; t++)
+        for (int c = 0; c < cols; c++) dst[(size_t)c * ld_dst + t] = src[(size_t)t * ld_src + c];
+}
+
+/* acc and add are always two of the ctx's scratch buffers. Those come from the ctx, so GCC at -O2
+ * cannot see they are distinct and will not version the loop for it: unmarked it runs scalar. */
 static void h_residual(size_t n, _Float16 *acc, const _Float16 *add)
-{ for (size_t i = 0; i < n; i++) acc[i] = (_Float16)((float)acc[i] + (float)add[i]); }
+{
+    MM_NO_OVERLAP
+    for (size_t i = 0; i < n; i++) acc[i] = (_Float16)((float)acc[i] + (float)add[i]);
+}
 
 static double prof_ms(void)
 { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6; }
@@ -461,6 +532,7 @@ rocket_siglip_ctx *rocket_siglip_ctx_create(const rocket_siglip_model *m, int nt
     rocket_siglip_ctx *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->m = m;
+    c->aux_fd = -1;   /* a failure before rocket_open() must not close fd 0 */
     c->ht = (nthreads <= 1) ? 1 : 4;   /* host softmax/GELU across the 4 A76 big cores */
     const int d = m->d, L = m->L, pdim = m->patch_dim, dff = m->d_ff, nL = m->n_layers;
     const int pdp = m->patch_dim_pad ? m->patch_dim_pad : pdim;   /* patch matmul K (%32) */
@@ -506,6 +578,33 @@ rocket_siglip_ctx *rocket_siglip_ctx_create(const rocket_siglip_model *m, int nt
         if ((!ae || atoi(ae) != 0) && nthreads > 1)
             c->fa = rocket_fa_ctx_create(nthreads);   /* NULL => single-stream fallback */
     }
+
+    /* Token buffers hold Mp rows and the patch buffers Lp; calloc leaves the pad rows and the
+     * im2col tail zero for the life of the ctx (see the struct). */
+    const int ntok = L + m->n_prefix, dh = d / m->n_head;
+    const size_t Td = (size_t)ntok * d;
+    c->patches = calloc((size_t)Lp * pdp, sizeof(_Float16));
+    c->xp = calloc((size_t)Lp * d, sizeof(_Float16));
+    c->x  = calloc((size_t)Mp * d, sizeof(_Float16));
+    c->ln = calloc((size_t)Mp * d, sizeof(_Float16));
+    c->q  = calloc((size_t)Mp * d, sizeof(_Float16));
+    c->k  = calloc((size_t)Mp * d, sizeof(_Float16));
+    c->v  = calloc((size_t)Mp * d, sizeof(_Float16));
+    c->cc = calloc((size_t)Mp * d, sizeof(_Float16));
+    c->y  = calloc((size_t)Mp * dff, sizeof(_Float16));
+    if (!c->patches || !c->xp || !c->x || !c->ln || !c->q || !c->k || !c->v || !c->cc || !c->y)
+        goto fail;
+    if (c->fa) {
+        c->Qh = calloc(Td, sizeof(_Float16)); c->Kh = calloc(Td, sizeof(_Float16));
+        c->Vh = calloc(Td, sizeof(_Float16)); c->Oh = calloc(Td, sizeof(_Float16));
+        if (!c->Qh || !c->Kh || !c->Vh || !c->Oh) goto fail;
+    } else {
+        c->qh  = malloc((size_t)ntok * dh * sizeof(_Float16));
+        c->khh = malloc((size_t)ntok * dh * sizeof(_Float16));
+        c->vhT = malloc((size_t)dh * ntok * sizeof(_Float16));
+        c->sc  = malloc((size_t)m->n_head * ntok * ntok * sizeof(_Float16));
+        if (!c->qh || !c->khh || !c->vhT || !c->sc) goto fail;
+    }
     return c;
 fail:
     rocket_siglip_ctx_free(c);
@@ -531,6 +630,10 @@ void rocket_siglip_ctx_free(rocket_siglip_ctx *c)
     if (c->strm) rocket_stream_free(c->strm);
     if (c->mm) rocket_ctx_free(c->mm);
     if (c->aux_fd >= 0) rocket_close(c->aux_fd);
+    free(c->patches); free(c->xp); free(c->x); free(c->ln); free(c->q); free(c->k); free(c->v);
+    free(c->cc); free(c->y);
+    free(c->Qh); free(c->Kh); free(c->Vh); free(c->Oh);
+    free(c->qh); free(c->khh); free(c->vhT); free(c->sc);
     free(c);
 }
 
@@ -556,39 +659,20 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
 
     const int use_fa = (c->fa != NULL);
     /* Token buffers hold Mp rows (padded to M%4); host elementwise touches only the first ntok, and
-     * every projection matmul runs at M=Mp with the pad rows held at zero. calloc + ntok-bounded host
-     * writes keep the pad rows zero, so each matmul's pad-row output stays zero (never poisons a real
-     * token, which the attention reads at n_tokens=ntok). patches/xp hold Lp patch rows. */
-    _Float16 *patches = calloc((size_t)Lp * pdp, sizeof(_Float16));
-    _Float16 *xp = calloc((size_t)Lp * d, sizeof(_Float16));      /* patch-projection output */
-    _Float16 *x  = calloc((size_t)Mp * d, sizeof(_Float16));
-    _Float16 *ln = calloc((size_t)Mp * d, sizeof(_Float16));
-    _Float16 *q  = calloc((size_t)Mp * d, sizeof(_Float16));
-    _Float16 *k  = calloc((size_t)Mp * d, sizeof(_Float16));
-    _Float16 *v  = calloc((size_t)Mp * d, sizeof(_Float16));
-    _Float16 *cc = calloc((size_t)Mp * d, sizeof(_Float16));      /* concat per-head context */
-    _Float16 *y  = calloc((size_t)Mp * dff, sizeof(_Float16));    /* o-proj / fc1 / fc2 out */
-    /* FA path: head-major Q/K/V/OUT for the flash-attention fan-out (each ntok*d elems).
-     * single-stream path: per-head gather scratch qh/khh/vhT + all-heads scores sc. */
-    _Float16 *Qh = NULL, *Kh = NULL, *Vh = NULL, *Oh = NULL;
-    _Float16 *qh = NULL, *khh = NULL, *vhT = NULL, *sc = NULL;
-    int alloc_ok;
-    if (use_fa) {
-        Qh = calloc(Td, sizeof(_Float16)); Kh = calloc(Td, sizeof(_Float16));
-        Vh = calloc(Td, sizeof(_Float16)); Oh = calloc(Td, sizeof(_Float16));
-        alloc_ok = Qh && Kh && Vh && Oh;
-    } else {
-        qh  = malloc((size_t)ntok * dh * sizeof(_Float16));
-        khh = malloc((size_t)ntok * dh * sizeof(_Float16));
-        vhT = malloc((size_t)dh * ntok * sizeof(_Float16));
-        /* all heads' scores in one buffer; softmaxed in place on the host (one pass over
-         * [nh*ntok, ntok] rows), so no NPU softmax round-trip and PV reads sc directly. */
-        sc  = malloc((size_t)nh * ntok * ntok * sizeof(_Float16));
-        alloc_ok = qh && khh && vhT && sc;
-    }
-    if (!patches || !xp || !x || !ln || !q || !k || !v || !cc || !y || !alloc_ok) goto done;
+     * every projection matmul runs at M=Mp with the pad rows held at zero, so each matmul's pad-row
+     * output stays zero (never poisons a real token, which the attention reads at n_tokens=ntok).
+     * patches/xp hold Lp patch rows. All of it is the ctx's scratch, zeroed once at create.
+     * FA path: head-major Q/K/V/OUT for the flash-attention fan-out (each ntok*d elems).
+     * single-stream path: per-head gather scratch qh/khh/vhT + all-heads scores sc, softmaxed in
+     * place on the host (one pass over [nh*ntok, ntok] rows), so PV reads sc directly. */
+    _Float16 *const patches = c->patches, *const xp = c->xp, *const x = c->x, *const ln = c->ln;
+    _Float16 *const q = c->q, *const k = c->k, *const v = c->v, *const cc = c->cc, *const y = c->y;
+    _Float16 *const Qh = c->Qh, *const Kh = c->Kh, *const Vh = c->Vh, *const Oh = c->Oh;
+    _Float16 *const qh = c->qh, *const khh = c->khh, *const vhT = c->vhT, *const sc = c->sc;
 
     int prof = getenv("ROCKET_SIGLIP_PROF") != NULL;
+    long flt0 = 0;
+    if (prof) { struct rusage ru; getrusage(RUSAGE_SELF, &ru); flt0 = ru.ru_minflt; }
     double tb[16] = {0}, t0 = 0;
 #define TIC (t0 = prof_ms())
 #define TOC(i) do { if (prof) tb[i] += prof_ms() - t0; } while (0)
@@ -644,10 +728,12 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
         if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, d, ln, q, c->wq[l])) != 0) goto done;
         if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, d, ln, k, c->wk[l])) != 0) goto done;
         if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, d, ln, v, c->wv[l])) != 0) goto done;
+        TOC(3);
+        TIC;
         h_add_bias(ntok, d, q, p.bq); h_add_bias(ntok, d, k, p.bk); h_add_bias(ntok, d, v, p.bv);
         if (!use_fa)
             for (size_t i = 0; i < Td; i++) q[i] = (_Float16)((float)q[i] * scale);  /* fold 1/sqrt(dh) */
-        TOC(3);
+        TOC(14);
 
         if (use_fa) {
             /* re-lay q/k/v [ntok,d] (heads interleaved) into head-major operands and run all heads
@@ -662,8 +748,9 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
                 for (int t = 0; t < ntok; t++) {
                     memcpy(Qd + (size_t)t * dh, q + (size_t)t * d + off, dh * sizeof(_Float16));
                     memcpy(Kd + (size_t)t * dh, k + (size_t)t * d + off, dh * sizeof(_Float16));
-                    for (int cx = 0; cx < dh; cx++) Vd[(size_t)cx * ntok + t] = v[(size_t)t * d + off + cx];
                 }
+                h_transpose_u16((uint16_t *)Vd, (size_t)ntok, (const uint16_t *)(v + off), (size_t)d,
+                                ntok, dh);
             }
             TOC(4);
             TIC;
@@ -696,8 +783,8 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
         for (int h = 0; h < nh; h++) {
             int off = h * dh;
             TIC;
-            for (int t = 0; t < ntok; t++)
-                for (int cx = 0; cx < dh; cx++) vhT[(size_t)cx * ntok + t] = v[(size_t)t * d + off + cx];
+            h_transpose_u16((uint16_t *)vhT, (size_t)ntok, (const uint16_t *)(v + off), (size_t)d,
+                            ntok, dh);
             TOC(4);
             TIC; if ((rc = cmatmul(c, ntok, ntok, dh, sc + (size_t)h * ntok * ntok, vhT, qh)) != 0) goto done; TOC(7);
             TIC;
@@ -707,21 +794,21 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
         }
         TIC;
         if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, d, cc, y, c->wo[l])) != 0) goto done;
-        h_add_bias(ntok, d, y, p.bo);
         TOC(9);
+        TIC; h_add_bias(ntok, d, y, p.bo); TOC(14);
         TIC; h_residual(Td, x, y); TOC(13);
 
         /* --- FFN sublayer: x += fc2(ACT(fc1(LN2(x)))) --- ACT = gelu-tanh (SigLIP) / quick-GELU (CLIP) */
         TIC; h_layernorm(ntok, d, x, p.ln2_g, p.ln2_b, m->eps, ln); TOC(2);
         TIC;
         if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, d, dff, ln, y, c->wf1[l])) != 0) goto done;
-        h_add_bias(ntok, dff, y, p.bf1);
         TOC(10);
+        TIC; h_add_bias(ntok, dff, y, p.bf1); TOC(14);
         TIC; h_mlp_act(m, (size_t)ntok * dff, y, c->ht); TOC(11);
         TIC;
         if ((rc = rocket_matmul_fp16_prepacked(c->mm, Mp, dff, d, y, cc, c->wf2[l])) != 0) goto done;
-        h_add_bias(ntok, d, cc, p.bf2);
         TOC(12);
+        TIC; h_add_bias(ntok, d, cc, p.bf2); TOC(14);
         TIC; h_residual(Td, x, cc); TOC(13);
 
         if (hidden_opt) memcpy(hidden_opt + (size_t)(l + 1) * Td, x, Td * sizeof(_Float16));
@@ -748,18 +835,16 @@ int rocket_siglip_encode_ctx(rocket_siglip_ctx *c, const _Float16 *pixels_chw,
     }
     rc = 0;
     if (prof) {
-        const char *nm[14] = {"im2col","patch+pos","layernorm","qkv-proj","head-xpose",
-            "scores-mm","softmax","pv-mm","ctx-scatter","o-proj","fc1","act","fc2","residual"};
-        double tot = 0; for (int i = 0; i < 14; i++) tot += tb[i];
-        ROCKET_LOGE("[siglip prof] total %.1f ms:\n", tot);
-        for (int i = 0; i < 14; i++)
+        const char *nm[15] = {"im2col","patch+pos","layernorm","qkv-proj","head-xpose",
+            "scores-mm","softmax","pv-mm","ctx-scatter","o-proj","fc1","act","fc2","residual","bias"};
+        double tot = 0; for (int i = 0; i < 15; i++) tot += tb[i];
+        struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+        ROCKET_LOGE("[siglip prof] total %.1f ms, %ld minor faults:\n", tot, ru.ru_minflt - flt0);
+        for (int i = 0; i < 15; i++)
             ROCKET_LOGE("    %-12s %8.1f ms  (%4.1f%%)\n", nm[i], tb[i], 100.0 * tb[i] / (tot + 1e-9));
     }
 #undef TIC
 #undef TOC
 done:
-    free(patches); free(xp); free(x); free(ln); free(q); free(k); free(v); free(cc); free(y);
-    free(qh); free(khh); free(vhT); free(sc);
-    free(Qh); free(Kh); free(Vh); free(Oh);
     return rc;
 }

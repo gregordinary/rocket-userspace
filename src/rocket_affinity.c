@@ -10,6 +10,7 @@
 #endif
 #include <sched.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,6 +166,42 @@ void rocket_pin_worker_based(int worker_idx, int core_base)
     if (getenv("ROCKET_DEBUG"))
         ROCKET_LOGD("rocket affinity: worker %d (base %d) -> cpu %d (%s)\n",
                 worker_idx, core_base, cpu, rc == 0 ? "ok" : strerror(rc));
+}
+
+/* ROCKET_PIN_AT_CREATE=0 creates workers with their creator's mask, as before the placement
+ * moved to creation; each still pins itself. */
+static int pin_at_create(void)
+{
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("ROCKET_PIN_AT_CREATE");
+        v = !(e && atoi(e) == 0);
+        atomic_store_explicit(&on, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+int rocket_thread_create_pinned(pthread_t *th, void *(*fn)(void *), void *arg,
+                                int worker_idx, int core_base)
+{
+    pthread_once(&g_once, detect_once);
+    if (g_n_big > 0 && pin_at_create()) {
+        if (worker_idx < 0) worker_idx = 0;
+        if (core_base < 0) core_base = 0;
+        const int cpu = g_big[(core_base + worker_idx) % g_n_big];
+        pthread_attr_t attr;
+        if (cpu >= 0 && cpu < CPU_SETSIZE && pthread_attr_init(&attr) == 0) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpu, &set);
+            int rc = pthread_attr_setaffinity_np(&attr, sizeof set, &set);
+            if (rc == 0) rc = pthread_create(th, &attr, fn, arg);
+            pthread_attr_destroy(&attr);
+            if (rc == 0) return 0;
+        }
+    }
+    return pthread_create(th, NULL, fn, arg);
 }
 
 /* Convenience: pin relative to the CALLING thread's affinity base (0 unless the

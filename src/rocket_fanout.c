@@ -10,6 +10,8 @@
 #include <string.h>
 
 #include "rocket_fanout.h"
+#include "rocket_affinity.h"
+#include "rocket_npu.h"
 #include "rocket_log.h"
 
 long rocket_fanout_wait_ns(void)
@@ -117,9 +119,10 @@ void rocket_fanout_run(int n, void *args, size_t stride, void *(*fn)(void *))
     pthread_t th[ROCKET_FANOUT_MAX_WORKERS];
     int joinable[ROCKET_FANOUT_MAX_WORKERS] = {0};
     char *base = (char *)args;
+    const int core_base = rocket_affinity_get_base();   /* the base every caller hands its workers */
 
     for (int t = 0; t < n; t++)
-        if (pthread_create(&th[t], NULL, fn, base + (size_t)t * stride) == 0)
+        if (rocket_thread_create_pinned(&th[t], fn, base + (size_t)t * stride, t, core_base) == 0)
             joinable[t] = 1;
 
     /* Spawn failures run here, AFTER the loop, so one of them cannot serialize the

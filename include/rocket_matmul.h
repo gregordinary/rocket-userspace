@@ -220,8 +220,12 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
  * [host arithmetic over two real models, 2026-08-10]
  *
  * rocket_matmul_plan_int8_rk3576 previews the tiling (pure, no HW) and returns the
- * NPU job count, or <0 on a shape this part cannot run — which now agrees with what
- * the entry does, since both refuse the same K. [HW sweep, H96 MAX M9] */
+ * NPU job count, or <0 on a shape this part cannot run — which agrees with what the
+ * entry does, since both refuse the same K. [HW sweep, H96 MAX M9] Both also refuse,
+ * with ROCKET_E_SHAPE, a dimension past 2^24 (the RK3588 planners' bound) and an M whose
+ * plane is taller than the 16-bit height field it is programmed into (any prime M past
+ * 65535 among them); and with ROCKET_E_TILING a plan of more than INT_MAX jobs, which the
+ * return value cannot carry. */
 int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *Nt);
 int rocket_matmul_int8_rk3576(int fd, int M, int K, int N,
                               const int8_t *A, const int8_t *B,
@@ -432,8 +436,10 @@ void rocket_rk3576_bo_pool_drain(int fd);
  *
  *     C[m][n] = sum_k A[m][k]*B[n][k] + bias[n]          (raw int32, no requant)
  *
- * K is split internally and the partials are summed on the host, so K is bounded only
- * by memory. `bias` may be NULL. Requires K%32 and N%32.
+ * K is split internally and the partials are summed on the host, so K is bounded by
+ * memory and by the 2^24 every matmul planner takes for each dimension. An M with no
+ * plane short enough for the 16-bit height field at any K slice is refused, as on the
+ * int8 entry. `bias` may be NULL. Requires K%32 and N%32.
  *
  * IT RUNS ON THE DENSE WRITER: the int8 program on the whole wide output stage
  * (gen_conv2d_int8_rk3576_i32out_dense), which writes every accumulator of a task as a raw

@@ -10,10 +10,12 @@
  * columns is the cost of carrying per-K-group quant scales, isolated: it prices the
  * group-wise mode against its own dtype rather than against a different one.
  *
- * It comes out at ~0.6%. The scales ride a readback the integer datapath is already forced
- * to pay (no on-device integer K-accum is implemented, so every K-tile partial crosses to the host
- * regardless), and the multiply-add fuses into an accumulate loop that is already there and
- * already memory-bound. Keep it that way: applying the scales in a SEPARATE pass over the
+ * On the NEON group-wise readback the gap is negative: the group-wise call reads 0.97-0.99x the
+ * per-channel one at M=64 and 0.81-0.90x at M=256, because the per-channel int64 accumulate is
+ * still a scalar loop [HW sweep 2026-10-09, RK1 600 MHz, governor ondemand, two runs a shape].
+ * The scales ride a readback the integer datapath is already forced to pay (no on-device integer
+ * K-accum is implemented, so every K-tile partial crosses to the host regardless), and the
+ * multiply-add fuses into the accumulate loop that is already there. Keep it that way: applying the scales in a SEPARATE pass over the
  * int32 output would turn a rounding error into a real cost.
  *
  * The default shape is one gpt-oss-20b expert projection at a 2048-token micro-batch

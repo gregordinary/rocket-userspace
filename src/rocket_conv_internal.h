@@ -12,6 +12,15 @@
 extern "C" {
 #endif
 
+struct rocket_ctx;
+
+/* Whether a resident conv entry's GEMM splits M across the context's workers (1) or N
+ * (0): M once every worker has 64 rows, N <= 4M, and the replicated weight stays within
+ * 64 MiB. The environment variable named by `env`, set to m or n, forces one. Shared by
+ * the resident transposed and forward entries; the measurements are beside its body in
+ * rocket_conv_transpose.c. */
+int rocket_conv_resident_split_m(struct rocket_ctx *ctx, int M, int K, int N, const char *env);
+
 /* One direct fp16 conv job, one task, with the output extent OH x OW programmed as given
  * instead of derived from IH/IW, the stride and the pad. Stride and dilation are 1.
  * Layouts are rocket_conv2d_fp16()'s: in [IC][IH][IW], W [OC][IC][KH][KW],

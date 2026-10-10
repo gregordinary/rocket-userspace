@@ -18,6 +18,7 @@
  * points are the caller's — see rocket_graph_rk3576.h.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,12 +64,14 @@ int rocket_graph_kick_on(void) { static int c = -1; if (c < 0) c = env_on("ROCKE
  * ROCKET_RK3576_NET_KICK_AT=<i>. */
 static int kick_at(void)
 {
-    static int cached = -2;
-    if (cached == -2) {
+    static _Atomic int cached = -2;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c == -2) {
         const char *e = getenv("ROCKET_RK3576_NET_KICK_AT");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* The longest run a kick may cover. Not a hardware bound — it is the instrument for
@@ -78,13 +81,15 @@ static int kick_at(void)
  * inside it. ROCKET_RK3576_NET_KICK_MAX=<n>. */
 static unsigned kick_max(void)
 {
-    static unsigned cached = 0;
-    if (!cached) {
+    static _Atomic unsigned cached = 0;
+    unsigned c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (!c) {
         const char *e = getenv("ROCKET_RK3576_NET_KICK_MAX");
         long v = (e && *e) ? strtol(e, NULL, 0) : 0;
-        cached = (v >= 2 && v <= 512) ? (unsigned)v : 512u;
+        c = (v >= 2 && v <= 512) ? (unsigned)v : 512u;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 /* A CONCATENATION LAYER whose operands are placed slices of one buffer: its consumers read
@@ -294,12 +299,14 @@ static void nojoin_note(rocket_graph_plan *g, unsigned i, unsigned j, int why)
  * which is what its price is, since neither half stands alone. */
 static int nojoin_at(void)
 {
-    static int cached = -2;
-    if (cached == -2) {
+    static _Atomic int cached = -2;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c == -2) {
         const char *e = getenv("ROCKET_RK3576_NET_NOJOIN");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) : -2;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) : -2;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 static int nojoin_forced(unsigned i) { return nojoin_at() == (int)i; }
@@ -312,12 +319,14 @@ static int nojoin_forced(unsigned i) { return nojoin_at() == (int)i; }
  * A/B), =<i> allows only the pair whose producer is layer i, unset allows every one. */
 static int padjoin_at(void)
 {
-    static int cached = -2;
-    if (cached == -2) {
+    static _Atomic int cached = -2;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c == -2) {
         const char *e = getenv("ROCKET_RK3576_NET_PADJOIN");
-        cached = (e && *e) ? (int)strtol(e, NULL, 0) : -2;
+        c = (e && *e) ? (int)strtol(e, NULL, 0) : -2;
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 static int padjoin_ok(rocket_graph_plan *g, unsigned i, unsigned j)
@@ -552,12 +561,14 @@ static void cat_link(rocket_graph_plan *g)
  * two programs of one stream, and this is the arm that isolates it. */
 static int catn_overlap_ok(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int c = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c < 0) {
         const char *e = getenv("ROCKET_RK3576_NET_CATN_OVERLAP");
-        cached = !e || !*e || *e != '0';
+        c = !e || !*e || *e != '0';
+        atomic_store_explicit(&cached, c, memory_order_relaxed);
     }
-    return cached;
+    return c;
 }
 
 static void concat_link(rocket_graph_plan *g)

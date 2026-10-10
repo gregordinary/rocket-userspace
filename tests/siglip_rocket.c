@@ -167,6 +167,37 @@ int main(int argc, char **argv)
             }
             free(hid2);
 
+            /* The ctx owns its scratch across encodes, so a second image must not leave state the
+             * next one reads. Encode a different image (the pixels reversed), then the reference
+             * again, and hold that to the first resident answer. Only the output lane-0 rounding
+             * that moves with the core a job lands on may differ (2^-16 relative). */
+            _Float16 *first = malloc(Ld * sizeof(_Float16));
+            _Float16 *other = malloc(pix_n * sizeof(_Float16));
+            if (first && other && rc2 == 0) {
+                memcpy(first, out, Ld * sizeof(_Float16));
+                for (size_t i = 0; i < pix_n; i++) other[i] = pix16[pix_n - 1 - i];
+                int rc3 = rocket_siglip_encode_ctx(c, other, out, NULL);
+                tf_sentinel_f16(out, Ld);
+                int rc4 = rc3 ? rc3 : rocket_siglip_encode_ctx(c, pix16, out, NULL);
+                size_t ndiff = 0; double maxd = 0, dot = 0, na = 0, nb = 0;
+                for (size_t i = 0; i < Ld; i++) {
+                    double a = (double)first[i], b = (double)out[i], dd = fabs(a - b);
+                    if (dd > 0) ndiff++;
+                    if (dd > maxd) maxd = dd;
+                    dot += a * b; na += a * a; nb += b * b;
+                }
+                double crep = (na > 0 && nb > 0) ? dot / sqrt(na * nb) : 0;
+                int rep_ok = (rc4 == 0) && crep >= 0.999999 && cosine_f16_f32(out, lref, Ld) >= 0.99;
+                printf("  resident reuse: another image, then the reference: rc=%d, %zu of %zu elements "
+                       "differ from the first encode, max |d| %.3g, cos %.9f  %s\n",
+                       rc4, ndiff, (size_t)Ld, maxd, crep, rep_ok ? "OK" : "STALE STATE -> FAIL");
+                if (!rep_ok) ok = 0;
+            } else if (rc2 == 0) {
+                printf("oom\n");
+                ok = 0;
+            }
+            free(first); free(other);
+
             double cold = now_ms();
             rocket_siglip_encode_ctx(c, pix16, out, NULL);
             cold = now_ms() - cold;

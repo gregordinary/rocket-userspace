@@ -122,7 +122,12 @@ int  rocket_siglip_encode(int fd, const rocket_siglip_model *m,
  *   rocket_siglip_ctx_free(c);
  *
  * Bit-faithful to rocket_siglip_encode within fp16 (the gate cross-checks cosine).
- * Returns NULL on create failure (e.g. a weight pack hit the IOVA limit).
+ * Returns NULL on create failure (e.g. a weight pack hit the IOVA limit, or the host scratch
+ * did not allocate).
+ *
+ * The ctx owns the per-image host scratch (the token buffers, the im2col patches and the
+ * attention operands, ~17 MiB at Depth Anything's ViT-S at 518 px), allocated once at create,
+ * so an encode does no heap traffic. NOT thread-safe: one ctx per concurrent caller.
  */
 typedef struct rocket_siglip_ctx rocket_siglip_ctx;
 

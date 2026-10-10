@@ -45,6 +45,8 @@ enum rocket_status {
     ROCKET_E_NOMEM       = -3,  /* host allocation failed */
     ROCKET_E_DEVICE      = -4,  /* device / driver / ioctl failure */
     ROCKET_E_UNSUPPORTED = -5,  /* feature gated or not implemented on this path */
+    ROCKET_E_RANGE       = -6,  /* a value left an fp16 surface's range; the output is not
+                                   valid and a wider-precision path has to compute it */
 };
 
 /* A buffer object: NPU-visible memory we can also mmap on the CPU. */
@@ -410,8 +412,11 @@ int  rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs);
  * did this call cost" is the first question about any layer's time — a chained job
  * (ROCKET_JOB_BATCHED) is ONE submit carrying n tasks, an unchained one is n submits
  * carrying one task each, and the two are told apart by reading both counters.
- * Process-wide and NOT thread-safe (plain non-atomic counters, as with the rest of the
- * context APIs); read them around a single-threaded call. */
+ * Process-wide and atomic: every submit is counted, including the ones the fan-out paths
+ * issue from several worker threads at once, so no caller needs to serialize submits for
+ * the counts to be right. What they cannot do is attribute: a reset or a read sees every
+ * thread's submits, so a per-call figure is only that call's when nothing else in the
+ * process submits between the reset and the read. */
 uint64_t rocket_submit_ioctl_count(void);
 uint64_t rocket_submit_task_count(void);
 void     rocket_submit_counters_reset(void);

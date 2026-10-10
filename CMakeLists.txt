@@ -130,6 +130,7 @@ set(ROCKETNPU_SOURCES
     src/rocket_conv2d_rk3576.c # the RK3576 CONV_2D entries (int8 direct/depthwise, fp16)
     src/rocket_conv.c         # general fp16 CONV_2D (KxK/stride/pad/dilation)
     src/rocket_conv_transpose.c # ConvTranspose2d (deconv) lowered onto the forward conv
+    src/rocket_conv_resident.c  # the resident-weight forward conv (im2col over the resident matmul)
     src/rocket_resize.c       # nearest/bilinear upsample via depthwise ConvTranspose
     src/rocket_pool.c         # on-NPU MaxPool / AveragePool via the PPU
     src/rocket_pool_rk3576.c  # the RK3576 PPU pooling entry (its own program, half-to-even avg)
@@ -334,6 +335,7 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_int8_dequant_rocket # fold int8 dequant scale into DPU OUT_CVT (int8->float out)
             activation_lut_rocket  # DPU LUT elementwise activation (sigmoid/hardsigmoid) HW gate
             leaky_relu_rocket      # parametric LeakyReLU on the DPU LUT (shifted single-table, x≈0 glitch-free)
+            activation_concurrent_rocket # GATE: LeakyReLU slopes and ELU/SELU from two threads at once, each vs its serial result
             recip_rsqrt_rocket     # positive-domain LUT (sqrt/rsqrt/reciprocal) + on-NPU Div accuracy gate
             lut_tanh_rocket        # SIGNED-output LUT (tanh bias-trick) — OUT_CVT affine HW gate/RE
             exp_lut_rocket         # EXP DPU-LUT (shifted single-table) + softmax-sum end to end
@@ -351,6 +353,7 @@ if(ROCKETNPU_BUILD_TESTS)
             conv_pad_field_gate    # GATE: no conv pad past 15 reaches the CNA's 4-bit PAD_CON0 fields (one-pass fp16/int8/depthwise/dilated)
             conv_transpose_rocket  # ConvTranspose2d: lowering self-check + HW oracle (vs scatter ref)
             conv_transpose_resident # the resident-weight ConvTranspose (col2im over the resident matmul) vs the scatter ref
+            conv_resident          # the resident-weight forward conv (im2col over the resident matmul) vs the reference
             ct_model_bench         # bench: the ConvTranspose entry's per-call time at pix2pix's and SAM's shapes
             conv_model_bench       # bench: a forward conv's per-call time by route (direct entry, im2col over the resident matmul) at pix2pix's encoder shapes
             ct_route_probe         # probe: price the candidate ConvTranspose routes (col2im / sub-pixel matmul, sub-pixel conv) at the same shapes
@@ -369,7 +372,6 @@ if(ROCKETNPU_BUILD_TESTS)
             conv_i8out_probe       # probe: the DIRECT int8 conv on Mesa's int8-out writer; CPEND and the per-channel BS multiplier on it
             dw_int8_cost_probe     # probe: where the int8 depthwise entry's per-call time goes (the call, its scalar pack, a blocked one)
             conv_pack_cost_probe   # probe: the fp16 conv's and the int8 direct conv's per-element pack against the whole call
-            softmax_exp_bench      # bench, CPU only: expf's share of the FA handler's host softmax loop, and a NEON exp's
             reduce_feature_rocket  # feature-axis reduce (ones-matmul): sum/mean over H per row vs fp64 oracle
             cumsum_rocket          # on-NPU prefix sum (triangular ones-matmul): incl/excl/reverse vs fp64 oracle
             rmsnorm_rocket         # on-NPU RMSNorm + per-row broadcast scale vs fp64 oracle
@@ -418,6 +420,7 @@ if(ROCKETNPU_BUILD_TESTS)
             moe_gw_bench           # resident group-wise int8 at the MoE expert shape (hand-run, not a gate)
             uapi_bo_lifetime_rocket # rocket uAPI GATE: a BO referenced by an in-flight job survives its file's close
             prep_signal_robust_rocket # PREP_BO wait: EINTR-retry + UINT64_MAX-deadline saturation gate
+            open_guard_race_rocket # GATE: the RK3576 second-fd guard under two barrier-released concurrent opens
             submit_overhead_rocket # per-job dispatch floor (us/submit) A/B probe for IOMMU keep-attach
             x0_glitch_probe        # RE: does the x≈0 LE/LO mux glitch fire for a shifted table straddling 0?
             regcmd_persist_rocket  # the one-task-after delta arm (lands in an unwritten group); see regcmd_delta_probe
@@ -431,6 +434,7 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_plan_gate       # host-only GATE: the shared matmul tiling policy's invariants (no HW)
             cube_transpose_gate    # host-only GATE: the plane <-> cube-group transposes vs the per-channel loop (no HW)
             regcmd_rk3576_gate     # host-only GATE: RK3576 conv regcmd vs the vendor capture (no HW)
+            pool_rk3576_bracket_gate # host-only GATE: the RK3576 pool's PREP/FINI brackets against a mock provider (no HW)
             rk3576_first_light     # RK3576 board: does the RK3576 emitter make the NPU compute?
             rk3576_conv_gate       # RK3576 board GATE: the int8 conv envelope + row windows + depthwise
             rk3576_conv_lib_gate   # RK3576 board GATE: the same envelope through the LIBRARY entries
@@ -522,6 +526,28 @@ if(ROCKETNPU_BUILD_TESTS)
         endforeach()
     endif()
 
+    # Microbenchmarks written in AArch64 NEON intrinsics. They measure one target's vector
+    # code and have no portable meaning, so they are built only where those intrinsics
+    # compile, and a host without them still builds every correctness gate.
+    include(CheckCSourceCompiles)
+    check_c_source_compiles([=[
+        #include <arm_neon.h>
+        int main(void) {
+            _Float16 h[4] = {0};
+            float32x4_t v = vcvt_f32_f16(vld1_f16((const float16_t *)h));
+            return (int)vaddvq_f32(vrndnq_f32(v));
+        }]=] ROCKETNPU_HAVE_A64_NEON)
+    if(ROCKETNPU_HAVE_A64_NEON)
+        foreach(t
+                softmax_exp_bench) # bench, CPU only: expf's share of the FA handler's host softmax loop, and a NEON exp's
+            add_executable(${t} tests/${t}.c)
+            target_link_libraries(${t} PRIVATE rocketnpu)
+            target_compile_options(${t} PRIVATE -Wall -Wextra)
+        endforeach()
+    else()
+        message(STATUS "rocketnpu: no AArch64 NEON intrinsics; skipping the NEON microbenchmarks")
+    endif()
+
     # the network gate is the graph planner's first caller: it owns the tensors and the
     # weights, graph/ owns which of them stay in cube layout and which runs are one kick
     if(TARGET rk3576_net_gate)
@@ -536,13 +562,15 @@ if(ROCKETNPU_BUILD_TESTS)
     # the fp16 envelope probe power-cycles before its second run of a shape that was not exact;
     # the conv width probe reads the library's output stamp to count elements never written;
     # the cube transpose gate checks rocket_cube.h's plane moves against the per-channel loop;
-    # the per-channel depthwise and direct gates model the device from the plan the entry used
+    # the per-channel depthwise and direct gates model the device from the plan the entry used;
+    # the open race gate reads the bound-core count the RK3576 fd guard itself reads
     foreach(t prototype_shared_scratch_rocket crossop_chain_rocket rk3576_cbuf_base
               rk3576_lut_probe rk3576_add_probe rk3576_mm_requant rk3576_w8a8_route
               pool_int8_native_probe deconv_extent_probe matmul_bf16_stream_rocket
               replay_dump rk3576_mm_fp16_envelope rk3576_mm_bf16_probe
               rk3576_conv_width_probe cube_transpose_gate rk3576_stallk_map
-              conv_dw_int8_perc_runtime conv2d_int8_q_perc_rocket conv_model_bench)
+              conv_dw_int8_perc_runtime conv2d_int8_q_perc_rocket conv_model_bench
+              open_guard_race_rocket)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
@@ -640,12 +668,20 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_host_test(chain_layout_rocket)
     rocket_host_test(chain_verify_gate)
     rocket_host_test(matmul_plan_gate SKIP_OFF_PART)    # the RK3588 planners; skips elsewhere
+    # The RK3576 int8 planner's envelope: a prime M returns at once, a task count past
+    # INT_MAX refuses rather than wrapping. Forces ROCKET_CHIP=rk3576 itself.
+    rocket_host_test(matmul_plan_gate_rk3576 COMMAND matmul_plan_gate rk3576)
     rocket_host_test(cube_transpose_gate)
     rocket_host_test(regcmd_rk3576_gate)                # forces ROCKET_CHIP=rk3576 itself
+    # Every PREP/FINI the RK3576 pool takes, on every path, against a host-memory provider
+    # defined in the test itself. Forces ROCKET_CHIP=rk3576 itself.
+    rocket_host_test(pool_rk3576_bracket_gate)
 
     # --- the DPU LUT and elementwise ops -----------------------------------------
     rocket_npu_test(activation_lut_rocket)
     rocket_npu_test(leaky_relu_rocket)
+    # The parametric tables from two threads at once; RK3588 only (skips elsewhere).
+    rocket_npu_test(activation_concurrent_rocket)
     rocket_npu_test(recip_rsqrt_rocket)
     rocket_npu_test(lut_tanh_rocket)
     rocket_npu_test(exp_lut_rocket)
@@ -713,6 +749,9 @@ if(ROCKETNPU_BUILD_TESTS)
     # The same gate on the matmul's CPU-accumulate path and its planes narrow.
     rocket_npu_test(conv_transpose_resident_nokacc COMMAND conv_transpose_resident
                     ENVIRONMENT "ROCKET_KACC=0")
+    rocket_npu_test(conv_resident)
+    # The same gate on the matmul's CPU-accumulate path and its planes narrow.
+    rocket_npu_test(conv_resident_nokacc COMMAND conv_resident ENVIRONMENT "ROCKET_KACC=0")
     rocket_npu_test(resize_rocket)
     rocket_npu_test(pool_fp16_rocket)
     rocket_npu_test(pool_int8_rocket)
@@ -871,4 +910,8 @@ if(ROCKETNPU_BUILD_TESTS)
     # "wait forever" timeout must saturate rather than wrap the signed deadline negative into an
     # instant poll. 60 iters/phase keeps the gate ~1s; exit 2 (SKIP) when no NPU is present.
     rocket_npu_test(prep_signal_robust_rocket ENVIRONMENT "ROCKET_SIG_ITERS=60")
+    # Two threads released into rocket_open() at once, 500 rounds. On an RK3576 with two
+    # cores bound each round must give exactly one fd and one -EBUSY; anywhere else both
+    # opens must succeed. Opens and closes only, no submit.
+    rocket_npu_test(open_guard_race_rocket)
 endif()
