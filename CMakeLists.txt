@@ -502,6 +502,7 @@ if(ROCKETNPU_BUILD_TESTS)
             membench               # DRAM bandwidth + NPU readback de-tile microbench
             ddr_pmu_cal            # positive control for the rockchip_ddr DDR PMU: known bytes in, counted bytes out
             ddr_mm_bytes           # the matmul arm the DDR PMU measures against bytes_moved_rocket
+            whisper_decode_step_probe # probe: a Whisper decoder step with every matmul on resident weights at M=4
             fabench)               # flash-attention QK/AV submit-chaining A/B (ROCKET_FA_CHAIN 0 vs 1)
         add_executable(${t} tests/${t}.c)
         target_link_libraries(${t} PRIVATE rocketnpu)

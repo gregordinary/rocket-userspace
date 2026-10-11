@@ -19,8 +19,12 @@
 
 /* The idle a poisoned submit needs before the next one will write.
  *
- * An int32-output job leaves the NEXT submit — of any kind, across calls and across
- * processes — completing normally in about 1.4 ms and writing nothing. What clears it
+ * A job from the older int32 writers (the narrow and wide ones, behind
+ * ROCKET_RK3576_I32_DENSE=0) leaves the NEXT submit — of any kind, across calls and across
+ * processes — completing normally in about 1.4 ms and writing nothing. So does the fp16
+ * conv's fp16 writer: the packed-image first conv, and the slice programs under
+ * ROCKET_RK3576_FP16_F32OUT=0. The dense int32 writer, the int32 entry's default, does
+ * not. What clears it
  * is the driver's runtime-PM autosuspend cycling the NPU power domain, not elapsed
  * time: with `power/control` = `on` no amount of idle clears it at all, and the working
  * gap tracks `power/autosuspend_delay_ms` one for one. So the delay is read from the

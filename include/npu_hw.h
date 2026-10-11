@@ -196,12 +196,16 @@
  * NC1HWC2 layout. It has POOLING kernel/stride/padding + an average-pool reciprocal,
  * but NO reshape/transpose/permute register (there is NO NVDLA-RUBIK block on RK3588 —
  * no such block appears in the register map). So the PPU CANNOT de-tile the cube to row-major
- * output: the A76 NEON output de-tile is irreducible, so "no on-chip layout conversion"
- * holds for BOTH input packB and output de-tile.
- * Decoded from Mesa rocket registers.xml (cross-checked vs allbilly rnpu_registers.h);
- * NOT yet driven by this library — these defines document the block and set up a future
- * MaxPool/AvgPool/GlobalAvgPool on-NPU path for the detection delegate (the op-coverage
- * backlog). Block ID BLOCK_PPU/BLOCK_PPU_RDMA above; register page 0x6000/0x7000.
+ * output, and no register converts a layout: the weights must be packed on the host. A
+ * matmul's activation and output need not be: a stride-only form (CNA GROUP_LINE_OFF, the
+ * line stride one row of A, the DPU surface stride one atom plus the notch) reads A and
+ * writes C as plain rows [HW 2026-09-26, tests/rowmajor_matmul_probe,
+ * tests/rowmajor_tile_probe]. The library's matmul paths do not use it, so they pack A and
+ * de-tile C on the host.
+ * Decoded from Mesa rocket registers.xml (cross-checked vs allbilly rnpu_registers.h).
+ * The library drives the block: gen_pool_fp16 (npu_regcmd.c) emits its program, behind
+ * MaxPool and AveragePool (rocket_pool.c) and the spatial reductions (rocket_reduce.c). Block ID BLOCK_PPU/BLOCK_PPU_RDMA above; register
+ * page 0x6000/0x7000.
  */
 #define PPU_S_STATUS             0x6000
 #define PPU_S_POINTER            0x6004 // Single register group pointer

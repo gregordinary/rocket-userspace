@@ -312,8 +312,10 @@ int  rocket_submit_matmul_flags(int fd,
  *   driver's wait past PC_DONE is a blind settle (rocket.dpu_blind_us, 250 us)
  *   rather than a wait for a completion that is coming. The driver cannot tell
  *   the two classes apart; the caller can, because it emitted the program. On
- *   the RK3576 the int32 writers raise none: without the hint each such job
- *   waits out the driver's 125 ms backstop and the kernel logs its retirement.
+ *   the RK3576 the narrow and wide int32 writers raise none: without the hint
+ *   each such job waits out the driver's 125 ms backstop and the kernel logs its
+ *   retirement. The dense int32 writer, the int32 entry's default, raises its own
+ *   and goes out without the hint.
  *   So does any job the wide-output poisoning reaches, which writes nothing.
  *   The fp16 convolution programs (the input-channel slice and the packed-image
  *   first conv) and the one-byte int8 program DO raise one [HW sweep, H96 MAX

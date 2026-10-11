@@ -43,8 +43,10 @@
  * L >= 2T + 2 window is BANDED: query tiles of T rows (ROCKET_MB_BAND_TILE, default 128, 0 off)
  * each see their T + 2 window keys, the interior tiles of all heads in one call and the two
  * edge tiles in one each. That is 13-14% off a 639- and a 726-token encode.
- * ROCKET_MB_ATTN=host runs every attention in fp32 on the host instead: it ties the NPU at 58
- * tokens and loses at 639. ROCKET_MB_PROF=1 prints each encode's phase split.
+ * ROCKET_MB_ATTN=host runs every attention in fp32 on the host instead. Against the
+ * 2026-09-27 library it tied the NPU at 58 tokens and lost at 639 [HW, RK1, 600 MHz]; the NPU
+ * route's flash-attention host passes are faster in later builds, and the crossover there is
+ * unmeasured. ROCKET_MB_PROF=1 prints each encode's phase split.
  *
  * Accuracy, against ONNX Runtime's fp32 CPU provider on the Laya decision model (`tests/
  * modernbert_rocket.c`, taps from every layer): worst layer cosine 0.9999936 (ModernBERT-large,

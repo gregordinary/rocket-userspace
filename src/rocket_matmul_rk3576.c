@@ -834,13 +834,16 @@ static int r76_mm_int8(int fd, int M, int K, int N,
         if (jobs == ROCKET_E_TILING) return ROCKET_E_TILING;
         if (jobs < 0) {
             /* A K with no single-task plan can only be run by splitting it through the
-             * int32 writer and requantizing on the host. That route TAKES THE DEVICE DOWN
-             * at prefill scale: at M=512 K=8192 N=2048 the write guard spends its eight
-             * power cycles, the entry returns -4, the part raises the driver's DMA-error
-             * WARN_ON, and the NPU then computes nothing in ANY process until the board is
-             * rebooted — a module reload leaves core 0 failing to probe at -22. So this
-             * entry declines instead of routing, and a caller falls back to its own CPU
-             * path with the device intact. [HW, H96 MAX M9, one shape, 2026-08-07]
+             * int32 entry and requantizing on the host, and this entry declines that route
+             * as policy. On the int32 entry's NARROW writer the route took the device down
+             * at M=512 K=8192 N=2048: the write guard spent its eight power cycles, the
+             * entry returned -4, the part raised the driver's DMA-error WARN_ON, and the NPU
+             * computed nothing in ANY process until a reboot (a module reload left core 0
+             * failing to probe at -22). [HW, H96 MAX M9, one shape, 2026-08-07] On the dense
+             * writer, the int32 entry's default, that shape runs in 345.7 ms, 48 submits with
+             * no redo, 4096 sampled elements exact [HW sweep, H96 MAX M9, rocket 1.6.0,
+             * 2026-09-30]. A caller that declines here calls the int32 entry and requantizes,
+             * or runs the K on its own CPU path.
              *
              * The boundary is where the single-task planner gives up, which is K >= 6176
              * for every (M, N) enumerated — a condition on K alone, because the planner
@@ -849,12 +852,9 @@ static int r76_mm_int8(int fd, int M, int K, int N,
              *
              * Small cells in this class do compute — M=32 K=8192 N=128 and M=16 K=16384
              * N=64 have run green in the gate list every session, and M=64 K=8192 N=32
-             * scored exact three times — so this is a bound on the SHAPES MEASURED, not a
-             * decoded mechanism, and it is set where it is because the cost of declining
-             * a shape that would have worked is a CPU fallback and the cost of accepting
-             * one that does not is a reboot. ROCKET_RK3576_MM_KSPLIT=1 restores the route
-             * for measurement; rocket_matmul_int8_rk3576_i32() still reaches it directly
-             * and carries the same warning. */
+             * scored exact three times — so on the narrow writer this is a bound on the
+             * SHAPES MEASURED, not a decoded mechanism. ROCKET_RK3576_MM_KSPLIT=1 takes the
+             * route from this entry. */
             int32_t *acc;
             int m, rc32;
             if (wbo) {
@@ -865,10 +865,10 @@ static int r76_mm_int8(int fd, int M, int K, int N,
             }
             if (!r76_mm_ksplit_opt_in()) {
                 ROCKET_LOGE("rk3576 matmul: K=%d has no single-task plan (the boundary is "
-                            "K>=6176), and the int32 K-split route that would run it has "
-                            "been seen to wedge the NPU across processes until a reboot. "
-                            "Declining — run this K on the host, or set "
-                            "ROCKET_RK3576_MM_KSPLIT=1 to take the route anyway\n", K);
+                            "K>=6176), and this entry declines the int32 K-split route by "
+                            "policy. Call rocket_matmul_int8_rk3576_i32() and requantize, "
+                            "run this K on the host, or set ROCKET_RK3576_MM_KSPLIT=1 to "
+                            "take the route from here\n", K);
                 return ROCKET_E_UNSUPPORTED;
             }
             if (M <= 0 || N <= 0) return ROCKET_E_SHAPE;

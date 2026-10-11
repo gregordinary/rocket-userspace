@@ -5,8 +5,8 @@
  * PARAMETERS: the values that are fixed for a given SoC but may differ on another
  * rknpu/NVDLA-class chip (CBUF size, tile geometry, the usable datatype menu, the
  * worker default). Collecting them in one profile makes librocketnpu agnostic by
- * construction, with the RK3588 as the first — and currently only HARDWARE-
- * VALIDATED — target.
+ * construction. The RK3588 is the fully validated target, and the RK3576 is validated
+ * on the paths its own encoders cover.
  *
  * The stack divides cleanly, and the two halves belong in different places:
  *   - HERE (machine parameters): CBUF banks + bank size, the matmul tile cap, the
@@ -24,21 +24,25 @@
  * coincide). The datapath SEMANTICS (the precision-field encodings, the CNA->CORE->DPU
  * block sequence, the BS/BN/EW/LUT meanings) still transfer. Multi-chip support
  * therefore needs a per-chip regcmd ENCODER for the geometry registers, not just an
- * offset table: npu_regcmd_rk3576.c is that encoder for the RK3576 int8 conv path, gated
- * off the vendor's own register programs (tests/regcmd_rk3576_gate.c). See
+ * offset table: npu_regcmd_rk3576.c holds the RK3576's encoders (int8 direct and
+ * depthwise conv, fp16 conv, the packed-image first conv, the int8, int32 and fp16
+ * matmuls, pooling and the LUT activations), the int8 conv gated off the vendor's own
+ * register programs (tests/regcmd_rk3576_gate.c). See
  * rockchip-npu-notes/chips/rk3576-regcmd.md.
  *
  * Two profiles exist. A chip earns one by having its machine parameters MEASURED on
- * that silicon, which the RK3576 now has: its encoder computes bit-exact int8
- * convolutions there, and the CBUF capacity was swept against them. A profile is not
+ * that silicon. The RK3576's were: its encoders compute bit-exact int8 and fp16
+ * convolutions, the int8, int32 and fp16 matmuls, pooling and the LUT activations
+ * there, and the CBUF capacity was swept against the int8 convolution. A profile is not
  * a claim of full support — the RK3576's covers only what has been measured, and it
  * carries a select_warning saying which datapaths still have no encoder for it.
  *
  * What rocket_hw_current() does add is SELECTION: it reads the NPU's DT `compatible`
  * (overridable with ROCKET_CHIP) and warns when the part is not an RK3588, instead of
- * silently applying RK3588 parameters to foreign silicon. On such a chip the warning
- * is the whole value — the geometry encoder is wrong for it too, so the run is
- * expected to produce no output or wrong output until its per-chip encoder lands.
+ * silently applying RK3588 parameters to foreign silicon. On a profiled part that is not
+ * the RK3588, every RK3588 generator refuses (rk3588_encoding_only in npu_regcmd.c),
+ * since its program would complete and write nothing there. A part with no profile runs
+ * on the RK3588's, and the RK3588 generators do not refuse it.
  */
 #ifndef ROCKET_HW_PROFILE_H
 #define ROCKET_HW_PROFILE_H
@@ -127,9 +131,9 @@ const struct rocket_hw_profile *rocket_hw_by_name(const char *name);
 /* The RK3588 profile — the full target: every datatype and every op path. */
 extern const struct rocket_hw_profile rocket_hw_rk3588;
 
-/* The RK3576 profile. Its machine parameters are HW-measured, but only the int8
- * CONV_2D path has a geometry encoder for this chip, so the profile carries a
- * select_warning saying so. */
+/* The RK3576 profile. Its machine parameters are HW-measured. Its own encoders cover
+ * int8 direct and depthwise conv, fp16 conv, the int8, int32 and fp16 matmuls, pooling
+ * and the LUT activations; the profile's select_warning names what they leave unserved. */
 extern const struct rocket_hw_profile rocket_hw_rk3576;
 
 /* True if `precision` (a precision_* value) is runnable on this profile. On the

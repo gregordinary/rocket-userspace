@@ -78,10 +78,12 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
  * softmax defaults to the host (the on-NPU softmax would be a pure round-trip here);
  * ROCKET_ATTN_HOST_SOFTMAX=0 forces the on-NPU softmax for comparison. On the materialized
  * paths the host scale, soft-cap, mask and softmax are ONE fp32 pass per row with a
- * vectorized exp and a single fp16 rounding (ROCKET_FA_FUSED_SOFTMAX, default on): 19% off a
- * 639-token ModernBERT-large encoder and equal or lower error on every flash_attn_rocket case
- * [HW 2026-09-27, RK1]. ROCKET_FA_FUSED_SOFTMAX=0 restores the separate mask pass and the
- * two-rounding softmax. fd<0 = exact host reference (the test oracle). Returns 0, <0 on error.
+ * vectorized exp and a single fp16 rounding (ROCKET_FA_FUSED_SOFTMAX, default on): equal or
+ * lower error on every flash_attn_rocket case, and 19% off a 639-token ModernBERT-large encoder
+ * on its generic vector form [HW 2026-09-27, RK1]. On aarch64 its score and exp passes run in
+ * NEON, bit-identical at 0.635-0.652x the generic form's time (one A76, 2026-10-10); the
+ * ModernBERT-large figure has not been re-run on that form. ROCKET_FA_FUSED_SOFTMAX=0 restores the separate
+ * mask pass and the two-rounding softmax. fd<0 = exact host reference (the test oracle). Returns 0, <0 on error.
  *
  * THE SCORE SURFACE IS fp16 AND SATURATES. A score past 65504 (scale·q·k, before the
  * soft-cap) is written as ±65504, not as inf, so the keys past it tie and the softmax
@@ -122,7 +124,7 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
  * ROCKET_FA_TILE_KV (long context) selects the online/tiled path: instead of one QK matmul
  * over the full key axis (materializing the [n_tokens,n_kv] score matrix host-side for the
  * mask + softmax — 32 MB/head at 32K, traffic that streams to DRAM and grows with n_kv), the
- * key axis is walked in tiles of ROCKET_FA_TILE_KV keys (default 2048, padded to %32) carrying
+ * key axis is walked in tiles of ROCKET_FA_TILE_KV keys (padded to %32) carrying
  * the FlashAttention-2 running softmax (max/denom/unnormalized-output, fp32). The working score
  * tile is [n_tokens,tile] and stays cache-resident, and the resident scratch is bounded — same
  * total MACs and host exp work, traded for more (smaller) per-tile NPU submits, so it only

@@ -10,6 +10,10 @@
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define FA_NEON 1      /* the fused softmax's NEON loops (vcvtmq / vfmaq are A64 forms) */
+#endif
 
 #include "rocket_attn.h"
 #include "rocket_npu.h"       /* rocket_open / rocket_close (the mt worker fds)  */
@@ -646,6 +650,30 @@ static inline fa_f4 fa_vexp(fa_f4 x)
     return y * (fa_f4)e;
 }
 
+#ifdef FA_NEON
+/* fa_vexp for an argument that is never positive, which a score minus its row maximum is: the
+ * same operations in the same order, so the same bits, with the lower clamp as one max, no upper
+ * clamp, and the floor as one convert toward minus infinity in place of four instructions. */
+static inline float32x4_t fa_vexp_nonpos(float32x4_t x)
+{
+    x = vmaxq_f32(x, vdupq_n_f32(-88.3762626647949f));
+    const float32x4_t fx = vfmaq_f32(vdupq_n_f32(0.5f), x, vdupq_n_f32(1.44269504088896341f));
+    const int32x4_t n = vcvtmq_s32_f32(fx);
+    const float32x4_t fn = vcvtq_f32_s32(n);
+    x = vfmaq_f32(x, fn, vdupq_n_f32(-0.693359375f));
+    x = vfmaq_f32(x, fn, vdupq_n_f32(2.12194440e-4f));
+    const float32x4_t z = vmulq_f32(x, x);
+    float32x4_t y = vfmaq_f32(vdupq_n_f32(1.3981999507e-3f), x, vdupq_n_f32(1.9875691500e-4f));
+    y = vfmaq_f32(vdupq_n_f32(8.3334519073e-3f), y, x);
+    y = vfmaq_f32(vdupq_n_f32(4.1665795894e-2f), y, x);
+    y = vfmaq_f32(vdupq_n_f32(1.6666665459e-1f), y, x);
+    y = vfmaq_f32(vdupq_n_f32(5.0000001201e-1f), y, x);
+    y = vaddq_f32(vfmaq_f32(x, y, z), vdupq_n_f32(1.0f));
+    const int32x4_t e = vshlq_n_s32(vaddq_s32(n, vdupq_n_s32(127)), 23);
+    return vmulq_f32(y, vreinterpretq_f32_s32(e));
+}
+#endif
+
 /* Returns whether a real key's raw score reached the saturation limit (see FA_SAT). */
 static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mask, int n_tokens,
                             int n_kv, int Tp, int Kn, float scale, float softcap)
@@ -666,6 +694,27 @@ static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mas
         const _Float16 *mr = (mask && i < n_tokens) ? mask + (size_t)i * n_kv : NULL;
         fa_f4 vmax = floor4;
         int j = 0;
+#ifdef FA_NEON
+        /* The same values as the generic loop below. The saturation test reads a running
+         * maximum of |raw|, which a NaN carries through; a NaN score may then leave a different
+         * row maximum, but the call returns ROCKET_E_RANGE and P is not used. */
+        {
+            float32x4_t amax = vdupq_n_f32(0.f), vm = vdupq_n_f32(-30000.f);
+            const float32x4_t fl = vdupq_n_f32(-30000.f);
+            for (; j < nv; j += 4) {
+                const float32x4_t raw = vcvt_f32_f16(vld1_f16((const __fp16 *)(row + j)));
+                amax = vmaxq_f32(amax, vabsq_f32(raw));
+                float32x4_t s = vmulq_n_f32(raw, scale);
+                if (mr) s = vaddq_f32(s, vcvt_f32_f16(vld1_f16((const __fp16 *)(mr + j))));
+                s = vmaxq_f32(s, fl);
+                vst1q_f32(buf + j, s);
+                vm = vmaxq_f32(vm, s);
+            }
+            satv |= (fa_i4)vreinterpretq_s32_u32(vmvnq_u32(vcltq_f32(amax, vdupq_n_f32(FA_SAT))));
+            vst1q_f32((float *)&vmax, vm);
+        }
+        (void)zero4; (void)sat4;
+#else
         for (; j < nv; j += 4) {
             fa_h4 hq; memcpy(&hq, row + j, sizeof hq);
             const fa_f4 raw = __builtin_convertvector(hq, fa_f4);
@@ -676,6 +725,7 @@ static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mas
             memcpy(buf + j, &s, sizeof s);
             vmax = fa_sel(s > vmax, s, vmax);
         }
+#endif
         float mx = vmax[0];
         for (int k = 1; k < 4; k++) if (vmax[k] > mx) mx = vmax[k];
         for (; j < n_kv; j++) {
@@ -688,12 +738,33 @@ static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mas
         for (; j < Kn; j++) buf[j] = -30000.0f;   /* pad keys */
         const fa_f4 m4 = { mx, mx, mx, mx };
         fa_f4 vs = { 0, 0, 0, 0 };
+#ifdef FA_NEON
+        /* Four exps a step, each its own dependency chain, added into the one sum in the
+         * generic loop's order, so the sum's bits are the same. */
+        {
+            const float32x4_t mn = vdupq_n_f32(mx);
+            float32x4_t vsn = vdupq_n_f32(0.f);
+            for (j = 0; j < Kn; j += 16) {        /* Kn % 32 == 0 */
+                const float32x4_t e0 = fa_vexp_nonpos(vsubq_f32(vld1q_f32(buf + j),      mn));
+                const float32x4_t e1 = fa_vexp_nonpos(vsubq_f32(vld1q_f32(buf + j + 4),  mn));
+                const float32x4_t e2 = fa_vexp_nonpos(vsubq_f32(vld1q_f32(buf + j + 8),  mn));
+                const float32x4_t e3 = fa_vexp_nonpos(vsubq_f32(vld1q_f32(buf + j + 12), mn));
+                vst1q_f32(buf + j, e0);     vst1q_f32(buf + j + 4, e1);
+                vst1q_f32(buf + j + 8, e2); vst1q_f32(buf + j + 12, e3);
+                vsn = vaddq_f32(vsn, e0); vsn = vaddq_f32(vsn, e1);
+                vsn = vaddq_f32(vsn, e2); vsn = vaddq_f32(vsn, e3);
+            }
+            vst1q_f32((float *)&vs, vsn);
+        }
+        (void)m4;
+#else
         for (j = 0; j < Kn; j += 4) {             /* Kn % 32 == 0 */
             fa_f4 s; memcpy(&s, buf + j, sizeof s);
             fa_f4 e = fa_vexp(s - m4);
             memcpy(buf + j, &e, sizeof e);
             vs += e;
         }
+#endif
         const float sum = vs[0] + vs[1] + vs[2] + vs[3];
         const float inv = sum > 0.f ? 1.f / sum : 0.f;
         _Float16 *op = P + (size_t)i * Kn;

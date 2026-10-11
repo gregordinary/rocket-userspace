@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # 99-rocket-npu-pm.rules — let an unprivileged NPU process drive the RK3576 power cycle.
 #
-# WHY THIS EXISTS. On the RK3576 a job whose DPU output element is wider than one byte
-# (any fp16 convolution, either int32 matmul writer) leaves the NEXT submit completing
-# normally and writing nothing. What clears it is the runtime-PM autosuspend cycling the
+# WHY THIS EXISTS. On the RK3576 a job that writes a wide DPU output element through a
+# partial output stage leaves the NEXT submit completing normally and writing nothing. On
+# the library's defaults that is the fp16 packed-image first conv (four or fewer input
+# channels); the older int32 matmul writers (ROCKET_RK3576_I32_DENSE=0) and the fp16
+# conv's fp16 writer (ROCKET_RK3576_FP16_F32OUT=0) do it too. What clears it is the runtime-PM autosuspend cycling the
 # NPU power domain, not elapsed time — so the library has to wait for that cycle before
 # the next submit, and mainline sizes the autosuspend delay at 50 ms for a display
 # pipeline. Waiting out that timer costs ~105 ms per call.

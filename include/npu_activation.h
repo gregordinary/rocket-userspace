@@ -83,17 +83,22 @@ typedef struct {
 int gen_lut_activation_fp16(lut_act_params_t *params);
 
 /*
- * SUPERSEDED (kept as the RE record). Elementwise fp16 multiply attempted with a
- * pure FLYING main: MRDMA reads input A, ERDMA reads input B, EW MUL combines
- * them. This CANNOT WORK on rocket — the DPU EW reads its 2nd operand only when
- * MRDMA is repurposed (COMB_USE(5)) to deliver the operand, which leaves no main
- * feed, so the operand reads 0 (Mesa Teflon add_tensor RE;).
+ * Elementwise fp16 multiply with a pure FLYING main: MRDMA reads input A, ERDMA reads
+ * input B, EW MUL combines them, with no conv. As emitted it does not compute, because two
+ * of its fields are wrong. Under its COMB_USE(5) the job never completes; with COMB_USE 0
+ * or 4 it writes the product on lane 0 of each 8-channel atom and zero on the other seven,
+ * because its DATA_CUBE_CHANNEL leaves ORIG_CHANNEL at 0 [HW sweep, RK3588,
+ * tests/ew_int_probe.c oldgen]. A DPU-only program with ORIG_CHANNEL equal to CHANNEL,
+ * COMB_USE bit 0 clear and the EW converter bypassed computes fp16 MUL exactly, as it does
+ * ADD, MAX, MIN and MINUS with the converter live (same probe), so a two-buffer EW op needs
+ * no conv main feed.
  *
- * The WORKING fully-on-NPU multiply is `rocket_ew_mul_fp16` (rocket_activation.c):
+ * The library's fully-on-NPU multiply is `rocket_ew_mul_fp16` (rocket_activation.c):
  * an IDENTITY conv/matmul supplies the main feed (== A) and the EW MUL combines
  * the ERDMA operand (B) with it (gen_matmul_fp16 accumulate=1, ew_mul=1 =>
- * EW_OP_TYPE=1). HW-validated bit-exact (tests/ew_mul_rocket.c). This generator is
- * retained only behind ROCKET_ACT_EXPERIMENTAL for the negative-result record.
+ * EW_OP_TYPE=1). HW-validated bit-exact (tests/ew_mul_rocket.c). No library entry calls
+ * this generator and no knob enables it; only the tests call it (an off-device regcmd
+ * smoke in tests/activation_lut_rocket.c and tests/ew_int_probe.c's oldgen arm).
  */
 typedef struct {
   uint64_t input_a_dma;   /* MRDMA main feed  */

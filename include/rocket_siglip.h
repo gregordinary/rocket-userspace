@@ -111,9 +111,11 @@ int  rocket_siglip_encode(int fd, const rocket_siglip_model *m,
  * (fine for a one-shot, but pack+readback dominates). The resident path packs the 7
  * static GEMMs per layer (patch, q/k/v/o, fc1, fc2) into resident NPU BOs ONCE at
  * ctx-create and fans them across the 3 NPU cores; per image only the activations are
- * packed. The computed attention matmuls (scores, P·V) use a resident streaming
- * context; softmax runs on the NPU; LayerNorm / GELU / residual / bias adds run on
- * the host (memory-bound, faster once the data is already de-tiled). The host GELU is
+ * packed. The computed attention matmuls (scores, P·V) run on the NPU through the
+ * flash-attention fan-out across the worker fds (ROCKET_SIGLIP_FA=0, or nthreads <= 1,
+ * keeps one resident streaming context instead). By default the softmax runs on the host
+ * on both routes, as do LayerNorm / GELU / residual / bias adds (memory-bound, faster once the
+ * data is already de-tiled). The host GELU is
  * the gelu_pytorch_tanh formula (an exact match to SigLIP's training activation).
  *
  *   c = rocket_siglip_ctx_create(&m, nthreads);   // packs all weights once (slow)

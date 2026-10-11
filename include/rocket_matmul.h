@@ -71,8 +71,10 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
  * separately AV, matmuls within a worker's head range).
  *
  * A/B/C are nbatch-long arrays of row-major operand/result pointers (A[i] is [M,K],
- * B[i] is [N,K], C[i] is [M,N]). BIT-IDENTICAL to calling rocket_matmul_fp16 per item
- * (same plan, fp16 pack, CPU fp32 K-accum, de-tile/narrow); it does NOT consult
+ * B[i] is [N,K], C[i] is [M,N]). Equal in value to calling rocket_matmul_fp16 per item
+ * (same plan and fp16 pack). At one K tile it de-tiles the NPU's fp16 straight into C,
+ * which keeps a -0 output -0; past one it sums the K tiles in CPU fp32 and narrows, where
+ * a -0 output comes back +0. It does NOT consult
  * ROCKET_KACC/REUSE/PIPE (the single-matmul perf variants) — the batch lever is
  * orthogonal. Requires M%4, K%32, N%16; nbatch==1 falls through to rocket_matmul_fp16.
  * The caller bounds nbatch (the in/wt BO and the fp32 accumulators scale with it).
@@ -102,8 +104,9 @@ int rocket_matmul_fp16_batch(int fd, int M, int K, int N, int nbatch,
  *       rocket_mm_batch_run(b, M, K, N, nbatch, A, B, C);
  *   rocket_mm_batch_free(b);
  *
- * rocket_mm_batch_run is BIT-IDENTICAL to rocket_matmul_fp16_batch (same plan, pack,
- * CPU fp32 K-accum, de-tile/narrow); the only difference is BO/scratch lifetime.
+ * rocket_mm_batch_run is BIT-IDENTICAL to rocket_matmul_fp16_batch (same plan, pack and
+ * de-tile: straight into C at one K tile, CPU fp32 K-accum and narrow past it); the only
+ * difference is BO/scratch lifetime.
  * Same shape contract (M%4, K%32, N%16; nbatch==1 falls through to rocket_matmul_fp16).
  * Returns 0 on success, negative on error (the resident BOs are kept for the next run;
  * free with rocket_mm_batch_free). */
@@ -169,9 +172,13 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
  *     output-channel tile by halves to 32 channels before it gives up, so what decides
  *     it is the CBUF pool against a one-group weight cube, a condition on K alone. Past
  *     it the return is ROCKET_E_UNSUPPORTED and nothing is submitted. The K-split route
- *     that used to run those shapes — the int32 entry below — wedges the NPU across
- *     processes until the board is rebooted, so a caller that needs a larger K runs it
- *     on the host. ROCKET_RK3576_MM_KSPLIT=1 takes the route anyway, for measurement.
+ *     is the int32 entry below, and the refusal is policy. On that entry's narrow writer
+ *     one shape of the class (M=512 K=8192 N=2048) wedged the NPU across processes until
+ *     a reboot [HW, H96 MAX M9, 2026-08-07]. On its dense writer, the default, the same
+ *     shape runs in 345.7 ms, 48 submits with no redo and 4096 sampled elements exact
+ *     [HW sweep, H96 MAX M9, rocket 1.6.0, 2026-09-30]. A caller that needs a larger K
+ *     calls rocket_matmul_int8_rk3576_i32() and requantizes, or runs it on the host.
+ *     ROCKET_RK3576_MM_KSPLIT=1 takes the route from this entry.
  *   - BELOW that boundary K is free, but it is not FLAT: the output tile collapses from
  *     1024 channels to 32 in one step at K > 4992, which multiplies the submit count by
  *     32 at M=512 N=2048 with nothing refusing and nothing computing wrong. A caller
@@ -393,9 +400,8 @@ int rocket_matmul_int8_rk3576_perc_sa(int fd, int M, int K, int N,
  * correctly sized, entirely plausible surface from the OLD weight. K and N are the one
  * cheap consistency check and a mismatch refuses.
  *
- * A K this part has no single-task plan for (K >= 6176) refuses here outright — the
- * int32 K-split fallback needs the row-major B this entry does not take, and that route
- * wedges the device at prefill scale anyway (see above).
+ * A K this part has no single-task plan for (K >= 6176) refuses here outright: the
+ * int32 K-split fallback needs the row-major B this entry does not take.
  *
  * Measured: bit-identical to rocket_matmul_int8_rk3576_perc_sa() over the requant
  * gate's shapes, including a forced eight-tile run — the cached cube is byte-for-byte
@@ -462,9 +468,10 @@ void rocket_rk3576_bo_pool_drain(int fd);
  * it. Small cells in the class do compute (M=32 K=8192 N=128 and M=16 K=16384 N=64 run
  * green in the gate list; M=64 K=8192 N=32 scored exact three times), and where the
  * boundary between them lies is NOT known — one shape reached the wedge and each
- * occurrence costs a reboot. rocket_matmul_int8_rk3576() therefore no longer falls onto
- * this entry at all. [HW, H96 MAX M9, one shape, 2026-08-07] That shape has not been run
- * on the dense writer. */
+ * occurrence costs a reboot. [HW, H96 MAX M9, one shape, 2026-08-07] On the dense writer
+ * that shape runs in 345.7 ms, 48 submits with no redo, 4096 sampled elements exact [HW
+ * sweep, H96 MAX M9, rocket 1.6.0, 2026-09-30]. As policy, rocket_matmul_int8_rk3576()
+ * falls onto this entry only under ROCKET_RK3576_MM_KSPLIT=1. */
 int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                                   const int8_t *A, const int8_t *B,
                                   const int32_t *bias, int32_t *C);
@@ -506,7 +513,9 @@ void rocket_rk3576_i32_last_stats(rocket_rk3576_i32_stats *out);
  * gathered on the host.
  *
  * This is NOT the fp16 convolution program, which contracts sixteen input channels a
- * task and made fp16 30-299x slower than int8 on this part. It is the matmul form of
+ * task. On its fp16 writer, which pays a power cycle per program, that program measured
+ * 30-299x slower than int8 over ordinary shapes. Its fp32-stage default, which pays none,
+ * has not been priced against int8. This entry is the matmul form of
  * gahingwoo/charsiu (`524e10a`), transcribed word for word.
  *
  * ENVELOPE: 1 <= M <= 2048, 32 <= K <= 6144 with K%32 == 0, 64 <= N <= 8192 with
@@ -539,9 +548,9 @@ void rocket_rk3576_i32_last_stats(rocket_rk3576_i32_stats *out);
  * [HW sweep, H96 MAX M9, 786 MHz, governor performance, tests/rk3576_mm_fp16_cost,
  * 2026-09-25]
  *
- * Its fp32 output does NOT poison the next submit, unlike this part's int32 writers and fp16
- * convolution: in one process at a zero gap, the int8 direct program wrote 20 of 20 after
- * it, and so did this entry after itself. [HW sweep, H96 MAX M9, rk3576_poison_probe, 2026-09-25]
+ * Its fp32 output does NOT poison the next submit, unlike the older int32 writers and the
+ * fp16 convolution's fp16 writer: in one process at a zero gap, the int8 direct program
+ * wrote 20 of 20 after it, and so did this entry after itself. [HW sweep, H96 MAX M9, rk3576_poison_probe, 2026-09-25]
  *
  * A call whose output still holds the sentinel stamp after the fence is redone after a
  * power cycle, and refused with ROCKET_E_DEVICE past eight attempts; C is unspecified

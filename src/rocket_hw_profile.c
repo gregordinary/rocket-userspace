@@ -120,8 +120,11 @@ const struct rocket_hw_profile rocket_hw_rk3576 = {
     /* int8 and fp16 DIRECT CONV_2D, both transcribed from vendor captures and both
      * gap-free in their output: fp16 contracts 16 input channels per task
      * (rocket_rk3576_plan_ic splits past that) and delivers every output channel.
-     * Every other precision is unexercised here, and an unset bit on a bring-up chip
-     * means unvalidated, which is the same thing as unsupported. */
+     * bf16 has run bit-exactly on the fp16 matmul program with CORE 0x3018's operand
+     * type at 3 [HW sweep, H96 MAX M9, rocket 1.6.0, tests/rk3576_mm_bf16_probe,
+     * 2026-09-26], but no entry emits it, so its bit stays unset. Every other precision
+     * is unexercised here, and an unset bit on a bring-up chip means unvalidated, which
+     * is the same thing as unsupported. */
     .dtype_supported = ROCKET_DT_BIT(precision_int8) |
                        ROCKET_DT_BIT(precision_float16),
 
@@ -129,11 +132,13 @@ const struct rocket_hw_profile rocket_hw_rk3576 = {
         "rk3576: machine parameters are measured. CONV_2D computes — direct at int8 "
         "(gen_conv2d_int8_rk3576, gap-free) and at fp16 (gen_conv2d_fp16_rk3576 + "
         "rocket_rk3576_plan_ic, 16 input channels per task), and depthwise at int8 "
-        "(gen_conv2d_dw_int8_rk3576). MATMUL computes at int8 through this part's own "
-        "entry, rocket_matmul_int8_rk3576, whose output is int8 through the DPU's "
-        "requant and whose K is bounded by one task's contraction. The op library and "
-        "every other matmul entry still emit the RK3588 encoding, which this part does "
-        "not run: those refuse rather than write nothing.",
+        "(gen_conv2d_dw_int8_rk3576). MATMUL computes through this part's own entries: "
+        "rocket_matmul_int8_rk3576 (int8 out through the DPU's requant, K bounded by one "
+        "task's contraction), rocket_matmul_int8_rk3576_i32 (int32 out, K split) and "
+        "rocket_matmul_fp16_rk3576 (fp32 out). Int8 POOLING (rocket_pool_int8_rk3576) and "
+        "the int8 LUT activations (rocket_act_int8_rk3576) compute too. The rest of the "
+        "op library and every other matmul entry emit the RK3588 encoding, which this "
+        "part does not run: those refuse rather than write nothing.",
 
     .default_workers = 8,                  /* not swept on this part */
     /* The RK3576 series retires a job that never reports completion at a 125 ms backstop

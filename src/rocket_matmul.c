@@ -106,16 +106,18 @@ static int mm_profile(void) {
  * candidate (below the min-M gate, no stable weight name) still takes the streaming
  * path and still pays a per-call weight scatter counted here. */
 static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct { double pack, packA, packB, gen, sync, submit, wait, read; long calls; } g_prof;
+static struct { double pack, packA, packB, gen, sync, submit, wait, read, acc; long calls; } g_prof;
 static int g_prof_armed = 0;
 static void mm_prof_dump(void) {
     /* packA = input(A) scatter, packB = weight(B) scatter; on the mt path A is
      * packed redundantly per worker (lever 2 target) while B is unavoidable
      * (each weight used once per prefill). Their split decides which to attack. */
+    /* acc = the batched path's fp32 accumulator, zeroed before the job-batches and narrowed
+     * to fp16 after them: outside every other bucket, so without it the time is unattributed. */
     ROCKET_LOGI("ROCKET profile total(ms): pack=%.0f (packA=%.0f packB=%.0f) "
-            "gen=%.0f sync=%.0f submit=%.0f wait=%.0f read=%.0f  over %ld job-batches\n",
+            "gen=%.0f sync=%.0f submit=%.0f wait=%.0f read=%.0f acc=%.0f  over %ld job-batches\n",
             g_prof.pack, g_prof.packA, g_prof.packB, g_prof.gen, g_prof.sync,
-            g_prof.submit, g_prof.wait, g_prof.read, g_prof.calls);
+            g_prof.submit, g_prof.wait, g_prof.read, g_prof.acc, g_prof.calls);
 }
 static void mm_prof_arm_locked(void) {
     if (!g_prof_armed) { atexit(mm_prof_dump); g_prof_armed = 1; }
@@ -2384,7 +2386,8 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
  * BO sizing: in_all/wt_all hold all nbatch items' packed tiles (the caller bounds
  * nbatch so this stays modest — flash attention caps the head group by score-matrix
  * size); out_all is the BATCH-tile rolling submit buffer, de-tiled per job-batch
- * into the per-item fp32 accumulators. Allocates its BOs per call (the caller holds
+ * into the per-item fp32 accumulators, or straight into each C when the plan has one
+ * K tile (every QK of a flash attention: K is the head dim). Allocates its BOs per call (the caller holds
  * the fd, not these BOs). Requires M%4, K%32, N%16 (the plan rejects otherwise);
  * nbatch==1 falls through to the one-shot rocket_matmul_fp16 verbatim. Returns 0 or
  * a negative rocket_status.
@@ -2491,15 +2494,27 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
                ? ROCKET_E_DEVICE : ROCKET_E_NOMEM;
     }
 
-    /* Per-item fp32 K-accumulators (grow-only); zeroed every run (they accumulate). */
-    size_t acc_n = (size_t)nbatch * M * N;
-    if (b->acc_cap < acc_n) {
-        float *na = realloc(b->acc, acc_n * sizeof(float));
-        if (!na) { b->prezeroed = 0; return ROCKET_E_NOMEM; }
-        b->acc = na; b->acc_cap = acc_n;
+    /* With one K tile every output element comes from exactly one tile, already narrowed to
+     * fp16 by the NPU, so it is de-tiled straight into C. Otherwise per-item fp32
+     * K-accumulators (grow-only), zeroed every run. The two agree bit for bit except that a
+     * -0 output stays -0, where the accumulator's 0.0f + -0.0f gives +0. */
+    const int direct = (nKt == 1);
+    int prof = mm_profile();
+    double t_packA = 0, t_packB = 0, t_gen = 0, t_sync = 0, t_submit = 0, t_wait = 0, t_read = 0, ts;
+    double t_acc = 0;
+    float *acc = NULL;
+    if (!direct) {
+        size_t acc_n = (size_t)nbatch * M * N;
+        if (b->acc_cap < acc_n) {
+            float *na = realloc(b->acc, acc_n * sizeof(float));
+            if (!na) { b->prezeroed = 0; return ROCKET_E_NOMEM; }
+            b->acc = na; b->acc_cap = acc_n;
+        }
+        ts = now_ms();
+        memset(b->acc, 0, acc_n * sizeof(float));
+        t_acc += now_ms() - ts;
+        acc = b->acc;
     }
-    memset(b->acc, 0, acc_n * sizeof(float));
-    float *acc = b->acc;
 
     /* Skip the full-BO zero whenever the layout repeats and the BOs were not just
      * (re)allocated: for a fixed (M,K,N,nbatch) the scatter rewrites the SAME live
@@ -2514,9 +2529,6 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
     rocket_task_desc *tasks = b->tasks;
     void   *submit_dt = b->submit_dt;
     int ret = 0;
-
-    int prof = mm_profile();
-    double t_packA = 0, t_packB = 0, t_gen = 0, t_sync = 0, t_submit = 0, t_wait = 0, t_read = 0, ts;
 
     /* Pack every item's A and B into its slice of the shared in_all/wt_all BO (zero
      * the whole BO first only when need_zero), then scatter each item at its per-item
@@ -2609,9 +2621,14 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
 
                         ts = now_ms();
                         _Float16 *ob = b->out_all.ptr;
-                        for (int j = 0; j < nb; j++)
-                            detile_accum_f16(acc + (size_t)bit_[j] * M * N, N, ob + boff[j],
-                                             bm0[j], bn0[j], bMtile[j], bNtile[j]);
+                        for (int j = 0; j < nb; j++) {
+                            if (direct)
+                                detile_store_f16(C[bit_[j]], N, ob + boff[j],
+                                                 bm0[j], bn0[j], bMtile[j], bNtile[j]);
+                            else
+                                detile_accum_f16(acc + (size_t)bit_[j] * M * N, N, ob + boff[j],
+                                                 bm0[j], bn0[j], bMtile[j], bNtile[j]);
+                        }
                         rocket_bo_fini(fd, &b->out_all);
                         t_read += now_ms() - ts;
                         nb = 0;
@@ -2621,15 +2638,19 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
         }
     }
 
-    for (int it = 0; it < nbatch; it++)
-        narrow_f32_to_f16(C[it], acc + (size_t)it * M * N, (size_t)M * N);
+    if (!direct) {
+        ts = now_ms();
+        for (int it = 0; it < nbatch; it++)
+            narrow_f32_to_f16(C[it], acc + (size_t)it * M * N, (size_t)M * N);
+        t_acc += now_ms() - ts;
+    }
 
     if (prof) {
         pthread_mutex_lock(&g_prof_mu);
         mm_prof_arm_locked();
         g_prof.pack += t_packA + t_packB; g_prof.packA += t_packA; g_prof.packB += t_packB;
         g_prof.gen += t_gen; g_prof.sync += t_sync; g_prof.submit += t_submit;
-        g_prof.wait += t_wait; g_prof.read += t_read; g_prof.calls++;
+        g_prof.wait += t_wait; g_prof.read += t_read; g_prof.acc += t_acc; g_prof.calls++;
         pthread_mutex_unlock(&g_prof_mu);
     }
     return ROCKET_OK;

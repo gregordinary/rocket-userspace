@@ -44,8 +44,11 @@
  * a tile runs with pad_top=pad_left=0 over real-halo + explicit-zero rows/cols.
  * Depthwise tiles over CHANNELS instead (channels are independent — no halo): a wide
  * DW layer is split into chunks of Cc channels (a multiple of G) that each fit one
- * pass. A single channel whose own feature is too large for one pass would need
- * SPATIAL tiling (not yet implemented) — rocket_conv2d_plan returns <0 for that case.
+ * pass. A G-channel chunk whose feature is still too large for one pass is tiled over
+ * SPACE as well (dw_spatial in rocket_conv.c, the direct path's materialized-halo band
+ * tiler). rocket_conv2d_plan returns <0 only when one G-channel weight cube does not fit
+ * a bank or the minimal spatial tile (G channels, one output row by one column) does
+ * not fit the feature budget.
  */
 
 /* Output spatial dim for one axis. dil is the dilation rate (1 = none). */
