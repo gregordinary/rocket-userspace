@@ -564,14 +564,15 @@ if(ROCKETNPU_BUILD_TESTS)
     # the conv width probe reads the library's output stamp to count elements never written;
     # the cube transpose gate checks rocket_cube.h's plane moves against the per-channel loop;
     # the per-channel depthwise and direct gates model the device from the plan the entry used;
-    # the open race gate reads the bound-core count the RK3576 fd guard itself reads
+    # the open race gate reads the bound-core count the RK3576 fd guard itself reads;
+    # the batch gate drives the row-major entry the flash attention uses
     foreach(t prototype_shared_scratch_rocket crossop_chain_rocket rk3576_cbuf_base
               rk3576_lut_probe rk3576_add_probe rk3576_mm_requant rk3576_w8a8_route
               pool_int8_native_probe deconv_extent_probe matmul_bf16_stream_rocket
               replay_dump rk3576_mm_fp16_envelope rk3576_mm_bf16_probe
               rk3576_conv_width_probe cube_transpose_gate rk3576_stallk_map
               conv_dw_int8_perc_runtime conv2d_int8_q_perc_rocket conv_model_bench
-              open_guard_race_rocket)
+              open_guard_race_rocket matmul_batch_rocket)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()

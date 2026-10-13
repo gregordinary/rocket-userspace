@@ -97,6 +97,12 @@ typedef struct npu_cna_desc {
    * (= input_zp_uint8 - 0x80); 0 for the float / int32-raw paths (read only by the
    * conv emitter; the matmul emitter always pads 0). */
   uint32_t pad_con1;          // 0x10A4
+
+  /* CONV_CON1 bit 29 (GROUP_LINE_OFF). Set with line_stride at one row of A and surf_stride 0,
+   * the CNA reads a matmul's A as plain [M][K] rows (the row-major form, set by
+   * gen_matmul_fp16 from matmul_params_t.a_row_atoms). 0 is the cube program's value. Read
+   * by the shared matmul emitter, so every matmul generator zero-initialises its desc. */
+  uint8_t group_line_off;     // 0x100C bit29
 } npu_cna_desc;
 
 typedef struct npu_core_desc {

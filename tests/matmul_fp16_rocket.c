@@ -21,9 +21,10 @@
 
 /* regcmd_count = the TOTAL number of NPUOP words the PC must execute, INCLUDING
  * the 4-op control trailer ops[104..107] (OP_NONE / PC_REGISTER_AMOUNTS / OP_40
- * / OP_ENABLE). ops[107] = OP_ENABLE writes PC_OPERATION_ENABLE = 0x0d
- * (PC_ENABLE|PC_ENABLE_CNA|PC_ENABLE_DPU) which is what actually TRIGGERS the
- * compute; the kernel's own OPERATION_ENABLE=0x1 write only starts the PC
+ * / OP_ENABLE). ops[107] = OP_ENABLE writes PC_OPERATION_ENABLE = 0x1D, a block
+ * bitmap laid out as the global enable register at 0xF008 (CNA b0 | CORE b2 |
+ * DPU b3 | DPU_RDMA b4), which is what actually TRIGGERS the compute; the
+ * kernel's own MMIO write of PC_OPERATION_ENABLE=0x1 only starts the PC
  * sequencer. If the PC stops before ops[107] the pipeline is configured but
  * never fired -> DPU never completes -> "NPU job timed out" (observed with 104).
  *

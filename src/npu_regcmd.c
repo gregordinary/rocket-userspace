@@ -194,7 +194,8 @@ static int gen_matmul_task(uint64_t *ops, npu_cna_desc *cna_desc,
    * 0xE bit pattern (POINTER_PP_MODE|EXECUTER_PP_EN|POINTER_PP_EN). */
   ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE, DPU_RDMA_S_POINTER);
 
-  value = ((cna_desc->proc_precision & 0x7) <<7) | ((cna_desc->in_precision & 0x7)<<4) |
+  value = ((cna_desc->group_line_off & 0x1) << 29) |
+    ((cna_desc->proc_precision & 0x7) <<7) | ((cna_desc->in_precision & 0x7)<<4) |
     (cna_desc->conv_mode & 0xf);
   ops[i++] = NPUOP(OP_REG_CNA, value, CNA_CONV_CON1);
   /* 10-bit CNA field. Normal path is m+1 (<=257), well within range; a diagnostic
@@ -326,7 +327,8 @@ static int gen_matmul_task(uint64_t *ops, npu_cna_desc *cna_desc,
   ops[i++] = NPUOP(OP_REG_DPU, value, DPU_DATA_CUBE_WIDTH);
   value = dpu_desc->height & 0x1FFF;
   ops[i++] = NPUOP(OP_REG_DPU, value, DPU_DATA_CUBE_HEIGHT);
-  ops[i++] = NPUOP(OP_REG_DPU, 0x0, DPU_DATA_CUBE_NOTCH_ADDR);
+  value = ((uint32_t)(dpu_desc->notch & 0x1FFF) << 16) | (dpu_desc->notch & 0x1FFF);
+  ops[i++] = NPUOP(OP_REG_DPU, value, DPU_DATA_CUBE_NOTCH_ADDR);
   value = ((dpu_desc->channel & 0x1FFF) << 16) | (dpu_desc->channel & 0x1FFF);
   ops[i++] = NPUOP(OP_REG_DPU, value, DPU_DATA_CUBE_CHANNEL);
   value = ((dpu_desc->bs_relu_bypass & 0x1) << 6) | ((dpu_desc->bs_mul_bypass & 0x1) << 4) |
@@ -450,8 +452,10 @@ static int gen_matmul_task(uint64_t *ops, npu_cna_desc *cna_desc,
                    DPU_RDMA_EW_SURF_NOTCH);
 
   /* PC trailer. The 0x0041.. magic word (required before op_en) then the
-   * 0x81 PC_OPERATION_ENABLE. Enable mask 0x1D = RESERVED_0(14)|OP_EN = bits
-   * 0,2,3,4; bit 4 is the one that brings the DPU_RDMA block into the op_en. */
+   * 0x81 write to PC_OPERATION_ENABLE. Its value is a per-block bitmap laid
+   * out as the global enable register at 0xF008, not as the PC register's own
+   * fields: 0x1D = CNA(b0)|CORE(b2)|DPU(b3)|DPU_RDMA(b4); bit 4 is the one
+   * that brings the DPU_RDMA block in. */
   ops[i++] = NPUOP(OP_NONE, 0x0, 0x0);
   ops[i++] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
   ops[i++] = NPUOP(OP_40, 0x0, 0x0);
@@ -493,7 +497,7 @@ static int rk3588_encoding_only(const char *gen)
 int gen_matmul_fp16(matmul_params_t *params)
 {
     if (rk3588_encoding_only("gen_matmul_fp16")) return -1;
-   npu_cna_desc cna_desc;
+   npu_cna_desc cna_desc = {0};   /* the shared emitter reads group_line_off */
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer fields; all used fields set below */
 
@@ -565,6 +569,13 @@ int gen_matmul_fp16(matmul_params_t *params)
    cna_desc.line_stride = cna_desc.datain_width * 4;
    surf_stride = cna_feature_surf_stride(cna_desc.line_stride, cna_desc.datain_height);
    cna_desc.surf_stride = surf_stride;
+   /* Row-major A: one line is one row of the full A, and no surfaces (matmul_params_t). */
+   if (params->a_row_atoms) {
+     if (params->a_row_atoms > 0xFFFFFFF) return -1;
+     cna_desc.group_line_off = 1;
+     cna_desc.line_stride = params->a_row_atoms;
+     cna_desc.surf_stride = 0;
+   }
    cna_desc.dma_width = cna_desc.datain_width;
    cna_desc.dma_height = cna_desc.datain_height;
    cna_desc.dma_channel = cna_desc.datain_channel;
@@ -616,6 +627,13 @@ int gen_matmul_fp16(matmul_params_t *params)
    dpu_desc.width_wdma = core_desc.dataout_width;
    dpu_desc.height_wdma = core_desc.dataout_height;
    dpu_desc.channel_wdma = core_desc.dataout_channel;
+   /* Row-major C: one atom from one channel group's run to the next, the notch from one row
+    * to the next, and SURFACE_ADD (below) one output group's bytes (matmul_params_t). */
+   if (params->c_row_atoms) {
+     if (params->c_row_atoms > 0x2000) return -1;
+     dpu_desc.dst_surf_stride = 1;
+     dpu_desc.notch = (uint16_t)(params->c_row_atoms - 1);
+   }
    dpu_desc.surf_add = (!params->fp32tofp16) ? dpu_desc.dst_surf_stride * 4 : dpu_desc.dst_surf_stride * 2;
 
    /* K-accumulation (eltwise-add) config: the conv result is the DPU main input,
@@ -751,7 +769,7 @@ int gen_lut_activation_fp16(lut_act_params_t *p)
   uint32_t width = cols - 1;                    /* width register is W-1       */
 
   uint32_t sptr   = 0xE;     /* arm single-register group (matmul convention)  */
-  uint32_t enable = 0x18;    /* RESERVED_0(12) => DPU+DPU_RDMA block bits 3,4  */
+  uint32_t enable = 0x18;    /* DPU(b3)|DPU_RDMA(b4), the 0xF008 block bitmap */
   const char *e;
   if ((e = getenv("ROCKET_LUT_SPTR")))   sptr   = (uint32_t)strtoul(e, NULL, 0);
   if ((e = getenv("ROCKET_LUT_ENABLE"))) enable = (uint32_t)strtoul(e, NULL, 0);
@@ -972,7 +990,7 @@ int gen_ew_mul_fp16(ew_mul_params_t *p)
 int gen_matmul_int8(matmul_params_t *params)
 {
     if (rk3588_encoding_only("gen_matmul_int8")) return -1;
-   npu_cna_desc cna_desc;
+   npu_cna_desc cna_desc = {0};   /* the shared emitter reads group_line_off */
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer fields; all used fields set below */
 
@@ -1291,7 +1309,7 @@ int gen_matmul_int8(matmul_params_t *params)
 int gen_matmul_int4(matmul_params_t *params)
 {
     if (rk3588_encoding_only("gen_matmul_int4")) return -1;
-   npu_cna_desc cna_desc;
+   npu_cna_desc cna_desc = {0};   /* the shared emitter reads group_line_off */
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer fields; all used fields set below */
 
@@ -1484,7 +1502,7 @@ int gen_matmul_int4(matmul_params_t *params)
 int gen_matmul_int16(matmul_params_t *params)
 {
     if (rk3588_encoding_only("gen_matmul_int16")) return -1;
-   npu_cna_desc cna_desc;
+   npu_cna_desc cna_desc = {0};   /* the shared emitter reads group_line_off */
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer fields; all used fields set below */
 
@@ -1716,7 +1734,7 @@ int gen_matmul_int16(matmul_params_t *params)
 int gen_matmul_bf16(matmul_params_t *params)
 {
     if (rk3588_encoding_only("gen_matmul_bf16")) return -1;
-   npu_cna_desc cna_desc;
+   npu_cna_desc cna_desc = {0};   /* the shared emitter reads group_line_off */
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer + EW fields; inert at accumulate=0 */
 
@@ -1915,7 +1933,7 @@ int gen_matmul_bf16(matmul_params_t *params)
 int gen_matmul_tf32(matmul_params_t *params)
 {
     if (rk3588_encoding_only("gen_matmul_tf32")) return -1;
-   npu_cna_desc cna_desc;
+   npu_cna_desc cna_desc = {0};   /* the shared emitter reads group_line_off */
    npu_core_desc core_desc;
    npu_dpu_desc dpu_desc = {0};   /* zero new output-writer + EW fields; inert at accumulate=0 */
 
@@ -2864,8 +2882,9 @@ int gen_conv2d_dw_fp16(conv_params_t *params) { return gen_conv2d_fill(params, 1
  * Native int8 CONV_2D generators (gen_conv2d_int8 / gen_conv2d_dw_int8).
  *
  * The int8 sibling of gen_conv2d_fp16: int8 features x int8 weights reduced
- * NATIVELY by the CNA into an int32 accumulator written raw to DRAM (the host
- * applies the per-output-channel weight-scale x per-tensor act-scale requant). It
+ * NATIVELY by the CNA into an int32 accumulator, by default (int8_out=0) written raw
+ * to DRAM (the host applies the per-output-channel weight-scale x per-tensor
+ * act-scale requant). It
  * is to gen_conv2d_fp16 exactly what gen_matmul_int8 is to gen_matmul_fp16 — the
  * same shared gen_conv2d_task emitter, with the mechanical int8 deltas:
  *   CNA  in/proc precision fp16->int8; 1 B/elem; data_entries /32->/64
@@ -2886,11 +2905,21 @@ int gen_conv2d_dw_fp16(conv_params_t *params) { return gen_conv2d_fill(params, 1
  * Host packing (rocket_conv.c / the standalone gate): feature cube C2=16 (int8),
  * weight cube weight_conv_int8 (oc-group 32 / ic-group 32), int32 output cube C2=4.
  *
- * DEPTHWISE int8 is wired but UNPROVEN — the DW output-geometry regs (size_e /
- * surf_add / feature_grains / bs_ow_op) and the channel group G were HW-cracked for
- * fp16 and may differ for the int32 output; every uncertain DW field is
- * env-overridable (ROCKET_CONV_DW_*) for the on-HW sweep, exactly as the fp16 DW
- * crack used. The DIRECT path is the validated deliverable.
+ * The DIRECT int8-OUT branch (int8_out=1) is Mesa's direct writer instead: the shared
+ * int8_out_epilogue (QD_EN 1, the folded bias in the BS stage, CPEND for the weight
+ * zero point, the OUT_CVT requant) at size_e 1 / surf*2, writing an int8 C2=16 cube
+ * with no int32 readback and no host requant. It is what rocket_conv2d_int8_q (and
+ * _perc, with a per-channel BS multiplier) runs, bit-exact against a host model on
+ * the RK1 (conv_i8out_probe, conv2d_int8_q_rocket).
+ *
+ * DEPTHWISE int8 is HW-validated on its int8-OUT branch only (int8_out=1, Mesa's
+ * int8-output writer, size_e=3 / surf*4, G=64): the program matches Teflon's capture
+ * (replay_dw_mesa) and is bit-exact against a host model of the OUT_CVT requant,
+ * asymmetric weight zero points through CPEND included (conv_dw_int8_runtime,
+ * cpend_wzp_probe), and with a per-channel BS multiplier (dw_perc_probe). It is what
+ * rocket_conv2d_dw_int8 and rocket_conv2d_dw_int8_perc run. The int32-raw DW writer
+ * (int8_out=0) is still UNPROVEN — it doubles the within-plane stride — and stays
+ * env-overridable (ROCKET_CONV_DW_*) for the on-HW sweep.
  */
 /* The int8-OUTPUT writer's epilogue, shared by the depthwise and the direct program so the
  * two cannot disagree: QD_EN 1, DATA_FORMAT 0 (int8 out), the per-OC int32 bias (or the

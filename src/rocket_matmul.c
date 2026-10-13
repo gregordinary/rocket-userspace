@@ -2304,8 +2304,8 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
                        const _Float16 *A, const _Float16 *B, _Float16 *C)
 {
     if (mm_wrong_encoding("rocket_matmul_fp16",
-                          "rocket_matmul_int8_rk3576 (int8 is this part's matmul "
-                          "precision; its fp16 conv contracts 16 channels a task)"))
+                          "rocket_matmul_fp16_rk3576 (the same fp16 contraction, "
+                          "written as fp32), or rocket_matmul_int8_rk3576 for int8"))
         return ROCKET_E_UNSUPPORTED;
     /* dtype capability gate: a chip declares its usable datatype menu in the hw
      * profile. RK3588's mask is all-ones (the datatype matrix is complete), so this
@@ -2401,6 +2401,10 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
 struct rocket_mm_batch {
     int fd;
     rocket_bo guard, regcmd, in_all, wt_all, out_all;
+    rocket_bo fence;                 /* 4 KiB, never written: a job writing a caller's
+                                      * row-major C lists it as a second output, and the
+                                      * run waits on it, because PREP_BO syncs the WHOLE BO
+                                      * it waits on and C may be megabytes */
     int    *bit_, *bm0, *bn0, *bMtile, *bNtile;
     size_t *boff;
     rocket_task_desc *tasks;
@@ -2408,6 +2412,9 @@ struct rocket_mm_batch {
     float  *acc;
     size_t  acc_cap;                 /* allocated fp32 elem count in acc            */
     int     prezeroed;               /* in_all/wt_all zero AND match last_* layout  */
+    int     in_stale;                /* in_all holds an older layout's lanes: a run that
+                                      * read A in place changed the layout without
+                                      * re-packing it                                  */
     int     last_M, last_K, last_N, last_nbatch;
 };
 
@@ -2446,6 +2453,7 @@ rocket_mm_batch *rocket_mm_batch_create(int fd)
 void rocket_mm_batch_free(rocket_mm_batch *b)
 {
     if (!b) return;
+    rocket_bo_free(b->fd, &b->fence);
     rocket_bo_free(b->fd, &b->out_all);
     rocket_bo_free(b->fd, &b->wt_all);
     rocket_bo_free(b->fd, &b->in_all);
@@ -2456,13 +2464,16 @@ void rocket_mm_batch_free(rocket_mm_batch *b)
     free(b);
 }
 
-int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
-                        const _Float16 *const *A, const _Float16 *const *B,
-                        _Float16 *const *C)
+/* The batched run, with A read from, or C written to, a caller's BO as plain rows when
+ * Arm / Crm is given (rocket_mm_batch_run_rows). Both NULL is rocket_mm_batch_run. */
+static int mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
+                        const _Float16 *const *A, const rocket_bo *Arm,
+                        const _Float16 *const *B,
+                        _Float16 *const *C, rocket_bo *Crm, int c_block)
 {
     if (!b) return ROCKET_E_SHAPE;
-    if (nbatch < 1 || !A || !B || !C) return ROCKET_E_SHAPE;
-    if (nbatch == 1) return rocket_matmul_fp16(b->fd, M, K, N, A[0], B[0], C[0]);
+    if (nbatch < 1 || (!A && !Arm) || !B || (!C && !Crm)) return ROCKET_E_SHAPE;
+    if (nbatch == 1 && !Arm && !Crm) return rocket_matmul_fp16(b->fd, M, K, N, A[0], B[0], C[0]);
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_float16))
         return ROCKET_E_UNSUPPORTED;
     const int fd = b->fd;
@@ -2477,15 +2488,31 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
     const size_t in_item = (size_t)nMt * nKt * in_slot;   /* packed fp16 elems / item */
     const size_t wt_item = (size_t)nNt * nKt * wt_slot;
 
+    /* A row-major C takes each element from one tile, so it needs one K tile; a row-major
+     * operand BO must hold every item's rows, and its last byte must sit inside the 32-bit
+     * IOVA window the task registers address. */
+    if (Crm && nKt != 1) return ROCKET_E_SHAPE;
+    /* A blocked C holds each N tile as its own [M][Nt] block, the last one at the full Nt
+     * pitch too, so a row of C is Nt wide whatever N is. */
+    const int c_pitch = (Crm && c_block) ? pl.Nt : N;
+    const size_t c_item = (size_t)M * (c_block ? (size_t)nNt * pl.Nt : (size_t)N);
+    if ((Arm && (Arm->size < (size_t)nbatch * M * K * sizeof(_Float16) ||
+                 Arm->dma_address + Arm->size > (1ull << 32))) ||
+        (Crm && (Crm->size < (size_t)nbatch * c_item * sizeof(_Float16) ||
+                 Crm->dma_address + Crm->size > (1ull << 32))))
+        return ROCKET_E_SHAPE;
+
     size_t in_sz  = (size_t)nbatch * in_item * sizeof(_Float16) + CBUF_BANK;
     size_t wt_sz  = (size_t)nbatch * wt_item * sizeof(_Float16) + CBUF_BANK;
     size_t out_sz = (size_t)BATCH * out_slot * sizeof(_Float16) + CBUF_BANK;
 
     /* Grow the resident BOs to this shape (no-op when it already fits). out_all never
-     * needs zeroing (the NPU writes it, only its live region is read back). */
-    int gi = rocket_bo_ensure32(fd, &b->in_all,  in_sz);
+     * needs zeroing (the NPU writes it, only its live region is read back). A row-major
+     * operand needs neither its cube BO nor its pack. */
+    int gi = Arm ? 0 : rocket_bo_ensure32(fd, &b->in_all,  in_sz);
     int gw = rocket_bo_ensure32(fd, &b->wt_all,  wt_sz);
-    int go = rocket_bo_ensure32(fd, &b->out_all, out_sz);
+    int go = Crm ? rocket_bo_ensure32(fd, &b->fence, 4096)
+                 : rocket_bo_ensure32(fd, &b->out_all, out_sz);
     if (gi < 0 || gw < 0 || go < 0) {
         ROCKET_LOGE("rocket_matmul: batch BO alloc failed (in=%zuMB wt=%zuMB out=%zuMB n=%d)\n",
                 in_sz >> 20, wt_sz >> 20, out_sz >> 20, nbatch);
@@ -2503,7 +2530,7 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
     double t_packA = 0, t_packB = 0, t_gen = 0, t_sync = 0, t_submit = 0, t_wait = 0, t_read = 0, ts;
     double t_acc = 0;
     float *acc = NULL;
-    if (!direct) {
+    if (!direct && !Crm) {
         size_t acc_n = (size_t)nbatch * M * N;
         if (b->acc_cap < acc_n) {
             float *na = realloc(b->acc, acc_n * sizeof(float));
@@ -2523,6 +2550,7 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
     int layout_changed = (M != b->last_M || K != b->last_K ||
                           N != b->last_N || nbatch != b->last_nbatch);
     int need_zero = gi || gw || layout_changed || !b->prezeroed;
+    int need_zero_in = need_zero || b->in_stale;
 
     int    *bit_ = b->bit_, *bm0 = b->bm0, *bn0 = b->bn0, *bMtile = b->bMtile, *bNtile = b->bNtile;
     size_t *boff = b->boff;
@@ -2534,11 +2562,13 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
      * the whole BO first only when need_zero), then scatter each item at its per-item
      * element offset. */
     ts = now_ms();
-    if (rocket_bo_prep(fd, &b->in_all, 1, 0) != 0) { ret = ROCKET_E_DEVICE; goto fail; }
-    if (need_zero) memset(b->in_all.ptr, 0, b->in_all.size);
-    for (int it = 0; it < nbatch; it++)
-        feat_scatter_into(&pl, (_Float16 *)b->in_all.ptr + (size_t)it * in_item, A[it]);
-    rocket_bo_fini(fd, &b->in_all);
+    if (!Arm) {
+        if (rocket_bo_prep(fd, &b->in_all, 1, 0) != 0) { ret = ROCKET_E_DEVICE; goto fail; }
+        if (need_zero_in) memset(b->in_all.ptr, 0, b->in_all.size);
+        for (int it = 0; it < nbatch; it++)
+            feat_scatter_into(&pl, (_Float16 *)b->in_all.ptr + (size_t)it * in_item, A[it]);
+        rocket_bo_fini(fd, &b->in_all);
+    }
     t_packA = now_ms() - ts;
 
     ts = now_ms();
@@ -2549,8 +2579,10 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
     rocket_bo_fini(fd, &b->wt_all);
     t_packB = now_ms() - ts;
 
-    /* in_all/wt_all now hold this layout's live lanes with zero padding. */
+    /* in_all/wt_all now hold this layout's live lanes with zero padding -- unless A was
+     * read in place, when in_all still holds whatever layout last packed it. */
     b->prezeroed = 1;
+    b->in_stale = Arm ? (b->in_stale || layout_changed) : 0;
     b->last_M = M; b->last_K = K; b->last_N = N; b->last_nbatch = nbatch;
 
     uint64_t npu_regs[256] = {0};
@@ -2573,14 +2605,27 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
                                    t_sync += now_ms() - ts; }
                     ts = now_ms();
                     size_t out_off = (size_t)nb * out_slot;
+                    /* A row-major operand is addressed at the tile's first element, with the
+                     * line (notch) at one row of the item's whole A (C). */
+                    const uint64_t in_dma = Arm
+                        ? Arm->dma_address + ((size_t)it * M * K + (size_t)m0 * K + k0) * sizeof(_Float16)
+                        : b->in_all.dma_address +
+                          (in_base + (size_t)(mi * nKt + ki) * in_slot) * sizeof(_Float16);
+                    const size_t c_at = (size_t)it * c_item + (c_block
+                        ? (size_t)ni * M * c_pitch + (size_t)m0 * c_pitch
+                        : (size_t)m0 * c_pitch + n0);
+                    const uint64_t out_dma = Crm
+                        ? Crm->dma_address + c_at * sizeof(_Float16)
+                        : b->out_all.dma_address + out_off * sizeof(_Float16);
                     matmul_params_t p = {
                         .m = Mtile, .k = Ktile, .n = Ntile,
-                        .input_dma   = (uint32_t)(b->in_all.dma_address +
-                                       (in_base + (size_t)(mi * nKt + ki) * in_slot) * sizeof(_Float16)),
+                        .input_dma   = (uint32_t)in_dma,
                         .weights_dma = (uint32_t)(b->wt_all.dma_address +
                                        (wt_base + (size_t)(ni * nKt + ki) * wt_slot) * sizeof(_Float16)),
-                        .output_dma  = (uint32_t)(b->out_all.dma_address + out_off * sizeof(_Float16)),
+                        .output_dma  = (uint32_t)out_dma,
                         .tasks = npu_regs, .fp32tofp16 = 1,
+                        .a_row_atoms = Arm ? (uint32_t)(K * sizeof(_Float16) / 16) : 0,
+                        .c_row_atoms = Crm ? (uint32_t)(c_pitch * sizeof(_Float16) / 16) : 0,
                     };
                     if ((ret = gen_matmul_fp16(&p)) != 0) {
                         ROCKET_LOGE("rocket_matmul: batch gen failed (%d)\n", ret); goto fail;
@@ -2597,19 +2642,25 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
                         mm_seal_chain(batch_chained, &b->regcmd, nb, tasks[0].regcmd_count);
                         ts = now_ms();
                         rocket_bo_fini(fd, &b->regcmd);
-                        rocket_bo_prep(fd, &b->out_all, 1, 0);
-                        rocket_bo_fini(fd, &b->out_all);
+                        /* A caller's C holds no dirty line here (rocket_mm_batch_run_rows'
+                         * contract), so only the rolling cube BO is cleaned. */
+                        if (!Crm) {
+                            rocket_bo_prep(fd, &b->out_all, 1, 0);
+                            rocket_bo_fini(fd, &b->out_all);
+                        }
                         t_sync += now_ms() - ts;
 
-                        uint32_t in_h[]  = { b->in_all.handle, b->wt_all.handle, b->regcmd.handle };
-                        uint32_t out_h[] = { b->out_all.handle };
+                        uint32_t in_h[]  = { Arm ? Arm->handle : b->in_all.handle,
+                                             b->wt_all.handle, b->regcmd.handle };
+                        uint32_t out_h[] = { Crm ? Crm->handle : b->out_all.handle, b->fence.handle };
                         ts = now_ms();
-                        ret = rocket_submit_tasks_pre(fd, submit_dt, tasks, nb, in_h, 3, out_h, 1, batch_chained);
+                        ret = rocket_submit_tasks_pre(fd, submit_dt, tasks, nb, in_h, 3, out_h,
+                                                      Crm ? 2 : 1, batch_chained);
                         t_submit += now_ms() - ts;
                         if (ret) goto fail;
 
                         ts = now_ms();
-                        ret = rocket_bo_prep(fd, &b->out_all, 0, rocket_wait_ns());
+                        ret = rocket_bo_prep(fd, Crm ? &b->fence : &b->out_all, 0, rocket_wait_ns());
                         double w_ms = now_ms() - ts;
                         t_wait += w_ms;
                         if (ret) {
@@ -2619,6 +2670,22 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
                             goto fail;
                         }
 
+                        if (Crm) {
+                            /* The rows are already in place; the last job hands C to the
+                             * CPU with one sync of its live bytes (the whole BO on a
+                             * kernel without the ranged form). */
+                            rocket_bo_fini(fd, &b->fence);
+                            if (done == total) {
+                                const rocket_bo_range live = {
+                                    0, (uint64_t)nbatch * c_item * sizeof(_Float16) };
+                                ts = now_ms();
+                                ret = rocket_bo_prep_ranges(fd, Crm, &live, 1, 0);
+                                t_sync += now_ms() - ts;
+                                if (ret) { ret = ROCKET_E_DEVICE; goto fail; }
+                            }
+                            nb = 0;
+                            continue;
+                        }
                         ts = now_ms();
                         _Float16 *ob = b->out_all.ptr;
                         for (int j = 0; j < nb; j++) {
@@ -2638,7 +2705,7 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
         }
     }
 
-    if (!direct) {
+    if (acc) {
         ts = now_ms();
         for (int it = 0; it < nbatch; it++)
             narrow_f32_to_f16(C[it], acc + (size_t)it * M * N, (size_t)M * N);
@@ -2659,6 +2726,22 @@ fail:
     /* The resident BOs are kept (the context owns them); the packed in/wt still hold a
      * consistent zero-padded layout, so prezeroed/last_* stay valid for the next run. */
     return ret;
+}
+
+int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
+                        const _Float16 *const *A, const _Float16 *const *B,
+                        _Float16 *const *C)
+{
+    return mm_batch_run(b, M, K, N, nbatch, A, NULL, B, C, NULL, 0);
+}
+
+int rocket_mm_batch_run_rows(rocket_mm_batch *b, int M, int K, int N, int nbatch,
+                             const _Float16 *const *A, const rocket_bo *Arm,
+                             const _Float16 *const *B,
+                             _Float16 *const *C, rocket_bo *Crm, int c_block)
+{
+    if (!Arm == !A || !Crm == !C) return ROCKET_E_SHAPE;   /* exactly one of each */
+    return mm_batch_run(b, M, K, N, nbatch, A, Arm, B, C, Crm, c_block);
 }
 
 /* One-shot batched matmul: a transient persistent-context (alloc + zero + run + free

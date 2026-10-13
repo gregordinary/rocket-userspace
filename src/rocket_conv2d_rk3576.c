@@ -1725,7 +1725,8 @@ static int r76_argb_bounds(const char *entry, const rocket_conv2d_desc *d,
 
     if (IW % 16u) {
         ROCKET_LOGE("%s: the first conv needs iw a multiple of 16 (iw=%u); its DDR row "
-                    "stride and CBUF row are both counted in 16-byte granules\n", entry, IW);
+                    "stride is counted in 16-byte atoms and its CBUF row in 64-byte "
+                    "granules, both whole only there\n", entry, IW);
         return ROCKET_E_UNSUPPORTED;
     }
     /* At pad_left 0 the DPU writes nothing at all — an untouched surface, not a wrong one —

@@ -18,6 +18,7 @@
 #include "rocket_attn.h"
 #include "rocket_npu.h"       /* rocket_open / rocket_close (the mt worker fds)  */
 #include "rocket_matmul.h"    /* rocket_matmul_fp16 (C = A·B^T) */
+#include "rocket_matmul_internal.h"   /* rocket_mm_batch_run_rows */
 #include "rocket_softmax.h"   /* rocket_softmax_fp16 (row-wise) */
 #include "rocket_affinity.h"  /* rocket_pin_worker_based (keep mt workers off the A55s) */
 #include "rocket_log.h"       /* centralized log channel */
@@ -377,6 +378,32 @@ static long fa_chain_elems(void)
     return v;
 }
 
+/* Row handoff (ROCKET_FA_ROWMAJOR, default ON). On the chained path with the fused host
+ * softmax, QK writes the scores as rows into a resident BO a worker, the softmax writes P as
+ * plain [Tp][Kn] rows, and AV reads its K slices of P as rows (rocket_mm_batch_run_rows).
+ * That drops the scores' de-tile out of the cube and P's pack back into one, two host passes
+ * over the score matrix, for one sync each way; the values are the cube path's, so the
+ * output's bits are too. The device writes a row-major C at no cost to a 4 KiB row and at a
+ * growing one past it (1.12-1.25x the cube program's at 8 KiB) [HW sweep,
+ * tests/rowmajor_tile_probe], so while a row of scores, Kn*2 bytes, is at most
+ * ROCKET_FA_RM_MAX_ROW (default 4096: 2048 keys) QK writes plain rows and the softmax
+ * rewrites them as P in place; past it QK writes each of its N tiles as its own block of
+ * rows, at the tile's width, and the softmax reads a row across the blocks into a second
+ * BO. ROCKET_FA_ROWMAJOR=0 keeps the cube handoff, for an A/B. */
+static int fa_rowmajor(void)
+{
+    static _Atomic int v = -1;
+    if (v < 0) { const char *e = getenv("ROCKET_FA_ROWMAJOR"); v = e ? atoi(e) : 1; }
+    return v;
+}
+
+static long fa_rm_max_row(void)
+{
+    static _Atomic long v = -1;
+    if (v < 0) { const char *e = getenv("ROCKET_FA_RM_MAX_ROW"); v = e ? atol(e) : 4096; }
+    return v;
+}
+
 /* Online/tiled long-context flash attention (ROCKET_FA_TILE_KV). The materialized path
  * computes scores over the FULL key axis in one QK matmul, holding the [Tp,Kn] score matrix
  * (32 MB/head at 32K) host-side for the mask+softmax — so the score traffic streams to DRAM
@@ -443,6 +470,10 @@ typedef struct {
      * matmul allocates its BOs per call. */
 #define FA_BCLS 8
     rocket_mm_batch *qk[FA_BCLS], *av[FA_BCLS];
+    /* The row handoff's BOs (fa_rowmajor), one per size class as the contexts are: Gmax
+     * heads' scores, and Gmax heads' P where the scores are blocked (with plain rows P
+     * overwrites the scores). Allocated on bfd on first use. */
+    rocket_bo rows[FA_BCLS], prows[FA_BCLS];
     int bfd;
 
     /* Online/tiled (long-context) running-softmax accumulators, all fp32 for stability:
@@ -495,14 +526,15 @@ static int fa_scratch_ensure(fa_scratch *s, int Tp, int Kn, int dk, int dv)
 
 /* Grow the chained-batch group buffers + pointer arrays for `Gmax` heads at (Tp,Kn,dh).
  * The gather steps memset their target region before filling and sc/P/cx are fully
- * written, so the buffers need no zero-init on (re)alloc. Returns 0 / -1. */
-static int fa_batch_ensure(fa_scratch *s, int Gmax, int Tp, int Kn, int dh)
+ * written, so the buffers need no zero-init on (re)alloc. The score and P matrices are
+ * grown only when `scores` is set: the row handoff keeps them in its BO. Returns 0 / -1. */
+static int fa_batch_ensure(fa_scratch *s, int Gmax, int Tp, int Kn, int dh, int scores)
 {
     const size_t qd = (size_t)Tp * dh, kd = (size_t)Kn * dh, tk = (size_t)Tp * Kn;
     if (fa_grow(&s->bqh, &s->c_bqh, (size_t)Gmax * qd) ||
         fa_grow(&s->bkh, &s->c_bkh, (size_t)Gmax * kd) ||
-        fa_grow(&s->bsc, &s->c_bsc, (size_t)Gmax * tk) ||
-        fa_grow(&s->bP,  &s->c_bP,  (size_t)Gmax * tk) ||
+        (scores && fa_grow(&s->bsc, &s->c_bsc, (size_t)Gmax * tk)) ||
+        (scores && fa_grow(&s->bP,  &s->c_bP,  (size_t)Gmax * tk)) ||
         fa_grow(&s->bvh, &s->c_bvh, (size_t)Gmax * kd) ||
         fa_grow(&s->bcx, &s->c_bcx, (size_t)Gmax * qd))
         return ROCKET_E_SHAPE;
@@ -519,21 +551,71 @@ static int fa_batch_ensure(fa_scratch *s, int Gmax, int Tp, int Kn, int dh)
     return 0;
 }
 
+/* The size class of Tp x Kn: one per 4x. */
+static int fa_bcls(int Tp, int Kn)
+{
+    int c = 0;
+    for (size_t e = (size_t)Tp * Kn; e > 4096 && c < FA_BCLS - 1; e >>= 2) c++;
+    return c;
+}
+
 /* The worker's batched-matmul context for this op at (Tp,Kn): one per 4x class of Tp x Kn,
  * created on first use. NULL when the worker has none (the per-call paths), or on a create
  * failure, which the caller answers with the per-call chained matmul. */
 static rocket_mm_batch *fa_batch_ctx(fa_scratch *s, rocket_mm_batch **set, int Tp, int Kn)
 {
     if (s->bfd < 0) return NULL;
-    int c = 0;
-    for (size_t e = (size_t)Tp * Kn; e > 4096 && c < FA_BCLS - 1; e >>= 2) c++;
+    const int c = fa_bcls(Tp, Kn);
     if (!set[c]) set[c] = rocket_mm_batch_create(s->bfd);
     return set[c];
+}
+
+/* Grow `bo` to `bytes`; a new BO is synced once both ways, so it enters its first run with
+ * no dirty line. Returns 0, or -1 with the BO freed. */
+static int fa_rows_grow(int fd, rocket_bo *bo, size_t bytes)
+{
+    const int g = rocket_bo_ensure32(fd, bo, bytes);
+    if (g < 0) return -1;
+    if (g > 0 && (rocket_bo_prep(fd, bo, 1, 0) != 0 || rocket_bo_fini(fd, bo) != 0)) {
+        rocket_bo_free(fd, bo);
+        return -1;
+    }
+    return 0;
+}
+
+/* The row handoff's BOs for `G` heads at (Tp,Kn): 0 with *S (the scores), *Pb (P, the same
+ * BO for plain rows) and *seg (the keys a block of scores holds: Kn for plain rows, QK's N
+ * tile for blocked), or -1 when the handoff does not apply here: the knob is off, QK plans
+ * more than one K tile (a row-major C takes each element from one tile), or a BO cannot be
+ * had, all of which leave the cube handoff. */
+static int fa_rows_bos(fa_scratch *s, int Tp, int dh, int Kn, int G,
+                       rocket_bo **S, rocket_bo **Pb, int *seg)
+{
+    if (s->bfd < 0 || !fa_rowmajor()) return -1;
+    int Mt, Kt, Nt;
+    if (rocket_matmul_plan(Tp, dh, Kn, &Mt, &Kt, &Nt) < 0 || Kt < dh) return -1;
+    const int nNt = (Kn + Nt - 1) / Nt;
+    const int blocked = (long)Kn * 2 > fa_rm_max_row() && nNt > 1;
+    const int c = fa_bcls(Tp, Kn);
+    const size_t p_bytes = (size_t)G * Tp * Kn * sizeof(_Float16);
+    if (fa_rows_grow(s->bfd, &s->rows[c],
+                     blocked ? (size_t)G * Tp * nNt * Nt * sizeof(_Float16) : p_bytes))
+        return -1;
+    if (blocked && fa_rows_grow(s->bfd, &s->prows[c], p_bytes)) return -1;
+    *S = &s->rows[c];
+    *Pb = blocked ? &s->prows[c] : &s->rows[c];
+    *seg = blocked ? Nt : Kn;
+    return 0;
 }
 
 static void fa_scratch_free(fa_scratch *s)
 {
     for (int c = 0; c < FA_BCLS; c++) { rocket_mm_batch_free(s->qk[c]); rocket_mm_batch_free(s->av[c]); }
+    if (s->bfd >= 0)
+        for (int c = 0; c < FA_BCLS; c++) {
+            rocket_bo_free(s->bfd, &s->rows[c]);
+            rocket_bo_free(s->bfd, &s->prows[c]);
+        }
     free(s->qh); free(s->kh); free(s->vh); free(s->sc); free(s->P); free(s->ctx);
     free(s->bqh); free(s->bkh); free(s->bsc); free(s->bP); free(s->bvh); free(s->bcx);
     free(s->pA); free(s->pB); free(s->pC);
@@ -674,15 +756,33 @@ static inline float32x4_t fa_vexp_nonpos(float32x4_t x)
 }
 #endif
 
-/* Returns whether a real key's raw score reached the saturation limit (see FA_SAT). */
+/* Score j of query row i in a head's scores held as blocks of `seg` keys: block b is a
+ * [Tp][seg] matrix at element b*Tp*seg (the blocked row handoff; see fa_rows_bos). One block,
+ * seg == Kn, is plain [Tp][Kn] rows. A run of four never crosses a block (seg % 16 == 0). */
+static inline const _Float16 *fa_score_at(const _Float16 *sc, int Tp, int seg, int i, int j)
+{
+    return sc + (size_t)(j / seg) * Tp * seg + (size_t)i * seg + j % seg;
+}
+
+/* Returns whether a real key's raw score reached the saturation limit (see FA_SAT). The
+ * scores are read as `seg`-key blocks (fa_score_at; seg == Kn for plain rows) and P is
+ * written as plain [Tp][Kn] rows; with plain rows, P may be the scores themselves. */
 static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mask, int n_tokens,
-                            int n_kv, int Tp, int Kn, float scale, float softcap)
+                            int n_kv, int Tp, int Kn, int seg, float scale, float softcap)
 {
     float stackbuf[4096];
     float *buf = Kn <= 4096 ? stackbuf : malloc((size_t)Kn * sizeof(float));
-    if (!buf) { const int s = fa_mask_scores((_Float16 *)sc, mask, n_tokens, n_kv, Tp, Kn,
-                                             scale, softcap);
-                host_softmax_rows(Tp, Kn, sc, P); return s; }
+    if (!buf) {
+        if (seg != Kn) {   /* blocked: lay the rows out in P, then run on P in place */
+            for (int i = 0; i < Tp; i++)
+                for (int j0 = 0; j0 < Kn; j0 += seg)
+                    memcpy(P + (size_t)i * Kn + j0, fa_score_at(sc, Tp, seg, i, j0),
+                           (size_t)(Kn - j0 < seg ? Kn - j0 : seg) * sizeof(_Float16));
+            sc = P;
+        }
+        const int s = fa_mask_scores((_Float16 *)sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+        host_softmax_rows(Tp, Kn, sc, P); return s;
+    }
     const fa_f4 floor4 = { -30000.f, -30000.f, -30000.f, -30000.f };
     const fa_f4 sat4   = { FA_SAT, FA_SAT, FA_SAT, FA_SAT };
     const fa_f4 zero4  = { 0.f, 0.f, 0.f, 0.f };
@@ -690,10 +790,11 @@ static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mas
     int sat = 0;
     const int nv = softcap != 0.0f ? 0 : (n_kv & ~3);
     for (int i = 0; i < Tp; i++) {
-        const _Float16 *row = sc + (size_t)i * Kn;
         const _Float16 *mr = (mask && i < n_tokens) ? mask + (size_t)i * n_kv : NULL;
         fa_f4 vmax = floor4;
-        int j = 0;
+        int j;
+        /* One block of keys at a time (one, for plain rows): the maxima are order-free, so
+         * the values are the same however the row is split. */
 #ifdef FA_NEON
         /* The same values as the generic loop below. The saturation test reads a running
          * maximum of |raw|, which a NaN carries through; a NaN score may then leave a different
@@ -701,35 +802,43 @@ static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mas
         {
             float32x4_t amax = vdupq_n_f32(0.f), vm = vdupq_n_f32(-30000.f);
             const float32x4_t fl = vdupq_n_f32(-30000.f);
-            for (; j < nv; j += 4) {
-                const float32x4_t raw = vcvt_f32_f16(vld1_f16((const __fp16 *)(row + j)));
-                amax = vmaxq_f32(amax, vabsq_f32(raw));
-                float32x4_t s = vmulq_n_f32(raw, scale);
-                if (mr) s = vaddq_f32(s, vcvt_f32_f16(vld1_f16((const __fp16 *)(mr + j))));
-                s = vmaxq_f32(s, fl);
-                vst1q_f32(buf + j, s);
-                vm = vmaxq_f32(vm, s);
+            for (int j0 = 0; j0 < nv; j0 += seg) {
+                const _Float16 *row = fa_score_at(sc, Tp, seg, i, j0) - j0;
+                const int je = nv - j0 < seg ? nv : j0 + seg;
+                for (j = j0; j < je; j += 4) {
+                    const float32x4_t raw = vcvt_f32_f16(vld1_f16((const __fp16 *)(row + j)));
+                    amax = vmaxq_f32(amax, vabsq_f32(raw));
+                    float32x4_t s = vmulq_n_f32(raw, scale);
+                    if (mr) s = vaddq_f32(s, vcvt_f32_f16(vld1_f16((const __fp16 *)(mr + j))));
+                    s = vmaxq_f32(s, fl);
+                    vst1q_f32(buf + j, s);
+                    vm = vmaxq_f32(vm, s);
+                }
             }
             satv |= (fa_i4)vreinterpretq_s32_u32(vmvnq_u32(vcltq_f32(amax, vdupq_n_f32(FA_SAT))));
             vst1q_f32((float *)&vmax, vm);
         }
         (void)zero4; (void)sat4;
 #else
-        for (; j < nv; j += 4) {
-            fa_h4 hq; memcpy(&hq, row + j, sizeof hq);
-            const fa_f4 raw = __builtin_convertvector(hq, fa_f4);
-            satv |= ~(fa_i4)(fa_sel(raw < zero4, -raw, raw) < sat4);   /* |raw| >= limit, or NaN */
-            fa_f4 s = raw * scale;
-            if (mr) { fa_h4 hm; memcpy(&hm, mr + j, sizeof hm); s += __builtin_convertvector(hm, fa_f4); }
-            s = fa_sel(s < floor4, floor4, s);
-            memcpy(buf + j, &s, sizeof s);
-            vmax = fa_sel(s > vmax, s, vmax);
+        for (int j0 = 0; j0 < nv; j0 += seg) {
+            const _Float16 *row = fa_score_at(sc, Tp, seg, i, j0) - j0;
+            const int je = nv - j0 < seg ? nv : j0 + seg;
+            for (j = j0; j < je; j += 4) {
+                fa_h4 hq; memcpy(&hq, row + j, sizeof hq);
+                const fa_f4 raw = __builtin_convertvector(hq, fa_f4);
+                satv |= ~(fa_i4)(fa_sel(raw < zero4, -raw, raw) < sat4);   /* |raw| >= limit, or NaN */
+                fa_f4 s = raw * scale;
+                if (mr) { fa_h4 hm; memcpy(&hm, mr + j, sizeof hm); s += __builtin_convertvector(hm, fa_f4); }
+                s = fa_sel(s < floor4, floor4, s);
+                memcpy(buf + j, &s, sizeof s);
+                vmax = fa_sel(s > vmax, s, vmax);
+            }
         }
 #endif
         float mx = vmax[0];
         for (int k = 1; k < 4; k++) if (vmax[k] > mx) mx = vmax[k];
-        for (; j < n_kv; j++) {
-            const float raw = (float)row[j];
+        for (j = nv; j < n_kv; j++) {
+            const float raw = (float)*fa_score_at(sc, Tp, seg, i, j);
             sat |= !(fabsf(raw) < FA_SAT);
             float s = fa_score(raw, scale, softcap, mr ? (float)mr[j] : 0.0f);
             buf[j] = s;
@@ -833,8 +942,19 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
      * pC are refilled for QK then AV (qh,kh->sc ; P,vh->cx). s->qk/s->av are the resident
      * batched-matmul contexts (one per shape) on the persistent path; on the stateless /
      * single-fd path they are NULL and the matmul allocates its BOs per call. */
-    if (fa_batch_ensure(s, Gmax, Tp, Kn, dh)) return ROCKET_E_NOMEM;
+    /* The row handoff needs both resident contexts and the fused host softmax, which is
+     * the one softmax that reads blocked scores and rewrites a row in place. */
+    rocket_mm_batch *bqk = fa_batch_ctx(s, s->qk, Tp, Kn), *bav = fa_batch_ctx(s, s->av, Tp, Kn);
+    rocket_bo *rows = NULL, *prow = NULL;
+    int seg = Kn;
+    if (bqk && bav && host_sm && fa_fused_softmax() &&
+        fa_rows_bos(s, Tp, dh, Kn, Gmax, &rows, &prow, &seg) != 0)
+        rows = prow = NULL;
+    if (fa_batch_ensure(s, Gmax, Tp, Kn, dh, !rows)) return ROCKET_E_NOMEM;
     _Float16 *qh = s->bqh, *kh = s->bkh, *sc = s->bsc, *P = s->bP, *vh = s->bvh, *cx = s->bcx;
+    /* A head's scores span its blocks, each at the tile's pitch, the last one too. */
+    const size_t sk = rows ? (size_t)Tp * ((Kn + seg - 1) / seg) * seg : tk;
+    if (rows) { sc = rows->ptr; P = prow->ptr; }
     const _Float16 **pA = s->pA, **pB = s->pB;
     _Float16       **pC = s->pC;
     int rc = 0;
@@ -852,20 +972,21 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
         }
         FA_ACC(pf, gather, t0);
         t0 = FA_T0(pf);
-        rocket_mm_batch *bqk = fa_batch_ctx(s, s->qk, Tp, Kn);
-        rc = bqk ? rocket_mm_batch_run(bqk, Tp, dh, Kn, G, pA, pB, pC)
-                   : rocket_matmul_fp16_batch(fd, Tp, dh, Kn, G, pA, pB, pC);
+        if (rows) rc = rocket_mm_batch_run_rows(bqk, Tp, dh, Kn, G, pA, NULL, pB, NULL, rows,
+                                                seg != Kn);
+        else rc = bqk ? rocket_mm_batch_run(bqk, Tp, dh, Kn, G, pA, pB, pC)
+                      : rocket_matmul_fp16_batch(fd, Tp, dh, Kn, G, pA, pB, pC);
         FA_ACC(pf, qk, t0);
         if (rc) break;
 
         /* per head: scale+mask -> softmax -> gather V; P[g],vh[g] feed the batched AV */
         for (int g = 0; g < G; g++) {
             const int h = gh + g, hk = h / gqa;
-            _Float16 *scg = sc + (size_t)g * tk, *Pg = P + (size_t)g * tk;
+            _Float16 *scg = sc + (size_t)g * sk, *Pg = P + (size_t)g * tk;
             t0 = FA_T0(pf);
             int sat;
             if (host_sm && fa_fused_softmax()) {
-                sat = fa_softmax_fused(scg, Pg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+                sat = fa_softmax_fused(scg, Pg, mask, n_tokens, n_kv, Tp, Kn, seg, scale, softcap);
                 FA_ACC(pf, softmax, t0);
             } else {
                 sat = fa_mask_scores(scg, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
@@ -881,11 +1002,18 @@ static int fa_heads_range_batched(int fd, int n_tokens, int n_kv, int head_dim,
             FA_ACC(pf, gather, t0);
             pA[g] = Pg; pB[g] = vh + (size_t)g * kd; pC[g] = cx + (size_t)g * qd;
         }
-        if (rc) break;
         t0 = FA_T0(pf);
-        rocket_mm_batch *bav = fa_batch_ctx(s, s->av, Tp, Kn);
-        rc = bav ? rocket_mm_batch_run(bav, Tp, Kn, dh, G, pA, pB, pC)
-                   : rocket_matmul_fp16_batch(fd, Tp, Kn, dh, G, pA, pB, pC);
+        if (rows) {
+            /* Write P back for the device on every exit, a refusal included: the next QK
+             * may write these rows, and a dirty line evicted over them would corrupt it.
+             * Blocked scores were only read, so they hold no dirty line. */
+            const rocket_bo_range live = { 0, (uint64_t)G * tk * sizeof(_Float16) };
+            if (rocket_bo_fini_ranges(s->bfd, prow, &live, 1) != 0 && !rc) rc = ROCKET_E_DEVICE;
+        }
+        if (rc) break;
+        if (rows) rc = rocket_mm_batch_run_rows(bav, Tp, Kn, dh, G, NULL, prow, pB, pC, NULL, 0);
+        else rc = bav ? rocket_mm_batch_run(bav, Tp, Kn, dh, G, pA, pB, pC)
+                      : rocket_matmul_fp16_batch(fd, Tp, Kn, dh, G, pA, pB, pC);
         FA_ACC(pf, av, t0);
         if (rc) break;
 
@@ -1107,7 +1235,7 @@ static int fa_heads_range(int fd, int n_tokens, int n_kv, int head_dim, int dv,
         t0 = FA_T0(pf);
         int sat;
         if (host_sm && fa_fused_softmax()) {
-            sat = fa_softmax_fused(sc, P, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);
+            sat = fa_softmax_fused(sc, P, mask, n_tokens, n_kv, Tp, Kn, Kn, scale, softcap);
             FA_ACC(pf, softmax, t0);
         } else {
             sat = fa_mask_scores(sc, mask, n_tokens, n_kv, Tp, Kn, scale, softcap);

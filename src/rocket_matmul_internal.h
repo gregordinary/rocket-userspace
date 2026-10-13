@@ -18,6 +18,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include "rocket_npu.h"
+#include "rocket_matmul.h"  /* rocket_mm_batch */
 #include "rocket_log.h"     // centralized log channel
 
 /* ============================================================================
@@ -324,5 +325,33 @@ int rocket_matmul_fp16_prepacked_planes(struct rocket_ctx *ctx, int M, int K, in
 
 /* The worker fd count a context was created with. */
 int rocket_ctx_nthreads(const struct rocket_ctx *ctx);
+
+/* ============================================================================
+ * SECTION — The batched matmul with operands as plain rows in a caller's BO
+ * ==========================================================================*/
+
+/* rocket_mm_batch_run with A read from, or C written to, a BO the caller holds on the
+ * context's fd, as plain rows, so a caller that hands one batched matmul's output to the
+ * next (flash attention: QK's scores, rewritten as P in place by the host softmax, are
+ * AV's A) pays neither the de-tile nor the pack. Pass exactly one of A / Arm and one of
+ * C / Crm. Item i of a row-major A is [M][K] at element i*M*K of Arm. Item i of a C is
+ * [M][N] at element i*M*N of Crm when c_block is 0; with c_block set it is the plan's
+ * nNt N tiles (rocket_matmul_plan's Nt), each a [M][Nt] block, block j of item i at
+ * element (i*nNt + j)*M*Nt, the last block at the Nt pitch too. The device reads and writes
+ * them through the row-major form (matmul_params_t.a_row_atoms / c_row_atoms), so the
+ * values are the cube path's.
+ *
+ * Crm needs a plan with one K tile (ROCKET_E_SHAPE otherwise). Its contract with the CPU
+ * cache: Crm holds no dirty line at entry (the caller's last write to it was followed by
+ * rocket_bo_fini), and on success it is synced for the CPU over the live bytes. Arm must
+ * have been passed to rocket_bo_fini after the CPU last wrote it. Neither BO is synced
+ * otherwise. The device cost is C's row pitch: free to a 4 KiB row, 1.4-1.6x the cube
+ * program's at 16 KiB [HW sweep, tests/rowmajor_tile_probe]; a blocked C's pitch is one
+ * tile's width, so it costs nothing at any N. Not thread-safe, as the context. Returns 0
+ * or a negative rocket_status. */
+int rocket_mm_batch_run_rows(rocket_mm_batch *b, int M, int K, int N, int nbatch,
+                             const _Float16 *const *A, const rocket_bo *Arm,
+                             const _Float16 *const *B,
+                             _Float16 *const *C, rocket_bo *Crm, int c_block);
 
 #endif /* ROCKET_MATMUL_INTERNAL_H */

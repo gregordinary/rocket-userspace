@@ -6,8 +6,9 @@
  * The NPU's own DMA byte counters are dead (reading the 0x2xxx page hard-locks the SoC;
  * the 0x80xx page is config-only). RKNN's "Total Memory R/W per frame" is likewise
  * *computed from the graph*, not read from HW. So this tool computes
- * the bytes each phase moves analytically from the shape + the real tiling
- * (rocket_matmul_plan, pure/no-HW) + the dtype + the reuse mode — a traffic metric
+ * the bytes each phase moves analytically from the shape + the real tiling (the
+ * dtype's own planner, rocket_matmul_plan / _plan_int8 / _int4 / _bf16 / _tf32,
+ * pure/no-HW) + the dtype + the reuse mode — a traffic metric
  * to drive the readback/dispatch-floor work with NO hardware counter.
  *
  * It quantifies the "not MAC-bound" finding per shape: pair these byte figures with a
@@ -63,6 +64,19 @@ static void elem_bytes(const char *dt, double *ein, double *eout, int *kacc_ok)
     else                         { *ein=2;   *eout=2; *kacc_ok=1; }
 }
 
+/* The planner the library's own entry point uses for this dtype. Each plans with its own
+ * element size, alignment and CBUF slack, so the fp16 plan is the wrong tiling for any
+ * other dtype (int8 at 512x3840x4096 differs in Kt). */
+typedef int (*plan_fn)(int M, int K, int N, int *Mt, int *Kt, int *Nt);
+static plan_fn dtype_planner(const char *dt)
+{
+    if (!strcmp(dt,"int8")) return rocket_matmul_plan_int8;
+    if (!strcmp(dt,"int4")) return rocket_matmul_plan_int4;
+    if (!strcmp(dt,"bf16")) return rocket_matmul_plan_bf16;
+    if (!strcmp(dt,"tf32")) return rocket_matmul_plan_tf32;
+    return rocket_matmul_plan;
+}
+
 static void human(double b, char *out)
 {
     const char *u[] = {"B","KB","MB","GB"}; int i=0; double v=b;
@@ -90,9 +104,10 @@ int main(int argc, char **argv)
 
     int Mt=0, Kt=0, Nt=0;
     /* plan returns njobs (>0) on success, -1 on unsupported shape */
-    int njobs_plan = rocket_matmul_plan(M, K, N, &Mt, &Kt, &Nt);
+    int njobs_plan = dtype_planner(dt)(M, K, N, &Mt, &Kt, &Nt);
     if (njobs_plan < 0 || Mt<=0 || Kt<=0 || Nt<=0) {
-        fprintf(stderr, "rocket_matmul_plan rejected %dx%dx%d (need K%%32, N%%16, M%%4)\n", M, K, N);
+        fprintf(stderr, "the %s planner rejected %dx%dx%d (alignment is per dtype: "
+                "see rocket_matmul.h)\n", dt, M, K, N);
         return 1;
     }
     int nMt = (M + Mt - 1) / Mt, nKt = (K + Kt - 1) / Kt, nNt = (N + Nt - 1) / Nt;

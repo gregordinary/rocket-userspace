@@ -40,6 +40,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_matmul.h"
+#include "rocket_matmul_internal.h"   /* rocket_mm_batch_run_rows */
 #include "test_fill.h"
 
 static int g_fail = 0;
@@ -164,6 +165,89 @@ static int test_batch_ctx(int fd, rocket_mm_batch *b, int M, int K, int N, int n
     return ok ? 0 : 1;
 }
 
+/* One (M,K,N,nbatch) case through rocket_mm_batch_run_rows on context `b`: A read as plain
+ * rows out of a BO (rm_a), C written as plain rows into one (rm_c), or as one block of rows
+ * per N tile (rm_c with `blocked`), against rocket_mm_batch_run on context `cube` with the
+ * same operands. The contract is the cube path's values bit for bit. The C BO is a sentinel
+ * to a page past the live bytes, and the tail must survive: a task that wrote outside its
+ * tile would land there or over a neighbour's rows. A blocked C's last block is read only
+ * where its tile is. */
+static int test_rows(int fd, rocket_mm_batch *b, rocket_mm_batch *cube, int M, int K, int N,
+                     int nbatch, int rm_a, int rm_c, int blocked)
+{
+    const size_t an = (size_t)M * K, bn = (size_t)N * K, cn = (size_t)M * N;
+    int Mt = 0, Kt = 0, Nt = N;
+    if (blocked && rocket_matmul_plan(M, K, N, &Mt, &Kt, &Nt) < 0) return 1;
+    const int nNt = (N + Nt - 1) / Nt;
+    const size_t citem = blocked ? (size_t)M * nNt * Nt : cn;   /* C elements an item */
+    const uint32_t round = 7919u * ++g_round;
+    _Float16 *Abuf = malloc((size_t)nbatch * an * sizeof(_Float16));
+    _Float16 *Bbuf = malloc((size_t)nbatch * bn * sizeof(_Float16));
+    _Float16 *Gbuf = malloc((size_t)nbatch * cn * sizeof(_Float16));   /* rows entry */
+    _Float16 *Rbuf = malloc((size_t)nbatch * cn * sizeof(_Float16));   /* cube path  */
+    const _Float16 **A = malloc((size_t)nbatch * sizeof(*A));
+    const _Float16 **B = malloc((size_t)nbatch * sizeof(*B));
+    _Float16 **G = malloc((size_t)nbatch * sizeof(*G)), **R = malloc((size_t)nbatch * sizeof(*R));
+    rocket_bo abo = {0}, cbo = {0};
+    int fail = 1, rc;
+    const size_t live = (size_t)nbatch * citem * sizeof(_Float16), tail = 4096;
+    if (!Abuf || !Bbuf || !Gbuf || !Rbuf || !A || !B || !G || !R) { fprintf(stderr, "oom\n"); goto out; }
+    for (int i = 0; i < nbatch; i++) {
+        fill(Abuf + (size_t)i * an, an, 1.0f, (uint32_t)(M * 3 + K + i * 131 + N) + round);
+        fill(Bbuf + (size_t)i * bn, bn, 1.0f, (uint32_t)(N * 11 + K + i * 977 + M) + round);
+        A[i] = Abuf + (size_t)i * an; B[i] = Bbuf + (size_t)i * bn;
+        G[i] = Gbuf + (size_t)i * cn; R[i] = Rbuf + (size_t)i * cn;
+    }
+    tf_sentinel_f16(Gbuf, (size_t)nbatch * cn);
+    if ((rc = rocket_mm_batch_run(cube, M, K, N, nbatch, A, B, R)) != 0) {
+        printf("  rows M=%d K=%d N=%d n=%d: cube reference -> FAIL (%d)\n", M, K, N, nbatch, rc);
+        goto out;
+    }
+    if (rm_a) {
+        if (rocket_bo_alloc32(fd, (size_t)nbatch * an * sizeof(_Float16), &abo) ||
+            rocket_bo_prep(fd, &abo, 1, 0)) { printf("  rows: A BO failed\n"); goto out; }
+        memcpy(abo.ptr, Abuf, (size_t)nbatch * an * sizeof(_Float16));
+        rocket_bo_fini(fd, &abo);
+    }
+    if (rm_c && (rocket_bo_alloc32(fd, live + tail, &cbo) || tf_sentinel_bo_f16(fd, &cbo))) {
+        printf("  rows: C BO failed\n"); goto out;
+    }
+    rc = rocket_mm_batch_run_rows(b, M, K, N, nbatch, rm_a ? NULL : A, rm_a ? &abo : NULL,
+                                  B, rm_c ? NULL : G, rm_c ? &cbo : NULL, blocked);
+    if (rc) {
+        printf("  rows M=%d K=%d N=%d n=%d a=%d c=%d -> FAIL (%d)\n", M, K, N, nbatch, rm_a, rm_c, rc);
+        goto out;
+    }
+    long tail_hit = 0;
+    if (rm_c) {   /* the entry synced the live bytes for the CPU; the tail needs its own */
+        rocket_bo_prep(fd, &cbo, 0, 0);
+        const _Float16 *c = cbo.ptr;
+        for (int i = 0; i < nbatch; i++)
+            for (int m = 0; m < M; m++)
+                for (int n = 0; n < N; n++)
+                    Gbuf[(size_t)i * cn + (size_t)m * N + n] = blocked
+                        ? c[(size_t)i * citem + ((size_t)(n / Nt) * M + m) * Nt + n % Nt]
+                        : c[(size_t)i * cn + (size_t)m * N + n];
+        const _Float16 *t = (const _Float16 *)((const char *)cbo.ptr + live);
+        for (size_t i = 0; i < tail / sizeof(_Float16); i++) tail_hit += !tf_is_sentinel_f16(t[i]);
+        rocket_bo_fini(fd, &cbo);
+    }
+    long nbad = 0;
+    for (size_t i = 0; i < (size_t)nbatch * cn; i++) {
+        uint16_t g, r;
+        memcpy(&g, &Gbuf[i], 2); memcpy(&r, &Rbuf[i], 2);
+        nbad += g != r;
+    }
+    fail = nbad != 0 || tail_hit != 0;
+    printf("  rows M=%d K=%d N=%d n=%d a=%s c=%s: nbad=%ld/%zu tail written=%ld -> %s\n",
+           M, K, N, nbatch, rm_a ? "rows" : "cube", rm_c ? (blocked ? "blocks" : "rows") : "cube", nbad,
+           (size_t)nbatch * cn, tail_hit, fail ? "FAIL" : "PASS");
+out:
+    rocket_bo_free(fd, &abo); rocket_bo_free(fd, &cbo);
+    free(Abuf); free(Bbuf); free(Gbuf); free(Rbuf); free(A); free(B); free(G); free(R);
+    return fail;
+}
+
 int main(int argc, char **argv)
 {
     /* Pin the per-item oracle to host fp32 K-accum (mm_compute) so it matches the batch
@@ -214,6 +298,41 @@ int main(int argc, char **argv)
         g_fail |= test_batch_ctx(fd, b, 512, 1024, 256, 3);  /* repeat AV: SKIP-zero     */
         rocket_mm_batch_free(b);
     }
+
+    /* the row-major entry, against the cube path on its own context. Depth Anything's QK
+     * (72 tiles: two jobs, ragged last M and N tiles) and AV (three K tiles read as slices
+     * of a 2752-byte row), a 4 KiB row, both operands at once, one item, and the refusal
+     * of a row-major C past one K tile. Then the context's prezero bookkeeping: a cube run
+     * at a layout whose in_all was left holding another layout's lanes by an in-place A
+     * run must re-zero, or its padding reads them. */
+    rocket_mm_batch *br = rocket_mm_batch_create(fd), *bc = rocket_mm_batch_create(fd);
+    if (!br || !bc) { printf("  rows: create FAILED\n"); g_fail = 1; }
+    else {
+        g_fail |= test_rows(fd, br, bc, 1372, 64, 1376, 2, 0, 1, 0); /* QK, two jobs         */
+        g_fail |= test_rows(fd, br, bc, 1372, 64, 1376, 2, 0, 1, 1); /* blocked, ragged last  */
+        g_fail |= test_rows(fd, br, bc, 1372, 1376, 64, 2, 1, 0, 0); /* AV, nKt 3            */
+        g_fail |= test_rows(fd, br, bc, 128, 256, 128, 8, 0, 1, 0);
+        g_fail |= test_rows(fd, br, bc, 512, 256, 2048, 2, 0, 1, 0); /* a 4 KiB row of C     */
+        g_fail |= test_rows(fd, br, bc, 512, 256, 8192, 2, 0, 1, 1); /* 32 blocks, two jobs  */
+        g_fail |= test_rows(fd, br, bc, 512, 8192, 256, 2, 1, 0, 0); /* a 16 KiB row of A    */
+        g_fail |= test_rows(fd, br, bc, 512, 256, 512, 4, 1, 1, 0);  /* both operands rows   */
+        g_fail |= test_rows(fd, br, bc, 256, 64, 256, 1, 0, 1, 0);   /* one item, no fall-through */
+        g_fail |= test_rows(fd, br, bc, 512, 1024, 256, 3, 1, 0, 0); /* AV-like, nKt>1       */
+        {
+            const _Float16 *a0[1] = { NULL };   /* refused before an operand is read */
+            rocket_bo big = {0};
+            int rr = rocket_bo_alloc32(fd, (size_t)512 * 256 * 2, &big) ? -1
+                   : rocket_mm_batch_run_rows(br, 512, 1024, 256, 1, a0, NULL, a0, NULL, &big, 0);
+            rocket_bo_free(fd, &big);
+            printf("  rows C at nKt>1 -> %d (want %d) %s\n", rr, ROCKET_E_SHAPE,
+                   rr == ROCKET_E_SHAPE ? "PASS" : "FAIL");
+            g_fail |= rr != ROCKET_E_SHAPE;
+        }
+        g_fail |= test_batch_ctx(fd, br, 1372, 1376, 64, 2);        /* cube: in_all at L1    */
+        g_fail |= test_rows(fd, br, bc, 512, 1024, 256, 3, 1, 0, 0); /* rows A at L2         */
+        g_fail |= test_batch_ctx(fd, br, 512, 1024, 256, 3);        /* cube at L2: re-zero   */
+    }
+    rocket_mm_batch_free(br); rocket_mm_batch_free(bc);
 
     rocket_close(fd);
     printf("==== %s ====\n", g_fail ? "FAIL" : "PASS");

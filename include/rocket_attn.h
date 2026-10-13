@@ -121,6 +121,20 @@ void rocket_mha_self_ref_fp16(int T, int d, int n_head, const _Float16 *x,
  * that refuses the group's single score buffer gets the group halved and retried, down to the
  * per-head path, so the result is unchanged and only the submit count moves.
  *
+ * ROCKET_FA_ROWMAJOR (default ON) hands the scores and P between the chained QK and AV jobs
+ * as rows, on the _ctx path with the fused host softmax. QK writes the scores into a resident
+ * BO through the row-major matmul form, the softmax writes P as plain rows, and AV reads its
+ * K slices of P as rows, so neither the scores' de-tile out of the NPU's cube layout nor P's
+ * pack back into it runs. While a row of scores is at most ROCKET_FA_RM_MAX_ROW bytes
+ * (default 4096) the softmax rewrites it as P in place. Past that, QK writes each of its N
+ * tiles as its own block of rows at the tile's width, because a wider row-major write costs
+ * the device more, and P goes to a second BO. Bit-identical to the cube handoff, with one
+ * exception: a lone head in a chained group keeps the batch's fp32 K-accumulation for AV,
+ * where the cube handoff runs it as a one-shot matmul that accumulates in fp16 on the device
+ * by default (a few fp16 ulps). The call measured 0.64-0.69x the cube handoff's at a 1370-token
+ * ViT layer and 0.73-0.82x at a 512-query LLM prefill shape from 2048 to 32768 keys [HW sweep
+ * 2026-10-11, RK1, 600 MHz]. ROCKET_FA_ROWMAJOR=0 keeps the cube handoff.
+ *
  * ROCKET_FA_TILE_KV (long context) selects the online/tiled path: instead of one QK matmul
  * over the full key axis (materializing the [n_tokens,n_kv] score matrix host-side for the
  * mask + softmax — 32 MB/head at 32K, traffic that streams to DRAM and grows with n_kv), the

@@ -200,8 +200,9 @@
  * matmul's activation and output need not be: a stride-only form (CNA GROUP_LINE_OFF, the
  * line stride one row of A, the DPU surface stride one atom plus the notch) reads A and
  * writes C as plain rows [HW 2026-09-26, tests/rowmajor_matmul_probe,
- * tests/rowmajor_tile_probe]. The library's matmul paths do not use it, so they pack A and
- * de-tile C on the host.
+ * tests/rowmajor_tile_probe]; gen_matmul_fp16 emits it from matmul_params_t.a_row_atoms and
+ * c_row_atoms. The flash attention hands its scores and P between QK and AV that way
+ * (rocket_mm_batch_run_rows); the other matmul paths pack A and de-tile C on the host.
  * Decoded from Mesa rocket registers.xml (cross-checked vs allbilly rnpu_registers.h).
  * The library drives the block: gen_pool_fp16 (npu_regcmd.c) emits its program, behind
  * MaxPool and AveragePool (rocket_pool.c) and the spatial reductions (rocket_reduce.c). Block ID BLOCK_PPU/BLOCK_PPU_RDMA above; register

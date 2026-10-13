@@ -171,6 +171,12 @@ typedef struct npu_dpu_desc {
   * post-processed by f(x) in the same job (see lut_epilogue_t). */
  uint8_t  lut_en;
  const lut_epilogue_t *lut_ep;
+ /* DATA_CUBE_NOTCH_ADDR, written to both halves (NOTCH_ADDR_1 [28:16], NOTCH_ADDR_0 [12:0]):
+  * the 16-byte atoms from one output row to the next, minus one. With dst_surf_stride at one
+  * atom the DPU writes a matmul's C as plain [M][N] rows (the row-major form, set by
+  * gen_matmul_fp16 from matmul_params_t.c_row_atoms). Either half alone leaves most of the
+  * tile unwritten [HW sweep, tests/rowmajor_tile_probe]. 0 is the cube program's value. */
+ uint16_t notch;            // 0x4038
 } npu_dpu_desc;
 
 /* The OUT_CVT_SHIFT bit-30 word for an integer requant: `requested` (the descriptor's

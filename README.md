@@ -23,8 +23,8 @@ The `rocket` driver is a generic register-command submitter (`CREATE_BO` / `SUBM
 `PREP_BO` / `FINI_BO`). It runs whatever register program it is handed, so op coverage is a
 userspace matter. The library emits its own matmul register programs and the kernel runs
 them, where a matmul is a 1×1 convolution over the NVDLA-style CNA→CORE→DPU blocks.
-Gemma-4-12B prefill runs on the NPU through this path. Decode stays on the CPU, because it
-is GEMV-bound and ~82x slower at M=1.
+Gemma-4-12B prefill runs on the NPU through this path. Decode stays on the CPU. An M=1 GEMV
+is bound by the DDR bandwidth the NPU shares with the CPU, and the NPU adds a dispatch to it.
 
 ## Operations
 
@@ -368,12 +368,16 @@ envelope:
   no integer K-accumulation mode. One would not speed prefill, which is dispatch-bound and
   DMA-bound rather than readback-bound.
 - **Quantization does not accelerate prefill.** int8 and int4 are for RAM rather than speed.
-- **Decode (M=1 GEMV) stays on the CPU**, ~82x slower on the NPU.
+- **Decode (M=1 GEMV) stays on the CPU.** It is bound by DDR bandwidth, which the NPU shares
+  with the CPU, so offloading it adds only dispatch overhead. A Whisper decoder step with every
+  matmul on the NPU runs 2.6-2.8x slower than whisper.cpp's 4-thread CPU step (RK3588, 600 MHz,
+  measured 2026-10-10).
 - **Weights are packed on the host.** No register converts a layout, because the datapath
   has no transpose or RUBIK engine. A matmul's activation and output need no packing. A
   stride-only register form reads A and writes C as plain rows, exact at fp16 and int8
-  (`tests/rowmajor_matmul_probe`, `tests/rowmajor_tile_probe`). The library's matmul entries
-  do not use that form, so they pack A and de-tile C on the host.
+  (`tests/rowmajor_matmul_probe`, `tests/rowmajor_tile_probe`). The flash attention hands its
+  scores and probabilities between its two matmuls that way. The matmul entries pack A and
+  de-tile C on the host.
 - **The clock boots throttled at 200 MHz.** 600 MHz needs the `patches/rocket` clock patch,
   and 900 MHz is unstable here.
 - **bf16, int16 and tf32 are completeness rungs rather than speedups.** bf16 and int16 tie

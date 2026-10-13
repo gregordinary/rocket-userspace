@@ -4,9 +4,11 @@
 #
 # WHY: the default IRQ affinity mask is all-CPUs (`0-7`); GICv3 then services the NPU
 # completion IRQ on the LOWEST cpu in the mask = cpu0, an A55 *little* core @1.8 GHz.
-# The completion handler + waiter wakeup runs there, so the per-submit dispatch floor is
-# ~51 us. Binding the IRQs to an A76 big core (cpu4-7 @2.4 GHz) cuts it to ~27 us (-47%),
-# measured on-device (RK3588 @600 MHz).
+# The completion handler + waiter wakeup runs there. Binding the IRQs to an A76 big core
+# (cpu4-7 @2.4 GHz) and running the app on that core about halves the per-submit dispatch
+# floor: 29.75 -> 14.58 us on a rocket that keeps the IOMMU domain attached (RK3588 @600 MHz,
+# kernel 7.2.9, governor performance, 2026-10-12). Moving the IRQ without the app gives
+# 25.67 us, so co-location is most of it.
 #
 # This is a runtime knob (no driver change). Re-apply after reboot (or wire into a unit).
 #

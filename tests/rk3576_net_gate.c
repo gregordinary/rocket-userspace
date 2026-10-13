@@ -9,14 +9,15 @@
  * padding convention that is right in isolation and off by one against the framework's,
  * a per-layer envelope decision that is fine alone and refuses in sequence, a hazard
  * whose rate is a property of the DDR traffic the rest of the graph is making. This
- * gate runs a whole quantized classifier at int8 — MobileNetV1-224, MobileNetV2-224 or
- * ResNet-18-224 — and checks every intermediate.
+ * gate runs a whole quantized classifier at int8 — MobileNetV1-224, MobileNetV2-224,
+ * ResNet-18-224, Inception V1-224 or Inception V3-299 — and checks every intermediate.
  *
- * The three ask different questions of the part. V1 is the feed-forward chain. V2 adds
+ * They ask different questions of the part. V1 is the feed-forward chain. V2 adds
  * ten residual skips and channel counts that are not multiples of 32. ResNet-18 is
  * 3x3-heavy where both MobileNets are 1x1-heavy, and brings a 7x7 stem, a max pool, a
  * fused ReLU on its adds, and explicit torchvision padding — a LEAD pad larger than the
- * trailing one, which TFLite's SAME never produces.
+ * trailing one, which TFLite's SAME never produces. The two Inceptions add the
+ * CONCATENATION: each module joins its branches along the channel axis.
  *
  * WHAT IT CHECKS AGAINST. Not a CPU model of this library: TFLite's OWN output for
  * every tensor, exported alongside the weights (tests/data/rk3576-net/mknet.py). So a
@@ -52,7 +53,7 @@
  * rate was measured to follow, and no per-op gate makes any.
  *
  * Usage:  rk3576_net_gate [oracle|chain|peraxis|cube|hostchain|all|bench [iters]]
- *         [--net v1|v2|r18|iv1] [--blob PATH] [-v]
+ *         [--net v1|v2|r18|iv1|iv3] [--blob PATH] [-v]
  * Exit:   0, 1 on a failure, 2 to skip (no NPU, wrong chip, or no blob).
  *
  * `hostchain` needs NO DEVICE — it runs the graph on the CPU three ways and is what
@@ -350,7 +351,8 @@ static int needs_prep(const rnet_layer *L)
  *
  * WHICH GRAPHS IT REACHES IS A MEASUREMENT, NOT AN ARITHMETIC. Its bounds are the
  * library's — a non-zero left pad, an output extent of exactly iw/stride, ow a multiple
- * of 16, a zero input zero point — and this gate does not restate them, because a bound
+ * of 16, a zero input zero point or a geometry whose pad columns the entry can
+ * materialise — and this gate does not restate them, because a bound
  * restated in a harness reads exactly like the part's and goes stale the same way. The
  * decision is taken by ATTEMPTING the pack: a refusal is printed with the library's own
  * reason and the layer falls back to the direct lowering, which is exact everywhere.
@@ -359,20 +361,19 @@ static int needs_prep(const rnet_layer *L)
  * ROCKET_RK3576_NET_ARGB=0 forces the direct lowering, which is the A/B: the two must
  * agree byte for byte over the whole surface.
  *
- * A MATERIALISING STEM IS REACHABLE AND COSTS A JOIN, so this gate does not take it while
- * the graph is cube-linked. At a non-zero input zero point the entry materialises the pad
- * columns, which makes the encoding EXACT on ResNet-18's stem and 1.41 ms against the
- * direct lowering's 3.13 as a resident per-op call — and its surface is then wider than the
- * caller's plane, so it cannot be a consumer's cube. Measured on the graph at `bench 100`,
- * three repeats each: 9.3-9.5 ms in 3 submits against the direct stem's 9.2-9.3 in 1. The
- * program's 1.7 ms goes back out at the break, and the break ejects TWO layers rather than
- * one — the stem de-scatters 784 KiB, the max pool scatters the same 784 KiB back, and a
- * run cannot OPEN on a pool, so both fall outside the kick (stem 1.9, pool 1.4, kick 6.0
- * against one kick of 9.2).
+ * A MATERIALISING STEM IS TAKEN WHERE ITS CONSUMER CAN READ IT. At a non-zero input zero
+ * point the entry materialises the pad columns, which makes the encoding EXACT on
+ * ResNet-18's stem and 1.41 ms against the direct lowering's 3.13 as a resident per-op
+ * call — and its surface is then a plane inside rows wider than the caller's. A POOL reads
+ * that in place, the PPU carrying the consumed extent and the DDR line stride in separate
+ * registers; a CONVOLUTION cannot, the CNA having one register for both. So while the
+ * graph is cube-linked, argb_cand() takes the packed encoding for a stem whose next
+ * non-softmax layer is a pool (ResNet-18's max pool stays inside the run) and leaves any
+ * other materialising stem on the direct lowering rather than break a join.
  *
  * So the rule is the frontend's, not the part's: take the packed encoding where it does not
- * break a join, which is a stem whose input zero point is zero. ROCKET_RK3576_NET_ARGB=2
- * takes it anyway and is the arm those numbers come from.
+ * break a join, which is a stem whose input zero point is zero or whose consumer is a
+ * pool. ROCKET_RK3576_NET_ARGB=2 takes it regardless of the consumer.
  */
 static signed char *ARGB;                 /* -1 not asked, 0 direct, 1 packed */
 static int CUBE_ON;                       /* set by resident_init(); see cube_link()  */

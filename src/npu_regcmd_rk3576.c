@@ -538,10 +538,9 @@ static inline uint32_t r76_cna_format(int windowed)
  *
  * That fold is the one inference here that the captures cannot separate. Every ARGB
  * capture is kw=3, so `4*kw` and the constant 12 fit equally, as do several readings
- * of the 48-element weight kernel. The mechanism above is what makes 4*kw the
- * reading rather than a curve fit — the register pair only makes sense as "4 lanes
- * per pixel column, kw columns" — but a first conv at another kernel width is
- * UNVALIDATED and should be checked against a CPU model.
+ * of the 48-element weight kernel. The hardware separates them: programmed as 4*kw,
+ * the int8 first conv is bit-exact against a CPU model at kw 3, 5 and 7.
+ * [HW sweep, H96 MAX M9]
  *
  * THE WEIGHT CUBE. The found programs pin only its SIZE and stride —
  * oc * kh * round16(4*kw) bytes, one 16-byte row per kernel row per output channel —
@@ -563,11 +562,11 @@ static inline uint32_t r76_cna_format(int windowed)
  * Reproduced at ic 3 and 4, k 1/3/5 and oc 16/32. [source-confirmed, RKNN-Toolkit2
  * rk3576 float build]
  *
- * WHAT IS STILL NOT TRANSCRIBED: the INT8 cube. It is not this one — the depthwise
- * path already showed that this part's int8 and float cubes are different objects —
- * and a quantized ARGB capture does take the ARGB path (0x100C reads 0x2000a006,
- * exactly the found value) but its weights do not survive as a findable value set.
- * So the int8 first conv stays refused rather than shipping a guessed cube.
+ * THE INT8 CUBE is not this one — the depthwise path already showed that this part's
+ * int8 and float cubes are different objects — and a quantized ARGB capture does take
+ * the ARGB path (0x100C reads 0x2000a006, exactly the found value) but its weights do
+ * not survive as a findable value set. It was read off the part instead, with an
+ * impulse image and a one-byte cube: see rocket_rk3576_weight_argb_int8().
  *
  * ONE CORRECTION from these captures: the low field of 0x100C is not precision-
  * independent. The found int8 ARGB programs carry 0x2000a006 and the float ones
@@ -1859,8 +1858,9 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     ops[i++] = NPUOP(OP_REG_CNA,
                      ((uint32_t)cna->cvt_scale3 << 16) | cna->cvt_scale2, R76_CNA_CVT_SCALE23);
     /* CVT_OFFSET0..2, one register per image channel, sign-extended. Zero on every
-     * bypassed path; on the ARGB one they carry the uint8 zero point the converter
-     * subtracts, which is how that datapath centres a raw camera image. A fourth
+     * bypassed path; on the ARGB one they carry the negated zero point the captures
+     * do, and are INERT there: the CNA reads each packed byte as a signed int8 with
+     * nothing subtracted. [HW sweep, H96 MAX M9] A fourth
      * offset almost certainly lives at 0x1060 — the three here are consecutive and
      * there are four scales — but every capture leaves it zero, so it stays in the
      * address-shotgun list below rather than being claimed. */
@@ -2326,8 +2326,8 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
     }
     if (argb && (IW % 16u)) {
         ROCKET_LOGE("rk3576 conv: the first-conv ARGB datapath needs iw a multiple of "
-                    "16 (iw=%u); its DDR row stride and CBUF row are both counted in "
-                    "16-byte granules\n", IW);
+                    "16 (iw=%u); its DDR row stride is counted in 16-byte atoms and "
+                    "its CBUF row in 64-byte granules, both whole only there\n", IW);
         return -1;
     }
     if (IH > ih_full || OH > oh_full) {
@@ -2508,15 +2508,18 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
         /* Border pad constant, in the uint8-centered domain, as on the RK3588. */
         cna.pad_con1    = (uint32_t)(((uint32_t)p->input_zero_point & 0xFFu) - 0x80u);
     } else {
-        /* CVT: the converter is the ARGB path's uint8 -> int8 stage. Each live image
-         * channel gets Q14 unity and the zero point as a subtracted offset, so the
-         * lane the MAC sees is (pixel - zero_point) exactly. The unused lanes keep
-         * the bypassed path's scale of 1, which is what the captures carry.
+        /* CVT: the ARGB path runs the converter, at Q14 unity on each live image
+         * channel. Its per-channel offset is written as the captures carry it (the
+         * negated zero point) but is INERT: the CNA reads each packed byte as a signed
+         * int8 with nothing subtracted, so the image is two's complement and the input
+         * zero point folds into the coefficient group's A term, as on the direct path.
+         * The unused lanes keep the bypassed path's scale of 1, which is what the
+         * captures carry. [HW sweep, H96 MAX M9]
          *
-         * The border then has to be padded in the RAW byte domain, since the pad is
-         * inserted BEFORE the converter runs: the constant is the uint8 zero point
-         * itself, replicated once per image channel, and the CVT maps it to 0. That
-         * is the opposite of the normal path, where pad_con1 is already centred. */
+         * The border constant is the STORED int8 zero point (input_zero_point here is
+         * that plus 0x80), replicated once per image channel, so a pad tap's true value
+         * is zero. Only the pad ROWS honour it; the pad columns feed 0 whatever it
+         * holds, which is why the entry materialises them (r76_argb_bounds()). */
         cna.cvt_scale0  = R76_ARGB_CVT_SCALE;
         cna.cvt_scale1  = (uint16_t)(IC > 1u ? R76_ARGB_CVT_SCALE : 1u);
         cna.cvt_scale2  = (uint16_t)(IC > 2u ? R76_ARGB_CVT_SCALE : 1u);
@@ -2589,8 +2592,8 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
      * A float output has nothing to requant: the RK3588's fp16 path leaves the
      * converter at unity and the accumulator is already in the output format. Unity
      * here is scale 1 << 14 with the matching shift, which is what this arithmetic
-     * produces for conv_scale == 1.0 — but the fp16 datapath is unvalidated on this
-     * part, so the sweep drives 0x40AC-0x40B4 directly when it needs to. */
+     * produces for conv_scale == 1.0, and the fp16 conv (gen_conv2d_fp16_rk3576) is
+     * bit-faithful against a CPU model under it. */
     if (prec == precision_float16 || prec == precision_bfloat16 ||
         out_prec == precision_int32) {
         /* Unity, and it has to be EXACTLY unity on the int32-out path: the QNNPACK
@@ -3584,13 +3587,10 @@ int rocket_rk3576_pack_coeff_prec(void *dst, size_t dst_bytes, const int32_t *bi
  * here without touching the register program — which is what makes uint8 weights a
  * packing question rather than an encoding one.
  *
- * UNVALIDATED: every capture carries B = 0, because every captured model quantizes
- * its weights symmetrically. That B is where the weight zero point goes is read off
- * the field's position and width in the group, not off a program that uses it, and
- * the SIGN CONVENTION is unknown — the accumulator correction is either -B*sum(x) or
- * +B*sum(x) and nothing here says which. A wrong sign is a bias-shaped error that
- * looks like a plausible surface, so drive it against a CPU model before believing
- * it, at a weight zero point far from zero where the two signs cannot be confused.
+ * Every capture carries B = 0, but the part was driven at other values: the BS stage
+ * ADDS B*sum(x) to the accumulator, so a weight zero point is programmed negated,
+ * B = -wzp. A wrong sign is a bias-shaped error that looks like a plausible surface.
+ * See the header. [HW sweep, H96 MAX M9]
  *
  * C defaults to 1 and must never be left at 0: a zero multiplier gates the whole BS
  * stage for that group and the DPU writes a full, correctly sized, entirely EMPTY

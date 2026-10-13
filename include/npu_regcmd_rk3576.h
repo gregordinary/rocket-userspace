@@ -131,27 +131,23 @@ int rocket_rk3576_i32_wide_word(unsigned ow, unsigned oh_full, unsigned c, unsig
  *     a camera or a decoder. NOT the NC1HWC2 cube every other layer reads. Row
  *     stride is iw*ic bytes, so rocket_rk3576_plan_rows() returns feature offsets in
  *     those units on this path (the output is a normal cube either way).
- *   - Pixels are RAW UINT8. The CNA's converter — bypassed on every other layer —
- *     subtracts params->input_zero_point + 0x80 and hands the MAC a centred int8, so
- *     a plain 0..255 image with input_zero_point 0 is exactly right. The border pad
- *     is inserted before that stage, so the emitter pads in the raw byte domain too.
- *   - iw must be a MULTIPLE OF 16: both the DDR row stride and the CBUF row are
- *     counted in 16-byte granules. Rejected otherwise.
+ *   - Pixels are SIGNED INT8, two's complement. The CNA's converter — bypassed on
+ *     every other layer — runs here, but its per-channel offset is inert: the MAC
+ *     sees each packed byte as a signed int8 with nothing subtracted, so the input
+ *     zero point folds into the coefficient group's A term as on the direct path,
+ *     and the border pad is the stored zero point. [HW sweep, H96 MAX M9]
+ *   - iw must be a MULTIPLE OF 16: the DDR row stride is counted in 16-byte atoms
+ *     and the CBUF row in 64-byte granules, and both are whole only there.
+ *     Rejected otherwise.
  *   - int8/uint8 only, and no depthwise form. Both rejected.
  *
- * THE WEIGHT CUBE FOR THIS PATH IS NOT TRANSCRIBED, and that is what stands between
- * this and a running first conv. The captures carry register programs, not weight
- * BOs, so what they pin is the cube's SIZE and stride and nothing about its byte
- * order: oc * kh * round16(4*kw) bytes, one 16-byte row per kernel row per output
- * channel, with 4*kw of those 16 bytes live. Packing it is a hardware bring-up item
- * — driving this emitter with a cube laid out by analogy with weight_conv_int8 is a
- * guess, and a wrong weight order here writes a full, correctly sized, wrong surface
- * with nothing to fault on.
+ * THE WEIGHT CUBE is not in any capture (they carry register programs, not weight
+ * BOs) and was read off the part instead: rocket_rk3576_weight_argb_int8() below.
  *
- * The one geometry inference: every ARGB capture is kw=3, so the "4 lanes per pixel
- * column, kw columns" fold that the two disagreeing channel counts (12 programmed,
- * 3 in the DMA) express cannot be told apart from a constant 12. The mechanism is
- * what makes 4*kw the reading; a first conv at another kernel width is UNVALIDATED.
+ * The channel fold: every ARGB capture is kw=3, so the "4 lanes per pixel column, kw
+ * columns" fold that the two disagreeing channel counts (12 programmed, 3 in the DMA)
+ * express cannot be told apart from a constant 12 there. Programmed as 4*kw, the
+ * first conv is bit-exact at kw 3, 5 and 7. [HW sweep, H96 MAX M9]
  */
 
 /*
@@ -802,7 +798,8 @@ int rocket_rk3576_pack_coeff_prec(void *dst, size_t dst_bytes, const int32_t *bi
  * than anything that faults.
  *
  * This is the DIRECT path only. The depthwise coefficient group has no B field at all,
- * so an asymmetric depthwise weight has to be folded into the bias.
+ * so an asymmetric depthwise weight is carried in the weight CUBE instead: its two live
+ * bytes per (channel, tap) are added by the datapath, so `w - w_zp` splits across them.
  *
  * `multiplier` must not be 0: that gates the whole BS stage off for the group and
  * the DPU writes a full, correctly sized, entirely EMPTY surface. Rejected here.

@@ -89,6 +89,20 @@ typedef struct {
   uint8_t   weight_reuse;
   uint8_t   data_reuse;
 
+  /* ROW-MAJOR OPERANDS (gen_matmul_fp16 only; 0 = the cube program, byte-identical).
+   * a_row_atoms != 0: the task reads A as plain rows, one row of the FULL A being this
+   * many 16-byte atoms (K_full*2/16), and input_dma points at the task's first element
+   * (row m0, column k0), so a task reads a K slice out of a wider A. c_row_atoms != 0: the
+   * task writes C as plain rows, one row of the FULL C being this many atoms (N_full*2/16
+   * at fp16 out, N_full*4/16 at fp32), and output_dma points at (m0, n0), so a task writes
+   * an N tile into a wider C and nothing outside it. Bit-exact against the cube program at
+   * every axis a tiled path varies [HW sweep, RK3588, tests/rowmajor_tile_probe]. The
+   * device cost is C's row pitch: free to a 4 KiB row, 1.4-1.6x at 16 KiB. An accumulating
+   * task still reads its partial (add_dma) as a cube. Either field past its register
+   * (a_row_atoms 28 bits, c_row_atoms 8192) refuses. */
+  uint32_t  a_row_atoms;
+  uint32_t  c_row_atoms;
+
   /* OUT: number of regcmd (NPUOP) words written to tasks[] by the generator.
    * The count varies by datatype and shape (the DPU_RDMA block size differs), so
    * callers must submit this value, not a hard-coded constant. */
