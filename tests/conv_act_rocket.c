@@ -141,14 +141,17 @@ static int run_shape(int fd, const rocket_conv2d_desc *d, int tiled)
     return fail;
 }
 
-/* Probe the x≈0-boundary mitigation (ROCKET_LUT_SHIFT) — INFORMATIONAL (the shift is an
- * experimental RE path, not the shipping one). It maps the whole domain onto the positive
- * index half via the now-mapped POST-scale BN-ALU bias (index = x·BN_MUL + fp32(-x_lo·scale),
- * MUL then ALU, fp32 index-domain bias — HW-confirmed by the BNALU sweep). That RELOCATES the
- * x≈0 LE/LO boundary glitch but does NOT eliminate it: a symmetric domain centers x=0 at
- * index 8192, which is itself a LO-internal sub-boundary, so a residual spike persists at x≈0
- * (and a single wider table also re-exposes the flat-region quirk). Reported, never failed —
- * the BN-ALU mechanism is the durable finding; a robust fix needs x=0 off every sub-boundary. */
+/* Probe the ROCKET_LUT_SHIFT mode, INFORMATIONAL (the shift is an experimental RE path,
+ * not the shipping one). It maps the whole domain onto the positive index half via the
+ * POST-scale BN-ALU bias (index = x·BN_MUL + fp32(-x_lo·scale), MUL then ALU, an fp32
+ * index-domain bias, HW-confirmed by the BNALU sweep). Reported, never failed: the BN-ALU
+ * mechanism is the durable finding.
+ *
+ * The bias moves the table address, not the x~0 LE/LO glitch. The mux selects on sign(x),
+ * the pre-ALU value, so the spike stays at the input value 0 wherever x=0 maps. Tanh's
+ * signed output decode is the case that spikes. (A single wider table also re-exposes the
+ * flat-region quirk.) No index shift removes the x~0 spike, and a fused epilogue cannot
+ * patch the band on the host. A robust activation there needs the 2-pass x·gate(x) path. */
 static int shift_probe(int fd)
 {
     if (fd < 0) return 0;
@@ -169,9 +172,10 @@ static int shift_probe(int fd)
     unsetenv("ROCKET_LUT_SHIFT");
     double ma=0; int x0=0;
     for(int i=0;i<N;i++){ double da=fabs((float)got[i]-(float)ref[i]); if(da>ma)ma=da; if(da>0.5&&fabs((float)cvt[i])<0.02)x0++; }
-    printf("SHIFT-mode probe (conv->tanh, curved [%.2f,%.2f], INFO): ACC=%.4f x0-spikes=%d  "
-           "(BN-ALU post-scale bias works; x≈0 relocated to the index-centre sub-boundary, residual remains)\n",
-           lo, hi, ma, x0);
+    printf("SHIFT-mode probe (conv->tanh, curved [%.2f,%.2f], INFO): ACC=%.4f x0-spikes=%d  (%s)\n",
+           lo, hi, ma, x0,
+           x0 ? "the x~0 spike stays at input 0: the LE/LO mux selects on the pre-ALU sign"
+              : "no x~0 spike on this draw");
     free(in);free(W);free(cvt);free(ref);free(got);
     return r ? 1 : 0;   /* only a hard error fails; the residual glitch is expected/reported */
 }

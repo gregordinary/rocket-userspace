@@ -55,6 +55,7 @@
 #include "rocket_hw_profile.h"
 #include "rocket_log.h"
 #include "rocket_npu.h"
+#include "npu_matmul.h"
 
 static long checked, failed;
 
@@ -78,8 +79,26 @@ static void check_plan(const char *dt, const char *tag, int M, int K, int N, int
         return fail("non-positive tile", dt, tag, M, K, N, rc, Mt, Kt, Nt);
     if (Mt % 4 || Nt % nalign || Kt % kalign)
         return fail("misaligned tile", dt, tag, M, K, N, rc, Mt, Kt, Nt);
-    if (strict_cap && (Mt > max_tile || Nt > max_tile))
+    /* 2c. Unless ROCKET_MM_STREAM=0 the fp16 plan streams its weights instead, and under
+     * ROCKET_MM_STREAM_INT8=1 the int8 plan does too: Nt runs to the streamed cap, and what
+     * bounds it is the CBUF holding the input tile beside the streamed-weight floor, which
+     * the generator refuses below. int8 adds a slack bank to the input and a spare to the
+     * weights (gen_matmul_int8). */
+    const char *se = getenv("ROCKET_MM_STREAM"), *s8 = getenv("ROCKET_MM_STREAM_INT8");
+    const int i8 = !strcmp(dt, "int8");
+    const int streamed = !(se && atoi(se) <= 0) &&
+                         (!strcmp(dt, "fp16") || (i8 && s8 && atoi(s8) > 0));
+    if (strict_cap && (Mt > max_tile || Nt > (streamed ? 4096 : max_tile)))
         return fail("tile over the cap", dt, tag, M, K, N, rc, Mt, Kt, Nt);
+    if (streamed) {
+        const struct rocket_hw_profile *hw = rocket_hw_current();
+        const long eb = i8 ? 1 : 2, bank = hw->cbuf_bank_size;
+        long in_banks = ((long)Mt * Kt * eb + bank - 1) / bank + i8;
+        if ((long)Nt * Kt * eb > (hw->cbuf_banks - in_banks) * bank &&
+            in_banks + (long)npu_stream_weight_banks((unsigned)(Kt * eb)) + i8 > hw->cbuf_banks)
+            return fail("streamed tile under its weight-bank floor", dt, tag, M, K, N, rc,
+                        Mt, Kt, Nt);
+    }
     /* A tile may exceed its dimension only by that dimension's own rounding. */
     if (Mt > M + 3 || Nt > N + nalign - 1 || Kt > K + kalign - 1)
         return fail("tile over its dimension", dt, tag, M, K, N, rc, Mt, Kt, Nt);

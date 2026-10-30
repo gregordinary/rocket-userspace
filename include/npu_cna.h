@@ -5,6 +5,8 @@
 /*
  * Copyright (C) 2024  Jasbir Matharu, <jasjnuk@gmail.com>
  *
+ * prose-lint: off
+ *
  * This file is part of rocket-userspace.
  *
  * rocket-userspace is free software: you can redistribute it and/or modify
@@ -20,6 +22,7 @@
  * You should have received a copy of the GNU General Public License
  * along with rocket-userspace.  If not, see <https://www.gnu.org/licenses/>.
  *
+ * prose-lint: on
  */
 
 #include <stdint.h>
@@ -49,7 +52,7 @@ typedef struct npu_cna_desc {
   uint16_t weight_kernels;    // 0x1038
   uint8_t weight_bank;        // 0x1040
   uint8_t data_bank;          // 0x1040
-  uint8_t weight_reuse;       // 0x1040 bit13 (CBUF reuse; 0 = re-fetch)
+  uint8_t weight_reuse;       // 0x1040 bit13 (CBUF reuse, 0 = re-fetch)
   uint8_t data_reuse;         // 0x1040 bit12
   uint16_t data_entries;      // 0x1044
   uint8_t data_sign;          // 0x104c
@@ -76,32 +79,33 @@ typedef struct npu_cna_desc {
 
   uint16_t dataout_height;
 
-  /* General CONV_2D fields. Read ONLY by gen_conv2d_task (npu_regcmd.c); the
-   * matmul generators leave them unset and the shared matmul emitter never reads
-   * them, so a 1x1-conv matmul is byte-identical regardless of these. atrous_*
-   * are the CONV_CON3 dilation fields [21:25]/[16:20], stored as the RAW register
-   * value (= dilation_rate - 1; 0 == no dilation). */
+  /* General CONV_2D fields. Only `gen_conv2d_task` (`npu_regcmd.c`) reads them. The matmul
+   * generators leave them unset, and the shared matmul emitter never reads them. A 1x1-conv
+   * matmul is therefore byte-identical whatever their values. `atrous_*` are the `CONV_CON3`
+   * dilation fields [21:25]/[16:20]. Each contains the raw register value,
+   * `dilation_rate - 1`, and 0 means no dilation. */
   uint8_t atrous_x_dilation;  // 0x1014 [20:16]  (rate-1)
   uint8_t atrous_y_dilation;  // 0x1014 [25:21]  (rate-1)
 
-  /* The deconvolution mode: CONV_CON1 bit 16 set, and CONV_CON3's DECONV strides as the
-   * RAW field value (= stride - 1; power-of-two strides only). The CNA then
-   * interior-dilates its input by the stride. 0 (default) is off. Read ONLY by
-   * gen_conv2d_task. */
+  /* Selects the deconvolution mode. `deconv` sets `CONV_CON1` bit 16, and the two strides
+   * are the `DECONV` stride fields of `CONV_CON3`, as the raw field value (`stride - 1`). The
+   * stride must be a power of two. The CNA then interior-dilates its input by the stride.
+   * 0, the default, is off. Only `gen_conv2d_task` reads these fields. */
   uint8_t deconv;             // 0x100C bit16
   uint8_t deconv_x_stride;    // 0x1014 [10:8]   (stride-1)
   uint8_t deconv_y_stride;    // 0x1014 [13:11]  (stride-1)
 
-  /* CNA_PAD_CON1 (0x10A4): the constant the CNA pads borders with. For the int8-out
-   * (uint8-centered) datapath this is the input zero-point in the shifted domain
-   * (= input_zp_uint8 - 0x80); 0 for the float / int32-raw paths (read only by the
-   * conv emitter; the matmul emitter always pads 0). */
+  /* Sets `CNA_PAD_CON1` (0x10A4), the constant the CNA pads borders with. For the int8-out
+   * (uint8-centered) datapath, it is the input zero-point in the shifted domain
+   * (`input_zp_uint8 - 0x80`). It is 0 for the float and int32-raw paths. Only the conv
+   * emitter reads it, and the matmul emitter always pads with 0. */
   uint32_t pad_con1;          // 0x10A4
 
-  /* CONV_CON1 bit 29 (GROUP_LINE_OFF). Set with line_stride at one row of A and surf_stride 0,
-   * the CNA reads a matmul's A as plain [M][K] rows (the row-major form, set by
-   * gen_matmul_fp16 from matmul_params_t.a_row_atoms). 0 is the cube program's value. Read
-   * by the shared matmul emitter, so every matmul generator zero-initialises its desc. */
+  /* Sets `CONV_CON1` bit 29 (`GROUP_LINE_OFF`). If it is set with `line_stride` at one row of
+   * `A` and `surf_stride` 0, the CNA reads a matmul's `A` as plain [M][K] rows.
+   * `gen_matmul_fp16` sets this row-major form from `matmul_params_t.a_row_atoms`. 0 is the
+   * cube program's value. The shared matmul emitter reads it, so every matmul generator must
+   * zero-initialize its descriptor. */
   uint8_t group_line_off;     // 0x100C bit29
 } npu_cna_desc;
 
@@ -111,8 +115,9 @@ typedef struct npu_core_desc {
   uint16_t dataout_height;  // 0x3014
   uint16_t dataout_width;   // 0x3014
   uint16_t dataout_channel; // 0x3018
-  /* CORE_MISC_CFG DW_EN bit1 — depthwise conv. Read ONLY by gen_conv2d_task; the
-   * matmul emitter never reads it (so matmul is byte-identical). Default 0. */
+  /* Enables depthwise convolution (`CORE_MISC_CFG` `DW_EN`, bit1). Only `gen_conv2d_task`
+   * reads it. The matmul emitter never reads it, so a matmul is byte-identical whatever its
+   * value. The default is 0. */
   uint8_t dw_en;            // 0x3010 bit1
 } npu_core_desc;
 
@@ -123,8 +128,8 @@ typedef struct nup_pc_desc {
 
 typedef struct npu_cna_core_task {
 
-  // Use cna, core, bypass dpu operations & output to memory.
-  // This can be done within 112 operations.
+  // A task that uses the CNA and CORE, bypasses the DPU operations and writes its output
+  // to memory. It fits within 112 operations.
   uint64_t ops[112];
 
 } npu_cna_core_task;

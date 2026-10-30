@@ -3,8 +3,9 @@
 /*
  * rocket_encoder.c — one Whisper/transformer encoder block, assembled from the validated on-NPU
  * primitives (LayerNorm, multi-head attention, the residual add, the projection matmuls, and the
- * 2-pass GELU). Runs FULLY on the NPU — the MLP's GELU is the on-NPU 2-pass x·Φ(x). See
- * rocket_encoder.h.
+ * 2-pass GELU). The GELU's Φ gate runs on the DPU LUT. On the default fused FFN its x·Φ(x)
+ * multiply runs on the host unless ROCKET_ACT_NPU_MUL is set. See rocket_encoder.h for the
+ * full work split.
  */
 #include <stdio.h>
 #include <stdlib.h>

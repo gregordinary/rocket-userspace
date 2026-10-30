@@ -77,14 +77,19 @@ static double act_eval(int kind, double x)
     }
 }
 
-/* The SHIFTED-table kinds (SQRT/RSQRT/RECIPROCAL + EXP): f realised with the SHIFTED
- * single-table LUT over [x_lo,x_hi] — the whole domain maps onto the positive LUT index
- * half via the BN-ALU bias, so x never crosses 0 IN THE INDEX domain ⇒ no LE/LO sign-mux
- * glitch (works standalone). SQRT/RSQRT/RECIPROCAL are defined for x>0 (positive domain);
- * EXP is defined for all x and its default domain INCLUDES x<=0 — the shifting is what makes
- * that safe. The output range [out_lo, out_lo+2^Sexp] covers f over the domain. Domain
- * defaults are tuned to typical magnitudes; ROCKET_LUT_XLO/XHI override. Returns 1 (and fills
- * params) if `kind` is a shifted-table kind, else 0. */
+/* The SHIFTED-table kinds (SQRT/RSQRT/RECIPROCAL/LOG, EXP, SOFTPLUS, ABS): f realised with
+ * the SHIFTED single-table LUT over [x_lo,x_hi]. The output range [out_lo, out_lo+2^Sexp]
+ * covers f over the domain. Domain defaults are tuned to typical magnitudes, and
+ * ROCKET_LUT_XLO/XHI override them. Returns 1 (and fills params) if `kind` is a
+ * shifted-table kind, else 0.
+ *
+ * The BN-ALU bias maps the whole domain onto the positive LUT index half, so the index
+ * never crosses 0. The x~0 LE/LO sign-mux glitch does not depend on the index, because the
+ * mux selects on sign(x). SQRT/RSQRT/RECIPROCAL/LOG are defined for x>0, so x never
+ * reaches 0 and the mux never toggles. The EXP, SOFTPLUS and ABS domains include x<=0, and
+ * these kinds decode an unsigned output (out_lo=0). In the kinds measured, the spike
+ * appears only with a signed decode (tests/x0_glitch_probe.c), and all of these work
+ * standalone. */
 static int act_shifted_domain(int kind, double *x_lo, double *x_hi, double *out_lo, int *Sexp)
 {
     /* Domains tuned so the UNIFORM 512-cell grid resolves the steep low end: the low-end
@@ -243,14 +248,23 @@ static void build_lut_affine(int kind, double index_scale, double lo, double hi,
 /* fp32 bit pattern (for the BN_ALU pre-scale bias on the shifted single-table path). */
 static uint32_t fp32_bits(double v) { float f=(float)v; uint32_t b; memcpy(&b,&f,4); return b; }
 
-/* SHIFTED single-table build (the x≈0 LE/LO boundary-glitch mitigation). Instead of
- * splitting LE=[neg,0] / LO=[0,pos] at the data's zero (where the hybrid mux glitches),
- * map the whole input domain [x_lo,x_hi] onto the POSITIVE index range via a BN-ALU bias:
- *   index = (x + B)*scale,  B = -x_lo,  scale = 16384/(x_hi-x_lo)
- * so x in [x_lo,x_hi] -> index in [0,16384], and a data range strictly inside [x_lo,x_hi]
- * is INTERIOR (index never 0 or 16384) -> no LE/LO boundary, no overflow edge. The LO table
- * holds f over the full domain; LE is never hit (filled flat = LO[0]). OUT_CVT (out_lo,S) is
- * unchanged (it decodes f's OUTPUT range). Table sample j -> x = x_lo + j*(x_hi-x_lo)/512.
+/* SHIFTED single-table build. Instead of splitting LE=[neg,0] / LO=[0,pos] at the data's
+ * zero, map the whole input domain [x_lo,x_hi] onto the POSITIVE index range. The BN-ALU
+ * bias is added after the BN-MUL scale, in the index domain:
+ *
+ *     index = x*scale + B,  scale = 16384/(x_hi-x_lo),  B = -x_lo*scale
+ *
+ * With it, x in [x_lo,x_hi] maps to index [0,16384]. A data range strictly inside
+ * [x_lo,x_hi] is INTERIOR (index never 0 or 16384), with no overflow edge. The LO table
+ * holds f over the full domain, and LE is never hit (filled flat = LO[0]). OUT_CVT
+ * (out_lo,S) is unchanged, because it decodes f's OUTPUT range. Table sample j maps to
+ * x = x_lo + j*(x_hi-x_lo)/512.
+ *
+ * The mapping does not remove the x~0 LE/LO sign-mux glitch, because the mux selects on
+ * sign(x), not on the index. A kind built here is clean at x~0 only if its domain stays on
+ * one side of 0 or its output decode is unsigned (see act_shifted_domain). With a signed
+ * decode over a domain that straddles 0 (the ROCKET_LUT_SHIFT tanh/SiLU/GELU tables), the
+ * x~0 band still spikes.
  *
  * HW FACT (found 2026-06-22 bringing up EXP): a LUT table entry of EXACTLY q=0 mis-decodes
  * to a garbage constant (~4.0 in the fp16 output) — NOT 0. EXP's deep tail (exp(x)<~1.5e-5,
@@ -275,20 +289,18 @@ static void build_lut_shifted(int kind, double x_lo, double x_hi, double out_lo,
     for (int j = 0; j <= 512; j++) lut[j] = lut[513];   /* LE never hit (index>=0): flat */
 }
 
-/* SHIFTED single-table build for LeakyReLU(alpha) over a SYMMETRIC domain [-R,R]. The
- * symmetric domain is the point: the x=0 kink lands on an EXACT table sample (j=256, the
- * table middle) AND the BN-ALU bias puts it at the positive-index interior — so there is
- * neither an interpolation error at the kink NOR an x≈0 LE/LO mux boundary. LeakyReLU is
- * linear on each side, so linear interpolation between samples is exact: the result is
- * exact (Q0.15 + fp16 quant) for x in [-R,R]; |x|>R saturates at the edge value. The output
- * span is [-R*alpha, R]; S (a power of two) covers it. Mirrors build_lut_shifted but with
- * the parametric f. */
-/* Build LeakyReLU into the natural LE/LO split: LE (table id 0) is the NEGATIVE branch
- * (x in [-range,0], slope alpha), LO (table id 1) the POSITIVE branch (x in [0,range],
- * slope 1) — a perfect structural fit for the kink at 0. Both encode g=(f-out_lo)/S in
- * Q0.15; the affine OUT_CVT decodes f back. step = 32/index_scale in the x domain; |x|>range
- * saturates at the table edge. The LE/LO mux glitches at exactly x=0 (sign-based, HW quirk);
- * the runtime repairs that razor-thin band on the host. */
+/* Build LeakyReLU into the natural LE/LO split. LE (table id 0) is the NEGATIVE branch
+ * (x in [-range,0], slope alpha). LO (table id 1) is the POSITIVE branch (x in [0,range],
+ * slope 1), a structural fit for the kink at 0. Both encode g=(f-out_lo)/S in Q0.15, and
+ * the affine OUT_CVT decodes f back. The step is 32/index_scale in the x domain, and
+ * |x|>range saturates at the table edge.
+ *
+ * The kink at x=0 falls on the shared table edge, and LeakyReLU is linear on each side.
+ * Linear interpolation between samples is therefore exact, and the result is exact
+ * (Q0.15 + fp16 quant) for x in [-range,range], with range = R in rocket_leaky_relu_fp16.
+ * The output span is [-R*alpha, R], and the caller's S (a power of two) covers it. The
+ * LE/LO mux glitches at exactly x=0 (sign-based, HW quirk), and the runtime repairs that
+ * razor-thin band on the host. */
 static void build_lut_leaky(double alpha, double index_scale, double out_lo, double S,
                             uint16_t lut[1026])
 {
@@ -311,9 +323,11 @@ static void build_lut_leaky(double alpha, double index_scale, double out_lo, dou
     }
 }
 
-/* SHIFTED single-table build for ELU/SELU over a SYMMETRIC domain [-R,R] (the Abs trick):
- * the x=0 kink lands on the middle sample (j=256) and the BN-ALU bias maps the whole domain
- * onto the positive LUT index half, so there is NO LE/LO sign-mux glitch (no host repair).
+/* SHIFTED single-table build for ELU/SELU over a SYMMETRIC domain [-R,R] (the Abs trick).
+ * The x=0 kink lands on the middle sample (j=256), and the BN-ALU bias maps the whole
+ * domain onto the positive LUT index half. The output is signed (out_lo<0), and the x~0
+ * band still meets the LE/LO sign-mux glitch, as in every signed-output kind measured. The
+ * host repairs that band in elu_run after readback, unless ROCKET_ELU_NOREPAIR is set.
  * f(x) = lambda*(x>=0 ? x : alpha*(e^x-1)); the curved negative branch interpolates on the
  * uniform grid (error ~ lambda*alpha*dx^2/8). out_lo is the negative saturation (-lambda*alpha);
  * S (a power of two) covers [out_lo, lambda*R]. Like build_lut_shifted, every entry is floored
@@ -355,10 +369,13 @@ int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
     ep->le_index_select = 5;            /* step = 2^5 = 32 in the Q index domain     */
     ep->lo_index_select = 5;
 
-    /* POSITIVE-DOMAIN kinds (sqrt / rsqrt / reciprocal): ALWAYS the shifted single-table
-     * mode — the whole positive domain [x_lo,x_hi] maps onto the LO (positive index) half,
-     * so x never crosses 0 and the LE/LO sign mux never glitches. Uniform-grid LUT, so
-     * accuracy is bounded by the domain width (tune to the data; ROCKET_LUT_XLO/XHI). */
+    /* SHIFTED-TABLE kinds (every act_shifted_domain kind: sqrt, rsqrt, reciprocal, log,
+     * exp, softplus, abs): ALWAYS the shifted single-table mode, with the whole domain
+     * [x_lo,x_hi] mapped onto the LO (positive index) half. None of them meets the x~0
+     * LE/LO sign-mux glitch. The positive-domain kinds never reach x=0, so the mux, which
+     * selects on sign(x), never toggles. Exp, softplus and abs decode an unsigned output
+     * (see act_shifted_domain). The LUT grid is uniform, so accuracy is bounded by the
+     * domain width. Tune it to the data with ROCKET_LUT_XLO/XHI. */
     {
         double x_lo, x_hi, out_lo; int Sexp;
         if (act_shifted_domain(kind, &x_lo, &x_hi, &out_lo, &Sexp)) {
@@ -384,10 +401,13 @@ int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
      * the LO tail saturates (slope 0), an approximation for |x|>16 (rare post-norm).
      * hardswish: KNEE-ONLY +-3 (S=4) — the NVDLA flat-tail quirk forbids its x<=-3
      * constant run, so the fused/standalone single-pass covers only the curved knee. */
-    /* SHIFTED single-table mode (ROCKET_LUT_SHIFT): map the whole domain onto the
-     * positive index half (data interior to one table) so there is NO x≈0 LE/LO
-     * boundary to glitch. BN-ALU adds B=-x_lo (fp32, pre-scale), BN-MUL scales by
-     * 16384/(x_hi-x_lo); OUT_CVT (out_lo,S) decodes f's output range as usual. */
+    /* SHIFTED single-table mode (ROCKET_LUT_SHIFT), for reverse engineering: map the whole
+     * domain onto the positive index half (data interior to one table). BN-MUL scales by
+     * 16384/(x_hi-x_lo), and BN-ALU adds B=-x_lo*scale (fp32, post-scale, in the index
+     * domain). OUT_CVT (out_lo,S) decodes f's output range as usual. The mode does not
+     * remove the x~0 LE/LO glitch for these kinds. The mux selects on sign(x), not on the
+     * index, and tanh, SiLU and GELU decode a signed output (out_lo<0), the case that
+     * spikes. */
     if (getenv("ROCKET_LUT_SHIFT")) {
         double x_lo, x_hi, out_lo, S;
         switch (kind) {
@@ -403,9 +423,13 @@ int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
         build_lut_shifted(kind, x_lo, x_hi, out_lo, S, lut);
         ep->bn_mul_operand    = fp16_bits(scale);
         /* index = x*BN_MUL + BN_ALU, the BN ALU bias added POST-scale (index domain) as
-         * fp32 — HW-confirmed by the BNALU sweep (0x46000000=fp32(8192) gave tanh
-         * ACC 0.0007, x0-spikes 0). So B = -x_lo*scale (= 8192, the index centre, for a
-         * symmetric domain: x=0 maps to the table middle, far from either edge). */
+         * fp32. The BNALU sweep confirmed it on hardware: 0x46000000=fp32(8192) gave tanh
+         * ACC 0.0007, and the pre-scale guess fp32(-x_lo) gave ACC~2. B is therefore
+         * -x_lo*scale (= 8192, the index centre, for a symmetric domain: x=0 maps to the
+         * table middle, far from either edge). The sweep also counted 0 x~0 spikes, which
+         * does not show the shift removes them. The band is ~±R/8192 wide, and a sparse
+         * sample steps over it. A shift that moves x=0 to another index moves the spike
+         * with it [HW sweep]. */
         ep->bn_alu_cfg        = fp32_bits(-x_lo * scale);
         ep->out_cvt_minus_exp = (uint8_t)lround(15.0 - log2(S));
         ep->out_cvt_offset    = (uint32_t)(int32_t)lround(out_lo * 32768.0 / S);
@@ -768,14 +792,14 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
      * here — M=1020,K=32 is ~2 banks). */
     const int M_TILE = 1020;
 
-    /* The K-accum EW operand geometry floors the surface stride at MAX(M,12), so
-     * M<12 mis-strides the upper channel surfaces (see gen_matmul_fp16). Keep
-     * M>=12 (and %4) for every tile — the extra rows are zero-padded and unread. */
+    /* Every tile is at least 12 rows (and %4), the extra rows zero-padded and unread.
+     * The EW operand's surface stride is M at any height (gen_matmul_fp16), so this is a
+     * library rule, not a hardware floor. */
     const int M_MIN = 12;
     int total_rows = (n + NN - 1) / NN;
     int alloc_M = total_rows < M_TILE ? total_rows : M_TILE;
     if (alloc_M < M_MIN) alloc_M = M_MIN;
-    alloc_M = (alloc_M + 3) & ~3;      /* M%4 (gen_matmul_fp16 requirement)        */
+    alloc_M = (alloc_M + 3) & ~3;      /* M%4 (the matmul planner's row unit)    */
 
     rocket_bo wt = {0}, in_bo = {0}, op_bo = {0}, out_bo = {0}, rc_bo = {0};
     uint64_t  regs[256] = {0};
@@ -870,8 +894,10 @@ out:
  * ==========================================================================*/
 
 /* ELU/SELU: f(x)=lambda*(x>=0?x:alpha*(e^x-1)) on the SYMMETRIC shifted single-table (the Abs
- * trick — x=0 kink on the middle sample, whole domain on the positive index half, so NO LE/LO
- * sign-mux glitch and NO host repair). Shared body; the public wrappers fix (alpha,lambda). */
+ * trick: the x=0 kink on the middle sample, the whole domain on the positive index half). The
+ * output is signed, and the x~0 band meets the LE/LO sign-mux glitch. The body repairs that
+ * band on the host after readback, and ROCKET_ELU_NOREPAIR disables the repair. It is the
+ * shared body, and the public wrappers fix (alpha,lambda). */
 static int elu_run(int fd, double alpha, double lambda, const _Float16 *in, _Float16 *out, int n)
 {
     if (fd < 0 || n <= 0) return ROCKET_E_SHAPE;
@@ -920,12 +946,14 @@ static int elu_run(int fd, double alpha, double lambda, const _Float16 *in, _Flo
     int r = run_dpu_lut(fd, &p, in, out, n);
     if (r) return r;
 
-    /* x≈0 REPAIR. A shifted single-table over a domain that STRADDLES 0 does NOT escape the
-     * DPU LUT's x≈0 LE/LO sign-mux glitch (the mux decides on sign(x), independent of the
-     * BN-ALU index shift — the LE/LO-mux QUIRK 2). The shifted positive-domain /
-     * exp kinds avoid it only because their domain is ONE-SIDED. ELU/SELU straddle 0, so the
-     * razor-thin x≈0 band spikes; patch it on the host with the exact value (the readback
-     * streams every element anyway). ELU(x≈0)≈lambda*x, exact via elu_d. */
+    /* x~0 repair. The BN-ALU index shift does not escape the DPU LUT's x~0 LE/LO sign-mux
+     * glitch, because the mux decides on sign(x), independent of the index shift.
+     * A domain that straddles 0 does not by itself cause the spike. Softplus and Abs
+     * straddle 0 and show none in tests/x0_glitch_probe.c. In the kinds measured, the spike
+     * follows a signed output decode (a negative OUT_CVT offset), which ELU/SELU have.
+     * The razor-thin x~0 band therefore spikes, and the loop below patches it on the host
+     * with the exact value (the readback streams every element anyway).
+     * ELU(x~0)~lambda*x, exact via elu_d. */
     if (!getenv("ROCKET_ELU_NOREPAIR")) {
         const float guard = (float)(R / 1024.0);
         for (int i = 0; i < n; i++) {

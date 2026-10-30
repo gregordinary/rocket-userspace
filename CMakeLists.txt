@@ -324,6 +324,9 @@ if(ROCKETNPU_BUILD_TESTS)
             rowmajor_matmul_probe  # probe: one fp16 matmul task reading A and writing C row-major (GROUP_LINE_OFF + strides)
             rowmajor_tile_probe    # probe: the row-major form at a tiled path's shapes -- K slice, N tile, int8, fp16 out, K-accumulation
             rowmajor_kacc_chain_probe # probe: the row-major form in one chained fp16 KACC kick with DATA_REUSE, against the cube program
+            weight_stream_probe    # probe: one fp16 task whose weight cube exceeds the CBUF weight banks (N whole), against whole-tile tasks
+            msmall_probe           # GATE: an fp16 or int8 task at every M 1-64 under the packed feature surface stride (RE knobs: the stride's arms)
+            gemv_bw_probe          # probe: resident-weight streaming bandwidth at decode M, fp16 and int8, one to three cores
             fa_replay_probe        # probe: replay one flash-attention op from its dumped tiles and count how often it differs from itself
             fa_core_matmul_probe   # probe: one head's real AV operands on every NPU core at once; a per-core difference reads as a count (the core from a trace)
             npu_core_diff_probe    # probe: fp16 -> fp32 tiles written per run, one core per process (RKNPU_CORE_MASK), and a diff of two cores' runs
@@ -334,7 +337,7 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_int8_crossm_gw_rocket # resident group-wise int8 weight reused across M, no re-pack
             matmul_int8_dequant_rocket # fold int8 dequant scale into DPU OUT_CVT (int8->float out)
             activation_lut_rocket  # DPU LUT elementwise activation (sigmoid/hardsigmoid) HW gate
-            leaky_relu_rocket      # parametric LeakyReLU on the DPU LUT (shifted single-table, x≈0 glitch-free)
+            leaky_relu_rocket      # parametric LeakyReLU on the DPU LUT (natural LE/LO split; the x≈0 band repaired on the host)
             activation_concurrent_rocket # GATE: LeakyReLU slopes and ELU/SELU from two threads at once, each vs its serial result
             recip_rsqrt_rocket     # positive-domain LUT (sqrt/rsqrt/reciprocal) + on-NPU Div accuracy gate
             lut_tanh_rocket        # SIGNED-output LUT (tanh bias-trick) — OUT_CVT affine HW gate/RE
@@ -855,6 +858,16 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_npu_test(matmul_int8_prepacked_k1_ssd COMMAND matmul_int8_prepacked_rocket 1444 32 192 2)
     rocket_npu_test(matmul_int8_prepacked_k1_eff COMMAND matmul_int8_prepacked_rocket 25600 32 96 2)
     rocket_npu_test(matmul_int8_crossm_rocket)
+    # One task at every M 1-17, 31, 33, 63, 64: the feature surface stride width*(H-4) that
+    # cna_feature_surf_stride() writes (the planners still take M in fours; this is the
+    # generator below them).
+    rocket_npu_test(msmall_probe)
+    rocket_npu_test(msmall_probe_int8 COMMAND msmall_probe 128 64 ENVIRONMENT "MSP_DT=int8")
+    # fp16 K-accumulation at every M: the EW partial read's surface stride is M
+    rocket_npu_test(msmall_probe_kacc COMMAND msmall_probe 128 64 ENVIRONMENT "MSP_KACC=1")
+    # a three-group fp16 conv at input height 2, unpadded: the signed feature surface stride
+    rocket_npu_test(conv2d_fp16_sub4 COMMAND conv2d_fp16_rocket 96 2 7 16 3 3 1 1 1 1 1 1
+                    ENVIRONMENT "ROCKET_CONV_NOPAD=1")
     rocket_npu_test(matmul_int8_groupwise_rocket)
     rocket_npu_test(matmul_int8_prepacked_gw_rocket)
     # group=576 (the default above) has Kt == group, so it never exercises the resident

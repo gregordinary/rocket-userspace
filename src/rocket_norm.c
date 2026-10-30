@@ -32,6 +32,8 @@ void rocket_scale_rows_ref_fp16(int M, int N,
     }
 }
 
+/* In a model, this per-row scale can fold into the matmul's activation pack, whose scatter
+ * already touches every element. Here it is a standalone op. */
 int rocket_scale_rows_fp16(int fd, int M, int N,
                            const _Float16 *in, const float *r, _Float16 *out)
 {
@@ -207,7 +209,11 @@ int rocket_layernorm_fp16(int fd, int M, int H, const _Float16 *x, const _Float1
     memcpy(stack + MH,       sq, MH * sizeof(_Float16));
     if ((rc = rocket_reduce_feature_fp16(fd, 2 * M, H, stack, csum, 0 /*sum*/)) != 0) goto out;
 
-    /* 3. per-row mean/var/rsqrt (host, exact). sum(x^2) = csum[M+m] * 4^k (undo the prescale). */
+    /* 3. per-row mean/var/rsqrt (host, exact). sum(x^2) = csum[M+m] * 4^k (undo the prescale).
+     *    Sending the M per-row scalars back to the NPU for a LUT rsqrt would add a round trip,
+     *    and the mean square can span many decades across rows and layers, which a
+     *    uniform-grid LUT cannot cover. The DPU rsqrt LUT is for a large tensor, not this
+     *    M-vector. */
     const float invH   = 1.f / (float)H;
     const float four_k = ldexpf(1.f, 2 * k);
     for (int m = 0; m < M; m++) {

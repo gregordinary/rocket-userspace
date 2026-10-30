@@ -6,32 +6,35 @@
 #include <stdint.h>
 
 /*
- * rocket_ffn — the gated-MLP transformer FFN block on the NPU.
+ * The transformer FFN block on the NPU: the gated FFN of an LLM layer, and the non-gated FFN
+ * of an encoder layer.
  *
  *     gate = x · Wg^T        [M,I]      (gate projection)
  *     up   = x · Wu^T        [M,I]      (up projection;  Wg/Wu share x -> fuse-able)
  *     prod = act(gate) ⊙ up  [M,I]      (the gated activation — GeGLU/SwiGLU core)
  *     out  = prod · Wd^T     [M,H]      (down projection)
  *
- * The only computation here beyond plain matmul is the GATED ACTIVATION `act(gate) ⊙ up`,
- * so that is the reusable primitive (rocket_geglu_fp16); the block (rocket_ffn_fp16) just
- * wraps it between the three matmuls.
- *
- * RESIDENT-FUSION NOTE: this composition uses HOST handoff between ops (each matmul reads
- * back to row-major; the activation/ew re-scatter). That is correct but pays the
- * de-tile->host->re-pack round-trip the not-mac-bound budget is dominated by. The perf win
- * (keeping the [M,I] intermediates cube-resident between matmul->act->mul->matmul) is the
- * follow-on; this block is the correctness substrate + the round-trip measurement
- * baseline it builds on.
+ * The one operation beyond a plain matmul is the gated activation `act(gate) ⊙ up`, which
+ * `rocket_geglu_fp16` exposes on its own. `rocket_ffn_fp16` runs it between the three matmuls
+ * and hands each intermediate back to the host. Each matmul output is de-tiled to row-major and
+ * re-packed for the next op, and that host round trip is most of the block's cost. The
+ * `_fused` entries keep the intermediates in cube layout on the NPU and avoid it.
  */
 
 /*
- * Gated activation (GeGLU / SwiGLU core):  prod[i] = act(gate[i]) * up[i], elementwise.
- *   `kind` is a rocket_activation_kind (ROCKET_ACTIVATION_SILU or _GELU — the gated-MLP
- *   nonlinearities). SiLU runs the robust 2-pass activation (sigmoid LUT then multiply, no
- *   x≈0 glitch); set ROCKET_ACT_NPU_MUL=1 for the fully-on-NPU SiLU multiply. The activation
- *   LUT domain is bounded (SiLU [-12,12]) — gate logits outside it saturate (see findings).
- *   n is the flat element count (M*I). fd<0 = exact host. Returns 0, <0 on error.
+ * Computes the gated activation `prod[i] = act(gate[i]) * up[i]` elementwise, the core of
+ * GeGLU and SwiGLU. `n` is the flat element count, `M*I`.
+ *
+ * `kind` is a `rocket_activation_kind`, either `ROCKET_ACTIVATION_SILU` or
+ * `ROCKET_ACTIVATION_GELU`. SiLU runs in two passes, a sigmoid LUT and then a multiply, which
+ * avoids the error spike a one-pass LUT has near x = 0. The multiply runs on the host by
+ * default. Set `ROCKET_ACT_NPU_MUL=1` to run it on the NPU.
+ *
+ * Caution: the activation LUT covers a bounded input range, [-12, 12] for SiLU, and a gate
+ * logit outside it saturates.
+ *
+ * With `fd` < 0 it computes the exact host result. Returns 0 on success and a negative value
+ * on error.
  */
 
 #ifdef __cplusplus
@@ -43,11 +46,17 @@ void rocket_geglu_ref_fp16(const _Float16 *gate, const _Float16 *up,
                            int kind, _Float16 *prod, int n);
 
 /*
- * Full FFN block. x[M,H], Wg[I,H], Wu[I,H], Wd[H,I] (all row-major fp16, the [N,K] matmul
- * weight convention), out[M,H]. `kind` selects the gated nonlinearity. Alignment: H%32,
- * I%32, M%4 (the matmul requirements; I is both an N and the down-matmul's K). Self-contained
- * (uses the multicore matmul + on-NPU activation/ew_mul). fd<0 = exact host reference.
- * Returns 0, <0 on error.
+ * Computes the gated FFN block, handing each intermediate back to the host between ops.
+ *
+ * `x` is [M,H], `Wg` and `Wu` are [I,H], `Wd` is [H,I] and `out` is [M,H], all row-major fp16
+ * in the [N,K] matmul weight convention. `kind` selects the gated activation, as for
+ * `rocket_geglu_fp16`. `H` and `I` must be multiples of 32, and `M` a multiple of 4. These are
+ * the matmul requirements, where `I` is both an `N` and the down matmul's `K`. The block uses
+ * the multicore matmul, the on-NPU activation and the elementwise multiply (`ew_mul`), and
+ * needs no other setup.
+ *
+ * With `fd` < 0 it computes the exact host reference. Returns 0 on success and a negative
+ * value on error.
  */
 int  rocket_ffn_fp16(int fd, int M, int H, int I,
                      const _Float16 *x, const _Float16 *Wg, const _Float16 *Wu,
@@ -57,41 +66,51 @@ void rocket_ffn_ref_fp16(int M, int H, int I,
                          const _Float16 *Wd, int kind, _Float16 *out);
 
 /*
- * CROSS-OP CUBE-RESIDENT FFN — same math and signature as rocket_ffn_fp16, but the [M,I]
- * intermediates stay in NPU cube layout across gate/up -> act⊙up -> down, so the host never
- * de-tiles/re-tiles them. The two projections leave their full output cubes in resident BOs
- * (no de-tile); the gated activation runs element-wise over the cube bytes (it commutes with
- * the cube reindex — pad lanes stay 0 since act(0)·0 = 0); the down matmul reads the product
- * cube directly as its input (same IOVA, zero host touch of the intermediate). Only x is
- * packed in and only `out` is read back.
+ * Computes the same gated FFN block as `rocket_ffn_fp16`, with the same signature, and keeps
+ * the [M,I] intermediates in cube layout on the NPU. The host packs only `x` and reads back
+ * only `out`.
  *
- * fp16-only (the cube aliasing is fp16's narrowed-output == input-feature-cube coincidence).
- * The numerics differ from rocket_ffn_fp16 only in the down matmul's K-tiling (pinned so its
- * Kt == the projections' Nt), i.e. a different fp16 K-accumulation grouping — same op, cosine
- * ~1 vs the host-handoff path and vs the fp64 oracle. Same alignment (H%32, I%32, M%4). Shapes
- * whose projection output exceeds one NPU batch (nMt*nNt > 64) or whose tiling can't be matched
- * transparently FALL BACK to rocket_ffn_fp16 (correct, just not cube-resident). fd<0 = host
- * reference. Returns 0, <0 on error.
+ * The two projections leave their output cubes in resident BOs. The gated activation runs
+ * elementwise over the cube bytes. The activation commutes with the cube reindex and keeps the
+ * pad lanes at zero (act(0)·0 = 0), so the result is unchanged. The down matmul reads the
+ * product cube as its input, at the same IOVA.
+ *
+ * The entry accepts fp16 only, because the aliasing depends on fp16's narrowed output having
+ * the layout of an input feature cube. The down matmul's K tiling is pinned so that its `Kt`
+ * equals the projections' `Nt`. This grouping of the fp16 K-accumulation is the only
+ * numerical difference from `rocket_ffn_fp16`. The result has cosine similarity ~1 against it
+ * and against the fp64 reference. The alignment is the same: `H` and `I` multiples of 32, and
+ * `M` a multiple of 4.
+ *
+ * A shape whose projection output exceeds one NPU batch (`nMt*nNt > 64`), or whose tiling
+ * cannot be matched, falls back to `rocket_ffn_fp16`. The fallback is correct and not
+ * cube-resident. With `fd` < 0 it computes the host reference. Returns 0 on success and a negative value on
+ * error.
  */
 int  rocket_ffn_fp16_fused(int fd, int M, int H, int I,
                            const _Float16 *x, const _Float16 *Wg, const _Float16 *Wu,
                            const _Float16 *Wd, int kind, _Float16 *out);
 
 /*
- * CROSS-OP CUBE-RESIDENT non-gated MLP — the transformer ENCODER feed-forward
- * (out = act(x·W1^T + b1) · W2^T), the regime where cross-op chaining pays (SigLIP/Whisper
- * are ~80% transform-bound). The fc1 output stays in NPU cube layout: the bias b1 is added
- * on the cube (a per-channel bias scattered into the cube layout, then a flat ew-add), the
- * activation runs element-wise over the cube bytes, and the fc2 matmul reads the activated
- * cube directly — so the [M,Dff] intermediate never de-tiles/re-tiles. Only x is packed in
- * and only `out` is read back.
+ * Computes the non-gated encoder FFN, `out = act(x·W1^T + b1) · W2^T`, and keeps the [M,Dff]
+ * intermediate in cube layout on the NPU. The host packs only `x` and reads back only `out`.
+ * Encoder blocks gain the most from this, because SigLIP and Whisper encoders spend ~80% of
+ * their time in layout transforms.
  *
- * x[M,Din], W1[Dff,Din], b1[Dff] (row-major fp16; NULL = no bias), W2[Dout,Dff], out[M,Dout].
- * `kind` is the activation (ROCKET_ACTIVATION_GELU for the standard encoder; the 2-pass
- * accurate route). fp16-only (the cube aliasing). Alignment: Din%32, Dff%32, Dout%16, M%4.
- * Shapes whose fc1 output exceeds one NPU batch (nMt*nNt > 64) or can't be tiling-matched
- * FALL BACK to a host-handoff MLP (correct, not cube-resident). fd<0 = host reference.
- * Returns 0, <0 on error.
+ * The bias `b1` is added on the cube: a per-channel bias scattered into the cube layout, then
+ * a flat elementwise add. The activation runs elementwise over the cube bytes, and the fc2
+ * matmul reads the activated cube directly.
+ *
+ * `x` is [M,Din], `W1` is [Dff,Din], `b1` is [Dff] or NULL for no bias, `W2` is [Dout,Dff] and
+ * `out` is [M,Dout], all row-major fp16. `kind` is the activation, `ROCKET_ACTIVATION_GELU`
+ * for a standard encoder, which runs the accurate two-pass path. The entry accepts fp16 only,
+ * for the same aliasing reason as `rocket_ffn_fp16_fused`. `Din` and `Dff` must be multiples
+ * of 32, `Dout` a multiple of 16 and `M` a multiple of 4.
+ *
+ * A shape whose fc1 output exceeds one NPU batch (`nMt*nNt > 64`), or whose tiling cannot be
+ * matched, falls back to a host-handoff FFN. The fallback is correct and not cube-resident.
+ * With `fd` < 0 it computes the host reference. Returns 0 on success and a negative value on
+ * error.
  */
 int  rocket_mlp_fp16_fused(int fd, int M, int Din, int Dff, int Dout,
                            const _Float16 *x, const _Float16 *W1, const _Float16 *b1,

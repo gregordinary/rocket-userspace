@@ -17,8 +17,11 @@
  * -> pack input -> compute. This one-shot entry point does all three per call;
  * rocket_prepacked.c reuses the phases to keep weights/scratch resident.
  *
- * K is split with CPU fp32 accumulation (fp16-out partials). 3-core concurrency
- * lives in rocket_matmul_mt.c / rocket_prepacked.c.
+ * K is split into fp16-out partials when it does not fit one tile. By default
+ * (ROCKET_KACC on, kacc_on()) the partials accumulate on the NPU with the DPU fp16
+ * elementwise add (mm_compute_kacc). The CPU sums them in fp32 instead (mm_compute)
+ * with ROCKET_KACC=0.
+ * The 3-core concurrency lives in rocket_matmul_mt.c / rocket_prepacked.c.
  */
 
 #include <assert.h>
@@ -249,12 +252,17 @@ static int kacc_chain_on(void) {
  * a SYMMETRIC Mt=Nt=MAX_TILE tile, which fixes Kt at the symmetric CBUF fit (384 on RK3588). For
  * a shape that tiles BOTH N and K, halving Nt to MAX_TILE/2 (keeping Mt full) frees CBUF so Kt
  * grows (384→512), and the asymmetric Mt>Nt tile runs the NPU datapath markedly more efficiently
- * — `wait` −~10%. End-to-end warm pp2048 [HW sweep, 600 MHz]: standalone matmuls 1024² +7.5% /
+ * — `wait` −~10%. End-to-end warm pp2048 [HW sweep, ~816 MHz]: standalone matmuls 1024² +7.5% /
  * Gemma FFN-down +4% [2026-06-30]; whole-model llama.cpp Qwen3.5-9B-F16 +9.5%, Gemma-4-12B-F16
  * +5.7%, Qwen3.5-9B-Q4_K +1.3% (quant is dequant-bound so the datapath win dilutes to ~noise)
- * [2026-07-01]. Win-or-wash across every tested shape/model, never a regression, and bit-exact
- * (tiling never changes the result; gated by matmul_correctness_matrix under both settings) →
- * default-on. `ROCKET_MM_ASYM=0` forces the symmetric plan. Read once per matmul (planner is
+ * [2026-07-01]. Win-or-wash across every tested shape/model, never a regression →
+ * default-on.
+ *
+ * Its output can differ from the symmetric plan's. The bigger Kt moves the points where
+ * the fp16 K partials round, on the NPU (KACC) or the host. The tests
+ * matmul_correctness_matrix_asym and _sym check each setting on its own against an fp32
+ * reference, within the fp16 tolerance. Neither compares the two settings.
+ * `ROCKET_MM_ASYM=0` forces the symmetric plan. Read once per matmul (planner is
  * per-call, not per-tile). */
 static int asym_on(void) {
     const char *e = getenv("ROCKET_MM_ASYM");
@@ -333,8 +341,25 @@ static int reuse_mode_for(int nMt, int nNt, int chained) {
     return m;
 }
 
-/* Shared M==1 GEMV shim for the six dtype one-shot paths. The HW height-1 conv
- * geometry mis-computes (see rocket_matmul_plan), so pad the single input row to a
+/* Whether an fp16 plan's weight tile is streamed: larger than the CBUF banks its input
+ * tile leaves, so a task holds only one weight atom at a time (gen_matmul_fp16). */
+static int mm_plan_streams(const mm_plan *pl)
+{
+    const long bank = rocket_hw_current()->cbuf_bank_size;
+    long in_banks = ((long)pl->Mt * pl->Kt * 2 + bank - 1) / bank;
+    return (long)pl->Nt * pl->Kt * 2 > (rocket_hw_current()->cbuf_banks - in_banks) * bank;
+}
+
+/* reuse_mode_for, for a plan. A streamed weight tile is never in the CBUF whole, so
+ * WEIGHT_REUSE would read the last atom as the whole tile; it degrades to off. */
+static int reuse_mode_plan(const mm_plan *pl, int chained)
+{
+    int m = reuse_mode_for(pl->nMt, pl->nNt, chained);
+    return (m == 1 && mm_plan_streams(pl)) ? 0 : m;
+}
+
+/* Shared M==1 GEMV shim for the six dtype one-shot paths. The planners take M in
+ * multiples of 4 rows (see mm_plan_geom), so pad the single input row to a
  * height-4 tile, run the dtype's matmul at M=4, and copy back row 0. AT/CT are the
  * A/C element types and MM the dtype's matmul entry; the macro expands to the
  * per-dtype idiom VERBATIM (calloc'd 4xK in / 4xN out, the M=4 call, the row-0
@@ -387,7 +412,9 @@ static int rup(int x, int a) { return ((x + a - 1) / a) * a; }
  * stops, regardless of the amount. Every matmul tile shares one data-independent
  * regcmd word count, so the stride is uniform and tasks[i].regcmd = base+i*stride.
  *
- * ROCKET_BATCH_SUBMIT = 0 (default, stock per-task) or 1 (chained). A chained batch
+ * ROCKET_BATCH_SUBMIT = 0 (stock per-task) or 1 (chained). Unset, it takes the
+ * provider's rocket_batched_submit_native(): 0 on the mainline provider, 1 where the
+ * chained layout is the uAPI's only multi-program shape (rknpu-submit). A chained batch
  * must be uniform-length (the matmul's op count is data-independent); a caller
  * mixing regcmd lengths in one job must keep it off. */
 /* The chain layout primitives now live in rocket_chain.{h,c} so every submit path
@@ -611,6 +638,9 @@ enum {
                                   * fewest tiles the cap allows, not at the cap itself  */
     MM_GEOM_GROUPED = 1u << 2,   /* Kt is pinned by a quant group, so a `group` argument
                                   * is REQUIRED — see mm_plan_geom                      */
+    MM_GEOM_STREAM  = 1u << 3,   /* the weight-streaming plan applies (see mm_plan_stream) */
+    MM_GEOM_KACC    = 1u << 4,   /* a K split's partials accumulate on the NPU when
+                                  * kacc_on(); otherwise the host reads every pass's      */
 };
 
 struct mm_geom {
@@ -622,10 +652,12 @@ struct mm_geom {
     int  kt_ceil;          /* largest Kt the generator will encode                     */
     int  bank_slack;       /* CBUF banks withheld from the tiling budget               */
     unsigned flags;
+    int  obytes;           /* bytes per output element; read by mm_plan_stream only    */
+    int  wspare;           /* weight banks a streamed task needs past its atom's        */
 };
 
 static const struct mm_geom mm_geom_fp16 = {
-    "fp16", 2, 1, 16, 32, 16384, 0, MM_GEOM_ASYM_NT };
+    "fp16", 2, 1, 16, 32, 16384, 0, MM_GEOM_ASYM_NT | MM_GEOM_STREAM | MM_GEOM_KACC, 2, 0 };
 static const struct mm_geom mm_geom_int8 = {
     /* Deliberately NOT MM_GEOM_PICK_NT, unlike the group-wise twin. This plan's Kt is
      * unconstrained (it starts at K and shrinks to fit the CBUF), so a smaller Nt frees
@@ -634,19 +666,20 @@ static const struct mm_geom mm_geom_int8 = {
      * need (the dense W8A8 path holds one weight per tensor, not thousands of experts).
      * The group-wise plan has no such coupling: its Kt can never exceed the quant group.
      * Applying it here is a real lever for dense-int8 model fit, but it is its own change,
-     * with its own gate run — int8 CBUF edges are where the feature-DMA resonance lived. */
-    "int8", 1, 1, 32, 32, 16384, 1, 0 };
+     * with its own gate run — int8 CBUF edges are where the feature-DMA resonance lived.
+     * Streams only under ROCKET_MM_STREAM_INT8 (stream_on_geom). */
+    "int8", 1, 1, 32, 32, 16384, 1, MM_GEOM_STREAM, 4, 1 };
 static const struct mm_geom mm_geom_int8_gw = {
-    "int8 group-wise", 1, 1, 32, 32, 16384, 1, MM_GEOM_PICK_NT | MM_GEOM_GROUPED };
+    "int8 group-wise", 1, 1, 32, 32, 16384, 1, MM_GEOM_PICK_NT | MM_GEOM_GROUPED, 4, 1 };
 static const struct mm_geom mm_geom_int4 = {
-    "int4", 1, 2, 64, 32, 16384, 0, 0 };
+    "int4", 1, 2, 64, 32, 16384, 0, 0, 4, 0 };
 static const struct mm_geom mm_geom_int16 = {
     /* bf16 shares this: identical 2-byte-in / 4-byte-out geometry and alignment. */
-    "int16", 2, 1, 16, 32, 16384, 0, 0 };
+    "int16", 2, 1, 16, 32, 16384, 0, 0, 4, 0 };
 static const struct mm_geom mm_geom_tf32 = {
     /* 4 B/elem halves the Kt ceiling: weight_bytes_per_kernel = Kt*4 must stay <= 32768
      * (gen_matmul_tf32 refuses above that), so Kt <= 8192. K-group is 16, not 32. */
-    "tf32", 4, 1, 16, 16, 8192, 0, 0 };
+    "tf32", 4, 1, 16, 16, 8192, 0, 0, 4, 0 };
 
 /* CBUF banks a `rows` x Kt operand tile of this dtype occupies. */
 static int mm_banks(const struct mm_geom *g, int rows, int Kt)
@@ -711,6 +744,126 @@ static int mm_pick_nt(int N, int max_tile, int na)
     return Nt;
 }
 
+/* Weight-streaming plan (ROCKET_MM_STREAM, default ON; =0 selects the whole-tile plan).
+ * Read once.
+ *
+ * The whole-tile rule (mm_fits) makes the weight tile share the CBUF with the input tile,
+ * which caps Nt and multiplies the task count. gen_matmul_fp16 instead streams a weight
+ * cube larger than its banks: the input tile stays resident, the weights cycle through
+ * the banks it leaves (at least npu_stream_weight_banks()), and one task covers a whole N
+ * slice. On one core with every task its own
+ * kick, 160x1024x4096 ran at 766 GFLOP/s against 223 for the best whole-tile tiling
+ * (3.4x), and 128x2560x4096 at 1.3x [HW sweep 2026-10-21, tests/weight_stream_probe].
+ *
+ * What the streamed tile costs instead is weight DMA: every M-tile re-reads the whole
+ * weight slice (~5.4 GB/s a core, tests/gemv_bw_probe), and the atom grows with Kt, so a
+ * deep K shrinks Mt. The plan therefore trades Kt against Mt.
+ *
+ * In a model it measured pp512 1.13-1.14x on Llama-3.2-3B F16 and 1.16x on its Q4_K_M
+ * under quant residency, 1.12-1.15x on Ministral-3-3B F16 and 1.07-1.11x on Qwen3.5-9B
+ * Q4_K_M, perplexity unchanged to 0.02% [HW sweep 2026-10-21, RK1, three passes rotated]. */
+static int stream_on(void) {
+    static _Atomic int v = -1;
+    if (v < 0) { const char *e = getenv("ROCKET_MM_STREAM"); v = e ? atoi(e) > 0 : 1; }
+    return v;
+}
+
+/* Whether a geometry's plan streams. int8 streams only under ROCKET_MM_STREAM_INT8=1 (read
+ * once) as well. Through the resident entry at M 512 it is 0.99-2.43x the whole-tile plan
+ * at LLM projection shapes, bit-exact at 18 shapes [HW sweep 2026-10-21], but tflite-rocket
+ * routes detector 1x1 convs to the same entry and those shapes are unmeasured. */
+static int stream_on_geom(const struct mm_geom *g) {
+    static _Atomic int i8 = -1;
+    if (!(g->flags & MM_GEOM_STREAM) || !stream_on()) return 0;
+    if (g->obytes != 4) return 1;
+    if (i8 < 0) { const char *e = getenv("ROCKET_MM_STREAM_INT8"); i8 = e && atoi(e) > 0; }
+    return i8;
+}
+
+/* DEBUG (RE, the cost fit): ROCKET_MM_STREAM_KT=n restricts a streamed plan to the Kt n
+ * (rounded down to the K granularity), so every streamed candidate can be timed. A Kt that
+ * leaves no M tile, or none at all, falls back to the unrestricted search. Read once. */
+static int stream_kt_force(void) {
+    static _Atomic int v = -1;
+    if (v < 0) { const char *e = getenv("ROCKET_MM_STREAM_KT"); v = e ? atoi(e) : 0; }
+    return v;
+}
+
+/* The widest streamed N tile. 4096 is the widest measured; the DPU channel field is 13
+ * bits, and an external userspace reports a 8192-wide int4 task that corrupts the job
+ * after it, so nothing past what was measured. */
+#define MM_STREAM_NT_MAX 4096
+
+/* Choose (Mt, Kt, Nt) for a streamed plan, or return 0 when none fits. Each candidate Kt
+ * is the smallest that reaches its K-pass count; Mt is what the input banks then hold.
+ * Its cost, in DRAM-byte equivalents over one max_mt-row slice:
+ *
+ *   - each task streams its weight slice while its MACs run, and costs the larger of the
+ *     two: the weight bytes, or STREAM_XM rows' worth of MACs per weight byte, so an M tile
+ *     of at least STREAM_XM rows hides its weight re-read;
+ *   - the input, once per N tile;
+ *   - the partial C each K pass writes: read back by the next pass when the NPU accumulates
+ *     K (MM_GEOM_KACC under kacc_on()), and at STREAM_HOSTW times its bytes when the host
+ *     reads and sums every pass.
+ *
+ * Fitted to a sweep of every streamed Kt at six fp16 and six int8 LLM projection shapes, M
+ * 512, five workers [HW sweep 2026-10-21, ROCKET_MM_STREAM_KT]: a crossover of 128 rows for
+ * both datatypes, a host-read pass at ~8x its bytes, and no fixed charge per task or pass
+ * (fitted as zero). It picks the measured-fastest Kt, or one within 2%, at 11 of the 12; the
+ * byte-count model it replaces picked Kt 1.10-2.0x slower at 10 of them. Against that model
+ * at 24 fp16 and 20 int8 shapes it is 1.06x and 1.23x faster (geo-mean), with one fp16
+ * mispick: 3584x1024 takes Kt 608 at 0.87x, because the slice's 76-row tail tile is charged
+ * as a whole exposed weight read. Costing tiles continuously fixes that shape and picks
+ * Kt 960 at K 3840, which is 1.25-1.6x slower than its neighbours for no reason the model
+ * has; the tail form stays. */
+#define STREAM_XM    128
+#define STREAM_HOSTW 8.0
+static int mm_plan_stream(const struct mm_geom *g, int M, int K, int N, int budget,
+                          int max_mt, int *pMt, int *pKt, int *pNt)
+{
+    const double eb = (double)g->ebytes_num / g->ebytes_den;
+    const int ka = g->kalign, devacc = (g->flags & MM_GEOM_KACC) && kacc_on();
+    const long bank = rocket_hw_current()->cbuf_bank_size;
+    /* Cost one max_mt-row slice of M, not all of it, so every M at or above the cap plans
+     * the same (Kt, Nt) and a resident weight packed at one M serves every prefill M. */
+    const int Ms = M < max_mt ? M : max_mt;
+    int Nt = mm_pick_nt(N, MM_STREAM_NT_MAX, g->nalign);
+    int nN = (N + Nt - 1) / Nt, best_Mt = 0, best_Kt = 0, prev_Kt = 0;
+    double best = 0;
+    const int force = stream_kt_force() / ka * ka;
+
+    /* Pass 0 is the forced Kt alone; pass 1 the full search, run when pass 0 found none. */
+    for (int pass = force > 0 ? 0 : 1; pass < 2 && !best_Mt; pass++, prev_Kt = 0)
+    for (int nK = 1; nK <= K / ka; nK++) {
+        int Kt = rup((K + nK - 1) / nK, ka);
+        if (Kt > g->kt_ceil || Kt == prev_Kt) continue;
+        prev_Kt = Kt;
+        if (pass == 0 && Kt != force) continue;
+        int atom = (int)npu_stream_weight_banks((unsigned)(Kt * g->ebytes_num / g->ebytes_den)) +
+                   g->wspare;
+        if (atom >= budget) continue;
+        long rows = (long)(budget - atom) * bank * g->ebytes_den / ((long)Kt * g->ebytes_num);
+        int Mt = (int)(rows < Ms ? rows : Ms);
+        Mt &= ~3;
+        if (Mt < 4) continue;
+        int nKp = (K + Kt - 1) / Kt;
+        double tasks = 0;
+        for (int m0 = 0; m0 < Ms; m0 += Mt) {
+            int mt = Ms - m0 < Mt ? Ms - m0 : Mt;
+            tasks += mt > STREAM_XM ? (double)mt / STREAM_XM : 1.0;
+        }
+        double cost = tasks * N * K * eb + (double)Ms * K * eb * nN +
+                      (double)Ms * N * g->obytes * (devacc ? 2 * nKp - 1 : STREAM_HOSTW * nKp);
+        if (!best_Mt || cost < best) { best = cost; best_Mt = Mt; best_Kt = Kt; }
+        /* The first Kt that holds the whole slice ends the search: a deeper split moves the
+         * same weight bytes in more passes and more tasks. */
+        if (Mt == (Ms & ~3)) break;
+    }
+    if (!best_Mt) return 0;
+    *pMt = best_Mt; *pKt = best_Kt; *pNt = Nt;
+    return 1;
+}
+
 /*
  * The planner every dtype entry point calls. Returns the job (tile) count, or
  * ROCKET_E_SHAPE for a dimension this geometry cannot express.
@@ -741,10 +894,11 @@ static int mm_plan_geom(const struct mm_geom *g, int M, int K, int N, int group,
     if (M <= 0 || K <= 0 || N <= 0 ||
         M > ROCKET_MM_DIM_MAX || K > ROCKET_MM_DIM_MAX || N > ROCKET_MM_DIM_MAX)
         return ROCKET_E_SHAPE;
-    /* M%4==0 only. M==1 (a height-1 GEMV) mis-computes on the HW height-1 conv
-     * geometry, so every path rejects it; the one-shot entries pad M==1->4 before
-     * planning, so they never ask for M==1. Every other caller gets a refusal rather
-     * than a wrong result. Single-vector callers: pad M to 4. */
+    /* M%4==0 only. The generators compute any M (cna_feature_surf_stride), but the
+     * plans tile M in multiples of 4 rows and every path sizes its slots and pads its
+     * scatter for that, so the rule is the library's, not the hardware's. The one-shot
+     * entries pad M==1->4 before planning, so they never ask for M==1; every other
+     * caller gets a refusal. Single-vector callers: pad M to 4. */
     if (K % ka || N % na || M % 4 != 0)
         return ROCKET_E_SHAPE;
     const int grouped = (g->flags & MM_GEOM_GROUPED) != 0;
@@ -768,7 +922,11 @@ static int mm_plan_geom(const struct mm_geom *g, int M, int K, int N, int group,
     if ((e = getenv("ROCKET_MM_NT"))) { int v = atoi(e); if (v >= na) { Nt = (v/na)*na; if (Nt > N) Nt = N; } }
 
     int Kt;
-    if (grouped) {
+    if (stream_on_geom(g) && !grouped && !getenv("ROCKET_MM_MT") &&
+        !getenv("ROCKET_MM_NT") && !getenv("ROCKET_MM_KT") &&
+        mm_plan_stream(g, M, K, N, budget, MAX_TILE, &Mt, &Kt, &Nt)) {
+        /* the streamed plan; see mm_plan_stream */
+    } else if (grouped) {
         /* Group-wise: Kt must divide the quant group, so walk the group's divisors down
          * from the group itself and take the first that fits. */
         Kt = 0;
@@ -788,7 +946,7 @@ static int mm_plan_geom(const struct mm_geom *g, int M, int K, int N, int group,
     } else {
         Kt = mm_max_kt(g, Mt, Nt, K, budget);
 
-        /* Asymmetric-Nt heuristic (opt-in): when N AND K both tile, halving the FULL Nt frees
+        /* Asymmetric-Nt heuristic (on by default, ROCKET_MM_ASYM): when N AND K both tile, halving the FULL Nt frees
          * CBUF so Kt grows (the symmetric fit caps it), and the asymmetric Mt>Nt tile runs the
          * datapath more efficiently. Only fires on the symmetric default (no Nt override, Nt
          * still at the cap, N>cap) and only when the symmetric plan actually K-tiles (else a
@@ -926,20 +1084,46 @@ void mm_scatter_bias_cube(const mm_plan *pl, _Float16 *restrict dst, const _Floa
     }
 }
 
+/* The host-accumulating paths' output BO: one slot per tile of a job, and a job never
+ * holds more tiles than the plan has. A streamed plan's tile is a whole N slice wide, so
+ * BATCH slots of it would be tens of MB no job can fill. */
+static size_t mm_out_all_size(const mm_plan *pl)
+{
+    long tiles = (long)pl->nMt * pl->nNt * pl->nKt;
+    if (tiles > BATCH) tiles = BATCH;
+    return (size_t)tiles * pl->out_slot * sizeof(_Float16) + CBUF_BANK;
+}
+
+/* Allocate out_all on first use when mm_bos_alloc left it (the KACC build). 0 or -1. */
+static int mm_out_all_ensure(int fd, const mm_plan *pl, mm_bos *b)
+{
+    if (b->out_all.handle) return 0;
+    rocket_bo *const chk[] = { &b->out_all };
+    if (rocket_bo_alloc(fd, mm_out_all_size(pl), &b->out_all) != 0 ||
+        rocket_op_iova_overflow("rocket_matmul (out)", chk, 1)) {
+        ROCKET_LOGE("rocket_matmul: output BO alloc failed\n");
+        rocket_bo_free(fd, &b->out_all);
+        return -1;
+    }
+    return 0;
+}
+
 int mm_bos_alloc(int fd, const mm_plan *pl, mm_bos *b)
 {
     memset(b, 0, sizeof(*b));
     size_t in_sz  = (size_t)pl->nMt * pl->nKt * pl->in_slot  * sizeof(_Float16) + CBUF_BANK;
     size_t wt_sz  = (size_t)pl->nNt * pl->nKt * pl->wt_slot  * sizeof(_Float16) + CBUF_BANK;
     size_t rc_sz  = (size_t)BATCH * RC_STRIDE * sizeof(uint64_t);
-    size_t out_sz = (size_t)BATCH * pl->out_slot * sizeof(_Float16) + CBUF_BANK;
+    size_t out_sz = mm_out_all_size(pl);
 
     int ret = 0;
     ret |= rocket_bo_alloc(fd, 4096, &b->guard);             /* push allocs off IOVA 0 */
     ret |= rocket_bo_alloc(fd, rc_sz,  &b->regcmd);
     ret |= rocket_bo_alloc(fd, in_sz,  &b->in_all);
     ret |= rocket_bo_alloc(fd, wt_sz,  &b->wt_all);
-    ret |= rocket_bo_alloc(fd, out_sz, &b->out_all);
+    /* The KACC path writes its own ping-pong, so out_all is the host-accumulating paths'
+     * BO; under KACC it is left for mm_out_all_ensure to allocate if one of those runs. */
+    if (!kacc_on()) ret |= rocket_bo_alloc(fd, out_sz, &b->out_all);
     if (ret) {
         ROCKET_LOGE("rocket_matmul: BO alloc failed (in=%zuMB wt=%zuMB out=%zuMB)\n",
                 in_sz >> 20, wt_sz >> 20, out_sz >> 20);
@@ -947,8 +1131,8 @@ int mm_bos_alloc(int fd, const mm_plan *pl, mm_bos *b)
         return -1;
     }
     {
-        rocket_bo *const chk[] = { &b->in_all, &b->wt_all, &b->out_all, &b->regcmd };
-        if (rocket_op_iova_overflow("rocket_matmul", chk, 4)) {
+        rocket_bo *const chk[] = { &b->in_all, &b->wt_all, &b->regcmd, &b->out_all };
+        if (rocket_op_iova_overflow("rocket_matmul", chk, b->out_all.handle ? 4 : 3)) {
             mm_bos_free(fd, b);
             return -1;
         }
@@ -966,7 +1150,7 @@ int mm_bos_alloc(int fd, const mm_plan *pl, mm_bos *b)
      * nMt*nNt — NOT BATCH. PREP_BO/FINI_BO cache-sync cost is proportional to BO
      * size, so this cuts the per-ki `sync` term by ~(nMt*nNt)/BATCH: measured
      * sync 127->15 ms and +18% fp16 throughput (455->539 GOP/s) on 512x3840x4096.
-     * out_all stays BATCH-sized for the rare tiny-M mm_compute fallback. */
+     * out_all stays BATCH-sized for the mm_compute fallback. */
     if (b->has_pong) {
         int ktiles = pl->nMt * pl->nNt;
         if (ktiles > BATCH) ktiles = BATCH;
@@ -1288,6 +1472,7 @@ double mm_load_input(int fd, const mm_plan *pl, mm_bos *b, const _Float16 *packe
 static int mm_compute_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, size_t ldc_planes,
                          double t_pack)
 {
+    if (mm_out_all_ensure(fd, pl, b) != 0) return -1;
     const int M = pl->M, K = pl->K, N = pl->N;
     const int Mt = pl->Mt, Kt = pl->Kt, Nt = pl->Nt;
     const int nMt = pl->nMt, nNt = pl->nNt, nKt = pl->nKt;
@@ -1463,6 +1648,7 @@ int mm_compute_planes(int fd, const mm_plan *pl, mm_bos *b, _Float16 *Ct, size_t
 int mm_compute_reuse(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
                      double t_pack, int mode)
 {
+    if (mm_out_all_ensure(fd, pl, b) != 0) return -1;
     const int M = pl->M, K = pl->K, N = pl->N;
     const int Mt = pl->Mt, Kt = pl->Kt, Nt = pl->Nt;
     const int nMt = pl->nMt, nNt = pl->nNt, nKt = pl->nKt;
@@ -1716,6 +1902,7 @@ static int pipe_detile(int fd, const mm_plan *pl, mm_bos *b, int slot, float *ac
 
 int mm_compute_pipe(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
 {
+    if (mm_out_all_ensure(fd, pl, b) != 0) return -1;
     const int M = pl->M, N = pl->N;
 
     int ret = 0;
@@ -1805,9 +1992,8 @@ done:
  * be different BOs). ki=0 is a plain conv (accumulate=0); ki>0 adds the prev buf.
  *
  * Tiles are processed in groups of <=BATCH so the regcmd BO and the two ping-pong
- * BOs stay bounded. The EW geometry needs Mtile>=12 (MAX(.,12) floor) — true for
- * all real prefill tiles (Mt=256); a tiny padded last M-tile would be off, so we
- * fall back to CPU-accum for any plan whose last M-tile is <12. ==========*/
+ * BOs stay bounded. Any M tile accumulates: the EW read's surface stride is the
+ * partial's own, M (gen_matmul_fp16). ==========*/
 static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
                               size_t ldc_planes, double t_pack)
 {
@@ -1815,15 +2001,6 @@ static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
     const int Mt = pl->Mt, Kt = pl->Kt, Nt = pl->Nt;
     const int nMt = pl->nMt, nNt = pl->nNt, nKt = pl->nKt;
     const size_t in_slot = pl->in_slot, wt_slot = pl->wt_slot, out_slot = pl->out_slot;
-
-    /* EW MAX(M,12) floor: a last M-tile < 12 would read a mis-strided operand.
-     * Cheap, exact guard — let those (rare, tiny-M) shapes use the CPU oracle. */
-    int lastM = pl->M - (nMt - 1) * Mt;
-    /* ROCKET_E_TILING here is a routing sentinel, NOT a hard error: the caller
-     * (and the prepacked workers / tests) treat == ROCKET_E_TILING as "fall back to
-     * the CPU-accum mm_compute oracle for this tiny-M shape". */
-    if (lastM < 12 && lastM != pl->M) return ROCKET_E_TILING;
-    if (pl->M < 12 && nMt == 1 && nKt > 1) return ROCKET_E_TILING;
 
     int ret = 0;
     int prof = mm_profile();
@@ -1873,7 +2050,7 @@ static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
      * unaffected — tile gi maps to the same (mi,ni) across all ki for either decode.
      * reuse_mode_for() picks the deeper run per shape (AUTO default); an explicit
      * ROCKET_REUSE forces one mode. */
-    int rmode = reuse_mode_for(nMt, nNt, batch_chained);
+    int rmode = reuse_mode_plan(pl, batch_chained);
 
     /* ── Cross-ki chaining (ROCKET_KACC_CHAIN=1) ──────────────────────────────
      * Replace the nKt fenced submits of one tile-group with a SINGLE self-chained
@@ -1904,7 +2081,7 @@ static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
     int chain_engage = (nKt > 1 && nKt <= BATCH) &&
                        (chain_mode == 2 || (chain_mode == 1 && nKt * 3 <= BATCH));
     if (chain_engage) {
-        rmode = reuse_mode_for(nMt, nNt, 1);       /* this path always kicks once */
+        rmode = reuse_mode_plan(pl, 1);            /* this path always kicks once */
         int gcap = BATCH / nKt;                    /* tiles/group: nKt*gcap <= BATCH */
         if (gcap > nTiles) gcap = nTiles;
         for (int base = 0; base < nTiles; base += gcap) {
@@ -2137,10 +2314,6 @@ int mm_compute_kacc_cube(int fd, const mm_plan *pl, mm_bos *b, rocket_bo *cube, 
      * de-tiling mm_compute_kacc tolerates multi-batch by reading each batch before the
      * next reuses the ping-pong; here the whole cube has to survive). */
     if (nTiles > BATCH) return ROCKET_E_TILING;
-    /* Same tiny-M EW MAX(M,12) stride floor guard as mm_compute_kacc. */
-    int lastM = pl->M - (nMt - 1) * Mt;
-    if (lastM < 12 && lastM != pl->M) return ROCKET_E_TILING;
-    if (pl->M < 12 && nMt == 1 && nKt > 1) return ROCKET_E_TILING;
 
     if (cube->size < (size_t)nTiles * out_slot * sizeof(_Float16)) return ROCKET_E_NOMEM;
 
@@ -2312,13 +2485,13 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
      * never fires here; it states the chip-dependency by construction. */
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_float16))
         return ROCKET_E_UNSUPPORTED;
-    /* M==1 (single-vector GEMV) has a broken HW geometry at feature-height 1: the
-     * matmul-as-1x1-conv produces wrong output below height 4 (M%4==0 is proven;
+    /* M==1 (single-vector GEMV): the planner tiles rows in multiples of 4, a library
+     * rule (the generators compute any M with the packed feature surface stride;
      * M=2,3 are rejected by the plan). Honor the documented single-vector case by
      * padding to a height-4 tile (3 zero rows) and returning only row 0 — cheap
-     * (M=1 is tiny) and it reuses the validated M%4==0 path verbatim. The LLM
-     * backend never reaches here at M<4 (ROCKET_MIN_M=4 routes GEMV to the CPU);
-     * the multicore/streaming/prepacked paths do NOT pad and reject M==1. */
+     * (M=1 is tiny) and it reuses the M%4==0 path verbatim. The LLM backend never
+     * reaches here at M<4 (ROCKET_MIN_M=4 routes GEMV to the CPU); the
+     * multicore/streaming/prepacked paths do NOT pad and reject M==1. */
     if (M == 1)
         MM_PAD_M1(fd, K, N, A, B, C, _Float16, _Float16, rocket_matmul_fp16);
     mm_plan pl;
@@ -2340,11 +2513,11 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
     int ret;
     if (b.has_pong) {
         ret = mm_compute_kacc(fd, &pl, &b, C, 0.0);   /* NPU-side K-accum (reuse-aware) */
-        if (ret == -2) ret = mm_compute(fd, &pl, &b, C, 0.0);  /* tiny-M: CPU oracle */
+        if (ret == -2) ret = mm_compute(fd, &pl, &b, C, 0.0);  /* routing sentinel */
     } else if (reuse_policy() != 0) {
         /* Reached only with KACC off + ROCKET_REUSE forced (AUTO implies KACC implies
          * has_pong above), so reuse_mode_for resolves to that forced 1/2 here. */
-        ret = mm_compute_reuse(fd, &pl, &b, C, 0.0, reuse_mode_for(pl.nMt, pl.nNt, 0));
+        ret = mm_compute_reuse(fd, &pl, &b, C, 0.0, reuse_mode_plan(&pl, 0));
     } else if (b.has_pipe) {
         ret = mm_compute_pipe(fd, &pl, &b, C, 0.0);   /* pipelined overlap */
     } else {
@@ -2367,13 +2540,23 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
  * completion IRQ instead of N — the contiguous self-chaining mechanism, extended
  * from one matmul's tiles to a batch of same-shape matmuls.
  *
- * BIT-IDENTICAL to calling rocket_matmul_fp16 per item: one mm_plan for the shared
- * shape, the same fp16 tile pack, the same CPU fp32 K-accumulation in ascending ki
- * order, the same de-tile + narrow. So the flash-attention cos-sim gate that holds
- * for the per-head path holds here unchanged; this path is a submit-batching
- * rearrangement, not a numeric change. (It is its own CPU-fp32-accum sibling — it
- * does NOT consult ROCKET_KACC/REUSE/PIPE, which are the single-matmul perf
- * variants; the batch lever is orthogonal and stacks with ROCKET_BATCH_SUBMIT.)
+ * With ROCKET_KACC=0 it equals calling rocket_matmul_fp16 per item, in value. Both use
+ * one mm_plan for the shared shape and the same fp16 tile pack. Both accumulate K in CPU
+ * fp32 in ascending ki order, then de-tile and narrow. The one difference is the sign of
+ * zero at one K tile. This path de-tiles straight into C and keeps a -0 output, which
+ * the per-item fp32 accumulator turns into +0.
+ *
+ * Under ROCKET_KACC=0 this path is therefore a submit-batching rearrangement, not a
+ * numeric change, for jobs on the same core. On the RK3588 each core occasionally writes
+ * output lane n%16 == 0 below the host model on its own set of inputs, so items that run on
+ * different cores can differ there. A flash-attention cosine test that holds for the per-head path there
+ * holds here too. At the ROCKET_KACC default, rocket_matmul_fp16 instead sums the K
+ * partials in fp16 on the NPU (mm_compute_kacc). Past one K tile the two paths then
+ * round differently.
+ *
+ * This path is its own CPU-fp32-accum sibling either way. It does not consult
+ * ROCKET_KACC/REUSE/PIPE, which are the single-matmul perf variants, and batching is
+ * orthogonal to them and combines with ROCKET_BATCH_SUBMIT.
  *
  * The use: flash attention fans the query heads across worker fds, and within a
  * worker the per-head QK matmuls share one shape (and separately the per-head AV
@@ -2992,8 +3175,8 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
         return ROCKET_E_UNSUPPORTED;
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
         return ROCKET_E_UNSUPPORTED;
-    /* M==1 GEMV: height-1 HW geometry is broken (same as fp16, see
-     * rocket_matmul_fp16). Pad to a 4-row tile (zero pad rows contribute 0 to the
+    /* M==1 GEMV: the planner takes M in multiples of 4 (same as fp16, see
+     * mm_plan_geom). Pad to a 4-row tile (zero pad rows contribute 0 to the
      * integer dot products — no saturation risk), return row 0. */
     if (M == 1) MM_PAD_M1(fd, K, N, A, B, C, int8_t, int32_t, rocket_matmul_int8);
     int Mt, Kt, Nt;
@@ -3016,7 +3199,10 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
     size_t in_sz  = (size_t)nMt * nKt * in_slot  + CBUF_BANK;
     size_t wt_sz  = (size_t)nNt * nKt * wt_slot  + CBUF_BANK;
     size_t rc_sz  = (size_t)BATCH * RC_STRIDE * sizeof(uint64_t);
-    size_t out_sz = (size_t)BATCH * out_slot * sizeof(int32_t) + CBUF_BANK;
+    /* A job holds at most BATCH tiles and never more than the plan has; a streamed tile is
+     * a whole N wide, so BATCH slots of it would be far past what any job writes. */
+    size_t slots  = (size_t)nMt * nNt * nKt < BATCH ? (size_t)nMt * nNt * nKt : BATCH;
+    size_t out_sz = slots * out_slot * sizeof(int32_t) + CBUF_BANK;
 
     int ret = 0;
     ret |= rocket_bo_alloc(fd, 4096, &guard);                 /* push allocs off IOVA 0 */
@@ -3199,7 +3385,7 @@ int rocket_matmul_int4_ex(int fd, int M, int K, int N,
 {
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int4))
         return ROCKET_E_UNSUPPORTED;
-    if (M == 1)   /* height-1 GEMV broken on HW; pad to 4 rows, return row 0 */
+    if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, int8_t, int32_t, rocket_matmul_int4);
     int Mt, Kt, Nt;
     if (rocket_matmul_plan_int4(M, K, N, &Mt, &Kt, &Nt) < 0) {
@@ -3551,7 +3737,7 @@ int rocket_matmul_int16_exact(int fd, int M, int K, int N,
      * int8, not the native int16 output. Gate on int8. */
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
         return ROCKET_E_UNSUPPORTED;
-    if (M == 1)   /* height-1 GEMV broken on HW; pad to 4 rows, return row 0 */
+    if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, int16_t, int64_t, rocket_matmul_int16_exact);
     int Mt, Kt, Nt;
     if (rocket_matmul_plan_int8(M, K, N, &Mt, &Kt, &Nt) < 0) {
@@ -3623,7 +3809,7 @@ int rocket_matmul_bf16(int fd, int M, int K, int N,
 {
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_bfloat16))
         return ROCKET_E_UNSUPPORTED;
-    if (M == 1)   /* height-1 GEMV broken on HW; pad to 4 rows, return row 0 */
+    if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, float, float, rocket_matmul_bf16);
     int Mt, Kt, Nt;
     if (rocket_matmul_plan_bf16(M, K, N, &Mt, &Kt, &Nt) < 0) {
@@ -3780,14 +3966,14 @@ free_bos:
  * Net: the fp16 path rounds each K-partial to fp16 *before* the host fp32 sum and
  * then narrows the final result to fp16; this path keeps every partial in fp32 and
  * returns fp32 — the genuine fp16-input dot product. Costs 2x output readback bytes
- * (fp32 vs fp16 cube), so it's opt-in (the prefill path is readback-bound).
+ * (fp32 vs fp16 cube), so it's opt-in.
  * ==========================================================================*/
 int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
                               const _Float16 *A, const _Float16 *B, float *C)
 {
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_float16))
         return ROCKET_E_UNSUPPORTED;
-    if (M == 1)   /* height-1 GEMV broken on HW; pad to 4 rows, return row 0 */
+    if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, _Float16, float, rocket_matmul_fp16_f32out);
     int Mt, Kt, Nt;
     if (rocket_matmul_plan(M, K, N, &Mt, &Kt, &Nt) < 0) {
@@ -3928,7 +4114,7 @@ free_bos:
  *
  * The FIRST 4-byte-INPUT tiled path. tf32 = fp32 RANGE (8-bit exp) + fp16
  * PRECISION (10-bit mantissa) in a 4-byte fp32 container: you feed RAW fp32, the
- * MAC rounds the mantissa to 10 bits and accumulates in fp32. Like bf16 it needs
+ * MAC truncates the mantissa to 10 bits and accumulates in fp32. Like bf16 it needs
  * NO activation scaling and is a pure FLOAT path (output fp32, host double K-accum,
  * NO saturation), so the interface mirrors rocket_matmul_bf16 — fp32 A/B straight
  * through. The ONLY difference from bf16 is the 4-byte geometry: feature cube C2=4
@@ -3954,7 +4140,7 @@ int rocket_matmul_tf32(int fd, int M, int K, int N,
 {
     if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_tf32))
         return ROCKET_E_UNSUPPORTED;
-    if (M == 1)   /* height-1 GEMV broken on HW; pad to 4 rows, return row 0 */
+    if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, float, float, rocket_matmul_tf32);
     int Mt, Kt, Nt;
     if (rocket_matmul_plan_tf32(M, K, N, &Mt, &Kt, &Nt) < 0) {

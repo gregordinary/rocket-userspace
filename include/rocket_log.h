@@ -1,28 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The rocket-userspace authors
 /*
- * rocket_log.h — centralized logging for librocketnpu.
+ * Declares the centralized logging of librocketnpu. Every diagnostic the library emits
+ * flows through one channel: errors, warnings, the ROCKET_MM_PROFILE breakdown and the
+ * ROCKET_DEBUG traces. A host application (llama.cpp, a TFLite delegate, Frigate) can then
+ * intercept, redirect or silence them, instead of having raw fprintf(stderr) output mixed
+ * into its own.
  *
- * Every diagnostic the library emits (errors, warnings, the ROCKET_MM_PROFILE
- * breakdown, the ROCKET_DEBUG traces) flows through one channel so a host
- * application (llama.cpp, a TFLite delegate, Frigate) can intercept, redirect,
- * or silence it instead of having raw fprintf(stderr) pollute its own output.
+ * With no host hook installed, ERROR, WARN and INFO go to stderr, and DEBUG is suppressed.
+ * Errors always print, and traces print only under ROCKET_DEBUG. A host overrides this by
+ * installing a callback with `rocket_log_set_callback`, much like ggml_log_set_callback.
  *
- * Default behavior with no host hook installed: ERROR/WARN/INFO go to stderr,
- * DEBUG is suppressed — matching the historical "errors always print, traces
- * only under ROCKET_DEBUG" behavior. A host overrides this by installing a
- * callback (see rocket_log_set_callback), much like ggml_log_set_callback.
+ * The library reads these environment variables once, on first use:
  *
- * Environment control (read once, on first use):
- *   ROCKET_LOG_LEVEL = error | warn | info | debug   (or 0..3)  — the threshold.
- *   ROCKET_DEBUG set                                  — raises the threshold to
- *                                                       at least DEBUG (back-compat).
- *   ROCKET_LOG_STDERR set (non-"0")                   — tee every emitted line to
- *                                                       stderr as well, but only when
- *                                                       a host callback is installed.
- *                                                       Escape hatch for a host that
- *                                                       silences its own logger (e.g.
- *                                                       llama-bench without -v).
+ * - `ROCKET_LOG_LEVEL`: the threshold, one of error, warn, info or debug (or 0..3).
+ * - `ROCKET_DEBUG`: any value raises the threshold to at least DEBUG, for backward
+ *   compatibility.
+ * - `ROCKET_LOG_STDERR`: a value other than "0" tees every emitted line to stderr as well,
+ *   but only while a host callback is installed. It serves a host that silences its own
+ *   logger, such as llama-bench without -v.
  */
 #ifndef ROCKET_LOG_H
 #define ROCKET_LOG_H
@@ -39,10 +35,16 @@ typedef enum {
 } rocket_log_level;
 
 /*
- * Sink for one already-formatted, newline-terminated-as-emitted message.
- * `text` is owned by the library and only valid for the duration of the call.
- * Install with rocket_log_set_callback; pass NULL to restore the stderr default.
- * The contract is set-once-before-first-use (no internal locking).
+ * Receives one already-formatted message, newline-terminated as emitted. `text` belongs to
+ * the library and is valid only for the duration of the call. Install the callback with
+ * `rocket_log_set_callback`, and pass NULL to restore the stderr default.
+ *
+ * An install is safe while other threads log. The callback and `user_data` are published
+ * together, so a concurrent message reaches either the old pair or the new one, never a
+ * mix. A message that loaded the old pair before the call can still reach it afterwards.
+ * The host must therefore keep the old callback and its `user_data` valid. Each install
+ * of a non-NULL callback allocates a small record that the library never frees. If that
+ * allocation fails, the current callback stays installed.
  */
 typedef void (*rocket_log_callback)(rocket_log_level level, const char *text, void *user_data);
 
@@ -50,7 +52,7 @@ void             rocket_log_set_callback(rocket_log_callback cb, void *user_data
 void             rocket_log_set_level(rocket_log_level level);
 rocket_log_level rocket_log_get_level(void);
 
-/* printf-style entry point. Prefer the ROCKET_LOG* convenience macros below. */
+/* Logs a printf-style message at `level`. Prefer the ROCKET_LOG* convenience macros below. */
 void rocket_log(rocket_log_level level, const char *fmt, ...)
 #if defined(__GNUC__) || defined(__clang__)
     __attribute__((format(printf, 2, 3)))

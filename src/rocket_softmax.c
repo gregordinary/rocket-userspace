@@ -43,8 +43,11 @@ void rocket_softmax_ref_fp16(int M, int N, const _Float16 *in, _Float16 *out)
  * Written out three times before this, identically, including the fp32 intermediate: the
  * max and the subtract happen in float and only the result narrows, so a row spanning
  * more than fp16's dynamic range still shifts exactly. The row max is on the HOST because
- * this part has no max-reduce datapath (the PPU-max is the resident path's, not this
- * one's) -- see rocket_softmax.h. */
+ * this part has no max-reduce datapath. The only on-NPU max is the PPU max-pool, which
+ * would need the sequence axis laid on the PPU's spatial axis and telescoping for N > 16
+ * (the reduce_mean machinery with POOL_METHOD_MAX). That helps only a path that keeps the
+ * scores cube-resident. Here the scores are already on the host, so the host max and
+ * subtract is the same O(M*N) memory pass the packing makes, with no round trip. */
 static void rows_sub_max(int M, int N, const _Float16 *x, _Float16 *xs, float *rowmax)
 {
     for (int m = 0; m < M; m++) {
@@ -84,7 +87,9 @@ int rocket_softmax_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *out)
     /* 3. s[m] = sum_n e[m][n] on the NPU (feature-axis ones-matmul reduce, fp32 accumulate). */
     if ((rc = rocket_reduce_feature_fp16(fd, M, N, e, s, 0 /*sum*/)) != 0) goto out;
 
-    /* 4. inv[m] = 1/s[m] on the host (exact, O(M)). s>=1 (the max term contributes exp(0)=1). */
+    /* 4. inv[m] = 1/s[m] on the host (exact, O(M)). s>=1 (the max term contributes exp(0)=1).
+     *    The reciprocal LUT would avoid reading s back on a cube-resident path, but it is
+     *    approximate, and s is already on the host from the reduce. */
     for (int m = 0; m < M; m++) inv[m] = (s[m] > 0.f) ? (1.f / s[m]) : 0.f;
 
     /* 5. out[m][n] = e[m][n] * inv[m] on the NPU (per-row broadcast scale = ew_mul). */
@@ -138,7 +143,10 @@ int rocket_logsoftmax_fp16(int fd, int M, int N, const _Float16 *in, _Float16 *o
     if ((rc = rocket_activation_fp16(fd, ROCKET_ACTIVATION_EXP, xs, e, (int)MN)) != 0) goto out;
     if ((rc = rocket_reduce_feature_fp16(fd, M, N, e, s, 0 /*sum*/)) != 0) goto out;
 
-    /* 4. ls[m] = log(s[m]) on the host (exact, O(M); s>=1 => ls>=0), broadcast across n. */
+    /* 4. ls[m] = log(s[m]) on the host (exact, O(M); s>=1 => ls>=0), broadcast across n.
+     *    ls covers only the M row sums, already on the host in fp32 after the reduce, so the
+     *    host log is exact and adds no round trip, as softmax keeps 1/s and RMSNorm keeps
+     *    rsqrt on the host. The DPU LOG LUT is for an elementwise log over a large tensor. */
     for (int m = 0; m < M; m++) {
         float ls = (s[m] > 0.f) ? logf(s[m]) : 0.f;
         _Float16 lv = (_Float16)ls;

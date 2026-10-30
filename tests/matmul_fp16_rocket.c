@@ -20,17 +20,18 @@
 #include "npu_matmul.h"
 
 /* regcmd_count = the TOTAL number of NPUOP words the PC must execute, INCLUDING
- * the 4-op control trailer ops[104..107] (OP_NONE / PC_REGISTER_AMOUNTS / OP_40
- * / OP_ENABLE). ops[107] = OP_ENABLE writes PC_OPERATION_ENABLE = 0x1D, a block
+ * the 4-op control trailer (OP_NONE / PC_REGISTER_AMOUNTS / OP_40 / OP_ENABLE).
+ * gen_matmul_fp16() returns it in task_count: 122 + 4 = 126, the trailer at
+ * ops[122..125]. The final OP_ENABLE writes PC_OPERATION_ENABLE = 0x1D, a block
  * bitmap laid out as the global enable register at 0xF008 (CNA b0 | CORE b2 |
  * DPU b3 | DPU_RDMA b4), which is what actually TRIGGERS the compute; the
  * kernel's own MMIO write of PC_OPERATION_ENABLE=0x1 only starts the PC
- * sequencer. If the PC stops before ops[107] the pipeline is configured but
- * never fired -> DPU never completes -> "NPU job timed out" (observed with 104).
+ * sequencer. If the PC stops before that OP_ENABLE the pipeline is configured but
+ * never fired -> DPU never completes -> "NPU job timed out" (observed with a count
+ * four words short).
  *
  * The hardware PC_DATA_AMOUNT confirms the count (scale = 2):
- *   (regcmd_count + 1)/2 - 1 = (108 + 1)/2 - 1 = 53. */
-#define REGCMD_COUNT 108
+ *   (regcmd_count + 1)/2 - 1 = (126 + 1)/2 - 1 = 62. */
 
 /* Report any nonzero (negative-errno) return from a shim call. */
 #define CK(call) do { int _r = (call); \
@@ -86,7 +87,7 @@ int main(int argc, char **argv) {
     }
 
     /* Build the register program (npu_regcmd.c).
-     * Sized for ~108 ops + the DPU_RDMA block. */
+     * Sized well past the generator's 126 words. */
     uint64_t npu_regs[256] = {0};
     matmul_params_t p = {
         .m = M, .k = K, .n = N,

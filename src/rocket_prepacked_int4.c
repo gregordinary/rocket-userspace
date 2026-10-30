@@ -308,7 +308,7 @@ rocket_i4_weights *rocket_i4_weights_pack(rocket_i4_ctx *ctx, int M, int K, int 
     /* Up-front shape contract — else rk4_worker_alloc fails deep inside with an
      * opaque "unsupported slice". N%64 (the int4 weight N-group) keeps every
      * N-slice aligned; K%32 the K-group; M%4 (or the M==1 GEMV case). */
-    if (N % 64 != 0 || K % 32 != 0 || M % 4 != 0) {   /* M==1 broken on HW; pad caller-side */
+    if (N % 64 != 0 || K % 32 != 0 || M % 4 != 0) {   /* the planner's row unit; pad caller-side */
         ROCKET_LOGE("rocket_i4_weights_pack: unsupported shape M=%d K=%d N=%d "
                 "(need N%%64, K%%32, M%%4)\n", M, K, N);
         return NULL;

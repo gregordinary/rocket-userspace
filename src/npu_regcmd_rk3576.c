@@ -2447,10 +2447,11 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
      * silently here. See the header for what each violation looks like on hardware.
      *
      * The 32-channel rule is the INTEGER cube's, and the float cube does not share it:
-     * its groups are 8 output channels and 16 input ones, and its input axis is bounded
-     * by the surface-index defect long before granularity binds (ic=8, one contraction
-     * step — gen_conv2d_fp16_rk3576() rejects past that). So the float path is warned
-     * against its own oc group, not against 32. */
+     * its groups are 16 output channels and 16 input ones. Its input axis is bounded by
+     * the DPU's output element stride before granularity binds. One task contracts
+     * exactly 16 input channels, and gen_conv2d_fp16_rk3576() refuses any other ic
+     * above 4. The float path is therefore warned against its own oc group of 16, not
+     * against 32. */
     if (r76_is_float(prec)) {
         if (!dw && (OC % R76_FP16_W_OC_GROUP))
             ROCKET_LOGW("rk3576 conv: oc=%u is a partial %u-channel float group and "
@@ -2653,12 +2654,13 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
  * SECTION — the float weight cube
  *
  * The int8 weight cube groups both channel axes by 32 (weight_conv_int8). The float
- * one does NOT inherit that: measured on the part, its output-channel group is 8 and
- * its input-channel group is 16, so a kernel spans 16 fp16 (32 bytes) and the group
- * block holds 8 of them. Driving a kernel that ramps over ic and reading the sum back
- * is what pins it — at the int8 groups the part contracts the first 16 lanes twice
- * and pushes the second 16 into the next output channel, and at (8, 16) the sum is
- * exact. [HW sweep, H96 MAX M9]
+ * one does NOT inherit that: measured on the RK3576, both of its channel groups are 16
+ * (R76_FP16_W_OC_GROUP, R76_FP16_W_IC_GROUP). A kernel spans 16 fp16 (32 bytes), and
+ * the group block holds 16 of them. A kernel that ramps over ic, with its sum read back,
+ * pins the input group: the sum is exact at 16. At the int8 groups the RK3576 contracts
+ * the first 16 lanes twice and pushes the second 16 into the next output channel. The
+ * output group cancels at k = 1, and was read at ic = 16 with k = 3 and k = 5
+ * [HW sweep, H96 MAX M9].
  * ==========================================================================*/
 int rocket_rk3576_weight_conv_fp16(unsigned oc_total, unsigned ic_total,
                                    unsigned kh_total, unsigned kw_total,
@@ -3021,12 +3023,13 @@ unsigned rocket_rk3576_fp16_pad_oc(unsigned oc)
 size_t rocket_rk3576_fp16_slice_weight_bytes(unsigned oc, unsigned ic,
                                              unsigned kh, unsigned kw)
 {
-    /* Sized by the GROUPS, not by the slice's channel count: a partial input-channel
-     * group still occupies a whole one, so an 8-channel slice at an ic group of 16
-     * needs a cube for 16. Sizing from the slice under-allocates, and at k=1 the
-     * overrun stays inside the BO's page and computes correctly anyway — it surfaces
-     * only at a kernel large enough to run past the page, where it reads as "this
-     * part cannot do k=3". */
+    /* Sized by the GROUPS, not by the channel count passed: a partial input-channel
+     * group still occupies a whole one of 16. The 16-channel slices rocket_rk3576_plan_ic()
+     * emits fill exactly one group each. An ic that is not a multiple of 16 still gets
+     * whole groups here. Sizing from that channel count under-allocates, and at k=1 the
+     * overrun stays inside the BO's page and computes correctly anyway. It surfaces only
+     * at a kernel large enough to run past the page, where it looks like a k=3 limit of
+     * the RK3576. */
     unsigned groups = (ic + R76_FP16_W_IC_GROUP - 1u) / R76_FP16_W_IC_GROUP;
     if (!groups) groups = 1u;
     return (size_t)rocket_rk3576_fp16_pad_oc(oc) * groups * R76_FP16_W_IC_GROUP
@@ -3265,17 +3268,17 @@ int gen_conv2d_int8_rk3576_reuse(conv_params_t *p, int dw,
 
 /* ONE fp16 task, which is exactly 16 input channels.
  *
- * The bound is the feature surface index: the datapath takes ic/8 contraction steps
- * and the surface pointer advances at the int8 rate of one per 16 channels, so a
- * second step re-reads surface 0 and the channels past 8 are contracted against the
- * wrong lanes. That produces a full, correctly sized, WRONG surface with nothing to
- * fault on, which is why a larger ic is REFUSED here rather than warned about — a
- * caller must not be able to reach it silently.
+ * The bound is the DPU's output element stride, 16/ic words. At ic=16 an element
+ * occupies exactly its own two bytes. Below it the writer spreads each element over a
+ * wider slot, and half the channels never reach DDR. Above it two channels collide in
+ * one slot, and the odd ones are lost. Either way the output has the right size, the
+ * wrong values and nothing to fault on. Any other ic above 4 is therefore REFUSED here
+ * rather than warned about, because a caller must not be able to reach it silently.
  *
- * Anything past 8 goes through rocket_rk3576_plan_ic(), which is the same convolution
- * as a sequence of slices. gen_conv2d_rk3576_prec() is the unchecked bring-up entry
- * and emits whatever it is asked for; use that, not this, to sweep the defect itself.
- * [HW sweep, H96 MAX M9] */
+ * Any other ic above 4 goes through rocket_rk3576_plan_ic(), which is the same
+ * convolution as a sequence of 16-channel slices. The unchecked bring-up entry,
+ * gen_conv2d_rk3576_prec(), emits whatever it is asked for. Use that, not this, to
+ * sweep the defect itself. [HW sweep, H96 MAX M9] */
 int gen_conv2d_fp16_rk3576(conv_params_t *p)
 {
     if (!p) return -1;
@@ -3407,7 +3410,8 @@ int rocket_rk3576_i32_dense_word(unsigned A, unsigned c, unsigned p)
 
 /* The unchecked entry: a program at any precision and any geometry, for bring-up
  * sweeps and for the register-fidelity gate. It does NOT apply the fp16 envelope
- * above, so an fp16 conv emitted through here past ic=8 computes wrong silently. */
+ * above. An fp16 conv emitted through here at any ic above 4 other than 16 produces
+ * wrong values silently. */
 int gen_conv2d_rk3576_prec(conv_params_t *p, int dw, unsigned prec)
 {
     return gen_conv2d_rk3576_fill(p, dw, prec, prec, prec, &R76_NO_REUSE);

@@ -45,7 +45,7 @@ int rocket_reduce_factor_axis(int n, int *f, int cap)
      * factors, hence >= the largest factor. For any axis > 16 the largest factor is >= 4,
      * so NO intermediate spatial dim is < 4. A chained pass reads a PPU-written 2x2 or 3x3
      * cube correctly on the current driver (tests/ppu_sub4_chain_probe, two-pass square
-     * chains, with and without the PPU completion class), so the order is kept for the
+     * chains, MAX and AVG, with and without the PPU completion class), so the order is kept for the
      * shapes that probe did not reach -- 1-wide intermediates and longer chains -- rather
      * than for a known defect. */
     for (int i = 1; i < c; i++)
@@ -398,7 +398,7 @@ int rocket_global_minpool_fp16(int fd, int C, int H, int W,
 
 /* ===================================================================== *
  * Feature-axis reduce (sum/mean over the hidden axis, per row)          *
- * via a ones-vector matmul. See rocket_reduce.h for the rationale.      *
+ * via a ones-vector matmul. The rationale is at the entry below.       *
  * ===================================================================== */
 
 void rocket_reduce_feature_ref_fp16(int M, int H,
@@ -413,6 +413,14 @@ void rocket_reduce_feature_ref_fp16(int M, int H,
     }
 }
 
+/* The feature-axis reduce is a matmul against a ones vector. PPU pooling reduces only the
+ * spatial axes within a channel, so no pooling pass contracts across channels, and the
+ * contraction the transformer needs is the matmul's K. It reuses rocket_matmul_fp16_f32out,
+ * whose K-partials are not narrowed to fp16, which keeps an RMSNorm or LayerNorm sum of
+ * squares from biasing the variance. N is padded to 16, the matmul's N group, so 16
+ * identical columns are computed and column 0 is read back. The redundant columns are a
+ * small fixed cost on this K-dominated shape, with no DRAM weight traffic beyond the
+ * 16xKpad ones vector. */
 int rocket_reduce_feature_fp16(int fd, int M, int H,
                                const _Float16 *in, float *out, int mean)
 {

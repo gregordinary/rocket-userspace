@@ -6,10 +6,14 @@
  *   Mish(x)     = x·tanh(softplus(x))   2-pass: a [0,1] gate LUT then an EW multiply
  *   Abs(x)      = |x|                    shifted single-table over a SYMMETRIC domain
  *
- * Softplus and Abs ride the shifted single-table mode (the whole domain maps onto the
- * positive LUT index half ⇒ no LE/LO sign-mux glitch — works standalone). Mish is the
- * SiLU/GELU 2-pass shape with a different gate (tanh∘softplus, a monotone 0→1 function on
- * the clean sigmoid grid). The YOLOv4/v7 backbone activation.
+ * Softplus and Abs run on the shifted single-table mode, with the whole domain mapped onto
+ * the positive LUT index half. Both domains straddle 0, and neither shows the x~0 LE/LO
+ * sign-mux glitch. Both decode an unsigned output (out_lo=0), and in the kinds measured
+ * the glitch appears only with a signed decode. Both work standalone. This test's grids do
+ * not sample the narrow x~0 band densely, and tests/x0_glitch_probe.c does.
+ *
+ * Mish is the SiLU/GELU 2-pass shape with a different gate (tanh∘softplus, a monotone 0→1
+ * function on the clean sigmoid grid). The YOLOv4/v7 backbone activation.
  *
  * The LUT is a uniform-grid fp16 approximation, so we gate with tolerances, not equality:
  *   - max ABSOLUTE error over the swept domain;

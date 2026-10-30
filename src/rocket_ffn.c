@@ -203,7 +203,7 @@ int rocket_ffn_fp16_fused(int fd, int M, int H, int I,
         rocket_bo saved = bd.in_all;
         bd.in_all = cube_g;
         rc = mm_compute_kacc(fd, &pld, &bd, out, 0.0);
-        if (rc == ROCKET_E_TILING) rc = mm_compute(fd, &pld, &bd, out, 0.0);  /* tiny-M */
+        if (rc == ROCKET_E_TILING) rc = mm_compute(fd, &pld, &bd, out, 0.0);  /* sentinel */
         bd.in_all = saved;   /* restore so mm_bos_free owns the real in_all */
     }
 

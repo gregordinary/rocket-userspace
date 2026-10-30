@@ -389,7 +389,7 @@ int rocket_conv_transpose2d_prepacked_plan(const rocket_conv_transpose2d_desc *d
  * and the M split re-reads B. The M split is taken when every worker has at least
  * CT_SPLIT_M_ROWS rows, B is at most CT_SPLIT_M_BA times A (N <= 4M), and the replicated
  * weight stays within CT_SPLIT_M_WT_MAX. Against the N split, per call [HW sweep, RK1 at
- * 600 MHz, tests/ct_model_bench.c and tests/conv_model_bench.c]:
+ * ~816 MHz, tests/ct_model_bench.c and tests/conv_model_bench.c]:
  *
  *   transposed (2026-09-27, three rotated passes, pinned): 0.88x at M = 1024 (pix2pix
  *   up6, B twice A), 0.92x at 4096 (up7), 0.51x at 16384 (up8), 0.70x and 0.67x at SAM's

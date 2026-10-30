@@ -9,9 +9,10 @@
  *
  * WHAT tf32 IS (NVIDIA-TF32 convention): 1 sign + 8-bit exponent (fp32 RANGE) +
  * 10-bit mantissa (fp16 PRECISION) = 19 used bits, stored in a 4-BYTE fp32
- * container (19 bits can't fit 2 bytes). You feed fp32; the MAC rounds the mantissa
+ * container (19 bits can't fit 2 bytes). You feed fp32; the MAC reduces the mantissa
  * to 10 bits, then accumulates in fp32. So we feed RAW fp32 operands and let the HW
- * round — that is exactly what the characterization measures.
+ * reduce them — that is exactly what the characterization measures. The reduction is a
+ * TRUNCATION: the HW matches round_to_tf32() below, which masks the low 13 bits.
  *
  * FEASIBILITY OUTLOOK (Step-0 recon): encoding STRONG, input geometry UNKNOWN. The
  * precision-field tables name "3'd7: tf32" in the CNA CONV_CON1 in/proc precision
@@ -78,9 +79,9 @@ static double env_dbl(const char *name, double def) {
     const char *e = getenv(name); return e ? strtod(e, NULL) : def;
 }
 
-/* Round an fp32 to NVIDIA-tf32 precision: keep sign + 8-bit exp + top 10 mantissa
- * bits, zero the low 13 (23-bit fp32 mantissa -> 10-bit tf32 mantissa). This is
- * what the HW MAC is hypothesized to do internally before the fp32 multiply. */
+/* Reduce an fp32 to tf32 precision BY TRUNCATION: keep sign + 8-bit exp + top 10
+ * mantissa bits, zero the low 13 (23-bit fp32 mantissa -> 10-bit tf32 mantissa). The
+ * name says round; the mask truncates, and the HW MAC matches it, not round-to-nearest. */
 static inline float round_to_tf32(float f) {
     uint32_t b; memcpy(&b, &f, sizeof b);
     b &= 0xFFFFE000u;                 /* keep bits 31..13, zero bits 12..0 */
@@ -183,9 +184,9 @@ int main(int argc, char **argv) {
     printf("regcmd ops = %u\n", p.task_count);
 
     /* host operands: full-23-bit-mantissa random fp32 (fed RAW to the HW — the MAC
-     * is what rounds to tf32). Two references: (a) inputs ROUNDED to tf32 then fp32
+     * is what truncates to tf32). Two references: (a) inputs TRUNCATED to tf32 then fp32
      * matmul; (b) full-fp32 inputs, fp32 matmul. They differ by ~2^-11 (the "ref
-     * gap"), which lets STAGE2 tell whether the HW really rounds to 10-bit tf32. */
+     * gap"), which lets STAGE2 tell whether the HW really reduces to 10-bit tf32. */
     float *A   = malloc((size_t)M * K * sizeof(float));   /* raw fp32 fed to HW */
     float *B   = malloc((size_t)N * K * sizeof(float));
     float *Atf = malloc((size_t)M * K * sizeof(float));   /* tf32-rounded copy   */

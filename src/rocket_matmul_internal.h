@@ -88,7 +88,7 @@ typedef struct {
                       * cache-sync is proportional to BO size, so this cuts the
                       * per-ki sync. Resident (alloc'd only when ROCKET_KACC) so
                       * mm_compute_kacc needn't alloc per call; out_all stays
-                      * BATCH-sized for the tiny-M mm_compute fallback.
+                      * BATCH-sized for the mm_compute fallback.
                       * .handle==0 when unused. */
     int prezeroed;   /* in_all/wt_all were zeroed once at alloc: the
                       * per-call pack can then skip its full-BO memset. */
@@ -104,7 +104,7 @@ typedef struct {
      * BATCH-sized per-job arrays are allocated once in mm_bos_alloc; `acc` (the
      * M*N fp32 accumulator for the CPU-accum mm_compute path) is sized lazily on
      * first use and grown only on shape change — under ROCKET_KACC it stays NULL
-     * (mm_compute is only the tiny-M fallback), so no RAM is wasted. A worker
+     * (mm_compute is only the fallback), so no RAM is wasted. A worker
      * thread owns its mm_bos and calls compute serially, so no locking is needed. */
     rocket_task_desc *tasks;                  /* BATCH task descriptors            */
     int    *bm0, *bn0, *bMtile, *bNtile;      /* BATCH each (mm_compute)           */
@@ -245,9 +245,10 @@ int mm_compute(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack)
 /* NPU-side K-accumulation variant of mm_compute (ROCKET_KACC=1): accumulates
  * the nKt K-partials of each tile ON the NPU (DPU eltwise-add ping-pong) and reads
  * each output tile ONCE (read ∝ M·N, not M·N·nKt). Same signature/contract as
- * mm_compute. Returns -2 (NOT a hard error) for shapes whose last M-tile < 12,
- * where the EW MAX(M,12) stride floor would misread — caller falls back to
- * mm_compute for those. Accumulates in fp16 (~0.4% drift vs the fp32 host sum). */
+ * mm_compute. Any M tile accumulates (the EW read's surface stride is M). Callers
+ * still treat -2 (ROCKET_E_TILING) as a routing sentinel and fall back to mm_compute,
+ * which this does not return today. Accumulates in fp16 (~0.4% drift vs the fp32 host
+ * sum). */
 int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_pack);
 
 /* The CHANNEL-PLANES forms of mm_compute / mm_compute_kacc: the same tiles, the same
@@ -255,8 +256,7 @@ int mm_compute_kacc(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, double t_
  * (row m at Ct[n * ldc + m], ldc > 0) instead of row m of a row-major C. That is the
  * layout a convolution holds its [C][H*W] tensors in, and the cube's C2=8 groups
  * deinterleave into it directly, so a caller wanting C transposed pays no row-major pass.
- * Every one of the plan's M rows is written in each of its N planes. Same return codes,
- * including mm_compute_kacc's tiny-M routing sentinel. */
+ * Every one of the plan's M rows is written in each of its N planes. Same return codes. */
 int mm_compute_planes(int fd, const mm_plan *pl, mm_bos *b, _Float16 *Ct, size_t ldc,
                       double t_pack);
 int mm_compute_kacc_planes(int fd, const mm_plan *pl, mm_bos *b, _Float16 *Ct, size_t ldc,
@@ -274,8 +274,7 @@ int mm_compute_kacc_planes(int fd, const mm_plan *pl, mm_bos *b, _Float16 *Ct, s
  *
  * Requires the whole result to be ONE NPU batch (nMt*nNt <= BATCH) so every tile co-exists
  * in `cube`; returns ROCKET_E_TILING (a routing sentinel, NOT a hard error) for shapes that
- * exceed it or that hit the same tiny-M EW-stride floor mm_compute_kacc guards — the caller
- * falls back to the host-handoff path for those. Returns 0 or <0 on a hard error. */
+ * exceed it, and the caller falls back to the host-handoff path for those. Returns 0 or <0 on a hard error. */
 int mm_compute_kacc_cube(int fd, const mm_plan *pl, mm_bos *b, rocket_bo *cube, double t_pack);
 
 /* Software-pipelined variant of mm_compute (ROCKET_MM_PIPE=1):

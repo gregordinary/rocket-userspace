@@ -134,7 +134,7 @@ int rocket_conv2d_prepacked_plan(const rocket_conv2d_desc *d)
 }
 
 /* The per-call estimate: a linear model in the GEMM's aligned extents, least squares
- * weighted by relative error over 21 measured shapes (rocket_conv.h has the fit set and
+ * weighted by relative error over 22 measured shapes (rocket_conv.h has the fit set and
  * its spread). Terms in ms: a fixed cost, the unfold's writes, the input cube (A), the
  * output (C), the weight (B), and the MACs. */
 double rocket_conv2d_prepacked_estimate_ms(const rocket_conv2d_desc *d)
@@ -143,8 +143,8 @@ double rocket_conv2d_prepacked_estimate_ms(const rocket_conv2d_desc *d)
     const double M = rc_rup(rocket_conv2d_oh(d) * rocket_conv2d_ow(d), 4);
     const double K = rc_rup(d->ic * d->kh * d->kw, 32), N = rc_rup(d->oc, 16);
     const double unfold = rc_in_place(d) ? 0.0 : K * M;
-    return 0.4125 + 0.2279e-6 * unfold + 0.5874e-6 * K * M + 0.7280e-6 * N * M +
-           0.1776e-6 * K * N + 2.7796e-9 * M * K * N;
+    return 0.2242 + 0.1294e-6 * unfold + 0.6733e-6 * K * M + 0.7371e-6 * N * M +
+           0.2181e-6 * K * N + 2.2281e-9 * M * K * N;
 }
 
 rocket_conv2d_weights *rocket_conv2d_weights_pack(struct rocket_ctx *ctx, const rocket_conv2d_desc *d,

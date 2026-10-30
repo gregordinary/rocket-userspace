@@ -6,8 +6,9 @@
  * step-4 capstone — proves the validated primitives compose into a complete pre-norm block.
  *
  * Validated against an fp64 block oracle (cosine similarity, the prompt's per-layer criterion,
- * + max abs/rel). Everything runs on the NPU except the MLP's elementwise GELU (the documented
- * host seam — the on-NPU GELU is the fused matmul->act epilogue, TRACK B). Off-device: SKIP.
+ * + max abs/rel). The GELU's Φ lookup runs on the NPU on both FFN paths. The default fused
+ * path multiplies x·Φ(x) on the host unless ROCKET_ACT_NPU_MUL=1, and ROCKET_ENCODER_NOFUSE
+ * multiplies on the DPU EW unit. Off-device: SKIP.
  *
  * Usage: encoder_block_rocket            (sweep)
  *        encoder_block_rocket T d nhead  (one shape, d_ff=4d)

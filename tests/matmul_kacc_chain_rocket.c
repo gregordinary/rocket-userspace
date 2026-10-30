@@ -173,11 +173,22 @@ int main(int argc, char **argv)
             { 256, 16384,  512, 1 },   /* nKt=43: deep chain, one tile-group */
             { 512, 16384, 1024, 1 },   /* nKt=43: multiple tiles per group */
             { 512, 15360, 3840, 0 },   /* nKt=40: Gemma FFN-down (byte-exact only) */
+            { 256,  1280, 2048, 1 },   /* nKt=2 streamed (the default), 3 whole-tile */
         };
+        /* A streamed plan (the default; ROCKET_MM_STREAM=0 opts out) holds K whole where
+         * the CBUF allows it, so 256x768x256 runs in one K pass there; 256x1280x2048 is its
+         * nKt=2 case. */
+        const char *se = getenv("ROCKET_MM_STREAM");
+        const int streamed = !(se && atoi(se) <= 0);
         for (size_t i = 0; i < sizeof(S) / sizeof(S[0]); i++) {
             int r = run_one(fd, S[i].M, S[i].K, S[i].N, S[i].ref);
             /* Every shape here is chosen to engage chaining, so one that does not is a
              * shape this gate no longer checks: a failure, not a quiet drop. */
+            if (r == 2 && streamed) {
+                printf("  [%d x %d x %d] holds K whole when streamed -> not this "
+                       "gate's shape there\n", S[i].M, S[i].K, S[i].N);
+                continue;
+            }
             if (r == 2) {
                 printf("  [%d x %d x %d] did not engage chaining -> FAIL\n",
                        S[i].M, S[i].K, S[i].N);

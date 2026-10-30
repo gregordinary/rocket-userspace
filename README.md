@@ -3,9 +3,9 @@
 ## AI disclosure
 
 Except for the prior work it builds on, rocket-userspace was developed by AI, primarily Claude.
-Human involvement was mostly limited to setting project goals and providing hardware access. This
-is a side project for curiosity's sake, and it comes with no guarantee of quality, accuracy, or
-update frequency.
+Human involvement was mostly limited to setting project goals and providing hardware access.
+rocket-userspace is a side project for curiosity's sake, and it comes with no guarantee of
+quality, accuracy, or update frequency.
 
 ## About rocket-userspace
 
@@ -38,13 +38,13 @@ is bound by the DDR bandwidth the NPU shares with the CPU, and the NPU adds a di
   exp, softplus, mish, abs, ELU, SELU, LeakyReLU, PReLU), plus elementwise
   add/sub/mul/div/max/min/clip.
 - **Transformer and Whisper primitives**: RMSNorm, LayerNorm, softmax, gated FFN,
-  multi-head self-attention, and a full encoder block. That is enough to run a
+  multi-head self-attention, and a full encoder block. Together they run a
   Whisper/transformer encoder block end to end on the NPU.
 - **Resident encoders**: whole models with their weights packed once, for SigLIP, SAM and
   ModernBERT. The ModernBERT encoder takes a batch of variable-length sequences.
 
 [API.md](API.md) is the function reference for the entry points a caller uses, per dtype and
-op. The headers under `include/` declare every public function and carry each one's full
+op. The headers under `include/` declare every public function and state each one's full
 contract.
 
 ## Terms
@@ -55,13 +55,13 @@ different things, and conflating them is the common mistake:
 | Term | What it means here |
 |---|---|
 | Submit | One `ROCKET_SUBMIT` ioctl. It costs one syscall, one fence and one IOMMU attach. |
-| Task | One register program inside a submit. A submit carries one task or many. |
+| Task | One register program inside a submit. A submit contains one task or many. |
 | Kick | One hardware start of the datapath, and one completion interrupt. On-chip state lives inside a kick and clears between kicks. |
 | regcmd | The register program itself: the CNA, CORE and DPU register writes the kernel replays. |
 | CNA, CORE, DPU | The three datapath blocks a program drives in sequence. Feature and weight fetch, the MAC array, then post-processing and write-out. |
 | CBUF | The on-chip buffer the CNA fills. Tile sizes are chosen to fit it. |
-| Cube layout | The NPU's native tensor format. The host scatters row-major data into it and de-scatters the result. |
-| Resident weights | Weights left in device memory across calls, so a repeated layer pays the packing once. |
+| Cube layout | The NPU's native tensor format. The host scatters row-major data into it and de-tiles the result. |
+| Resident weights | Weights left in device memory across calls, so a repeated layer packs them once. |
 | Prefill, decode | The two LLM phases. Prefill is a batched GEMM and runs here, and decode is `M=1` and stays on the CPU. |
 | The submit seam | The `rocket_*` symbols every kernel interaction goes through, and the swap point for a non-mainline driver. |
 
@@ -69,58 +69,72 @@ Submits, tasks and kicks vary independently, which is what makes them worth sepa
 
 | Path | Submits | Tasks | Kicks |
 |---|---:|---:|---:|
-| Default, one job per tile | n | n | n |
-| `ROCKET_BATCH_SUBMIT=1`, self-chained, fp16 | 1 | n | 1 |
+| Default convolution, one job per tile | n | n | n |
+| Default matmul, up to 64 tiles a job, gapped | ⌈n/64⌉ | n | n |
+| `ROCKET_BATCH_SUBMIT=1`, self-chained, fp16 matmul | ⌈n/64⌉ | n | ⌈n/64⌉ |
 | `ROCKET_CONV_BATCH=1`, gapped, int8 | 1 | n | n |
 
-The last two rows cost the same syscalls and run the same programs, and differ only in
+The two matmul rows cost the same syscalls and run the same programs, and differ only in
 kicks. On-chip state lives inside one kick, so a self-chained task can read what an earlier
-task in the same kick just wrote. `ROCKET_KACC_CHAIN` rests on that read-after-write.
-Independent int8 tasks compute bit-exactly either way, gapped or chained.
+task in the same kick just wrote. `ROCKET_KACC_CHAIN` depends on that read-after-write.
+Independent int8 tasks are bit-exact either way, gapped or chained.
 
 ## Requirements
 
 - An RK3588 board. It is the only fully validated target, and
   [Hardware support](#hardware-support) has the rest.
-- A mainline kernel carrying the `rocket` DRM-accel driver, developed against ~v7.1, with
+- A mainline kernel with the `rocket` DRM-accel driver, developed against ~v7.1, with
   the device node `/dev/accel/accel0` present. Confirm with `ls /dev/accel/accel0` and
   `lsmod | grep rocket`, where the module is named `rocket`.
-- The `drm/rocket_accel.h` uAPI header, which ships in `/usr/include/drm` on a kernel with
+- The `drm/rocket_accel.h` uAPI header, which is in `/usr/include/drm` on a kernel with
   `rocket`. CMake checks for it at configure time. Only the built-in submit provider needs
   it, because a BSP-kernel board has no mainline `rocket` uAPI and supplies its own provider
   instead. See [Submit provider](#submit-provider).
 - libdrm and pthreads. No ML-framework dependency.
 - Privilege to open the accel node. Run as a user in the node's group, or with `sudo -E`,
-  where the `-E` preserves the `ROCKET_*` env knobs that plain `sudo` strips.
+  where the `-E` preserves the `ROCKET_*` environment variables that plain `sudo` strips.
 
 ### The RK3576 power-management rule
 
 Install `udev/99-rocket-npu-pm.rules` on the RK3576.
 
-On that part, a program that writes a wide output element through a partial output stage
-leaves the next submit writing nothing. That submit completes normally, so nothing reports
-it. On the defaults only the fp16 packed-image first convolution, at four or fewer input
-channels, does it. So do the older int32 matmul writers (`ROCKET_RK3576_I32_DENSE=0`) and the
-fp16 convolution's fp16 writer (`ROCKET_RK3576_FP16_F32OUT=0`). What clears it is the
-runtime-PM autosuspend cycling the NPU power domain.
+On the RK3576, a program that writes a wide output element through a partial output stage
+leaves the next submit writing nothing. The next submit completes normally, and nothing
+reports the missing output. On the defaults only the fp16 packed-image first convolution, at
+four or fewer input channels, does it. The older int32 matmul writers
+(`ROCKET_RK3576_I32_DENSE=0`) and the fp16 convolution's fp16 writer
+(`ROCKET_RK3576_FP16_F32OUT=0`) do it too. The runtime-PM autosuspend clears the condition by
+cycling the NPU power domain.
 
-The library drives that cycle rather than waiting out the driver's 50 ms timer, which needs
-write access to one sysfs file. The rule hands that file to the group that already owns
-`/dev/accel/accel0`. It therefore grants nothing to anyone who could not already submit NPU
-work. Without the rule the library falls back to waiting, and an fp16 224×224 stem costs
+The library drives that cycle itself rather than waiting out the driver's 50 ms timer.
+Driving it needs write access to one sysfs file. The rule gives that file to the group that
+already owns `/dev/accel/accel0`, so it grants nothing to anyone who could not already submit
+NPU work. Without the rule the library falls back to waiting, and an fp16 224×224 stem costs
 226 ms instead of 13.8 ms. The RK3588 has no such hazard and needs no rule.
 
 ### Clock
 
-The NPU boots at 200 MHz and the library is correct there. Every performance figure below is
-at 600 MHz. Apply the `patches/rocket` clock patch and load the module with
-`rocket_npu_clk_hz=600000000`. The patches only raise the clock (~1.43x) and trim dispatch
-latency.
+The NPU boots at 200 MHz and the library is correct there. Above 200 MHz the RK3588's NPU
+clock comes from a PVTPLL, a ring oscillator whose frequency follows the rail voltage. A
+requested rate is therefore not the running clock.
+
+Apply the `patches/rocket` clock and voltage patches and load the module with
+`rocket_npu_clk_hz=900000000`. On the RK1's 0.80 V rail that request runs at 928 MHz. It held 922-928 MHz through 15 minutes of continuous load, at a 49 °C peak,
+with every matmul bit-exact. The patches also trim dispatch latency.
+
+The RK3588 performance figures below were measured with the 600 MHz request, which runs at
+~816 MHz on the same rail. The 900 MHz request is 1.044x faster on matmul device time. The
+RK3576 figures state their own clock, which the board's device tree assigns.
+
+> [!CAUTION]
+> With the NPU cores pinned on (`power/control=on`), an `rmmod` at the 900 MHz request
+> hard-locks the board, and only a power cycle recovers it. Unload the module only while all
+> three cores are runtime-suspended.
 
 ## Quickstart
 
-Build the static library and run the correctness gates. They are green off-device, because
-the gates that need the NPU skip:
+Build the static library and run the correctness tests. They pass off-device, because the
+tests that need the NPU skip:
 
 ```sh
 cmake -S . -B build && cmake --build build -j
@@ -148,14 +162,14 @@ transformer op library.
 ### RK3588
 
 The RK3588 (rknpu v2, 3 NPU cores) is the full target: every datatype, the whole op library,
-and every `tests/` gate bit-exact.
+and every correctness test under `tests/` bit-exact.
 
 ### RK3576
 
-The RK3576 (2 cores) runs a growing subset through its own encoder. `CONV_2D` computes
-bit-exactly, direct at int8 and fp16 and depthwise at int8. So does an int8 matmul,
-`rocket_matmul_int8_rk3576()`. Int8 pooling and the int8 LUT activations have their own
-entries there too.
+The RK3576 (2 cores) runs a growing subset through its own encoder. `CONV_2D` is bit-exact
+there, direct at int8 and fp16 and depthwise at int8. The int8 matmul,
+`rocket_matmul_int8_rk3576()`, is bit-exact too. Int8 pooling and the int8 LUT activations
+have their own RK3576 entries.
 
 Three of that matmul's properties are the RK3588's inverted, and a caller porting between
 the two must expect all three:
@@ -163,7 +177,7 @@ the two must expect all three:
 - int8 is the default matmul precision here. One int8 task contracts up to 6144 input
   channels, where an fp16 convolution task contracts sixteen. For speed keep K at or below
   4608, because past 4992 the output tile drops from 1024 channels to 32.
-- The M axis carries no alignment constraint, so `M=1` is simply correct.
+- The M axis has no alignment constraint, so `M=1` is correct.
 - The output is int8 through the DPU's requant rather than raw int32.
 
 `rocket_matmul_int8_rk3576()` refuses a K of 6176 or more with `ROCKET_E_UNSUPPORTED`. For a
@@ -186,7 +200,7 @@ about 2x: 2.0-2.1x at 512×1536×1536, and 1.8-2.6x across N at M 512 and K 1536
 tie, because the int8 entry slows there. On the device alone this program contracts at about
 half the int8 program's rate (`tests/rk3576_mm_fp16_cost`, 786 MHz, warm).
 
-The rest of the op library emits the RK3588 encoding. On this part its generators refuse
+The rest of the op library emits the RK3588 encoding. On the RK3576 its generators refuse
 rather than submit a program the hardware will not run.
 
 #### Prepacked convolution
@@ -196,11 +210,11 @@ Some layers run repeatedly, in a graph's forward pass or over a video stream. Fo
 `rocket_conv2d_int8_prepacked_rk3576()` runs the packed handle per inference.
 
 Everything a per-call entry rebuilds from the weights alone is prepared once: the
-per-output-channel filter sums, the coefficient group and the weight cube. So is every
-buffer whose size follows the shape: the feature cube, the register program and each tile's
-output surface. An inference then allocates no buffers and does no weight arithmetic. On
-MobileNetV1-224 that is **98.8 ms to 33.6 ms per inference on the same 40 submits**, with
-the same result to the byte.
+per-output-channel filter sums, the coefficient group and the weight cube. Every buffer whose
+size follows the shape is prepared once too: the feature cube, the register program and each
+tile's output. An inference then allocates no buffers and does no weight arithmetic. On
+MobileNetV1-224 the time per inference falls from 98.8 ms to 33.6 ms on the same 40 submits,
+with the same result to the byte.
 
 The handle is bound to the `fd` it was packed on, because a buffer belongs to the file that
 created it. It freezes the output-channel tiling and the quantization contract it was packed
@@ -208,7 +222,7 @@ for. It is not thread-safe, so pack per thread or serialize.
 
 #### Residual add
 
-A residual add is a convolution on this part rather than an elementwise op. The DPU's
+On the RK3576 a residual add is a convolution rather than an elementwise op. The DPU's
 elementwise stage takes exactly one operand. A skip is therefore lowered by concatenating the
 two operands along channels, then convolving with a 1×1 kernel of two diagonal blocks.
 `rocket_residual_add_weights_rk3576()` fills that weight matrix, its bias and its weight
@@ -217,30 +231,31 @@ entries on the result.
 
 Two properties of the lowering beat a dedicated elementwise program:
 
-- **The operands can carry different scales.** The ratio rides in the weights as a pair of
+- **The operands can have different scales.** The weights encode the ratio as a pair of
   int8s. Searching every denominator resolves it to about one part in 127², where anchoring
   the larger term at 127 gives one part in 127.
-- **Both zero points ride exactly.** `w2*(a_zp - b_zp)` is a per-output-channel constant,
-  and that is what the bias is.
+- **Both zero points are applied exactly.** `w2*(a_zp - b_zp)` is a per-output-channel
+  constant, and the bias is that constant.
 
-It also fuses. A block's last convolution can absorb its own skip. It takes `C` more input
-channels and an identity block at the center tap of its kernel. The add then costs no program
-at all. The weight slice rule `ic*kh*kw <= 4608` bounds it, which a 1×1 project convolution
-is nowhere near and a 3×3 reaches exactly at `C = 256`.
+The add can also fuse into a block's last convolution, which absorbs its own skip. The fused
+convolution takes `C` more input channels and an identity block at the center tap of its
+kernel. The add then needs no program of its own. The weight slice rule `ic*kh*kw <= 4608`
+bounds the fusion. A 1×1 project convolution is far below it, and a 3×3 reaches it exactly at
+`C = 256`.
 
 #### Cube layout and chained runs
 
 A tensor can stay in cube layout between two layers, so neither host transpose runs at the
-join. A direct convolution's output surface is the next layer's feature cube byte for byte
-(`rocket_conv2d_int8_cube_of_rk3576()` / `_cube_in_` / `_cube_out_`). A run of cube-linked
-layers goes out as one hardware kick through `rocket_chain_new_rk3576()`, with
-`rocket_chain_plan_rk3576()` grouping already-linked nodes into the longest legal runs.
+join. A direct convolution's output is the next layer's feature cube byte for byte
+(`rocket_conv2d_int8_cube_of_rk3576()` / `_cube_in_` / `_cube_out_`). A run of layers joined
+in cube layout runs as one hardware kick through `rocket_chain_new_rk3576()`, with
+`rocket_chain_plan_rk3576()` grouping already-joined nodes into the longest legal runs.
 
 A run's members are *nodes* rather than convolution handles, because three kinds can sit in
 one stream:
 
 - A convolution.
-- A pool. It carries its own register program and covers the interior only.
+- A pool. It has its own register program and covers the interior only.
 - A placement layer. The caller states that it emits no program and leaves no host work. A
   concatenation whose operands are already slices of one buffer is one.
 
@@ -249,12 +264,12 @@ Without that third kind, a layer with no program breaks every run it sits in.
 #### Cube slices
 
 A cube can be a slice of a larger buffer. Its base is a plain address on both sides of a
-convolution. A producer can therefore be told to write its surface at a channel-group offset
+convolution. A producer can therefore be told to write its output at a channel-group offset
 inside a caller's allocation (`rocket_rk3576_cube_alloc()`, `_cube_slice()`,
 `_cube_declare_tail()`, `rocket_conv2d_int8_cube_out_at_rk3576()`).
 
-That is what makes a channel concatenation free. Producers writing their own slices of one
-buffer already *are* the concatenated tensor. A residual add's operands and an Inception
+Slices make a channel concatenation free. Producers writing their own slices of one buffer
+already *are* the concatenated tensor. A residual add's operands and an Inception
 module's four branches therefore need no host copy. The layer that feeds the skip does not
 have to leave a row-major tensor behind for it.
 
@@ -266,7 +281,7 @@ the constant the groups past the live channels hold.
 #### Whole networks
 
 Four whole networks run end to end. Each layer is bit-exact against a CPU model of the
-part's own arithmetic, and each network returns TFLite's own top-1. Each runs as one hardware
+RK3576's own arithmetic, and each network returns TFLite's own top-1. Each runs as one hardware
 kick in one submit:
 
 | Network | Compute layers | Topology | This library | Per-op entries, transient weights |
@@ -276,113 +291,125 @@ kick in one submit:
 | ResNet-18-224 | 31 | | 6.6 ms | 144.9 ms |
 | Inception V1-224 | 81 | Nine four-operand concatenations, thirteen pooling layers | 7.0-7.1 ms | 159.7 ms |
 
-This library's times are warm, with resident weights, at an NPU clock of 786 MHz and the CPU
-governor at `ondemand` (`tests/rk3576_net_gate.c`, `bench 100`, 2026-08-03). At 594 MHz, with
-a newer library and kernel, the four read 12-21% slower (2026-10-02).
+**Conditions:** RK3576, NPU clock 786 MHz, CPU governor `ondemand`, `tests/rk3576_net_gate.c`
+with `bench 100`, measured 2026-08-03. The library's times are warm, with resident weights. At
+594 MHz, with a newer library and kernel, the four measure 12-21% slower (2026-10-02).
 
-The last column is the same graph with none of resident weights, cube layout, the placed
-slices and the cross-layer kick. It costs tens of submits. The answer is the same to the byte
-at every step.
+The last column runs the same graph without resident weights, cube layout, the placed slices
+or the cross-layer kick, in tens of submits. Its result is the same to the byte at every step.
 
 ### RK3566 and RK3568
 
-The RK3566 and RK3568 are recognized from the device tree and warned about. They are named
-but unprofiled, and not supported.
+The library recognizes the RK3566 and RK3568 from the device tree and logs a warning. They
+are named but have no hardware profile, and are not supported.
 
 ### Portability
 
-Portability is by construction, and it is two layers rather than one. The RK3576 settled
-that:
+Portability is by construction, in two layers. The RK3576 port confirmed that both are
+needed:
 
 1. **Machine parameters.** CBUF banks and size, tile caps, tile-group sizes, datatype mask
    and worker default. These live in one `rocket_hw_profile` (`include/rocket_hw_profile.h`,
    read via `rocket_hw_current()`), which the tiling planners consult instead of bare
-   literals. These must be *measured* on the part: the RK3576's CBUF, matmul tile cap (2048,
-   not 256) and weight N-group (32, not 16) all differ from the RK3588's.
-2. **A regcmd encoder for the CNA/CORE/DPU geometry registers**, which is *not* a shared
-   offset table. The RK3576 re-packs those blocks at the same block bases. Registers move,
+   literals. Each value must be measured on the SoC itself: the RK3576's CBUF, matmul tile
+   cap (2048, not 256) and weight N-group (32, not 16) all differ from the RK3588's.
+2. **A regcmd encoder for the CNA/CORE/DPU geometry registers**, per SoC rather than a
+   shared offset table. The RK3576 re-packs those blocks at the same block bases. Registers move,
    the bit-packing differs at shared offsets, and it drives offsets the RK3588 leaves at
    reset. The emission is therefore per-chip (`src/npu_regcmd_rk3576.c`). What stays shared
    is the datapath *semantics*: the precision encodings, the CNA→CORE→DPU sequence, the
    BS/BN/EW/LUT field meanings, and the block bases.
 
 Chip selection reads the NPU's device-tree `compatible`, with a `ROCKET_CHIP` override for
-bring-up, and logs which datapaths the selected chip has an encoder for. A part with no
-profile falls back to the RK3588's and says so, rather than silently applying the wrong
-parameters.
+bring-up, and logs which datapaths the selected chip has an encoder for. A Rockchip NPU with
+no profile falls back to the RK3588's and logs a warning, rather than silently applying the
+wrong parameters.
 
 ## Performance
 
-The matmul is a prefill and batched-GEMM engine. At 600 MHz its resident throughput is
-~460 GOP/s across precisions: fp16 461, int8 386 and int4 413 GOP/s on `512×3840×4096`. As
-an LLM prefill it runs Gemma-4-12B at ~15 t/s pp2048, which is ~3.2x the 8-thread CPU at
-M>=512 and 3.6x at pp512. It is DMA/dispatch-bound rather than MAC-bound, so quantization
-buys RAM and model-fit rather than prefill speed. Decode (M=1 GEMV) stays on the CPU.
+The matmul is a prefill and batched-GEMM engine. At ~816 MHz (the 600 MHz request) the
+whole-tile program's resident throughput is ~460 GOP/s across precisions: fp16 461, int8 386
+and int4 413 GOP/s on `512×3840×4096`. As an LLM prefill it runs Gemma-4-12B at ~15 t/s
+pp2048, which is ~3.2x the 8-thread CPU at M>=512 and 3.6x at pp512. It is DMA/dispatch-bound
+rather than MAC-bound, so quantization saves RAM and fits larger models rather than raising
+prefill speed. Decode (M=1 GEMV) stays on the CPU.
+
+The fp16 planner streams the weights through the CBUF by default (`ROCKET_MM_STREAM`), which
+runs `512×3840×4096` in 12 tasks instead of the whole-tile program's 512. Through `ggml-rocket`
+it runs pp512 1.07-1.17x faster than the whole-tile program on four models, at 928 MHz (the
+900 MHz request). The Gemma-4-12B figures in this section are the whole-tile program's.
+[API.md](API.md#runtime-environment-variables) has the streamed plan's conditions and per-model figures.
 
 ### The MRDMA trap
 
-A matmul regcmd that configures CNA/CORE/DPU but omits the DPU-RDMA block (`0x5xxx`) hangs,
-because the DPU read-DMA waits forever. The matmul path emits the DPU-RDMA block and the
-correct enable mask. Tiling past the 12×32 KB CBUF covers all Gemma FFN shapes, with M and N
-independent and K split with host fp32 accumulation.
+> [!CAUTION]
+> A matmul register program must include the DPU-RDMA block (`0x5xxx`). A regcmd that
+> configures CNA/CORE/DPU and omits it hangs, because the DPU read-DMA waits forever.
 
-### The fp16 ladder
+The matmul path emits the DPU-RDMA block and the correct enable mask. Tiling past the
+12×32 KB CBUF covers all Gemma FFN shapes, with M and N independent and K split. The fp16
+K-partials accumulate on the NPU by default (`ROCKET_KACC`), and in fp32 on the host with
+`ROCKET_KACC=0`.
 
-The ~15 t/s figure on Gemma-4-12B pp2048 is a stack of operating-point wins over the 200 MHz
-boot clock:
+### Gemma-4-12B fp16 prefill
+
+The ~15 t/s figure on Gemma-4-12B pp2048 is the product of these operating-point gains over
+the 200 MHz boot clock:
 
 | Step | Result |
 |---|---|
 | Baseline (200 MHz, tiled multicore fp16) | 7.98 t/s |
-| Clock 600 MHz (`patches/rocket`) | 1.43x -> 11.40 |
+| Clock ~816 MHz, the 600 MHz request (`patches/rocket`) | 1.43x -> 11.40 |
 | fp16 NPU K-accum (DPU eltwise-add, read each tile once) | +19% -> 13.38 |
 | CBUF DATA_REUSE | +7% -> ~14.5 |
 | Resident weights (prefill-only) | +6% -> ~15.1 |
 
-A76 affinity, NEON fp16 converts and NEON readback de-tile trim the host buckets around
-these. The CPU baseline is ~4.7 t/s flat, so the win is ~3.2-3.6x at M>=512 and about a tie
-at pp128. With the clock raised and K-accum on, the matmul is NPU-`wait`-bound at ~60-68%
-with packB ~22%. The remaining host work is memory-bound and gather-bound rather than
-instruction-bound.
+A76 affinity, NEON fp16 conversion and the NEON readback de-tile reduce the host time around
+these steps. The CPU baseline is ~4.7 t/s flat, so the speedup is ~3.2-3.6x at M>=512 and
+about a tie at pp128. With the clock raised and K-accumulation on, the NPU `wait` takes
+~60-68% of the matmul's time and packB ~22%. The remaining host work is
+memory-bound and gather-bound rather than instruction-bound.
 
 ### Quantization and prefill speed
 
 Quantization does not speed prefill at this operating point. Resident int8 and int4 tie the
-~460 GOP/s floor, where the NPU runs at ~15% of fp16 MAC peak. In-model resident int8
-prefill measured 0.60x fp16 on Gemma-4-12B (600 MHz, a June 2026 build), because its int32
-readback is not K-accumulated on the NPU. So int8 and int4 buy RAM and model-fit rather
-than throughput. Treat that as bottleneck-conditional rather than a permanent property. The full per-dtype
-detail is in the [datatype matrix](API.md#datatype-matrix).
+whole-tile fp16 program at ~460 GOP/s, where the NPU runs at ~15% of its fp16 MAC peak. In-model resident int8
+prefill measured 0.60x fp16 on Gemma-4-12B (~816 MHz, a June 2026 build), because its int32
+readback is not K-accumulated on the NPU. The int8 and int4 paths therefore save RAM and fit
+larger models rather than raising throughput. The result holds while prefill is DMA-bound and
+dispatch-bound. The [datatype matrix](API.md#datatype-matrix) has the full per-dtype detail.
 
 ## Capabilities and limitations
 
-Everything above is HW-validated on the RK3588. The matmul dtypes are bit-exact at int8 and
-int4, and within fp16 tolerance otherwise. The conv and op library each carry a CTest gate
+Everything above is validated on hardware, the RK3588 sections on the RK3588 and the RK3576
+sections on the RK3576. The matmul dtypes are bit-exact at int8 and
+int4, and within fp16 tolerance otherwise. The conv and op library each have a CTest test
 against an fp64 oracle reference, and [API.md](API.md#tests) holds the full catalog. The
-envelope:
+limits:
 
 - **Integer K-partials accumulate on the host.** The conv accumulator reduces K only within
   one CBUF-resident tile. The cross-tile adder is the DPU eltwise, which accumulates fp16
-  partials on the NPU, and that is the on-NPU K-accum win. With its whole precision bundle
-  set to integer, the eltwise ALU also adds int32 exactly (`tests/ew_int_probe`). The library has
-  no integer K-accumulation mode. One would not speed prefill, which is dispatch-bound and
-  DMA-bound rather than readback-bound.
+  partials on the NPU as the on-NPU K-accumulation. With all of its precision fields set to
+  one integer code, the eltwise ALU also adds int32 exactly (`tests/ew_int_probe`). The
+  library has no integer K-accumulation mode. One would not speed prefill, which is
+  dispatch-bound and DMA-bound rather than readback-bound.
 - **Quantization does not accelerate prefill.** int8 and int4 are for RAM rather than speed.
 - **Decode (M=1 GEMV) stays on the CPU.** It is bound by DDR bandwidth, which the NPU shares
   with the CPU, so offloading it adds only dispatch overhead. A Whisper decoder step with every
-  matmul on the NPU runs 2.6-2.8x slower than whisper.cpp's 4-thread CPU step (RK3588, 600 MHz,
-  measured 2026-10-10).
+  matmul on the NPU runs 2.6-2.8x slower than whisper.cpp's 4-thread CPU step (RK3588 at
+  ~816 MHz, measured 2026-10-10).
 - **Weights are packed on the host.** No register converts a layout, because the datapath
   has no transpose or RUBIK engine. A matmul's activation and output need no packing. A
   stride-only register form reads A and writes C as plain rows, exact at fp16 and int8
   (`tests/rowmajor_matmul_probe`, `tests/rowmajor_tile_probe`). The flash attention hands its
   scores and probabilities between its two matmuls that way. The matmul entries pack A and
   de-tile C on the host.
-- **The clock boots throttled at 200 MHz.** 600 MHz needs the `patches/rocket` clock patch,
-  and 900 MHz is unstable here.
-- **bf16, int16 and tf32 are completeness rungs rather than speedups.** bf16 and int16 tie
-  the ~460 GOP/s floor and tf32 is half-rate. Only bf16 has an in-model use: fp32 range with
-  no activation scaling.
+- **The clock boots at 200 MHz.** A higher rate needs the `patches/rocket` clock patch. The
+  900 MHz request runs at 928 MHz and is the operating point. An `rmmod` with the cores pinned
+  on hard-locks the board at that request ([Clock](#clock)).
+- **bf16, int16 and tf32 add datatype coverage rather than speed.** bf16 and int16 tie the
+  whole-tile fp16 program at ~460 GOP/s and tf32 is half-rate. Only bf16 has an in-model use: fp32 range with no
+  activation scaling.
 
 ## Build and test
 
@@ -392,30 +419,32 @@ No ML dependencies: libdrm and pthreads only.
 cmake -S . -B build && cmake --build build -j        # -> build/librocketnpu.a
 cmake -S . -B build -DBUILD_SHARED_LIBS=ON           # also emit librocketnpu.so
 cmake --install build --prefix /usr/local            # export the rocketnpu::rocketnpu package
-ctest --test-dir build                               # correctness gates (skip off-device)
+ctest --test-dir build                               # correctness tests (skip off-device)
 ```
 
-The default is `-O2`. `-DROCKETNPU_OPT_FLAGS="-O3;-mcpu=native;-DNDEBUG"` overrides it,
-though on the matmul path, which is memory-bound and gather-bound, these are flat within
-±3%. Off-device the full build compiles on x86, with a portable `_Float16` and the NEON
-readback intrinsics `__aarch64__`-gated. The NEON microbenchmarks build only where the AArch64
-intrinsics compile. `ctest` is green there with the NPU gates skipped.
+The default is `-O2`. `-DROCKETNPU_OPT_FLAGS="-O3;-mcpu=native;-DNDEBUG"` overrides it. On
+the matmul path, which is memory-bound and gather-bound, those flags are flat within ±3%.
+
+Off-device the full build compiles on x86, with a portable `_Float16` and the NEON readback
+intrinsics behind `__aarch64__`. The NEON microbenchmarks build only where the AArch64
+intrinsics compile. `ctest` passes there, with the NPU tests skipped.
 `drm/rocket_accel.h` must be present, and CMake checks at configure time.
 
-Each file under `tests/` is a standalone executable that links the library and runs on the
-NPU, doubling as a CTest correctness gate. [API.md](API.md#tests) holds the full catalog.
+Each file under `tests/` is a standalone executable that links the library, and most run on
+the NPU. The correctness tests are registered with CTest, and the probes and benchmarks are
+built but not registered. [API.md](API.md#tests) holds the full catalog.
 
-### Key runtime knobs
+### Key environment variables
 
-`sudo` strips the env, so use `sudo -E`:
+`sudo` strips the environment, so use `sudo -E`:
 
-| Knob | Default | Effect |
+| Variable | Default | Effect |
 |---|---|---|
 | `ROCKET_KACC` | on | fp16 NPU K-accumulation (+19%), the operating mode |
 | `ROCKET_REUSE` | auto under KACC | CBUF operand reuse: 0 off, 1 weight, 2 data. Auto picks the longer reuse run per shape, data on a tie (+7%) |
 | `ROCKET_CPU_AFFINITY` | auto | Big-core set the pack and readback workers pin to |
 
-[API.md](API.md#runtime-knobs) holds the full `ROCKET_*` reference, covering
+[API.md](API.md#runtime-environment-variables) holds the full `ROCKET_*` reference, covering
 flash-attention chaining, tiling overrides and batched submit, and the diagnostic log
 channel.
 
@@ -423,8 +452,8 @@ channel.
 
 Every kernel interaction the library makes goes through one set of C symbols, the submit
 seam. It covers device lifetime, buffer management, cache maintenance, submission and the
-capability queries. The rest of the library targets the silicon, so it compiles unchanged whichever
-kernel is underneath.
+capability queries. The rest of the library targets the silicon, so it compiles unchanged
+whichever kernel driver it runs on.
 
 The seam has two implementations, selected at link time:
 
@@ -435,7 +464,7 @@ The seam has two implementations, selected at link time:
 
 `external` is how the library runs on a BSP kernel, where the NPU is an `rknpu` node rather
 than an `accel/rocket` one. It is also the only configuration that builds at all on such a
-board. The built-in provider needs a uAPI header the BSP kernel does not ship.
+board. The built-in provider needs a uAPI header the BSP kernel does not provide.
 
 ```sh
 cmake -S . -B build -DROCKETNPU_PROVIDER=external \
@@ -443,28 +472,28 @@ cmake -S . -B build -DROCKETNPU_PROVIDER=external \
 ```
 
 The seam is exactly the externally-visible `rocket_*` functions defined in
-`src/rocket_npu.c`, and **a provider must define all of them.** `tools/provider-seam.sh`
-prints that list, and checks a provider against it:
+`src/rocket_npu.c`, and a provider must define all of them. `tools/provider-seam.sh` prints
+that list, and checks a provider against it:
 
 ```sh
 tools/provider-seam.sh                          # the symbols a provider owes
 tools/provider-seam.sh path/to/provider.a       # or a .o, a .so, or the .c source
 ```
 
-Configure runs the same check whenever the provider is external and names a file, and stops
-with the missing symbols listed. The failure is otherwise late and misleading. A provider
+If the provider is external and names a file, configure runs the same check and stops with
+the missing symbols listed. The failure is otherwise late and misleading. A provider
 *defines* these symbols rather than calling them, so a seam that grows breaks nothing at the
-provider's own compile. `librocketnpu.a` is a static archive, and it links happily with the
-symbol unresolved. Without the check, the first sign is every executable in the tree failing
-at the end of the build.
+provider's own compile. `librocketnpu.a` is a static archive, and it links without error with
+the symbol unresolved. Without the check, the first sign is every executable in the tree
+failing at the end of the build.
 
 ## The rocket NPU stack
 
-This is the foundation of an open source stack for Rockchip NPUs. The stack is a driver
-library, three frontends, a submit provider for the vendor kernel, and a set of optional
-kernel patches:
+`librocketnpu` is the foundation of an open source stack for Rockchip NPUs. The stack is a
+driver library, three frontends, a submit provider for the vendor kernel, and a set of
+optional kernel patches:
 
-- **`rocket-userspace`** (this project): the userspace driver, matmul and on-NPU op library.
+- **`rocket-userspace`** (this repository): the userspace driver, matmul and on-NPU op library.
   It is self-contained, and the three frontends below link it.
 - **[`ggml-rocket`](https://github.com/gregordinary/ggml-rocket)**: a ggml backend `.so`, a
   drop-in NPU device for stock `llama.cpp` and `whisper.cpp`. Links `librocketnpu`.
@@ -476,8 +505,8 @@ kernel patches:
   runs `librocketnpu` on the vendor `rknpu` BSP kernel driver instead of mainline `rocket`.
 - **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional
   out-of-tree kernel-module patches for clock, voltage and IOMMU. They raise the NPU clock
-  from its 200 MHz boot default to 600 MHz and trim dispatch latency, and the performance
-  figures above assume them.
+  from its 200 MHz boot default and trim dispatch latency. The RK3588 performance figures above
+  were measured with them at the 600 MHz request (~816 MHz).
 
 ## License and credits
 
@@ -494,7 +523,7 @@ It builds on prior work:
 - johanvdb/librocket, a FOSS userspace fp16 matmul on mainline `rocket` that combined the
   two above, which served as the starting point for the kernel-access layer.
 
-This project uses that prior work as a starting point. It adopts the RK3588 register headers
-and rewrites the kernel-access layer for the mainline `rocket` DRM-accel driver. It then adds
+`librocketnpu` starts from that prior work. It adopts the RK3588 register headers and
+rewrites the kernel-access layer for the mainline `rocket` DRM-accel driver. It then adds
 the tiled/multicore/resident/multi-dtype matmul and the on-NPU op library. Those additions
 are validated bit-exact on real RK3588 hardware.

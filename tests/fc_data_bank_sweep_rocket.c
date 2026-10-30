@@ -77,6 +77,9 @@ static long check_ref(const _Float16 *C, const float *R, int M, int N,
 int main(void)
 {
     int fail = 0;
+    /* The sweep characterizes FC_DATA_BANK on whole-tile tasks. On a streamed weight cube
+     * (ROCKET_MM_STREAM) values 2-5 hang the task until the watchdog, so pin the planner. */
+    setenv("ROCKET_MM_STREAM", "0", 1);
     int fd = rocket_open();
     if (fd < 0) { printf("no NPU (%d) -> SKIP\n", fd); return 2; }
 

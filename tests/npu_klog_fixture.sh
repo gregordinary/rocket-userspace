@@ -11,9 +11,10 @@
 # The `rocket` driver retires a job that runs 500 ms, resets the core and signals the
 # job's fence, and PREP_BO then returns 0 as it does for a job that completed. So a hung
 # job fails no syscall, and a gate comparing the untouched output BO can pass on it. The
-# kernel log is where it shows, as "NPU job timed out". `check` fails the run on any such
-# line, on any rk_iommu line, and on any WARNING from the NPU's drivers, and prints the
-# first few.
+# kernel log is where it shows, as "NPU job timed out". The vendor `rknpu` driver, under
+# the rknpu-submit provider, logs "RKNPU: job timeout", "RKNPU: job abort" or "RKNPU:
+# failed to wait job" instead. `check` fails the run on any such line, on any rk_iommu
+# line, and on any WARNING from the NPU's drivers, and prints the first few.
 #
 # The mark is a journal cursor, not a dmesg line count: dmesg reads empty under
 # dmesg_restrict and stops moving once its ring buffer rolls. The journal is read as the
@@ -72,8 +73,9 @@ check)
         echo "SKIP: the kernel journal could not be read back after the mark"
         exit 2
     fi
-    npu_warn='WARNING: .*(rocket|drivers/accel|drivers/gpu/drm|drivers/iommu)'
-    n_to=$(grep -c 'NPU job timed out' <<<"$log" || true)
+    npu_warn='WARNING: .*(rocket|drivers/accel|drivers/gpu/drm|drivers/iommu|rknpu)'
+    npu_to='NPU job timed out|RKNPU: (job timeout|job abort|failed to wait job)'
+    n_to=$(grep -cE "$npu_to" <<<"$log" || true)
     n_iommu=$(grep -c 'rk_iommu' <<<"$log" || true)
     n_warn=$(grep -cE "$npu_warn" <<<"$log" || true)
     n_lines=$(grep -c . <<<"$log" || true)
@@ -81,7 +83,7 @@ check)
          "rk_iommu lines $n_iommu, NPU-side WARNINGs $n_warn"
     if [ "$n_to" -gt 0 ] || [ "$n_iommu" -gt 0 ] || [ "$n_warn" -gt 0 ]; then
         echo "FAIL: the first offending lines:"
-        grep -E "NPU job timed out|rk_iommu|$npu_warn" <<<"$log" | head -n 12
+        grep -E "$npu_to|rk_iommu|$npu_warn" <<<"$log" | head -n 12
         echo "A timed-out job's fence signals like a completed one, so any test above that"
         echo "read its output may have scored the BO's previous contents."
         exit 1

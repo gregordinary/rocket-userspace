@@ -43,8 +43,10 @@
 
 #define CBUF_BANK 32768
 
-/* int8 DW channel group: Mesa's value is 64; ROCKET_CONV_DW_GROUP sweeps it on HW
- * (the int8 DW geometry is unconfirmed, like the fp16 G=32 crack was). */
+/* int8 DW channel group: 64, Mesa's value. The int8-out depthwise program runs at 64 and
+ * is bit-exact on HW (replay_dw_mesa against Teflon's captured output, conv_dw_int8_runtime
+ * against a host model). This test's DW shapes model the int32-raw output instead, whose geometry
+ * is still unproven, and ROCKET_CONV_DW_GROUP overrides the group for a sweep of it. */
 static int dwg(void) { const char *e = getenv("ROCKET_CONV_DW_GROUP"); int g = e?atoi(e):64; return g>0?g:64; }
 
 static int rup(int x, int a) { return ((x + a - 1) / a) * a; }
@@ -393,14 +395,20 @@ static int run_shape(int fd, const rocket_conv2d_desc *d)
      * DIAGNOSTIC, NOT a gate failure: the gate's verdict tracks the validated DIRECT
      * scope. The DW cube-self-check above DOES gate (pure layout math). */
     if (fd >= 0 && d->depthwise) {
-        /* Depthwise int8 = the int8-OUT on-chip-requant path, CRACKED + HW-validated
-         * bit-exact against Mesa/Teflon ground truth by the `replay_dw_mesa` test
-         * (regcmd EMITs also match the Teflon capture). The correct oracle for this
-         * op is Teflon itself (its NPU int8 DW diverges from CPU TFLite by up to ~143
-         * on full-range random int8), so the bit-exact gate is capture-replay, not a
-         * from-scratch software reference. Here the gate covers the cube-layout
-         * self-check (above) + regcmd smoke (below). */
-        printf("  HW: DW int8-out on-chip-requant — correctness gated by replay_dw_mesa (bit-exact vs Teflon)\n");
+        /* Depthwise int8 on hardware is the int8-OUT on-chip-requant path, and two other
+         * tests validate it. `replay_dw_mesa` checks the register program: run over
+         * Teflon's captured BOs, it matches Mesa's captured output byte for byte, pad word
+         * aside (regcmd EMITs also match the Teflon capture).
+         *
+         * Teflon's output is an oracle for that program, not for the model's function.
+         * Mesa's driver applies its uint8 formulas to int8 bytes. Its NPU int8 DW diverges
+         * from CPU TFLite by up to ~143 on full-range random int8. `conv_dw_int8_runtime`
+         * gates the function of rocket_conv2d_dw_int8. It is bit-exact against a host
+         * model of the arithmetic, and within one of TFLite's reference kernels on at most
+         * 2% of the elements. Here the gate covers the cube-layout self-check (above) +
+         * regcmd smoke (below). */
+        printf("  HW: DW int8-out on-chip-requant — register program gated by replay_dw_mesa "
+               "(bit-exact vs Teflon), function by conv_dw_int8_runtime (bit-exact vs a host model)\n");
     } else if (fd >= 0) {
         memset(got, 0, out_n * sizeof(int32_t));
         int r = run_hw_single_job(fd, d, in, W, got);
@@ -439,6 +447,8 @@ int main(int argc, char **argv)
             .dil_y=atoi(argv[11]),.dil_x=atoi(argv[12]),
             .depthwise=(argc==14 ? atoi(argv[13]) : 0) };
         fail = run_shape(fd, &d);
+        /* and through the library entry, which pads IC and OC and tiles */
+        if (!d.depthwise) fail |= run_tiled_runtime(fd, &d);
     } else {
         rocket_conv2d_desc shapes[] = {
             /* DIRECT — int8 N-group(oc) is 32, so use OC%32==0 for clean single-job HW */

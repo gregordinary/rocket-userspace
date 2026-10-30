@@ -377,7 +377,7 @@ static void *rkw_thread_planes(rkw_arg *t)
     _Float16 *Ct = pp->Ct + (size_t)ww->n0 * pp->ldc + ww->m0;
     if (t->kacc) {
         t->ret = mm_compute_kacc_planes(t->fd, &ww->pl, &ww->bos, Ct, pp->ldc, t_pack);
-        if (t->ret == ROCKET_E_TILING)   /* tiny-M tile: the CPU-accum oracle */
+        if (t->ret == ROCKET_E_TILING)   /* routing sentinel: host-summed partials */
             t->ret = mm_compute_planes(t->fd, &ww->pl, &ww->bos, Ct, pp->ldc, t_pack);
     } else {
         /* The pipelined compute has no planes form; its result is mm_compute's. */
@@ -432,7 +432,7 @@ static void *rkw_thread(void *a)
     }
     if (t->kacc) {
         t->ret = mm_compute_kacc(t->fd, &ww->pl, &ww->bos, Csub, t_pack);
-        if (t->ret == -2)   /* tiny-M tile: fall back to the CPU-accum oracle */
+        if (t->ret == -2)   /* routing sentinel: host-summed partials */
             t->ret = mm_compute(t->fd, &ww->pl, &ww->bos, Csub, t_pack);
     } else if (t->pipe) {
         t->ret = mm_compute_pipe(t->fd, &ww->pl, &ww->bos, Csub, t_pack);

@@ -701,9 +701,10 @@ int rocket_pool_int8_cube_in_rk3576(rocket_pool_int8_rk3576_handle *h,
      * the windows consume (`0x600C`), honoured at a pitch above the extent and at a base
      * part way into a row [HW sweep, 16 + 12 cells, tests/rk3576_row_pitch.c]. So a slice's
      * window of a producer's surface is the ordinary pitched cube every other consumer
-     * takes, and the split costs the input side nothing. The OUTPUT stays refused: the
-     * destination surface stride is derived from the plane and no register moves it, so
-     * the slices cannot write one plane between them. */
+     * takes, and the split costs the input side nothing. The OUTPUT stays refused. The
+     * destination has a channel-group stride (`0x607C`) but no line stride, so each
+     * slice's rows sit its own output width apart. The slices therefore cannot write one
+     * plane between them (see rocket_pool_int8_cube_out_at_rk3576). */
     if (h->nslice) {
         unsigned s;
         int rc;
@@ -898,9 +899,9 @@ int rocket_pool_int8_cube_out_at_rk3576(rocket_pool_int8_rk3576_handle *h,
                     entry, dst->w, dst->h, h->ow, h->oh);
         return ROCKET_E_SHAPE;
     }
-    /* A WRITER IGNORES A PITCH IT WAS NEVER TOLD. Both destination strides here are
-     * derived from the output plane, so a slice whose rows sit further apart than its width
-     * — or whose plane starts part way into a row — would be written contiguously and read
+    /* A WRITER IGNORES A PITCH IT WAS NEVER TOLD. The destination has no line-stride
+     * register, so its row pitch is the output width, and a slice whose rows sit further
+     * apart than its width — or whose plane starts part way into a row — would be written contiguously and read
      * back skewed. Nothing this library allocates carries either (`rocket_rk3576_cube_alloc()`
      * zeroes them and a slice inherits), so this is a refusal rather than a case. */
     if ((dst->pitch_w && dst->pitch_w != dst->w) || dst->col_off) {

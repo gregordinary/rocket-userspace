@@ -5,10 +5,13 @@
  * the genuinely-new primitive of the Whisper-encoder softmax.
  *
  * EXP uses the SHIFTED single-table mode (like sqrt/rsqrt/reciprocal): the whole domain maps
- * onto the positive LUT index half, so x never crosses 0 in the INDEX domain — no LE/LO
- * sign-mux glitch, so it works on the STANDALONE flying path (unlike build_lut_affine GELU,
- * which is cos~0.05 standalone). The default domain [-16,0] is the softmax case: after the
- * row-max subtraction EXP's input is (-∞,0], output (0,1].
+ * onto the positive LUT index half. The LE/LO mux selects on sign(x), not on the index, so
+ * that mapping is not what avoids the x~0 glitch. EXP decodes an unsigned output (out_lo=0),
+ * and the glitch appears only with a signed decode in the kinds measured. It therefore works
+ * on the STANDALONE flying path (unlike build_lut_affine GELU, which is cos~0.05
+ * standalone). The default domain [-16,0] is the softmax case: after the row-max
+ * subtraction EXP's input is (-∞,0], output (0,1]. The sweeps below include x=0, the row
+ * maximum.
  *
  * The grid is UNIFORM, so the honest metrics are: (a) max ABSOLUTE error over the full domain
  * — this is what governs softmax-sum accuracy (the tail terms are tiny in abs, so quantizing

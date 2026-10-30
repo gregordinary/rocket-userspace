@@ -82,6 +82,9 @@ int main(int argc, char **argv)
 {
     int trials = argc > 1 ? atoi(argv[1]) : 20;
     if (trials < 1) trials = 1;
+    /* The reuse bits follow a run of whole tiles; a streamed plan (ROCKET_MM_STREAM) holds
+     * N whole and leaves no run to follow, so this gate pins the whole-tile planner. */
+    setenv("ROCKET_MM_STREAM", "0", 1);
 
     int fd = rocket_open();
     if (fd < 0) {

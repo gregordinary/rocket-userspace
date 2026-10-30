@@ -28,6 +28,9 @@ compile_commands.json
 # Tool dump output (dump_dw_regcmd et al. write into the cwd)
 *-regcmd.bin
 
+# Tools built in place from tools/*.c
+tools/npu_clock
+
 # The rk3576-net model blob and its inputs: rebuilt by tests/data/rk3576-net/fetch.sh
 # + mknet.py, ~9 MB, not worth carrying in the history.
 tests/data/rk3576-net/*.rnet

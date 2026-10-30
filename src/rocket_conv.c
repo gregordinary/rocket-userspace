@@ -14,9 +14,13 @@
  * the output spatial dims (OH/OW), and pads IC<32 first layers, so a feature map + OC
  * kernel set larger than one CBUF pass IS handled by host-side tiling. Each tile still
  * reduces its full KH*KW*IC contraction in one native pass (no host K-accumulation).
- * Depthwise has CHANNEL tiling but NOT spatial tiling: a DW layer whose single
- * channel's feature map exceeds the CBUF budget still falls back to the caller's CPU
- * path. A native int8/uint8 conv path also exists (gen_conv2d_*int8); see rocket_conv.h.
+ *
+ * Depthwise tiles over channels. It also tiles over output rows and columns (dw_spatial)
+ * when one G-channel chunk overflows the feature budget or its pad exceeds the CNA's pad
+ * fields. On size, plan() refuses a DW layer in two cases only. One is a G-channel weight
+ * cube past a bank. The other is a one-output tile past the CNA's fields or the feature
+ * budget. A native int8/uint8 conv path also exists (gen_conv2d_*int8); see
+ * rocket_conv.h.
  */
 
 #include <stdint.h>
@@ -221,12 +225,24 @@ static size_t dw_feat_budget(void)
     return (size_t)banks * CBUF_BANK;
 }
 
-/* The CNA feature DMA is height-blocked in 4-row blocks (surf_stride = IW*(IH-4)/4);
- * a sub-input with fewer than 4 rows (datain_height < 4) produces WRONG hardware
- * output regardless of surf_stride — HW-confirmed at every IC (IH=2,3 fail; IH>=4
- * pass; tests/conv_bisect.c). datain_height is the materialized sub-input height
- * (rh-1)*sy + (KH-1)*dy + 1, so this is the hard floor on each row band's OUTPUT rows. */
+/* The one-job paths pad a sub-input shorter than this with zero rows. It is a library rule,
+ * not the hardware's: the CNA reads a cube in 4-row lines, and with the generators' signed
+ * surface stride IW*(IH-4) a one-job fp16, fp16 depthwise or int8 conv is bit-exact at
+ * IH 1-3 unpadded (ROCKET_CONV_NOPAD=1); the stride clamped at 0 was what failed there, on
+ * every shape with more than one channel group [HW sweep 2026-10-22, conv2d_fp16_rocket and
+ * conv2d_int8_rocket argv shapes]. The int8 depthwise path is not measured unpadded.
+ * datain_height is the materialized sub-input height (rh-1)*sy + (KH-1)*dy + 1. */
 #define CONV_MIN_DATAIN_H 4
+/* DEBUG (RE): ROCKET_CONV_NOPAD=1 gives a one-job fp16, int8 or int8 depthwise conv its real
+ * input height below CONV_MIN_DATAIN_H instead of padding it with zero rows, so the
+ * generators' signed feature surface stride can be gated there. Read once. */
+static int conv_job_ih(int IH)
+{
+    static _Atomic int nopad = -1;
+    if (nopad < 0) { const char *e = getenv("ROCKET_CONV_NOPAD"); nopad = e && atoi(e) > 0; }
+    return IH < CONV_MIN_DATAIN_H && !nopad ? CONV_MIN_DATAIN_H : IH;
+}
+
 static inline long datain_h(int out_rows, int sy, int KH, int dy)
 {
     return (long)(out_rows - 1) * sy + (long)(KH - 1) * dy + 1;
@@ -334,6 +350,8 @@ static rocket_bo *conv_bo(rocket_conv_ctx *ctx, rocket_bo *cls, rocket_bo *local
     return &cls[k];
 }
 
+/* Reuse is bit-identical to a fresh allocation because every job memsets and refills its
+ * BOs. The resident matmul path caches its BOs the same way. */
 rocket_conv_ctx *rocket_conv_ctx_create(int fd)
 {
     rocket_conv_ctx *c = calloc(1, sizeof(*c));
@@ -484,8 +502,8 @@ void rocket_conv2d_ref_int8(const rocket_conv2d_desc *d,
 }
 
 /* Validate a descriptor against the supported set. Returns 0 or <0. */
-/* The conv tilers' smallest validated sub-input height: a tile below it computes wrong
- * (see conv2d_fp16_tiled), and ROCKET_CONV_MIN_IH moves it for a sweep. */
+/* The conv tilers' smallest sub-input height, a tiling rule (no hardware floor applies;
+ * see CONV_MIN_DATAIN_H). ROCKET_CONV_MIN_IH moves it for a sweep. */
 static int conv_min_ihs(void)
 {
     int min_ihs = 6;
@@ -607,11 +625,11 @@ static int conv2d_one_job(int fd, rocket_conv_ctx *ctx,
         return 0;
     }
 
-    /* Pad the job's input height up to the 4-row CNA DMA floor with zero rows below the
-     * real data (see the int8 sibling): the cube gets IHj rows, datain_height is IHj, but
+    /* Pad the job's input height up to CONV_MIN_DATAIN_H (a library rule) with zero rows
+     * below the real data (see the int8 sibling): the cube gets IHj rows, datain_height is IHj, but
      * OH stays the real output count, so the padded rows never enter a computed output's
      * receptive field — bit-exact, and a short band / small-spatial conv just works. */
-    const int IHj = IH < CONV_MIN_DATAIN_H ? CONV_MIN_DATAIN_H : IH;
+    const int IHj = conv_job_ih(IH);
     size_t in_elems  = (size_t)IC * IHj * IW;
     size_t wt_elems  = DW ? (size_t)Cpad * KH * KW : (size_t)OC * IC * KH * KW;
     size_t out_elems = (size_t)OC * OH * OW;
@@ -868,7 +886,7 @@ static int dw_spatial(int fd, rocket_conv_ctx *ctx, int Cn, int IH, int IW, int 
     #define DW_FEAT(rh, cw) ((size_t)Cn * (size_t)job_rows(datain_h(rh, sy, KH, dy)) * \
         (size_t)datain_w(cw, sx, KW, dx) * sizeof(_Float16))
 
-    const int min_ihs = conv_min_ihs();   /* never below the HW row floor */
+    const int min_ihs = conv_min_ihs();   /* the tilers' row floor */
     int rht_lo = 1;
     while (rht_lo < OH && datain_h(rht_lo, sy, KH, dy) < min_ihs) rht_lo++;
     int rht = OH, cwt = OW;
@@ -943,24 +961,30 @@ static int dw_spatial(int fd, rocket_conv_ctx *ctx, int Cn, int IH, int IW, int 
     return ret;
 }
 
-/* Run the conv on the NPU, tiling over output channels (OC) and output rows (OH)
- * when the whole problem won't fit one CBUF pass. Each tile is an independent
- * single-job direct conv (the HW-validated path); OH-band tiles MATERIALIZE their
- * top/bottom edge padding into the sub-input (the CNA only has symmetric pad_top,
- * so a per-band pad_top would also pad the band's interior bottom — instead we feed
- * real halo rows + explicit zero rows and run the sub-conv with pad_top=0). Width
- * (OW) is not tiled; pad_left is applied by the HW as usual. in / W / out are
- * row-major fp16. Returns 0 / <0.
+/* Run the conv on the NPU, tiling over output channels (OC) and output rows (OH). It
+ * also tiles over output columns (OW) when a full-width band still overflows the feature
+ * budget or the CNA's width field. A problem with no IC pad that fits one CBUF pass and
+ * the CNA's fields runs as one job with the HW applying both pads.
+ *
+ * Otherwise each tile is an independent single-job direct conv (the HW-validated path)
+ * that MATERIALIZES its edge padding into the sub-input. The CNA only has symmetric
+ * pad_top, so a per-band pad_top would also pad the band's interior bottom. Instead each
+ * tile gets real halo rows and columns plus explicit zeros, and runs with
+ * pad_top=pad_left=0. in / W / out are row-major fp16. Returns 0 / <0.
  *
  * Native depthwise (DW_EN) is HW-VALIDATED (2026-06-20, bit-exact on every DW test
  * shape) with group G=32 and the size_e=3 / surf_add*2 / feature_grains=52 /
  * bs_ow_op=128 register fixes. It tiles over CHANNELS — each channel is independent,
  * so a wide DW layer is split into chunks of Cc channels (multiple of G) that each fit
  * one CBUF pass and run as an independent single DW job (bit-exact; concatenating the
- * chunks == the whole). A single channel whose own feature is too large for one pass
- * would need SPATIAL tiling (not yet implemented) — plan() rejects that case. The
- * whole-fits case is one chunk == the original single job. ROCKET_CONV_DW_NATIVE is
- * accepted as a diagnostic no-op; ROCKET_CONV_DW_GROUP overrides G for sweeps.
+ * chunks == the whole). The whole-fits case is one chunk == the original single job.
+ * ROCKET_CONV_DW_NATIVE is accepted as a diagnostic no-op; ROCKET_CONV_DW_GROUP
+ * overrides G for sweeps.
+ *
+ * The function dw_spatial bands a chunk over output rows and columns in two cases. One
+ * is a chunk that still overflows the feature budget at G channels. The other is a pad
+ * past the CNA's pad fields. On size, plan() rejects only a layer whose minimal tile (G
+ * channels, one output position) does not fit.
  *
  * ctx (optional, may be NULL): a resident-BO pool threaded down to conv2d_one_job so
  * repeat calls / tiles reuse BOs instead of alloc/freeing them per job. NULL keeps the
@@ -1073,14 +1097,11 @@ static int conv2d_run(int fd, rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
      * the materialized feature within budget — shrink rows first (full width),
      * then columns if a full-width band still overflows.
      *
-     * The per-tile NPU job is HW-validated only for "tall enough" tiles: the
-     * smallest validated single job is datain_height 6 / 3 output rows, and a
-     * 1-output-row tile (sub-input 3 rows) produces WRONG hardware output even
-     * with surf_stride clamped to 0 (the CNA's height-blocked feature DMA is not
-     * correct below ~4 input rows). So never shrink rows past the point where the
-     * materialized sub-input drops below MIN_IHs rows — narrow the COLUMNS to fit
-     * budget instead (ROCKET_CONV_MIN_IH overrides the floor for HW sweeps). */
-    const int min_ihs = conv_min_ihs();   /* never below the HW row floor */
+     * Rows never shrink past the point where the materialized sub-input drops below
+     * MIN_IHs rows; the COLUMNS narrow to fit the budget instead (ROCKET_CONV_MIN_IH
+     * moves the floor for a sweep). It is a tiling rule, not a hardware floor
+     * (CONV_MIN_DATAIN_H). */
+    const int min_ihs = conv_min_ihs();
 
     /* OC tile (mult-16) and the feature budget JOINTLY share the 12 CBUF banks (the gen
      * gives weight 12 - data_bank banks). Shrink OCt toward the 16 oc-group to keep
@@ -1435,14 +1456,13 @@ static int conv2d_int8_one_job(int fd, rocket_conv_ctx *ctx,
         return 0;
     }
 
-    /* CNA feature DMA is height-blocked in 4-row blocks; datain_height < 4 reads the cube
-     * wrong (HW-confirmed, any IC). Pad the job's input height up to the floor with zero
-     * rows below the real data: the cube gets IHj rows (extra rows zeroed by the memset),
+    /* Pad the job's input height up to CONV_MIN_DATAIN_H (a library rule; see there) with
+     * zero rows below the real data: the cube gets IHj rows (extra rows zeroed by the memset),
      * the regcmd's datain_height is IHj, but OH stays the real output count, so the padded
      * rows lie beyond every computed output row's receptive field — bit-exact. This makes
      * a small-spatial conv (a 3x3/2x2/1x1 SSD head) or any short row-band correct without
      * a separate code path. */
-    const int IHj = IH < CONV_MIN_DATAIN_H ? CONV_MIN_DATAIN_H : IH;
+    const int IHj = conv_job_ih(IH);
     size_t in_elems  = (size_t)IC * IHj * IW;
     size_t wt_elems  = (size_t)OC * IC * KH * KW;
     size_t out_elems = (size_t)OC * OH * OW;
@@ -1985,7 +2005,7 @@ static int conv2d_int8_plan(const rocket_conv2d_desc *d, i8plan *pl)
     #define CONV_FEAT_I8(rh, cw) ((size_t)IC * (size_t)job_rows(datain_h(rh, sy, KH, dy)) * \
         (size_t)datain_w(cw, sx, KW, dx) * sizeof(int8_t))
 
-    const int min_ihs = conv_min_ihs();   /* never below the HW row floor */
+    const int min_ihs = conv_min_ihs();   /* the tilers' row floor */
 
     /* OC tile (mult-32) and the feature budget JOINTLY share the 12 CBUF banks: the gen
      * gives weight (12 - data_bank) banks, so a tile is valid only when its weight cube
@@ -2466,10 +2486,10 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
         return 0;
     }
 
-    /* Pad input height to the 4-row CNA DMA floor (see conv2d_int8_one_job): padded rows
+    /* Pad input height to CONV_MIN_DATAIN_H (see conv2d_int8_one_job): padded rows
      * sit below the real data, beyond every computed output's receptive field, so a
      * small-spatial DW (a deep EfficientDet block) is correct. IHj==IH when IH>=4. */
-    const int IHj = IH < CONV_MIN_DATAIN_H ? CONV_MIN_DATAIN_H : IH;
+    const int IHj = conv_job_ih(IH);
     size_t in_elems   = (size_t)Cj * IHj * IW;
     size_t wt_elems   = (size_t)Cj * KH * KW;
     size_t out_elems  = (size_t)Cj * OH * OW;

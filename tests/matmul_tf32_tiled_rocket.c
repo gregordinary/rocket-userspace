@@ -10,8 +10,8 @@
  * tf32 is the FIRST 4-byte-INPUT tiled path and the LAST datatype rung. It is the
  * float sibling of the bf16 tiled path, differing only in 4-byte geometry (feature
  * cube C2=4, weight (N/16,K/16,16,16)) and that the scatter feeds RAW fp32 (no
- * truncation) — the HW MAC rounds the mantissa to 10 bits and accumulates in fp32.
- * The reference rounds each input to tf32 (zero the low 13 mantissa bits) so the
+ * truncation) — the HW MAC truncates the mantissa to 10 bits and accumulates in fp32.
+ * The reference truncates each input to tf32 (zero the low 13 mantissa bits) so the
  * only HW-vs-ref difference is summation order.
  *
  * VERIFICATION is SAMPLE-BASED (like the bf16 tiled test): for huge K a full

@@ -5,11 +5,14 @@
  *   ELU(x)  = x>=0 ? x : alpha*(e^x-1)          (parametric, rocket_elu_fp16)
  *   SELU(x) = lambda*(x>=0 ? x : alpha*(e^x-1)) (fixed self-normalizing constants)
  *
- * Both ride the SYMMETRIC shifted single-table mode (the Abs trick): the x=0 kink lands on
- * the middle table sample and the whole domain maps onto the positive LUT index half, so
- * there is NO LE/LO sign-mux glitch (no host repair, unlike LeakyReLU). The negative branch
- * is curved (uniform-grid interpolation), so we gate with tolerances: max abs error over the
- * domain + max rel error where |f| is non-tiny. A large-n sweep crosses the DPU_LUT_MAXN tile.
+ * Both run on the SYMMETRIC shifted single-table mode (the Abs trick). The x=0 kink falls on
+ * the middle table sample, and the whole domain maps onto the positive LUT index half. The
+ * output decode is signed (out_lo<0), so the x~0 band still meets the LE/LO sign-mux
+ * glitch. The runtime repairs that band on the host, as for LeakyReLU, and
+ * ROCKET_ELU_NOREPAIR disables the repair (tests/x0_glitch_probe.c shows the raw spike).
+ * The negative branch is curved (uniform-grid interpolation), so we gate with tolerances:
+ * max abs error over the domain + max rel error where |f| is non-tiny. A large-n sweep
+ * crosses the DPU_LUT_MAXN tile.
  *
  * Off-device: SKIP (exit 2). Usage: elu_rocket
  */

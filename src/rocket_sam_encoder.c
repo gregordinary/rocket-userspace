@@ -3,7 +3,8 @@
 /*
  * rocket_sam_encoder.c — the SAM ViT-Det image encoder (facebook/sam-vit-base) end to end
  * on the NPU, glue over the validated primitives. See rocket_sam.h for the graph, the blob
- * format, and the decomposed rel-pos math.
+ * format, and the decomposed rel-pos math. It is a separate module so that the bit-exact
+ * rocket_siglip path is unchanged by it.
  *
  * This file holds the model blob load/free, the one-shot per-call encode (rocket_sam_encode:
  * the correctness reference; fd<0 is a pure-host datapath), and the resident multicore ctx

@@ -322,7 +322,7 @@ int main(int argc, char **argv)
             const _Float16 *a0[1] = { NULL };   /* refused before an operand is read */
             rocket_bo big = {0};
             int rr = rocket_bo_alloc32(fd, (size_t)512 * 256 * 2, &big) ? -1
-                   : rocket_mm_batch_run_rows(br, 512, 1024, 256, 1, a0, NULL, a0, NULL, &big, 0);
+                   : rocket_mm_batch_run_rows(br, 512, 16384, 256, 1, a0, NULL, a0, NULL, &big, 0);
             rocket_bo_free(fd, &big);
             printf("  rows C at nKt>1 -> %d (want %d) %s\n", rr, ROCKET_E_SHAPE,
                    rr == ROCKET_E_SHAPE ? "PASS" : "FAIL");

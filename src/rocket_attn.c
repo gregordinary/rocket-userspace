@@ -35,6 +35,15 @@
  * off, so attention stays fully on the NPU; a fully on-NPU RESIDENT softmax (scores kept in a BO,
  * on-NPU row-max) would remove the transfers without the CPU cost. */
 static _Atomic int g_attn_host_sm = -1;
+
+/* ROCKET_ATTN_HOST_SOFTMAX reads the same on every attention path: a nonzero value runs the
+ * softmax on the host and 0 runs it on the NPU. Unset, each path takes its own default: the
+ * encoder MHA path the NPU, flash attention the host. */
+static int attn_host_softmax_env(int dflt)
+{
+    const char *e = getenv("ROCKET_ATTN_HOST_SOFTMAX");
+    return e ? (atoi(e) != 0) : dflt;
+}
 static void host_softmax_rows(int M, int N, const _Float16 *in, _Float16 *out){
     for (int m = 0; m < M; m++) {
         const _Float16 *xp = in + (size_t)m*N; _Float16 *op = out + (size_t)m*N;
@@ -233,7 +242,7 @@ int rocket_mha_self_fp16(int fd, int T, int d, int n_head, const _Float16 *x,
      *    The key count T is padded to Tn (matmul N/K alignment); the pad key columns get a
      *    score of 0 from the zero keys, which we MASK to a large negative before softmax so
      *    they contribute ~0 (exp underflow) — and the zero pad v rows add nothing to ctx. */
-    if (g_attn_host_sm < 0) g_attn_host_sm = getenv("ROCKET_ATTN_HOST_SOFTMAX") ? 1 : 0;
+    if (g_attn_host_sm < 0) g_attn_host_sm = attn_host_softmax_env(0);
     for (int h = 0; h < n_head; h++) {
         int off = h*dh;
         for (int t = 0; t < Tp; t++) memcpy(qh+(size_t)t*dh, q+(size_t)t*d+off, dh*sizeof(_Float16));
@@ -332,7 +341,7 @@ void rocket_flash_attn_ref_fp16(int n_tokens, int n_kv, int head_dim, int dv,
 static int fa_host_softmax(void)
 {
     static _Atomic int v = -1;
-    if (v < 0) { const char *e = getenv("ROCKET_ATTN_HOST_SOFTMAX"); v = e ? atoi(e) : 1; }
+    if (v < 0) v = attn_host_softmax_env(1);
     return v;
 }
 

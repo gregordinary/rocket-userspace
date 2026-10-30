@@ -5,6 +5,8 @@
 /*
  * Copyright (C) 2024  Jasbir Matharu, <jasjnuk@gmail.com>
  *
+ * prose-lint: off
+ *
  * This file is part of rocket-userspace.
  *
  * rocket-userspace is free software: you can redistribute it and/or modify
@@ -20,28 +22,32 @@
  * You should have received a copy of the GNU General Public License
  * along with rocket-userspace.  If not, see <https://www.gnu.org/licenses/>.
  *
+ * prose-lint: on
  */
 
-// RK3588 NPU register offsets and field descriptions (some cryptic or missing).
+// Declares the RK3588 NPU's register offsets and field descriptions. Some descriptions are
+// cryptic or missing.
 //
-// These offsets are the RK3588's and are IP-REVISION-specific, not shared across every
-// Rockchip NPU. The block BASES (PC 0x0xxx, CNA 0x1xxx, CORE 0x3xxx, DPU 0x4xxx) and the
-// datapath SEMANTICS (precision fields, BS/BN/EW/LUT meanings, the CNA->CORE->DPU
-// sequence) are IP-inherent, but the CNA/CORE/DPU GEOMETRY-register encoding is not: the
-// RK3576 re-packs the CNA block at the same block base -- registers move, the bit-packing
-// differs at shared offsets, and it writes offsets that are gaps here (0x1018/0x101c/
-// 0x103c/0x1090-0x1098/0x118c). Barely any CNA geometry reg coincides: 0x1014 (stride)
-// and 0x1110 (weight addr) do; the FEATURE address does NOT -- the RK3576 carries it at
-// 0x1088 on BOTH its datapaths, and leaves 0x1070 (this chip's slot) at zero. Several
-// registers that look RK3576-only are these same ones moved: its 0x1048 is CNA_CVT_CON0
-// with identical packing, and its 0x108c is CNA_DMA_CON0 (the burst-length word).
-// A second-chip port therefore needs a per-chip regcmd ENCODER for the geometry
-// registers, not just an offset table -- npu_regcmd_rk3576.c is that encoder for the
-// RK3576 int8 conv path. See rocket_hw_profile.h and
-// rockchip-npu-notes/chips/rk3576-regcmd.md.
+// The offsets are the RK3588's and are specific to the IP revision. The block bases (PC
+// 0x0xxx, CNA 0x1xxx, CORE 0x3xxx, DPU 0x4xxx) are common to every RKNPU. The datapath
+// semantics are common too: the precision fields, the BS, BN, EW and LUT meanings, and the
+// CNA->CORE->DPU sequence. The CNA, CORE and DPU geometry-register encoding differs. The
+// RK3576 re-packs the CNA block at the same block base. Registers move, the bit-packing
+// differs at shared offsets, and it writes offsets that are gaps here
+// (0x1018/0x101c/0x103c/0x1090-0x1098/0x118c).
+//
+// Few CNA geometry registers coincide: 0x1014 (stride) and 0x1110 (weight address) do.
+// The feature address does not. The RK3576 places it at 0x1088 on both its datapaths, and
+// leaves 0x1070, the RK3588's slot, at zero. Several registers that look RK3576-only are
+// these same ones moved: its 0x1048 is CNA_CVT_CON0 with identical packing, and its 0x108c
+// is CNA_DMA_CON0 (the burst-length word).
+//
+// A second-chip port therefore needs a per-chip regcmd encoder for the geometry
+// registers, not only an offset table. `npu_regcmd_rk3576.c` is that encoder for the
+// RK3576. See `rocket_hw_profile.h`.
 
 /* ============================================================================
- * SECTION — PC / CNA / CORE register offsets
+ * PC, CNA and CORE register offsets
  * ==========================================================================*/
 
 #define PC_OPERATION_ENABLE    0x0008 // Operation Enable
@@ -76,7 +82,7 @@
 #define CNA_DMA_CON2           0x1080 // AXI control register 2
 #define CNA_FC_DATA_SIZE0      0x1084 // Full connected data size control register0
 #define CNA_FC_DATA_SIZE1      0x1088 // Full connected data size control register1
-#define CNA_CLK_GATE           0x1090 // Clock gating control (RK3588; the RK3576 line stride sits here)
+#define CNA_CLK_GATE           0x1090 // Clock gating control on the RK3588, line stride on the RK3576
 #define CNA_DCOMP_CTRL         0x1100 // Weight decompress control register
 #define CNA_DCOMP_REGNUM       0x1104 // Weight decompress register number
 #define CNA_DCOMP_ADDR0        0x1110 // Base address of the weight
@@ -105,10 +111,10 @@
 #define CORE_DATAOUT_SIZE_0    0x3014 // Feature size register 0 of output
 #define CORE_DATAOUT_SIZE_1    0x3018 // Feature size register 1 of output
 #define CORE_CLIP_TRUNCATE     0x301C // Shift value register
-#define CORE_3030              0x3030 // Doesn't seem to be documented, is it required ??
+#define CORE_3030              0x3030 // Undocumented, requirement not characterized
 
 /* ============================================================================
- * SECTION — DPU register offsets
+ * DPU register offsets
  * ==========================================================================*/
 
 #define DPU_S_POINTER            0x4004 // Single register group pointer
@@ -150,23 +156,24 @@
 #define DPU_EW_OP_VALUE_7        0x40AC // Configure operand7 of the EW
 
 /* ============================================================================
- * SECTION — DPU EW config / ERDMA value builders
+ * DPU EW configuration and ERDMA value builders
  * ==========================================================================*/
 
-/* DPU_EW_CFG VALUE builders. The EW two-operand configs differ only in the
- * EW_ALU_ALGO field (DPU_EW_CFG bits[17:16]). EW_CFG_ALU_BASE is the
- * validated 16-bit-element two-operand config (EW_DATA_MODE=1 | EDATA_SIZE=2 | …)
- * with EW_ALU_ALGO=0; EW_CFG_ALU(algo) sets the field. (EW_ALU_ALGO == NVDLA SDP X1
- * ALU algo.) The macros expand to the validated per-algo constants:
- *   EW_CFG_ALU(MAX)=0x108002C0  EW_CFG_ALU(MIN)=0x108102C0  EW_CFG_ALU(ADD)=0x108202C0 */
+/* Build `DPU_EW_CFG` values. The EW two-operand configurations differ only in the
+ * `EW_ALU_ALGO` field (`DPU_EW_CFG` bits[17:16]). `EW_CFG_ALU_BASE` is the validated
+ * 16-bit-element two-operand configuration (`EW_DATA_MODE=1 | EDATA_SIZE=2 | …`) with
+ * `EW_ALU_ALGO=0`, and `EW_CFG_ALU(algo)` sets the field. `EW_ALU_ALGO` is NVDLA's SDP X1
+ * ALU algorithm field. The macros expand to the validated per-algorithm constants:
+ *
+ *     EW_CFG_ALU(MAX)=0x108002C0  EW_CFG_ALU(MIN)=0x108102C0  EW_CFG_ALU(ADD)=0x108202C0 */
 #define EW_ALU_ALGO_SHIFT  16u
 #define EW_ALU_ALGO_MAX    0u
 #define EW_ALU_ALGO_MIN    1u
 #define EW_ALU_ALGO_ADD    2u
 #define EW_CFG_ALU_BASE    0x108002C0u
 #define EW_CFG_ALU(algo)   (EW_CFG_ALU_BASE | ((uint32_t)(algo) << EW_ALU_ALGO_SHIFT))
-/* EW configs that are NOT ALU-algo variants of the base (different EW_OP_TYPE /
- * EDATA_SIZE fields), kept as named constants: */
+/* EW configurations that are not ALU-algorithm variants of the base, because their
+ * `EW_OP_TYPE` or `EDATA_SIZE` fields differ. They are kept as named constants. */
 #define EW_CFG_MUL         0x108003C4u // EW_OP_TYPE=mul (clears EW_ALU_ALGO)
 #define EW_CFG_ADD_32B     0x10C202C0u // EW_ALU_ALGO=add, EDATA_SIZE=3 (32-bit elems)
 #define ERDMA_CFG_16B      0x40000008u // ERDMA_DATA_MODE=1 | ERDMA_DATA_SIZE=2 (16-bit)
@@ -188,25 +195,31 @@
 #define DPU_LUT_LO_SLOPE_SHIFT   0x412C // LO LUT slope shift
 
 /* ============================================================================
- * SECTION — PPU / PPU-RDMA register offsets (pooling engine)
+ * PPU and PPU-RDMA register offsets (pooling engine)
  * ==========================================================================*/
 
-/* PPU — Planar Processing Unit = the NPU's POOLING engine (NVDLA PDP analog). It
- * reads a feature cube via PPU_RDMA and writes a pooled cube (max/avg), in the SAME
- * NC1HWC2 layout. It has POOLING kernel/stride/padding + an average-pool reciprocal,
- * but NO reshape/transpose/permute register (there is NO NVDLA-RUBIK block on RK3588 —
- * no such block appears in the register map). So the PPU CANNOT de-tile the cube to row-major
- * output, and no register converts a layout: the weights must be packed on the host. A
- * matmul's activation and output need not be: a stride-only form (CNA GROUP_LINE_OFF, the
- * line stride one row of A, the DPU surface stride one atom plus the notch) reads A and
- * writes C as plain rows [HW 2026-09-26, tests/rowmajor_matmul_probe,
- * tests/rowmajor_tile_probe]; gen_matmul_fp16 emits it from matmul_params_t.a_row_atoms and
- * c_row_atoms. The flash attention hands its scores and P between QK and AV that way
- * (rocket_mm_batch_run_rows); the other matmul paths pack A and de-tile C on the host.
- * Decoded from Mesa rocket registers.xml (cross-checked vs allbilly rnpu_registers.h).
- * The library drives the block: gen_pool_fp16 (npu_regcmd.c) emits its program, behind
- * MaxPool and AveragePool (rocket_pool.c) and the spatial reductions (rocket_reduce.c). Block ID BLOCK_PPU/BLOCK_PPU_RDMA above; register
- * page 0x6000/0x7000.
+/* The PPU (Planar Processing Unit) is the NPU's pooling engine, the counterpart of
+ * NVDLA's PDP. It reads a feature cube through PPU_RDMA and writes a pooled cube (max or
+ * average) in the same NC1HWC2 layout. It has pooling kernel, stride and padding registers
+ * and an average-pool reciprocal. It has no reshape, transpose or permute register, and
+ * the RK3588 has no NVDLA RUBIK block: none appears in the register map. The PPU
+ * therefore cannot de-tile the cube to row-major output.
+ *
+ * No register converts a layout, so software must pack the weights on the host. A
+ * matmul's activation and output need not be packed.
+ *
+ * A stride-only form reads A and writes C as plain rows [HW sweep, 2026-09-26,
+ * tests/rowmajor_matmul_probe, tests/rowmajor_tile_probe]. It programs CNA
+ * `GROUP_LINE_OFF`, a line stride of one row of A, and a DPU surface stride of one atom
+ * plus the notch. `gen_matmul_fp16` emits it from `matmul_params_t.a_row_atoms` and
+ * `c_row_atoms`. The flash attention hands its scores and P between QK and AV that way
+ * (`rocket_mm_batch_run_rows`). The other matmul paths pack A and de-tile C on the host.
+ *
+ * The register map is decoded from Mesa's rocket `registers.xml`, cross-checked against
+ * allbilly's `rnpu_registers.h`. `gen_pool_fp16` (`npu_regcmd.c`) emits the PPU's
+ * program, behind MaxPool and AveragePool (`rocket_pool.c`) and the spatial reductions
+ * (`rocket_reduce.c`). The block IDs are `BLOCK_PPU` and `BLOCK_PPU_RDMA` (below), and the
+ * register pages are 0x6000 and 0x7000.
  */
 #define PPU_S_STATUS             0x6000
 #define PPU_S_POINTER            0x6004 // Single register group pointer
@@ -241,10 +254,10 @@
 #define PPU_RDMA_DATA_FORMAT     0x7030
 
 /* ============================================================================
- * SECTION — Block IDs & PC op-enable encodings
+ * Block IDs and PC op-enable encodings
  * ==========================================================================*/
 
-// NPU capability is limited to the following units
+// The NPU's capability is limited to the following units.
 #define BLOCK_PC       0x0100
 #define BLOCK_CNA      0x0200
 #define BLOCK_CORE     0x0800
@@ -253,40 +266,43 @@
 #define BLOCK_PPU      0x4000
 #define BLOCK_PPU_RDMA 0x8000
 
-#define PC_OP_01     0x01  // reg ??
-#define PC_OP_40     0x40  // ??
+#define PC_OP_01     0x01  // reg (not characterized)
+#define PC_OP_40     0x40  // Not characterized
 #define PC_OP_ENABLE 0x80  // Enables block(s)  
 
-#define OP_REG_PC   (BLOCK_PC | PC_OP_01)   // ??
-#define OP_REG_CNA  (BLOCK_CNA | PC_OP_01)  // ??
-#define OP_REG_CORE (BLOCK_CORE | PC_OP_01) // ??
-#define OP_REG_DPU  (BLOCK_DPU | PC_OP_01)  // ??
+#define OP_REG_PC   (BLOCK_PC | PC_OP_01)   // Not characterized
+#define OP_REG_CNA  (BLOCK_CNA | PC_OP_01)  // Not characterized
+#define OP_REG_CORE (BLOCK_CORE | PC_OP_01) // Not characterized
+#define OP_REG_DPU  (BLOCK_DPU | PC_OP_01)  // Not characterized
 
-#define OP_40     (PC_OP_40 | PC_OP_01)     // ??
-#define OP_ENABLE (PC_OP_ENABLE | PC_OP_01) // ??
-#define OP_NONE   0x0                       // ??
+#define OP_40     (PC_OP_40 | PC_OP_01)     // Not characterized
+#define OP_ENABLE (PC_OP_ENABLE | PC_OP_01) // Not characterized
+#define OP_NONE   0x0                       // Not characterized
 
 #define PC_ENABLE      0x01  // Enable for this task
-#define PC_ENABLE_CNA  0x04  // ?? Interrupt
-#define PC_ENABLE_DPU  0x08  // ?? Interrupt
-#define PC_ENABLE_PPU  0x10  // ?? Interrupt
+#define PC_ENABLE_CNA  0x04  // Interrupt (not characterized)
+#define PC_ENABLE_DPU  0x08  // Interrupt (not characterized)
+#define PC_ENABLE_PPU  0x10  // Interrupt (not characterized)
 
 /* ============================================================================
- * SECTION — NPUOP regcmd word builder & CBUF geometry
+ * NPUOP regcmd word builder and CBUF geometry
  * ==========================================================================*/
 
-/* Each parameter is parenthesized so a compound `value` (e.g. `(2u<<16) | (1u<<6)`)
- * is masked as a whole — `((value) & 0xffffffff)` — not just its last `|` term, and
- * the whole expansion is parenthesized for safe use as a sub-expression. */
+/* Builds one regcmd word from an op, a value and a register offset. Each parameter is
+ * parenthesized, so a compound `value` such as `(2u<<16) | (1u<<6)` is masked as a whole
+ * by `((value) & 0xffffffff)`, not only its last `|` term. The whole expansion is
+ * parenthesized for safe use as a subexpression. */
 #define NPUOP(op, value, reg) ((((uint64_t)((op) & 0xffff)) << 48) | (((uint64_t)((value) & 0xffffffff)) << 16) | (uint64_t)((reg) & 0xffff))
 
-/* CBUF geometry — RK3588 machine parameters, and the COMPILE-TIME source the
- * rocket_hw_profile mirrors (rocket_hw_rk3588.cbuf_bank_size / .cbuf_banks). Every
- * consumer now reads the PROFILE, not these literals: the tiling planners
- * (rocket_matmul.c / rocket_conv.c) through ctx->hw, and the regcmd bank-assignment
- * math in npu_regcmd.c through rocket_hw_current() (its generators take a params
- * struct and never see a context). These remain as the RK3588 profile's initializers,
- * so the literal still lives exactly once. See rocket_hw_profile.h. */
+/* CBUF geometry: the RK3588's machine parameters, and the compile-time source that
+ * `rocket_hw_rk3588.cbuf_bank_size` and `.cbuf_banks` mirror. Every consumer reads the
+ * bank count from the profile rather than from `NPU_CBUF_BANKS`, through
+ * `rocket_hw_current()`. That covers the tiling planners (`rocket_matmul.c`,
+ * `rocket_conv.c`) and the regcmd bank-assignment arithmetic in `npu_regcmd.c`, whose
+ * generators take a params struct and never see a context. `npu_regcmd.c` and
+ * `rocket_prepacked_int4.c` still read `NPU_CBUF_BANK_SIZE` directly. The literals remain
+ * as the RK3588 profile's initializers, so each value is defined once. See
+ * `rocket_hw_profile.h`. */
 #define NPU_CBUF_BANK_SIZE 32768
 #define NPU_CBUF_BANKS 12
 
@@ -295,17 +311,20 @@
 extern "C" {
 #endif
 /* ============================================================================
- * SECTION — Convolution mode & precision field encodings
+ * Convolution mode and precision field encodings
  * ==========================================================================*/
 
 enum  { direct_convolution = 0};
-/* Precision field encoding (3-bit, CNA/CORE/DPU in/proc/out). int8/fp16/int32/
- * fp32 are the documented values; int16 = 1 is the NVDLA lineage value. int4 = 6
- * was established by HW sweep (precision 6 is the only value giving bit-exact
- * int4xint4->int16; 3 saturates, 7 writes nothing). bf16 = 3 and tf32 = 7 were
- * confirmed on-device: the CNA/DPU precision fields accept 3'd3 for bf16 and 3'd7
- * for tf32, and bf16 runs at the same MAC rate as fp16. All six have working,
- * HW-validated matmuls. */
+/* The precision field encoding: 3 bits, in the CNA, CORE and DPU input, processing and
+ * output fields. int8, fp16, int32 and fp32 are the documented values, and int16 = 1 is
+ * the value from the NVDLA lineage. int4 = 6 [HW sweep]: precision 6 is the only value
+ * that gives a bit-exact int4xint4->int16, where 3 saturates and 7 writes nothing.
+ * bf16 = 3 and tf32 = 7 [HW sweep]: the CNA and DPU precision fields accept 3'd3 for bf16
+ * and 3'd7 for tf32. bf16 runs at the same MAC rate as fp16.
+ *
+ * Six of the eight values are input datatypes: int4, int8, int16, fp16, bf16 and tf32.
+ * Each has a matmul generator (`gen_matmul_*` in `npu_matmul.h`) validated on the RK3588.
+ * int32 and fp32 are output and DPU precisions, and no matmul takes either as its input. */
 enum  { precision_int8 = 0,
         precision_int16 = 1,
         precision_float16 = 2,
@@ -313,7 +332,7 @@ enum  { precision_int8 = 0,
         precision_int32 = 4,
         precision_float32 = 5,
         precision_int4 = 6,
-        precision_tf32 = 7};      /* 3'd7; 4-byte input */
+        precision_tf32 = 7};      /* 3'd7, 4-byte input */
 
 
 #ifdef __cplusplus

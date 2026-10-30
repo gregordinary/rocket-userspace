@@ -2,16 +2,21 @@
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * leaky_relu_rocket.c — HW gate for on-NPU LeakyReLU (rocket_leaky_relu_fp16), the
- * parametric piecewise-linear activation on the DPU LUT (shifted single-table mode).
+ * parametric piecewise-linear activation on the DPU LUT (natural LE/LO split).
  *
- * LeakyReLU(x) = x>=0 ? x : alpha*x. The implementation maps a SYMMETRIC domain [-R,R]
- * onto the positive LUT index half so the x=0 kink is an exact interior sample — exact and
- * glitch-free (no x≈0 LE/LO mux spike). This gate proves both:
+ * LeakyReLU(x) = x>=0 ? x : alpha*x. The implementation (build_lut_leaky) splits [-R,R]
+ * at x=0. LE holds the alpha*x branch and LO the x branch, and the x=0 kink falls on their
+ * shared edge. Each side is linear, so the result is exact within [-R,R].
+ *
+ * The LE/LO mux selects on sign(x) and spikes in a razor-thin band at x~0. The runtime
+ * repairs that band on the host, and ROCKET_LEAKY_NOREPAIR disables the repair. This gate
+ * checks both:
  *
  *   1. ACCURACY over [-R,R] across a sweep of alphas vs the fp16 CPU reference.
- *   2. THE x≈0 BAND specifically — inputs within ±0.002 of 0 (where the smooth single-pass
- *      kinds spike on the LE/LO boundary) must stay correct (≈0). This is the whole reason
- *      for the symmetric-shifted design.
+ *   2. THE x~0 BAND specifically: inputs within ±0.002 of 0, where the mux spikes without
+ *      the repair, must stay correct (~0). The host repair covers this band.
+ *
+ * The `scan` mode turns the repair off and reports every raw spike.
  *
  * Off-device (no NPU): the CPU reference self-consistency only -> SKIP (exit 2).
  *
@@ -87,8 +92,10 @@ static int run_alpha(int fd, float alpha)
 }
 
 /* RE probe: map which LUT indices glitch. Feeds x(I) = x_lo + I*(x_hi-x_lo)/16384 for the
- * runtime's default symmetric domain [-16,16] (scale=512), so index I is hit exactly, and
- * reports every I where the output spikes. Reveals the LE/LO sub-boundary structure. */
+ * runtime's default symmetric domain [-16,16]. The runtime's index_scale there is 16384/R =
+ * 1024, so the scan's x step of 1/512 lands on every second index of [-16384,16384], and
+ * the probe reports every input whose output spikes. Reveals the LE/LO sub-boundary
+ * structure. */
 static int boundary_scan(int fd, float alpha)
 {
     if (fd < 0) { printf("scan needs the NPU\n"); return 0; }

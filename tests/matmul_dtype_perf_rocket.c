@@ -50,8 +50,18 @@ int main(int argc, char **argv) {
     printf("dtype perf C[%d,%d]=A[%d,%d]xB[%d,%d]^T  %.2f GOP, %d threads, reps=%d (drop cold)\n",
            M, N, M, K, N, K, gop, nthreads, reps);
 
-    /* show the int4 tiling so we can see nKt (single-pass?) */
-    int mt, kt, nt;
+    /* show the fp16 and int8 tilings of one worker's N slice (each worker plans its own,
+     * and a streamed plan's Nt runs past the 256 tile cap), and the whole-N int4 one, so we
+     * can see nKt (single-pass?) */
+    int mt, kt, nt, nj;
+    for (int a = 16; a <= 32; a += 16) {
+        int ns = ((N + nthreads - 1) / nthreads + a - 1) / a * a;
+        nj = a == 16 ? rocket_matmul_plan(M, K, ns, &mt, &kt, &nt)
+                     : rocket_matmul_plan_int8(M, K, ns, &mt, &kt, &nt);
+        if (nj >= 0)
+            printf("%s tiling (slice N=%d): Mt=%d Kt=%d Nt=%d tasks=%d\n",
+                   a == 16 ? "fp16" : "int8", ns, mt, kt, nt, nj);
+    }
     if (rocket_matmul_plan_int4(M, K, N, &mt, &kt, &nt) >= 0)
         printf("int4 tiling: Mt=%d Kt=%d Nt=%d nKt=%d%s\n", mt, kt, nt, (K+kt-1)/kt,
                (K+kt-1)/kt == 1 ? "  (SINGLE-PASS K)" : "");

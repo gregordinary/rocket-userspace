@@ -470,8 +470,8 @@ static int rki_scatter_weights(const char *who, rocket_i8_ctx *ctx, rki_scratch 
 
 /* Shape contract shared by both pack variants — checked here rather than left to fail
  * deep inside rki_worker_alloc with an opaque "unsupported slice". N%32 (the int8 weight
- * N-group) keeps every N-slice aligned; K%32 the K-group; M%4 (M==1 height-1 GEMV is
- * broken on HW and the resident path can't pad — pad M to 4 caller-side). */
+ * N-group) keeps every N-slice aligned; K%32 the K-group; M%4 (the planner's row
+ * unit; the resident path can't pad — pad M to 4 caller-side). */
 static int rki_shape_ok(const char *who, int M, int K, int N)
 {
     if (N % 32 != 0 || K % 32 != 0 || M % 4 != 0) {

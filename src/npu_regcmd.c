@@ -94,22 +94,32 @@
 /* RDMA_ERDMA_CFG.ERDMA_DISABLE bit0 */
 #define RDMA_ERDMA_DISABLE           0x1
 
-/* CNA feature-surface (channel-plane) stride in bytes for a tile of `datain_height`
- * input rows with per-row `line_stride`. A full CNA block is 4 rows; datain_height < 4
- * is a partial (sub-block) height — the IH 4..7 regime where (IH/4)-1 == 0 and a zero
- * surf_stride is HW-proven. Without the clamp the (height/4)-1 term goes negative and
- * masks to a garbage 28-bit stride, corrupting any tile with fewer than 4 input rows
- * (e.g. an OW-column tile shrunk to one output row). The per-datatype matmul generators
- * (whose M%4 rule keeps datain_height a multiple of 4) all route the feature surface
- * through here so the clamp lives in one place. The general conv path needs a different,
- * non-truncating formula and clamps inline. */
+/* CNA feature-surface (channel-plane) stride of a packed cube, `datain_height` rows of
+ * `line_stride / 4` atoms. The CNA reads the cube in lines of four rows (`line_stride` is
+ * width*4 atoms) and reaches the next surface by the line stride plus this stride, so a
+ * surface of H packed rows needs width*(H - 4): negative below four rows, written as a
+ * 28-bit two's complement (the emitter masks it). It equals the old line*(H/4 - 1) at
+ * every H%4 == 0, and that truncating form was wrong at every other H: the matmul's
+ * M%4 rule was this formula, not the silicon. With it, an fp16 task is exact at M 1-17,
+ * 31, 33, 63 and 64, M along the height or the width [HW sweep 2026-10-21,
+ * tests/msmall_probe]. The per-datatype matmul generators route the feature surface
+ * through here. The general conv path computes the same value inline but clamps a
+ * sub-4-row input to 0 and pads such inputs to four rows (rocket_conv.c). */
 /* ============================================================================
  * SECTION — Shared regcmd emitter and feature-stride helper
  * ==========================================================================*/
 
+/* The fewest CBUF weight banks a streamed weight cube (one larger than its banks) runs
+ * in: one whole 32-kernel atom, and never fewer than two. Below that the task does not
+ * complete. See gen_matmul_fp16. */
+unsigned npu_stream_weight_banks(unsigned weight_bytes_per_kernel)
+{
+  unsigned atom = (weight_bytes_per_kernel * 32 + NPU_CBUF_BANK_SIZE - 1) / NPU_CBUF_BANK_SIZE;
+  return atom < 2 ? 2 : atom;
+}
+
 static inline int cna_feature_surf_stride(int line_stride, int datain_height) {
-    int s = line_stride * ((datain_height / 4) - 1);
-    return s < 0 ? 0 : s;
+    return (int)((long)line_stride * (datain_height - 4) / 4);
 }
 
 /* OUT_CVT_SHIFT bit 30. Declared in npu_dpu.h, and shared with the RK3576 encoder, which
@@ -167,6 +177,20 @@ static int geometry_fits(const npu_cna_desc *cna, const npu_dpu_desc *dpu)
  * be published together. */
 static pthread_once_t g_gate_once = PTHREAD_ONCE_INIT;
 static long g_gate_clk = -1, g_gate_soft = -1, g_gate_mac = -1, g_core_3030 = 0;
+/* DEBUG M-geometry knobs (RE, tests/msmall_probe), gen_matmul_fp16 only, read once with
+ * the gating knobs. ROCKET_MM_MWIDTH=1 lays the M rows along the CNA WIDTH at height 1
+ * (the same bytes: a C2=8 cube at H=1 is [C1][M][8] either way). ROCKET_MM_SURF_TRUNC=1
+ * restores the truncating line*(H/4 - 1) surface stride, clamped at 0, that was wrong at
+ * every M%4 != 0. ROCKET_MM_GRAINS=n replaces CONV_CON2's feature grains (M+1).
+ * ROCKET_MM_LINE_STRIDE=n writes the cube's line stride raw, and ROCKET_MM_SURF_PER_M=s
+ * its surface stride as s*M (28-bit two's complement); an external userspace programs
+ * 0x200 and -3 with M along the width. Unset, the program is byte-identical. */
+static long g_mm_mwidth = 0, g_mm_surf_trunc = 0, g_mm_grains = -1, g_mm_line = -1;
+static long g_mm_surf_per_m = 0, g_mm_surf_per_m_set = 0;
+/* DEBUG (RE): ROCKET_CONV_SURF_TRUNC=1 makes the fp16 and int8 conv generators clamp a
+ * sub-4-row feature surface stride at 0, which misreads every input of more than one channel
+ * group below four rows. Set or unset, the program is the same at every IH >= 4. */
+static long g_conv_surf_trunc = 0;
 
 static void gate_knobs_read(void)
 {
@@ -175,6 +199,21 @@ static void gate_knobs_read(void)
   if ((e = getenv("ROCKET_CORE_SOFT_GATING"))) g_gate_soft = (long)(strtoul(e, NULL, 0) & 0x3F);
   if ((e = getenv("ROCKET_CORE_MAC_GATING")))  g_gate_mac  = (long)(strtoul(e, NULL, 0) & 0x7FFFFFF);
   if ((e = getenv("ROCKET_CORE_3030")))        g_core_3030 = (long)(strtoul(e, NULL, 0) & 0xFFFFFFFF);
+  if ((e = getenv("ROCKET_MM_MWIDTH")))        g_mm_mwidth = atoi(e) != 0;
+  if ((e = getenv("ROCKET_MM_SURF_TRUNC")))    g_mm_surf_trunc = atoi(e) != 0;
+  if ((e = getenv("ROCKET_MM_GRAINS")))        g_mm_grains = (long)(strtoul(e, NULL, 0) & 0x3FF);
+  if ((e = getenv("ROCKET_MM_LINE_STRIDE")))   g_mm_line = (long)(strtoul(e, NULL, 0) & 0xFFFFFFF);
+  if ((e = getenv("ROCKET_MM_SURF_PER_M"))) { g_mm_surf_per_m = strtol(e, NULL, 0); g_mm_surf_per_m_set = 1; }
+  if ((e = getenv("ROCKET_CONV_SURF_TRUNC")))  g_conv_surf_trunc = atoi(e) != 0;
+}
+
+/* The conv generators' feature surface stride: cna_feature_surf_stride() at the job's input
+ * height, negative below four rows, or 0 there under ROCKET_CONV_SURF_TRUNC. */
+static int conv_feature_surf_stride(int line_stride, int IH)
+{
+  pthread_once(&g_gate_once, gate_knobs_read);
+  int s = cna_feature_surf_stride(line_stride, IH);
+  return g_conv_surf_trunc && s < 0 ? 0 : s;
 }
 
 /*
@@ -520,6 +559,12 @@ int gen_matmul_fp16(matmul_params_t *params)
    cna_desc.datain_channel = params->k;
    cna_desc.dataout_width = 1;
    cna_desc.dataout_height = params->m;
+   pthread_once(&g_gate_once, gate_knobs_read);
+   if (g_mm_mwidth) {
+     cna_desc.datain_width = cna_desc.dataout_width = params->m;
+     cna_desc.datain_height = cna_desc.dataout_height = 1;
+   }
+   if (g_mm_grains >= 0) cna_desc.feature_grains = (unsigned)g_mm_grains;
    cna_desc.dataout_atomics = cna_desc.dataout_width * cna_desc.dataout_height;
 
    cna_desc.weight_width = 1;
@@ -543,6 +588,17 @@ int gen_matmul_fp16(matmul_params_t *params)
          return -2;
        }
    }
+   /* A weight cube larger than its banks is STREAMED: the input stays resident and the
+    * CNA fetches the kernel groups through the weight banks, so one task covers all of N.
+    * That needs at least two weight banks and one whole 32-kernel atom: with one bank and
+    * an atom smaller than it (K 384) the task never completes, and an atom past the banks
+    * does the same [HW sweep 2026-10-21, tests/weight_stream_probe]. Past that floor the
+    * bank count moves the time by under 3%. A WEIGHT_REUSE bit would read a CBUF holding
+    * only the last atoms as the whole tile. Both refuse. */
+   if (cna_desc.weight_bytes > weight_banks * NPU_CBUF_BANK_SIZE &&
+       (weight_banks < npu_stream_weight_banks(cna_desc.weight_bytes_per_kernel) ||
+        params->weight_reuse))
+     return -3;
 
    cna_desc.weight_bank = weight_banks;
    cna_desc.data_bank = fd_banks;
@@ -568,6 +624,13 @@ int gen_matmul_fp16(matmul_params_t *params)
    cna_desc.data_burst_len = 0xf;
    cna_desc.line_stride = cna_desc.datain_width * 4;
    surf_stride = cna_feature_surf_stride(cna_desc.line_stride, cna_desc.datain_height);
+   if (g_mm_surf_trunc) {
+     surf_stride = (int)cna_desc.line_stride * ((int)(cna_desc.datain_height / 4) - 1);
+     if (surf_stride < 0) surf_stride = 0;
+   }
+   if (g_mm_surf_per_m_set)
+     surf_stride = (int)((g_mm_surf_per_m * (long)params->m) & 0xFFFFFFF);
+   if (g_mm_line >= 0) cna_desc.line_stride = (unsigned)g_mm_line;
    cna_desc.surf_stride = surf_stride;
    /* Row-major A: one line is one row of the full A, and no surfaces (matmul_params_t). */
    if (params->a_row_atoms) {
@@ -651,17 +714,20 @@ int gen_matmul_fp16(matmul_params_t *params)
     * one position spans 16 bytes (8 fp16 ch, or 16 int8 ch) = ATOMIC_K_SIZE. All
     * stride/notch fields are reg bits [4:31], i.e. the geometric value <<4. For
     * matmul output_w=1, output_h=M:
-    *   ew_stride  = MAX(output_w*output_h, 12) = MAX(M,12)
+    *   ew_stride  = output_w*output_h = M, the partial's own surface stride
     *   surf_notch = ew_stride (single un-split task; split term is 0)
     *   ERDMA base = add_dma + output_w*output_h*16  (one surface)
     *   MRDMA SRC  = add_dma (no offset)
     *   COMB_USE(5) combines the MRDMA (surface n) + ERDMA (surface n+offset) feeds.
-    * NOTE: MAX(.,12) over-states the surface stride for M<12 — use M>=12 (e.g.
-    * M=16) to exercise the real, floor-free geometry. */
+    * The stride and notch place the third surface on, so N <= 16 never reads them. A
+    * stride floored at MAX(M, 12) misreads every M < 12 with N > 16; stride M is exact at
+    * M 1-17, 31, 33, 63, 64 [HW sweep 2026-10-22, tests/msmall_probe MSP_KACC].
+    * The int8, int4 and int16 generators below still floor at 12, unmeasured; no
+    * library path accumulates through them. */
    {
      uint32_t M = (uint32_t)params->m;          /* output_h; output_w == 1      */
      uint32_t hw = M;                            /* output_w*output_h            */
-     uint32_t ew_stride = hw > 12 ? hw : 12;     /* MAX(hw,12), geometric value  */
+     uint32_t ew_stride = hw;                    /* geometric value              */
      uint32_t base_off  = hw * 16;               /* one surface in BYTES         */
      const char *e;
      if ((e = getenv("ROCKET_EW_SURF")))     ew_stride = (uint32_t)strtoul(e, NULL, 0);
@@ -1056,8 +1122,18 @@ int gen_matmul_int8(matmul_params_t *params)
    }
    {
        unsigned data_bank = fd_banks + 1;
+       unsigned wbanks = CBUF_BANKS - data_bank;
+       /* A weight cube past its banks is streamed: gen_matmul_fp16's floor plus one bank.
+        * With the weight banks equal to the atom's bank count and the atom not a whole
+        * number of banks, int8 tasks ran to the watchdog and wrote nothing, at (M 256,
+        * K 1120) and (M 200, K 1376); one more bank was exact at both K, as was K 2080 at
+        * the bare floor [HW sweep 2026-10-21]. fp16 at the bare floor is exact. */
+       if (cna_desc.weight_bytes > wbanks * NPU_CBUF_BANK_SIZE &&
+           (wbanks < npu_stream_weight_banks(cna_desc.weight_bytes_per_kernel) + 1 ||
+            params->weight_reuse))
+           return -3;
        cna_desc.data_bank   = data_bank;
-       cna_desc.weight_bank = CBUF_BANKS - data_bank;
+       cna_desc.weight_bank = wbanks;
    }
    cna_desc.weight_reuse = params->weight_reuse & 0x1;   /* default 0 */
    cna_desc.data_reuse   = params->data_reuse   & 0x1;
@@ -1109,11 +1185,17 @@ int gen_matmul_int8(matmul_params_t *params)
 
    /* Dequant-output mode: instead of reading back the raw int32 accumulator
     * and dequantizing on the host (C[m,n] * a_scale[m] * b_scale[n]), have the DPU
-    * OUT_CVT apply the scale on-chip and emit a FLOAT result (fp32 reuses the proven
-    * fp32-out geometry; fp16 halves the readback — its 2-byte writer geometry is the
-    * sweep). The OUT_CVT affine + the optional BN-MUL per-tensor scale are fully
-    * env-overridable so tests/matmul_int8_dequant_rocket.c can classify the exact HW
-    * semantics before a clean API is committed. Default unset = byte-identical. */
+    * OUT_CVT apply the scale on-chip and emit a FLOAT result. The OUT_CVT affine + the
+    * optional BN-MUL per-tensor scale are fully env-overridable so
+    * tests/matmul_int8_dequant_rocket.c can classify the exact HW semantics before a
+    * clean API is committed. Its sweep found that only an integer gain folds on this
+    * accumulator (below), so a fractional W8A8 dequant stays on the host.
+    *
+    * fp32 out reuses the proven fp32-out geometry. fp16 out halves the readback, and the
+    * test records its writer geometry as size_e=3 / surf*2. This generator does not
+    * default to it: the test sets it through ROCKET_INT8_SIZE_E/_SURF_MULT. The test runs
+    * that fp16 case as a diagnostic, not a gated case. It is bit-exact only for small
+    * single-tile shapes and |acc| <= 2048. Default unset = byte-identical. */
    int deq = getenv("ROCKET_INT8_DEQ") != NULL;
    int deq_prec = precision_float32;
    {
@@ -1154,12 +1236,20 @@ int gen_matmul_int8(matmul_params_t *params)
    dpu_desc.fp32tofp16_en =0;
    dpu_desc.out_cvt_scale =1;
    if (deq) {
-     /* Fold the dequant scale into the DPU output converter. The effective output
-      * (hypothesis, to be HW-confirmed) is
-      *   out_float = (acc_i32 + offset) * out_cvt_scale * 2^-minus_exp
-      * with cvt_type=1 selecting the float-affine decode and fp32tofp16_en narrowing
-      * to fp16. Defaults give scale=1, minus_exp=0 (identity * int->float cast); the
-      * gate sweeps SCALE/MINEXP/CVTTYPE/OFFSET/FP32TOFP16 + the alt BN-MUL operand. */
+     /* Fold the dequant scale into the DPU output converter. On the raw int32
+      * accumulator the converter is integer-only, as tests/matmul_int8_dequant_rocket.c
+      * measured in its sweep mode [HW sweep]:
+      *
+      *     out_float = (float)((acc_i32 * out_cvt_scale) >> out_cvt_shift)
+      *
+      * The result is narrowed to fp16 when fp32tofp16_en is set. The scale and the BN-MUL
+      * operand are integer multipliers, and the shift rounds to an integer before the
+      * float cast. An
+      * integer gain therefore folds exactly, and a fractional dequant scale does not.
+      * The LUT path's float-affine decode, cvt_type=1 with minus_exp, has no effect on
+      * this accumulator. Defaults give scale=1, minus_exp=0 (an int->float cast). The
+      * test's sweep mode overrides SCALE/SHIFT/MINEXP/CVTTYPE/OFFSET/FP32TOFP16 and the
+      * alt BN-MUL operand. */
      const char *de;
      dpu_desc.fp32tofp16_en   = (deq_prec == precision_float16) ? 1 : 0;
      dpu_desc.out_cvt_scale   = 1;
@@ -1886,7 +1976,7 @@ int gen_matmul_bf16(matmul_params_t *params)
  *
  * tf32 = 1 sign + 8-bit exponent (fp32 RANGE) + 10-bit mantissa (fp16 PRECISION),
  * stored in a 4-BYTE fp32 container (NVIDIA-TF32 convention: 19 used bits can't fit
- * 2 bytes). You feed fp32; the MAC rounds the mantissa to 10 bits and accumulates
+ * 2 bytes). You feed fp32; the MAC truncates the mantissa to 10 bits and accumulates
  * in fp32. So tf32 is the FIRST 4-byte-INPUT matmul on this stack (fp16/bf16/int16
  * are 2-byte, int8 1-byte, int4 0.5-byte; int32/fp32 have only ever been OUTPUTS).
  *
@@ -2751,17 +2841,11 @@ static int gen_conv2d_fill(conv_params_t *params, int depthwise)
    cna_desc.weight_burst_len = 0xf;
    cna_desc.data_burst_len = 0xf;
    cna_desc.line_stride = IW * 4;
-   /* Feature surface (channel-plane) stride. The matmul uses
-    * line_stride*((IH/4)-1), which is only exact when IH%4==0 (the matmul's M%4
-    * rule) — the integer IH/4 truncates otherwise, under-stating the stride and
-    * mis-sampling every conv with a non-%4 input height (HW-confirmed: IH in
-    * {6,7,9,10} all failed, {8,12} passed). Mesa (rkt_task.c) computes it in float,
-    * line_stride*(IH/4.0 - 1); since line_stride = IW*4 that is exactly IW*(IH-4),
-    * which matches the matmul for IH%4==0 and is correct for any IH. */
-   surf_stride = (int)((long)cna_desc.line_stride * ((int)IH - 4) / 4);
-   /* Clamp the sub-4-row (no-full-block) case to 0: a negative surf_stride masks to a
-    * garbage 28-bit stride and corrupts any tile with fewer than 4 input rows. */
-   surf_stride = surf_stride < 0 ? 0 : surf_stride;
+   /* Feature surface (channel-plane) stride, IW*(IH-4) (cna_feature_surf_stride). The
+    * truncating line_stride*((IH/4)-1) mis-sampled every conv with a non-%4 input height
+    * (HW-confirmed: IH in {6,7,9,10} failed, {8,12} passed); Mesa (rkt_task.c) computes
+    * line_stride*(IH/4.0 - 1), the same value. */
+   surf_stride = conv_feature_surf_stride((int)cna_desc.line_stride, (int)IH);
    cna_desc.surf_stride = surf_stride;
    cna_desc.dma_width = IW;
    cna_desc.dma_height = IH;
@@ -3015,8 +3099,10 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
      return -1;
 
    if (depthwise) {
-     /* int8 DW channel group: Mesa's value is 64 (feature-atom 16 × 4). HW-unconfirmed
-      * (the fp16 G=32 crack was register-masked once) — ROCKET_CONV_DW_GROUP sweeps it. */
+     /* int8 DW channel group: Mesa's value is 64 (feature-atom 16 × 4). The int8-out
+      * branch runs at G=64 and is bit-exact on the RK1 [HW sweep]: replay_dw_mesa matches
+      * Teflon's captured output, and conv_dw_int8_runtime a host model. On the int32-raw
+      * branch, whose geometry is unproven, ROCKET_CONV_DW_GROUP overrides G for a sweep. */
      unsigned G = params->dw_group ? params->dw_group : 64;
      const char *eg = getenv("ROCKET_CONV_DW_GROUP");
      if (eg) G = (unsigned)strtoul(eg, NULL, 0);
@@ -3100,8 +3186,7 @@ static int gen_conv2d_int8_fill(conv_params_t *params, int depthwise)
    cna_desc.line_stride = IW * 4;
    /* Same float-correct feature surface stride as the fp16 conv (IW*(IH-4)); the
     * cube atom is 16 B for both dtypes, so the stride is element-size-independent. */
-   surf_stride = (int)((long)cna_desc.line_stride * ((int)IH - 4) / 4);
-   surf_stride = surf_stride < 0 ? 0 : surf_stride;
+   surf_stride = conv_feature_surf_stride((int)cna_desc.line_stride, (int)IH);
    cna_desc.surf_stride = surf_stride;
    cna_desc.dma_width = IW;
    cna_desc.dma_height = IH;

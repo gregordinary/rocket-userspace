@@ -44,8 +44,9 @@
  * <drm/rocket_accel.h> already carries it, set job.flags directly. When it
  * predates the field (e.g. an off-device syntax check against an unpatched
  * header), append the field via a wrapper at exactly the offset the kernel
- * expects (pinned by the static_assert). Either way the flag is a no-op against
- * a kernel that does not implement it.
+ * expects (pinned by the static_assert). A kernel whose job struct has no flag word
+ * ignores the flag, or at interface 1.0 refuses a nonzero word with -E2BIG. A kernel
+ * with the word rejects an unknown bit with -EINVAL (see ROCKET_JOB_* in rocket_npu.h).
  */
 #ifndef DRM_ROCKET_JOB_BATCHED
 #define DRM_ROCKET_JOB_BATCHED (1u << 0)
@@ -170,9 +171,10 @@ static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tas
     };
     rkt_count_submit(n_tasks);
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
+        int e = errno;                       /* capture before the log call clobbers it */
         ROCKET_LOGE("ROCKET_SUBMIT(%u tasks, flags=0x%x): %s\n",
-                    n_tasks, job_flags, strerror(errno));
-        return -errno;
+                    n_tasks, job_flags, strerror(e));
+        return -e;
     }
     return 0;
 }
@@ -584,8 +586,9 @@ int rocket_open(void)
     if (!dev || !*dev) dev = "/dev/accel/accel0";
     int fd = open(dev, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        ROCKET_LOGE("open(%s): %s\n", dev, strerror(errno));
-        return -errno;
+        int e = errno;                       /* capture before the log call clobbers it */
+        ROCKET_LOGE("open(%s): %s\n", dev, strerror(e));
+        return -e;
     }
 
     char name[32] = {0};
@@ -697,6 +700,9 @@ int rocket_bo_ensure32(int fd, rocket_bo *bo, size_t need)
     return rc == 0 ? 1 : rc;            /* 1 = REALLOCATED, so any zero padding is gone */
 }
 
+/* The 32-bit IOVA check lives in the allocator so that no call site has to repeat it. The
+ * RK3588 matmul once wrote it out at each call site, and the RK3576 entries, which allocate
+ * 28 BOs between them and program every address into a 32-bit field, had none. */
 int rocket_bo_alloc32(int fd, size_t size, rocket_bo *bo)
 {
     int rc = rocket_bo_alloc(fd, size, bo);
@@ -1043,8 +1049,8 @@ int rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs)
     for (uint32_t j = 0; j < n_jobs; j++) ntask += jobs[j].n_tasks;
     rkt_count_submit(ntask);
     if (ioctl(fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0) {
-        ROCKET_LOGE("ROCKET_SUBMIT(%u jobs): %s\n", n_jobs, strerror(errno));
-        r = -errno;
+        r = -errno;                          /* capture before the log call clobbers it */
+        ROCKET_LOGE("ROCKET_SUBMIT(%u jobs): %s\n", n_jobs, strerror(-r));
     }
 
 cleanup:

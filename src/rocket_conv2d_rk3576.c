@@ -3561,12 +3561,12 @@ int rocket_conv2d_int8_plan_rk3576(const rocket_conv2d_desc *d)
     if (!d) return ROCKET_E_SHAPE;
     dd = *d;
     dw = dd.depthwise ? 1 : 0;
-    /* THE ENCODING THIS ANSWERS ABOUT IS THE ONE THE PACK WILL SETTLE ON. Four or fewer
-     * input channels may take the packed-image first conv, but that encoding is ATTEMPTED
-     * rather than predicted and a refusal there falls back to the direct datapath — which
-     * is exact at any geometry — so the shape that decides whether the pack succeeds at
-     * all is the direct one, and that is what is priced here. A caller that has already
-     * set `direct_datapath` is asking the same question. */
+    /* THE ENCODING THIS ANSWERS ABOUT IS THE DIRECT ONE. Four or fewer input channels may
+     * take the packed-image first conv, but the pack does not fall back from it: on an
+     * r76_argb_bounds() refusal it returns NULL, and the caller packs again with
+     * direct_datapath set. The direct datapath is exact at any geometry, so it decides
+     * whether a pack can succeed at all, and that is what is checked here. A caller that
+     * has already set `direct_datapath` is asking the same question. */
     if (!dw && dd.ic <= 4) dd.direct_datapath = 1;
 
     rc = r76_conv_check(entry, &dd, dw, 0, &ow, &oh);
