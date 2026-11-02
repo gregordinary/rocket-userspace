@@ -65,6 +65,11 @@ void rocket_softmax_ref_fp16(int M, int N, const _Float16 *in, _Float16 *out);
  * everywhere. LogSoftmax is better conditioned than softmax for a test, because it is
  * all-additive with no tiny-probability blow-up. A test must therefore check absolute error.
  *
+ * Against an fp64 reference, max_abs is 0.031 at the widest score spread tested, inputs in
+ * [-20,20] [HW sweep]. It is about 0.008 typically, the fp16 storage of the low
+ * log-probabilities, at N up to 1500. `tests/softmax_rocket.c` fails on an element past 0.05,
+ * or on a row whose `sum_n exp(out)` is more than 0.03 from 1.
+ *
  * With `fd` < 0 it computes the exact host reference. Returns 0 on success and a negative
  * value on error.
  */

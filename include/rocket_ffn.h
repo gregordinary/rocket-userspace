@@ -57,6 +57,11 @@ void rocket_geglu_ref_fp16(const _Float16 *gate, const _Float16 *up,
  *
  * With `fd` < 0 it computes the exact host reference. Returns 0 on success and a negative
  * value on error.
+ *
+ * The block measures cosine similarity 1.000000 against an fp64 reference, with no element
+ * outside the coarse bound [HW sweep]. The four shapes reach M 128, H 2048, I 1024.
+ * `tests/ffn_rocket.c` fails below cosine 0.998. It also fails on an element that is neither
+ * within 5% of the output's peak plus 1e-3 nor within 10% of its own magnitude.
  */
 int  rocket_ffn_fp16(int fd, int M, int H, int I,
                      const _Float16 *x, const _Float16 *Wg, const _Float16 *Wu,
@@ -79,8 +84,9 @@ void rocket_ffn_ref_fp16(int M, int H, int I,
  * the layout of an input feature cube. The down matmul's K tiling is pinned so that its `Kt`
  * equals the projections' `Nt`. This grouping of the fp16 K-accumulation is the only
  * numerical difference from `rocket_ffn_fp16`. The result has cosine similarity ~1 against it
- * and against the fp64 reference. The alignment is the same: `H` and `I` multiples of 32, and
- * `M` a multiple of 4.
+ * and against the fp64 reference. `tests/ffn_fused_rocket.c` fails below cosine 0.999 against
+ * fp64 or 0.9995 against `rocket_ffn_fp16`, or on an output the down matmul left unwritten.
+ * The alignment is the same: `H` and `I` multiples of 32, and `M` a multiple of 4.
  *
  * A shape whose projection output exceeds one NPU batch (`nMt*nNt > 64`), or whose tiling
  * cannot be matched, falls back to `rocket_ffn_fp16`. The fallback is correct and not
@@ -94,8 +100,8 @@ int  rocket_ffn_fp16_fused(int fd, int M, int H, int I,
 /*
  * Computes the non-gated encoder FFN, `out = act(x·W1^T + b1) · W2^T`, and keeps the [M,Dff]
  * intermediate in cube layout on the NPU. The host packs only `x` and reads back only `out`.
- * Encoder blocks gain the most from this, because SigLIP and Whisper encoders spend ~80% of
- * their time in layout transforms.
+ * Encoder blocks gain the most from this. On the SigLIP-B/16 encoder the layout transforms
+ * take ~81% as long as the NPU compute, against ~8% on an LLM prefill.
  *
  * The bias `b1` is added on the cube: a per-channel bias scattered into the cube layout, then
  * a flat elementwise add. The activation runs elementwise over the cube bytes, and the fc2

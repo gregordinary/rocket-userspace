@@ -231,7 +231,16 @@ int rocket_conv2d_fp16_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
  * descriptor, -11 for an unsupported `kind`, and another negative value on any other error.
  *
  * The fused `f` is an fp16 LUT approximation, so a test must compare its output with a
- * tolerance, not for equality. */
+ * tolerance, not for equality. Against the standalone LUT op on the same conv output, the
+ * fused output differs by at most 0.0039, the LUT's quantization step. It measures 0.0005 for
+ * tanh, 0.0039 for SiLU and 0.0020-0.0039 for GELU [HW sweep, RK3588, 2026-09-23].
+ * `tests/conv_act_rocket.c` fails past 0.02 of the standalone op. It also fails past 0.02 of
+ * the true function for tanh, or 0.05 for SiLU and GELU, where the conv output `x` has
+ * |x| >= 0.02 and, for GELU, x >= -3.
+ *
+ * Caution: every single-pass kind spikes in a narrow band around a conv output of 0 (|x|
+ * below about 0.0015), where the LUT's sign-based LE/LO mux switches. The two-pass path of
+ * `rocket_activation_fp16` has no such band. */
 int rocket_conv2d_act_fp16(int fd, const rocket_conv2d_desc *d, int kind,
                            const _Float16 *in, const _Float16 *W, _Float16 *out);
 int rocket_conv2d_act_fp16_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d, int kind,
@@ -1167,9 +1176,14 @@ int rocket_residual_fuse_weight_rk3576(float in_scale, float w_scale, float skip
  *
  * A packed-image handle cannot take a cube as input, because its feature buffer is an
  * interleaved image, so it can only begin a run. Its output side is an ordinary cube and
- * joins normally. The exception is a handle that materializes its pad columns for a non-zero
- * input zero point. Its output is wider than the caller's plane, and every cube entry
- * refuses it.
+ * joins normally.
+ *
+ * The exception is a handle that materializes its pad columns for a non-zero input zero
+ * point. Its output is wider than the caller's plane.
+ * `rocket_conv2d_int8_cube_out_rk3576()` and `rocket_conv2d_int8_cube_of_rk3576()` describe
+ * that output as a cube with a row pitch (`pitch_w`, `col_off`). A pool reads such a cube in
+ * place, and a convolution's `rocket_conv2d_int8_cube_in_rk3576()` refuses it.
+ * `rocket_conv2d_int8_cube_out_at_rk3576()` refuses the handle.
  *
  * Caution: a handle is not thread-safe. It holds the scratch a call writes through, so
  * concurrent prepacked calls on one handle race. Pack one handle per thread, or serialize
@@ -1319,9 +1333,16 @@ int rocket_rk3576_cube_declare_tail(rocket_rk3576_cube *c, unsigned live, int va
  * channel count, and the DPU writes every group it is told to. A partial group's channels
  * are packed with zero weights and a zero A term, so they are written as the output zero
  * point. At a graph join that is the consumer's input zero point, the border constant its
- * own cube would have used. A depthwise handle is programmed with the raw count and leaves
- * everything past it untouched. It declares nothing unless its output channels fill the last
- * group exactly.
+ * own cube would have used.
+ *
+ * A depthwise handle is programmed with the raw count and never writes past it. When it
+ * writes its own output buffer, and that count is a multiple of 16 and not of 32, the pack
+ * adds a channel group. The pack fills that group with the output zero point, once. The
+ * handle then declares that tail, and the cube has the extra group. Otherwise a depthwise
+ * handle declares nothing unless its output channels fill the last group exactly.
+ *
+ * A packed-image handle that materializes its pad columns describes the caller's plane at
+ * column `col_off` of rows `pitch_w` elements wide. Only a pool reads that cube.
  *
  * Evidence: [HW sweep, H96 MAX M9, tests/rk3576_pad_channels.c] for the constant tail. */
 int rocket_conv2d_int8_cube_of_rk3576(const rocket_conv2d_int8_weights_rk3576 *h,
@@ -1377,8 +1398,12 @@ int rocket_conv2d_int8_cube_shared_rk3576(rocket_conv2d_int8_weights_rk3576 *h, 
  *
  * - A foreign fd
  * - A handle with more than one output-channel tile
+ * - A packed-image handle that materializes its pad columns, whose output plane is wider
+ *   than the caller's
  * - A plane or a channel-group stride that is not this handle's
- * - A slice too short for its output channels
+ * - A slice with a row pitch or a column offset
+ * - A slice too short for its output channels, or one that does not start on a whole
+ *   channel group
  */
 int rocket_conv2d_int8_cube_out_at_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
                                           const rocket_rk3576_cube *dst);
@@ -1414,8 +1439,8 @@ int rocket_conv2d_int8_cube_out_at_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
  * through `rocket_conv2d_int8_prepacked_rk3576()`, which is what the chain falls back to if
  * a program has to be redone. Nothing here changes what is computed.
  *
- * The constructor refuses each case where the chain would otherwise be silently wrong or
- * impossible to build:
+ * The constructor returns NULL for each case where the chain would otherwise be silently
+ * wrong or impossible to build:
  *
  * - Fewer than two handles
  * - A handle with more than one output-channel tile
@@ -1536,7 +1561,8 @@ unsigned rocket_conv2d_int8_programs_rk3576(const rocket_conv2d_int8_weights_rk3
  * that a caller prepares a layer's input on the host.
  *
  * The convolution-only entries above are these with every node a `conv`. They exist because
- * most callers have no pooling layer to place, and they share one implementation.
+ * most callers have no pooling layer to place, and they share one implementation. Like
+ * them, `rocket_chain_new_rk3576()` returns NULL for a node array it refuses.
  *
  * Evidence: [HW sweep, tests/rk3576_chain_pool.c], over five geometries to a 110x110 plane,
  * with both intermediates read.
@@ -1554,7 +1580,8 @@ unsigned rocket_chain_plan_rk3576(const rocket_chain_node_rk3576 *nodes, unsigne
                                   rocket_conv2d_int8_run_rk3576 *runs, unsigned max_runs);
 
 /* Returns how many register programs this node emits, or 0 for a node that cannot be
- * chained. */
+ * chained. A placement node, one with `placement` set, also returns 0 because it emits
+ * nothing, and it can sit inside a run. A caller tells the two apart by that field. */
 unsigned rocket_chain_node_programs_rk3576(const rocket_chain_node_rk3576 *node);
 
 /* Returns the longest program stream a chain accepts. The kernel's completion deadline

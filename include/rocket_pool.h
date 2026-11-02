@@ -73,8 +73,14 @@ static inline int rocket_pool_ow(const rocket_pool_desc *d)
 { return rocket_pool_out_dim(d->iw, d->kw, d->stride_x, d->pad_left, d->pad_right); }
 
 /* Checks a descriptor against the supported set: the field widths and the fit in a single
- * job. Returns 0 if the pool can run, and a negative reason code otherwise. It is pure and
- * touches no hardware. */
+ * job. Returns 0 if the pool can run, and a negative `rocket_status` otherwise:
+ *
+ * - `ROCKET_E_SHAPE`: a NULL or malformed descriptor (a dimension, kernel or stride below 1,
+ *   a negative pad, an unknown method, or an empty output)
+ * - `ROCKET_E_UNSUPPORTED`: past the PPU's fields (a dimension above 8192, a kernel or
+ *   stride above 16, a pad above 7), an average kernel below 2, or `avg_exclude_pad` = 1
+ *
+ * It is pure and touches no hardware. */
 int rocket_pool_fp16_plan(const rocket_pool_desc *d);
 
 /* Runs the pool on the NPU. `fd` is an open `rocket` device from `rocket_open()`, and `in`
@@ -91,28 +97,26 @@ int rocket_pool_fp16(int fd, const rocket_pool_desc *d,
 void rocket_pool_ref_fp16(const rocket_pool_desc *d,
                           const _Float16 *in, _Float16 *out);
 
-/* Pool int8 and uint8 tensors on the PPU, in the C2=16 cube. These are the int8
- * counterparts of `rocket_pool_fp16`, and the PPU reduces in the signed int8 domain:
+/* Pool int8 and uint8 tensors on the PPU. These are the int8 counterparts of
+ * `rocket_pool_fp16`, and they run through it. Every int8 and uint8 value is exact in fp16.
+ * The entry therefore converts the input to fp16, runs the fp16 pool and converts back:
  *
  * - `rocket_pool_int8`: signed int8 in and out (`in` [C][IH][IW], `out` [C][OH][OW]).
- * - `rocket_pool_uint8`: uint8 in and out. The host recenters each byte around the
- *   signed PPU compare with `byte ^ 0x80`, an order-preserving uint8-to-int8 map.
+ * - `rocket_pool_uint8`: uint8 in and out. The host subtracts 128 from each byte before the
+ *   pool and adds it back after, which leaves a max and an average unchanged.
  *
- * A max is a bit-exact integer max, the case detection needs. An average is supported,
- * with the same fp16(65536/k) reciprocal, but the PPU truncates toward zero in the int8
- * domain. The result is therefore not rounded to nearest. With `POOL_METHOD_AVG`, the
- * entries return the hardware-truncated average, and the CPU reference below matches that
- * truncation.
+ * A max is a bit-exact integer max, the case detection needs. An average is the fp16
+ * pool's, with its fp16(65536/k) reciprocal, rounded to nearest and clamped to the output
+ * type. It is within one of the exactly rounded average (`tests/pool_int8_rocket.c`).
  *
  * With `fd` < 0 they compute the CPU reference. Returns 0 on success and a negative value
- * on error. The fp16 plan's rule that an average needs a kernel of at least 2 (-9) still
- * applies. */
+ * on error. The fp16 plan's rule that an average needs a kernel of at least 2
+ * (`ROCKET_E_UNSUPPORTED`) still applies. */
 int rocket_pool_int8(int fd, const rocket_pool_desc *d, const int8_t *in, int8_t *out);
 int rocket_pool_uint8(int fd, const rocket_pool_desc *d, const uint8_t *in, uint8_t *out);
 
-/* Computes the CPU int8 reference: a signed integer max, or the PPU's truncating average
- * (the window sum times the reciprocal). It matches the hardware the two entries drive,
- * and runs on the host only. */
+/* Computes the CPU int8 reference: the fp16 reference of the same values, rounded to
+ * nearest and clamped, which is what the two entries compute. It runs on the host only. */
 void rocket_pool_ref_int8(const rocket_pool_desc *d, const int8_t *in, int8_t *out);
 
 /* Pools int8 tensors on the RK3576 with its own entry. It takes the same descriptor and
@@ -121,7 +125,9 @@ void rocket_pool_ref_int8(const rocket_pool_desc *d, const int8_t *in, int8_t *o
  * as `rocket_conv2d_int8()` and `rocket_matmul_int8()` are on the RK3576. It differs in two
  * ways:
  *
- * - The average rounds half to even, where `rocket_pool_int8()` truncates toward zero.
+ * - The average is the integer window sum times the PPU's Q16 reciprocal of each axis, and
+ *   rounds half to even where that reciprocal is exact. `rocket_pool_int8()` averages in
+ *   fp16 and is within one of the exactly rounded average.
  * - On the average path the pad value is the input zero point, so this entry takes one.
  *   With `avg_exclude_pad` set, the pad value is 0 instead, so the pad taps add nothing to
  *   the sum. A max pads with -128 and ignores the zero point.
@@ -324,6 +330,15 @@ size_t rocket_pool_int8_rk3576_lag_src_bytes(const rocket_pool_int8_rk3576_handl
  * handle sums its column slices. */
 void rocket_pool_int8_rk3576_lag_counts(const rocket_pool_int8_rk3576_handle *h,
                                         unsigned *fires, unsigned *calls);
+/* Returns how many of the elements the lag check scored could have shown the lag on the data
+ * they held. Those are the elements whose average rounds to different values under the
+ * window's own divisor and under the previous window's. The count sums every check on this
+ * handle, and a parent handle sums its column slices. A layer whose count is 0 could not have
+ * reported a lag, so its `fires` from `_lag_counts()` says nothing about the hazard there.
+ * Returns 0 for a NULL handle.
+ *
+ * The count is kept only while `ROCKET_RK3576_POOL_LAG_DISCR` is a nonzero integer, read
+ * once, and is 0 otherwise. Counting adds a second rounding per scored element. */
 unsigned long rocket_pool_int8_rk3576_lag_discr(const rocket_pool_int8_rk3576_handle *h);
 /* Returns how many redos the lag check gives a call. The default is 32, and
  * `ROCKET_RK3576_POOL_LAG_ATTEMPTS` sets it. The budget is separate from the wide-output

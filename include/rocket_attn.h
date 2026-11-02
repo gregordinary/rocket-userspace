@@ -44,6 +44,11 @@ extern "C" {
  *
  * With `fd` < 0 it computes the exact host reference. Returns 0 on success and a negative
  * value on error.
+ *
+ * The output measures cosine similarity 1.000000 against an fp64 attention reference at
+ * Whisper-base (d 512, 8 heads) [HW sweep]. The shapes include a `T` that is not a
+ * multiple of 16. `tests/mha_rocket.c` fails below cosine 0.9999 or past a max_abs of 2% of
+ * the output's peak plus 1e-3, at d 512 and d 384.
  */
 int  rocket_mha_self_fp16(int fd, int T, int d, int n_head, const _Float16 *x,
                           const _Float16 *Wq, const _Float16 *bq,
@@ -112,6 +117,12 @@ void           rocket_fa_ctx_free(rocket_fa_ctx *c);
  * With `fd` < 0 it computes the exact host reference, which the tests compare against.
  * Returns 0 on success, `ROCKET_E_RANGE` for a real key's score that reached the fp16 limit
  * (see the Caution below), and a negative value on another error.
+ *
+ * The output measures cosine similarity 1.000000 against an fp64 attention reference at
+ * Gemma-4-12B shapes (head_dim 256, 16 query heads, 8 kv heads and 1) [HW sweep].
+ * `tests/flash_attn_rocket.c` fails below cosine 0.9995 or past a max_abs of 2% of the
+ * output's peak plus 1e-3. Its cases include a sliding window, a soft-cap, `n_kv` > `n_tokens`,
+ * unaligned `n_tokens` and `n_kv`, MLA, and the `_mt`, `_ctx`, chained and tiled paths.
  *
  * With `dv` != `head_dim` (MLA), the materialized per-head path runs. The chained-batch and
  * online-tiled paths assume a single head dimension and run only for `dv` == `head_dim`. The

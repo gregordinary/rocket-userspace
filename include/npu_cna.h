@@ -5,8 +5,6 @@
 /*
  * Copyright (C) 2024  Jasbir Matharu, <jasjnuk@gmail.com>
  *
- * prose-lint: off
- *
  * This file is part of rocket-userspace.
  *
  * rocket-userspace is free software: you can redistribute it and/or modify
@@ -22,7 +20,6 @@
  * You should have received a copy of the GNU General Public License
  * along with rocket-userspace.  If not, see <https://www.gnu.org/licenses/>.
  *
- * prose-lint: on
  */
 
 #include <stdint.h>

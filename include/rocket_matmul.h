@@ -143,7 +143,13 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
  *
  * Use it after activation scaling, or for accuracy at a large `K`. It reads back 2x the
  * output bytes (an fp32 cube against an fp16 one), so it is a separate opt-in entry rather
- * than the default. */
+ * than the default.
+ *
+ * The output agrees with an fp64 sum of the same fp16 inputs to ~1e-7 [HW sweep].
+ * `tests/matmul_fp32out_rocket.c`, registered at 64x4096x512, scores 8192 sampled outputs
+ * against that sum. It fails when the largest error reaches 2e-4 of the largest reference
+ * value. It also fails when the error is not at least 5x smaller than `rocket_matmul_fp16`'s
+ * on the same inputs, and it prints that ratio. */
 int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
                               const _Float16 *A, const _Float16 *B, float *C);
 
@@ -163,12 +169,12 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
  * Along each axis the entry behaves as follows, measured on the RK3576:
  *
  *   - `M` has no constraint. `M`=1 is supported, as is every plane the `M` rows can be cut
- *     into. On the RK3588, by contrast, rows are the convolution's spatial height, a
- *     height < 4 produces wrong values, and `M`==1 is padded to 4.
+ *     into. The RK3588 entries, by contrast, take `M` in multiples of four, their planners'
+ *     rule, and pad `M`==1 to 4.
  *   - `N` is tiled, and the tile sets the throughput. At the feature budget a submit's
- *     device time rises from about 0.12 ms at N 32 to 0.91 ms at N 2048. The device's
- *     rate therefore rises almost linearly with `N`, the only free axis [HW sweep, rocket
- *     1.6.0, 786 MHz, 2026-09-25]. `ROCKET_RK3576_MM_NT` overrides the default tile.
+ *     device time rises from about 0.12 ms at N 32 to 0.91 ms at N 2048. Sixty-four times
+ *     the work therefore takes 7.6 times as long. `N` is the only free axis [HW sweep,
+ *     rocket 1.6.0, 786 MHz, 2026-09-25]. `ROCKET_RK3576_MM_NT` overrides the default tile.
  *   - `K` is not tiled, and the entry refuses a `K` it cannot contract in one task. The
  *     boundary is `K` >= 6176 for every (M, N) enumerated. The planner halves the
  *     output-channel tile down to 32 channels before it gives up. The CBUF pool against a
@@ -897,7 +903,11 @@ void            rocket_ctx_free(rocket_ctx *ctx);
  * call's `M`. `_prepacked` then never returns -2 for a small `M`. The cost is the `Kt` a
  * small `M` gives up: at most the K-tile count the M = MAX_TILE plan already runs. The flag
  * suits a resident encoder whose sequence length varies per call. Flags 0 is
- * `rocket_ctx_create`. */
+ * `rocket_ctx_create`.
+ *
+ * Every output element is exact against an integer reference over nine encoder projection
+ * shapes at M 4-640 (`tests/matmul_prepacked_canonical_rocket.c`). Each weight is packed once,
+ * at M 60 or 512, and reused at every M. */
 #define ROCKET_CTX_TILING_CANONICAL 0x1u
 rocket_ctx     *rocket_ctx_create_ex(int nthreads, unsigned flags);
 

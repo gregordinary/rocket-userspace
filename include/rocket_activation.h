@@ -8,8 +8,6 @@
 /*
  * Copyright (C) 2026  The rocket-userspace authors
  *
- * prose-lint: off
- *
  * This file is part of rocket-userspace.
  *
  * rocket-userspace is free software: you can redistribute it and/or modify
@@ -25,7 +23,6 @@
  * You should have received a copy of the GNU General Public License
  * along with rocket-userspace.  If not, see <https://www.gnu.org/licenses/>.
  *
- * prose-lint: on
  */
 
 /*
@@ -100,7 +97,12 @@ enum rocket_activation_kind {
      * ~3e-5). The tiny tail terms quantize to ~0, which is harmless in the softmax sum. The
      * grid is uniform, so exp's relative interpolation error ~Δ²/8 is constant (~1e-4 at 512
      * intervals). Q0.15 sets the minimum of the low tail's relative error. Tune the domain with
-     * `ROCKET_LUT_XLO/XHI`, and with `ROCKET_LUT_SEXP` for x_hi>0. */
+     * `ROCKET_LUT_XLO/XHI`, and with `ROCKET_LUT_SEXP` for x_hi>0.
+     *
+     * The DPU decodes a table entry of exactly q=0 as about 4.0, and exp's tail over the
+     * default domain (x <= -11) quantizes to q=0. The library therefore clamps every
+     * shifted-table entry to q >= 1 (`ROCKET_LUT_QFLOOR`, default 1), which changes nothing
+     * for sqrt, rsqrt and reciprocal [HW sweep]. */
     ROCKET_ACTIVATION_EXP         = 10,  /* exp(x), default domain [-16,0] (softmax) */
     /* Internal gate kind: the Gaussian CDF Φ(x)=0.5(1+erf(x/√2)). It is the [0,1]-output gate
      * of the 2-pass GELU, GELU(x)=x·Φ(x). Φ is monotone [0,1] like sigmoid, so it uses the
@@ -183,7 +185,24 @@ enum rocket_activation_kind {
  * For the two-pass gated kinds (HardSwish, SiLU, GELU and Mish), `ROCKET_ACT_NPU_MUL=1` runs
  * the final x·gate(x) multiply on the NPU EW unit instead of on the host. The NPU multiply
  * changes the result slightly, because the NPU fp16 EW multiply rounds differently from the
- * host multiply. With it set, the output is not bit-identical to the host-multiply path. */
+ * host multiply. With it set, the output is not bit-identical to the host-multiply path.
+ *
+ * Accuracy per kind [HW sweep], with the threshold of the test that checks it:
+ *
+ * - Sigmoid and hardsigmoid: max_abs 0.00146 and 0.00049 against the fp16 CPU reference over
+ *   [-8,8] (2026-06-22). `tests/activation_lut_rocket.c` fails past 0.005, and past 0.03 for
+ *   HardSwish and SiLU.
+ * - SQRT, RSQRT and RECIPROCAL: max relative error 0.85%, 0.44% and 1.0% against double
+ *   precision. The inputs span 100-200x inside each default domain: [0.3,60], [0.6,60] and
+ *   [0.3,30]. `tests/recip_rsqrt_rocket.c` fails past 2%, 2% and 3%.
+ * - LOG: max_abs 0.0066 and mean 0.0007 over [0.3,30], worst near x = 0.33. The same test
+ *   fails past 0.03.
+ * - EXP: a softmax sum over row-max-subtracted scores is within 0.04% of double precision.
+ *   `tests/exp_lut_rocket.c` fails past 1% on that sum, and past 2e-3 absolute or 1% relative
+ *   (x >= -4) on exp over [-16,0].
+ * - SOFTPLUS and MISH: max relative error 0.14% and 0.06% against double precision, and ABS
+ *   max_abs 1e-3. `tests/softplus_mish_rocket.c` fails past 3% relative for Softplus, 5% for
+ *   Mish and 2% for Abs. */
 int rocket_activation_fp16(int fd, int kind,
                            const _Float16 *in, _Float16 *out, int n);
 
@@ -228,6 +247,9 @@ int rocket_clip_fp16(int fd, float lo, float hi, const _Float16 *in, _Float16 *o
  * test must compare it with a tolerance. It covers TFLite/ONNX DIV. Returns 0 on success and a
  * negative value on error.
  *
+ * Measured max relative error 0.35% against double precision for `b` in [0.5,8] and `a` in
+ * [-4,4] [HW sweep]. `tests/recip_rsqrt_rocket.c` fails past 5%.
+ *
  * If `b` straddles 0 or has a wide range, the caller should divide on the host instead. */
 int rocket_ew_div_fp16(int fd, const _Float16 *a, const _Float16 *b,
                        _Float16 *out, int n);
@@ -246,7 +268,11 @@ int rocket_ew_div_fp16(int fd, const _Float16 *a, const _Float16 *b,
  * The DPU LUT's sign-based LE/LO mux spikes at exactly x=0. The runtime repairs that
  * razor-thin band on the host, at negligible cost because the readback already streams every
  * element. `ROCKET_LEAKY_NOREPAIR` disables the repair. `n` is padded to a multiple of 8.
- * Returns 0 on success and a negative value on error. */
+ * Returns 0 on success and a negative value on error.
+ *
+ * `tests/leaky_relu_rocket.c` tests alpha 0.01-0.5 against the fp16 CPU reference, over
+ * [-15.9,15.9] at the default R and the band within 0.002 of x = 0. It fails on any element
+ * past 0.02. */
 int rocket_leaky_relu_fp16(int fd, float alpha, const _Float16 *in, _Float16 *out, int n);
 
 /* Computes the CPU reference for LeakyReLU(alpha), fp16-rounded, for tests. */
@@ -260,11 +286,14 @@ void rocket_leaky_relu_ref_fp16(float alpha, const _Float16 *in, _Float16 *out, 
  * since e^-8~0.
  *
  * Where |x|>R, the output saturates at the table edge. `n` is padded to a multiple of 8.
- * Returns 0 on success and a negative value on error. (TFLite/ONNX Elu.) */
+ * Returns 0 on success and a negative value on error. (TFLite/ONNX Elu.)
+ *
+ * Tested at alpha 0.5-2.0 against double precision over [-8,8]: `tests/elu_rocket.c` fails
+ * past 3% relative where |f| >= 0.1, and past 0.02 absolute (0.03 at alpha 2.0). */
 int rocket_elu_fp16(int fd, float alpha, const _Float16 *in, _Float16 *out, int n);
 /* Computes SELU(x) = lambda*(x>=0 ? x : alpha*(e^x-1)) with the fixed self-normalizing
  * constants alpha=1.6732632423543772 and lambda=1.0507009873554805, on the same shifted-table
- * path as ELU. */
+ * path as ELU. `tests/elu_rocket.c` holds it to the ELU thresholds, at 0.03 absolute. */
 int rocket_selu_fp16(int fd, const _Float16 *in, _Float16 *out, int n);
 
 /* Compute the CPU references, fp16-rounded, for tests. */

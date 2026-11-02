@@ -1828,10 +1828,12 @@ static int r76_argb_bounds(const char *entry, const rocket_conv2d_desc *d,
  * [HW sweep, H96 MAX M9, tests/rk3576_argb_extend.c].
  *
  * What it costs is a wider image (one 16-output granule of columns), the MACs of the surplus
- * output columns, and a de-scatter that walks rows instead of one contiguous plane. What it
- * cannot do is leave a CUBE: the surface is `owx` wide where a consumer wants the caller's
- * `ow`, and the row stride inside a plane is implied by `iw` with no register to move it —
- * r76_cube_shape_ok() refuses it there.
+ * output columns, and a de-scatter that walks rows instead of one contiguous plane. Its cube
+ * is `owx` wide where a consumer wants the caller's `ow`, so it leaves one only with a row
+ * pitch (`pitch_w`, `col_off`), which a pool reads in place. A convolution's input has no
+ * register for that pitch, and a caller's slice fixes its own geometry, so
+ * r76_cube_shape_ok() refuses the stem as a placed slice and cube_in refuses the pitched
+ * cube.
  *
  * Returns ROCKET_OK with the programmed descriptor in `dx`, or a negative status, in which
  * case the caller falls through to r76_argb_bounds()'s refusal.
@@ -4095,6 +4097,10 @@ int rocket_conv2d_int8_cube_out_at_rk3576(rocket_conv2d_int8_weights_rk3576 *h,
      * pay for one allocation and not two. */
     if (h->tile[0].out.ptr) rocket_bo_free(h->fd, &h->tile[0].out);
     memset(&h->tile[0].out, 0, sizeof h->tile[0].out);
+    /* The tail the pack filled went with that surface. Nothing fills a group past the
+     * written ones in the caller's slice, which may be the next producer's channels, so
+     * the cube this handle describes from here declares no such tail. */
+    h->tile[0].tail_zp = 0;
     /* Its sentinel goes on at the START of the next call, like every other cube-out
      * surface: this one is read as an input before this handle runs again. */
     h->tile[0].stamped = 0;

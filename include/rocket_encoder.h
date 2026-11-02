@@ -38,6 +38,11 @@
  * All weights are row-major [out,in] (PyTorch nn.Linear). Biases are optional, and NULL means
  * none (Whisper attention has bq, bv and bo, and no bk). With `fd` < 0 it computes the exact
  * host reference. Returns 0 on success and a negative value on error.
+ *
+ * The block measures cosine similarity 1.000000 against an fp64 block reference, and a max_abs
+ * of about 2e-3 at an output magnitude near 2.4 [HW sweep]. The shapes are d 256 and 512, a `T`
+ * that is not a multiple of 16 included. `tests/encoder_block_rocket.c` fails below cosine
+ * 0.9995 or past a max_abs of 3% of the output's peak plus 2e-3.
  */
 
 #ifdef __cplusplus

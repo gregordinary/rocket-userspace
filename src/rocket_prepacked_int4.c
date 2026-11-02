@@ -233,13 +233,15 @@ static rocket_wsig rk4_wsig(const rk4_scratch *sc, int t) {
  * check only saw the PACK's M, and rk4_worker_alloc plans at the canonical tileM (=
  * MAX_TILE), so rocket_matmul_plan_int4's own M%4 guard never sees the call's M either.
  * M-independence is what makes the gap reachable — varying M against one packed weight is
- * the feature. An unaligned M silently MISCOMPUTES (the int8 twin's HW sweep: M =
- * 1/2/3/5/6 all return garbage with rc=0), so reject rather than pad: padding M would
- * need a matching pad of a_scale, which only the caller can supply. */
+ * the feature. The int8 twin's sweep once returned garbage at M = 1/2/3/5/6 with rc=0, before
+ * the packed feature-surface stride (cna_feature_surf_stride) made a task exact at any M; this
+ * path has not been run unaligned since, so the planners' M%4 rule is enforced here. Reject
+ * rather than pad: padding M would need a matching pad of a_scale, which only the caller can
+ * supply. */
 static int rk4_call_m_ok(const char *who, int M) {
     if (M % 4 != 0 || M <= 0) {
-        ROCKET_LOGE("%s: M=%d must be a positive multiple of 4 (an unaligned M "
-                "miscomputes on HW) — pad rows caller-side\n", who, M);
+        ROCKET_LOGE("%s: M=%d must be a positive multiple of 4 (the resident tiling takes "
+                "rows in fours) — pad rows caller-side\n", who, M);
         return 0;
     }
     return 1;

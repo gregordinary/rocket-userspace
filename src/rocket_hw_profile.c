@@ -95,8 +95,8 @@ const struct rocket_hw_profile rocket_hw_rk3576 = {
      * max_tile is the OUTPUT-CHANNEL tile, and here that is the whole of the tiling
      * question. M*K is capped by the feature budget above and K by the resident weight
      * slice, which leaves N as the only axis worth spending. At that budget a submit's
-     * device time is about 0.12 ms at N=32 and 0.91 ms at N=2048, so the device's rate
-     * rises almost linearly with N, from about 140 GOP/s to about 1.2 TOP/s [HW sweep,
+     * device time is about 0.12 ms at N=32 and 0.91 ms at N=2048: 64 times the work takes
+     * 7.6 times the time, and the rate rises from about 140 GOP/s to about 1.2 TOP/s [HW sweep,
      * rocket 1.6.0, 786 MHz, 2026-09-25]. It rises up to a boundary past which the
      * trailing output channels simply do not reach DDR: 2944
      * channels computes and 3072 is intermittent, and independently a weight cube of

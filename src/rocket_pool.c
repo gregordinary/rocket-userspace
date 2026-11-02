@@ -30,27 +30,32 @@
 
 int rocket_pool_fp16_plan(const rocket_pool_desc *d)
 {
+    /* A malformed descriptor is ROCKET_E_SHAPE and one past the PPU's fields or this
+     * path's features is ROCKET_E_UNSUPPORTED, as in rocket_pool_int8_rk3576_plan(). */
     if (!d) return ROCKET_E_SHAPE;
-    if (d->c < 1 || d->ih < 1 || d->iw < 1) return ROCKET_E_NOMEM;
-    if (d->kh < 1 || d->kw < 1 || d->stride_y < 1 || d->stride_x < 1) return ROCKET_E_UNSUPPORTED;
-    if (d->method != POOL_METHOD_MAX && d->method != POOL_METHOD_AVG) return -4;
+    if (d->c < 1 || d->ih < 1 || d->iw < 1) return ROCKET_E_SHAPE;
+    if (d->kh < 1 || d->kw < 1 || d->stride_y < 1 || d->stride_x < 1) return ROCKET_E_SHAPE;
+    if (d->pad_top < 0 || d->pad_left < 0 || d->pad_bottom < 0 || d->pad_right < 0)
+        return ROCKET_E_SHAPE;
+    if (d->method != POOL_METHOD_MAX && d->method != POOL_METHOD_AVG) return ROCKET_E_SHAPE;
     /* count-include-pad = FALSE is claimed on the RK3576 int8 path alone
      * (rocket_pool_int8_rk3576()). These entries always divide by kh*kw, so a 1 here is
      * refused rather than silently dropped — the two are the same function only at pad 0
      * and a caller that asked has a padded window in mind. */
-    if (d->avg_exclude_pad) return -10;
+    if (d->avg_exclude_pad) return ROCKET_E_UNSUPPORTED;
     int oh = rocket_pool_oh(d), ow = rocket_pool_ow(d);
-    if (oh < 1 || ow < 1) return -5;
+    if (oh < 1 || ow < 1) return ROCKET_E_SHAPE;
     /* CUBE_* dims are 13-bit (value-1); kernel/stride 4-bit (value-1); pad 3-bit. */
     if ((unsigned)(d->iw-1) >> 13 || (unsigned)(d->ih-1) >> 13 || (unsigned)(ow-1) >> 13 ||
-        (unsigned)(oh-1) >> 13 || (unsigned)(d->c-1) >> 13) return -6;
+        (unsigned)(oh-1) >> 13 || (unsigned)(d->c-1) >> 13) return ROCKET_E_UNSUPPORTED;
     if ((unsigned)(d->kw-1) >> 4 || (unsigned)(d->kh-1) >> 4 ||
-        (unsigned)(d->stride_x-1) >> 4 || (unsigned)(d->stride_y-1) >> 4) return -7;
-    if ((unsigned)d->pad_left >> 3 || (unsigned)d->pad_top >> 3 ||
-        (unsigned)d->pad_right >> 3 || (unsigned)d->pad_bottom >> 3) return -8;
+        (unsigned)(d->stride_x-1) >> 4 || (unsigned)(d->stride_y-1) >> 4)
+        return ROCKET_E_UNSUPPORTED;
+    if (d->pad_left >> 3 || d->pad_top >> 3 || d->pad_right >> 3 || d->pad_bottom >> 3)
+        return ROCKET_E_UNSUPPORTED;
     /* AVG reciprocal fp16(65536/k) overflows fp16 at k=1, so an average needs k>=2 per
      * axis (a 1-wide average kernel is degenerate anyway). MAX is fine with k=1. */
-    if (d->method == POOL_METHOD_AVG && (d->kw < 2 || d->kh < 2)) return -9;
+    if (d->method == POOL_METHOD_AVG && (d->kw < 2 || d->kh < 2)) return ROCKET_E_UNSUPPORTED;
     return 0;
 }
 

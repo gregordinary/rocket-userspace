@@ -196,8 +196,9 @@ int rocket_rk3576_i32_wide_word(unsigned ow, unsigned oh_full, unsigned c, unsig
  *   writes fp16 and width 3 writes bfloat16. Without it, width 2 writes the fp32 word's low
  *   mantissa bits, which are zero for small values.
  *
- * CORE 0x3018 pins the operand type, and only 2 computes. CNA 0x100C's `in` field pins the
- * 2-byte width class. The two words differ in this way, so an fp16 and a bf16 program are
+ * CORE 0x3018 pins the operand type: 2 is fp16 and 3 is bf16. The matmul-form program
+ * contracts bf16 bit-exactly at 3 (`tests/rk3576_mm_bf16_probe.c`). 3 on fp16 bytes returns
+ * a wrong output, as it must. CNA 0x100C's `in` field pins the 2-byte width class. The two words differ in this way, so an fp16 and a bf16 program are
  * indistinguishable in the CNA word.
  *
  * The float weight cube groups both channel axes by 16 (`rocket_rk3576_weight_conv_fp16`),

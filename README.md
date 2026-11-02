@@ -119,12 +119,14 @@ clock comes from a PVTPLL, a ring oscillator whose frequency follows the rail vo
 requested rate is therefore not the running clock.
 
 Apply the `patches/rocket` clock and voltage patches and load the module with
-`rocket_npu_clk_hz=900000000`. On the RK1's 0.80 V rail that request runs at 928 MHz. It held 922-928 MHz through 15 minutes of continuous load, at a 49 °C peak,
-with every matmul bit-exact. The patches also trim dispatch latency.
+`rocket_npu_clk_hz=900000000`. On the RK1's 0.80 V rail that request runs at 928 MHz. It held
+922-928 MHz through 15 minutes of continuous load, at a 49 °C peak, with every matmul
+bit-exact. The patches also trim dispatch latency.
 
-The RK3588 performance figures below were measured with the 600 MHz request, which runs at
-~816 MHz on the same rail. The 900 MHz request is 1.044x faster on matmul device time. The
-RK3576 figures state their own clock, which the board's device tree assigns.
+Most RK3588 performance figures below were measured with the 600 MHz request, which runs at
+~816 MHz on the same rail, and each states its clock. On matmul device time the 900 MHz request
+is 1.044x faster than the 600 MHz one. The RK3576 figures state their own clock, which the
+board's device tree assigns.
 
 > [!CAUTION]
 > With the NPU cores pinned on (`power/control=on`), an `rmmod` at the 900 MHz request
@@ -175,8 +177,9 @@ Three of that matmul's properties are the RK3588's inverted, and a caller portin
 the two must expect all three:
 
 - int8 is the default matmul precision here. One int8 task contracts up to 6144 input
-  channels, where an fp16 convolution task contracts sixteen. For speed keep K at or below
-  4608, because past 4992 the output tile drops from 1024 channels to 32.
+  channels. A caller choosing K for speed keeps it at or below 4608. Past 4992 the output
+  tile drops from 1024 channels to 32, which multiplies the submit count by 32 at M 512 and
+  N 2048.
 - The M axis has no alignment constraint, so `M=1` is correct.
 - The output is int8 through the DPU's requant rather than raw int32.
 
@@ -239,9 +242,11 @@ Two properties of the lowering beat a dedicated elementwise program:
 
 The add can also fuse into a block's last convolution, which absorbs its own skip. The fused
 convolution takes `C` more input channels and an identity block at the center tap of its
-kernel. The add then needs no program of its own. The weight slice rule `ic*kh*kw <= 4608`
-bounds the fusion. A 1×1 project convolution is far below it, and a 3×3 reaches it exactly at
-`C = 256`.
+kernel. The add then needs no program of its own. The skip inherits that convolution's
+weight scale, so the identity weight `skip_scale / (in_scale·w_scale)` must fit an int8. That
+needs a requant gain above about 1/127, and none of MobileNetV2's ten residual blocks has one.
+`rocket_residual_fuse_weight_rk3576()` computes the weight and refuses a block where it does
+not fit.
 
 #### Cube layout and chained runs
 
@@ -286,14 +291,17 @@ kick in one submit:
 
 | Network | Compute layers | Topology | This library | Per-op entries, transient weights |
 |---|---:|---|---:|---:|
-| MobileNetV1-224 | 29 | | 5.0 ms | ~115 ms |
+| MobileNetV1-224 | 29 | | 5.0 ms | 98.8 ms |
 | MobileNetV2-224 | 64 | Ten residual skips | 6.5-6.6 ms | 112.9 ms |
 | ResNet-18-224 | 31 | | 6.6 ms | 144.9 ms |
 | Inception V1-224 | 81 | Nine four-operand concatenations, thirteen pooling layers | 7.0-7.1 ms | 159.7 ms |
 
 **Conditions:** RK3576, NPU clock 786 MHz, CPU governor `ondemand`, `tests/rk3576_net_gate.c`
-with `bench 100`, measured 2026-08-03. The library's times are warm, with resident weights. At
-594 MHz, with a newer library and kernel, the four measure 12-21% slower (2026-10-02).
+with `bench 100`, measured 2026-08-03 (MobileNetV1's last column 2026-07-29). The library's
+times are warm, with resident weights.
+
+On a later image whose device tree assigns 594 MHz, with a newer library and kernel, the four
+networks run 12-21% slower (2026-10-02). That difference is not isolated to the clock.
 
 The last column runs the same graph without resident weights, cube layout, the placed slices
 or the cross-layer kick, in tens of submits. Its result is the same to the byte at every step.
@@ -328,62 +336,56 @@ wrong parameters.
 ## Performance
 
 The matmul is a prefill and batched-GEMM engine. At ~816 MHz (the 600 MHz request) the
-whole-tile program's resident throughput is ~460 GOP/s across precisions: fp16 461, int8 386
-and int4 413 GOP/s on `512×3840×4096`. As an LLM prefill it runs Gemma-4-12B at ~15 t/s
-pp2048, which is ~3.2x the 8-thread CPU at M>=512 and 3.6x at pp512. It is DMA/dispatch-bound
-rather than MAC-bound, so quantization saves RAM and fits larger models rather than raising
-prefill speed. Decode (M=1 GEMV) stays on the CPU.
+whole-tile program's resident throughput on `512×3840×4096` is 461 GOP/s in fp16, 413 in int4
+and 386 in int8. It is DMA-bound and dispatch-bound rather than MAC-bound.
+
+As an LLM prefill through `ggml-rocket`, with the weights streamed through the CBUF, it runs
+Gemma-4-12B F16 at 24.6 t/s at pp2048. The 8-thread CPU runs 4.7 t/s there, so the speedup is
+5.2x, and 5.1x at pp512. Measured 2026-11-01 at 928 MHz (the 900 MHz request), CPU governor `performance`,
+llama.cpp b11539.
 
 The fp16 planner streams the weights through the CBUF by default (`ROCKET_MM_STREAM`), which
 runs `512×3840×4096` in 12 tasks instead of the whole-tile program's 512. Through `ggml-rocket`
 it runs pp512 1.07-1.17x faster than the whole-tile program on four models, at 928 MHz (the
-900 MHz request). The Gemma-4-12B figures in this section are the whole-tile program's.
-[API.md](API.md#runtime-environment-variables) has the streamed plan's conditions and per-model figures.
-
-### The MRDMA trap
-
-> [!CAUTION]
-> A matmul register program must include the DPU-RDMA block (`0x5xxx`). A regcmd that
-> configures CNA/CORE/DPU and omits it hangs, because the DPU read-DMA waits forever.
-
-The matmul path emits the DPU-RDMA block and the correct enable mask. Tiling past the
-12×32 KB CBUF covers all Gemma FFN shapes, with M and N independent and K split. The fp16
-K-partials accumulate on the NPU by default (`ROCKET_KACC`), and in fp32 on the host with
-`ROCKET_KACC=0`.
+900 MHz request). The step table below is the whole-tile program's.
+[API.md](API.md#matmul-tiling-plans) has the streamed plan's conditions and per-model figures.
 
 ### Gemma-4-12B fp16 prefill
 
-The ~15 t/s figure on Gemma-4-12B pp2048 is the product of these operating-point gains over
-the 200 MHz boot clock:
+The whole-tile program reached ~15 t/s on Gemma-4-12B pp2048 through these steps over the
+200 MHz boot clock. Each ratio is the step from the row above:
 
 | Step | Result |
 |---|---|
 | Baseline (200 MHz, tiled multicore fp16) | 7.98 t/s |
 | Clock ~816 MHz, the 600 MHz request (`patches/rocket`) | 1.43x -> 11.40 |
-| fp16 NPU K-accum (DPU eltwise-add, read each tile once) | +19% -> 13.38 |
-| CBUF DATA_REUSE | +7% -> ~14.5 |
-| Resident weights (prefill-only) | +6% -> ~15.1 |
+| fp16 NPU K-accum (DPU eltwise-add, read each tile once) | 1.17x -> 13.38 |
+| CBUF DATA_REUSE | 1.08x -> ~14.5 |
+| Resident weights (prefill-only) | 1.04x -> ~15.1 |
+
+**Conditions:** RK3588, Gemma-4-12B F16 through `ggml-rocket`, the whole-tile fp16 program,
+the clock step measured 2026-06-15.
 
 A76 affinity, NEON fp16 conversion and the NEON readback de-tile reduce the host time around
-these steps. The CPU baseline is ~4.7 t/s flat, so the speedup is ~3.2-3.6x at M>=512 and
-about a tie at pp128. With the clock raised and K-accumulation on, the NPU `wait` takes
-~60-68% of the matmul's time and packB ~22%. The remaining host work is
-memory-bound and gather-bound rather than instruction-bound.
+these steps. The remaining host work is memory-bound and gather-bound rather than
+instruction-bound.
 
 ### Quantization and prefill speed
 
-Quantization does not speed prefill at this operating point. Resident int8 and int4 tie the
-whole-tile fp16 program at ~460 GOP/s, where the NPU runs at ~15% of its fp16 MAC peak. In-model resident int8
-prefill measured 0.60x fp16 on Gemma-4-12B (~816 MHz, a June 2026 build), because its int32
-readback is not K-accumulated on the NPU. The int8 and int4 paths therefore save RAM and fit
-larger models rather than raising throughput. The result holds while prefill is DMA-bound and
-dispatch-bound. The [datatype matrix](API.md#datatype-matrix) has the full per-dtype detail.
+Quantization does not speed prefill at this operating point. Resident int8 and int4 run at 386
+and 413 GOP/s beside the whole-tile fp16 program's 461. The NPU then runs at ~15% of its fp16
+MAC peak. In-model resident int8 prefill measured 0.60x fp16 on Gemma-4-12B (~816 MHz, a June
+2026 build), because its int32 readback is not K-accumulated on the NPU.
+
+The int8 and int4 paths therefore save RAM and fit larger models rather than raising
+throughput. The result holds while prefill is DMA-bound and dispatch-bound. The [datatype
+matrix](API.md#datatype-matrix) has the full per-dtype detail.
 
 ## Capabilities and limitations
 
 Everything above is validated on hardware, the RK3588 sections on the RK3588 and the RK3576
-sections on the RK3576. The matmul dtypes are bit-exact at int8 and
-int4, and within fp16 tolerance otherwise. The conv and op library each have a CTest test
+sections on the RK3576. The matmul datatypes are bit-exact at int8, int4 and the int16
+decomposition, and within a floating-point tolerance at fp16, bf16 and tf32. The conv and op library each have a CTest test
 against an fp64 oracle reference, and [API.md](API.md#tests) holds the full catalog. The
 limits:
 
@@ -404,12 +406,11 @@ limits:
   (`tests/rowmajor_matmul_probe`, `tests/rowmajor_tile_probe`). The flash attention hands its
   scores and probabilities between its two matmuls that way. The matmul entries pack A and
   de-tile C on the host.
-- **The clock boots at 200 MHz.** A higher rate needs the `patches/rocket` clock patch. The
-  900 MHz request runs at 928 MHz and is the operating point. An `rmmod` with the cores pinned
-  on hard-locks the board at that request ([Clock](#clock)).
-- **bf16, int16 and tf32 add datatype coverage rather than speed.** bf16 and int16 tie the
-  whole-tile fp16 program at ~460 GOP/s and tf32 is half-rate. Only bf16 has an in-model use: fp32 range with no
-  activation scaling.
+- **The clock boots at 200 MHz.** A higher rate needs the `patches/rocket` clock patch
+  ([Clock](#clock)).
+- **bf16, int16 and tf32 add datatype coverage rather than speed.** bf16 and int16 have
+  fp16's nominal MAC rate and tf32 half of it. Only bf16 has an in-model use: fp32 range with
+  no activation scaling.
 
 ## Build and test
 
@@ -440,9 +441,12 @@ built but not registered. [API.md](API.md#tests) holds the full catalog.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `ROCKET_KACC` | on | fp16 NPU K-accumulation (+19%), the operating mode |
-| `ROCKET_REUSE` | auto under KACC | CBUF operand reuse: 0 off, 1 weight, 2 data. Auto picks the longer reuse run per shape, data on a tie (+7%) |
+| `ROCKET_KACC` | on | fp16 NPU K-accumulation, the operating mode. `0` selects the host fp32 sum |
+| `ROCKET_REUSE` | auto under KACC | CBUF operand reuse: 0 off, 1 weight, 2 data. Auto picks the longer reuse run per shape, data on a tie |
 | `ROCKET_CPU_AFFINITY` | auto | Big-core set the pack and readback workers pin to |
+
+Each switch reads its value as a number, so set `0` or `1`: `ROCKET_KACC=on` reads as 0 and
+turns K-accumulation off.
 
 [API.md](API.md#runtime-environment-variables) holds the full `ROCKET_*` reference, covering
 flash-attention chaining, tiling overrides and batched submit, and the diagnostic log
@@ -505,8 +509,7 @@ optional kernel patches:
   runs `librocketnpu` on the vendor `rknpu` BSP kernel driver instead of mainline `rocket`.
 - **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional
   out-of-tree kernel-module patches for clock, voltage and IOMMU. They raise the NPU clock
-  from its 200 MHz boot default and trim dispatch latency. The RK3588 performance figures above
-  were measured with them at the 600 MHz request (~816 MHz).
+  from its 200 MHz boot default and trim dispatch latency.
 
 ## License and credits
 

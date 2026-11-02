@@ -107,8 +107,8 @@ int rocket_encoder_block_fp16(int fd, int T, int d, int n_head, int d_ff,
      * intermediate in NPU cube layout across fc1 -> +bf1 -> GELU -> fc2 — the bf1 add and the
      * 2-pass GELU run element-wise on the cube and fc2 reads it directly, so the host never
      * de-tiles/re-tiles the activation. This is the lever for the TRANSFORM-BOUND encoder
-     * (SigLIP/Whisper ~80% transform-to-compute). For shapes it can't tiling-match it falls
-     * back internally to the host-handoff fc1/GELU/fc2 below. ROCKET_ENCODER_NOFUSE forces the
+     * (SigLIP-B/16: transforms ~81% of compute; Whisper not measured). For shapes it can't
+     * tiling-match it falls back internally to the host-handoff fc1/GELU/fc2 below. ROCKET_ENCODER_NOFUSE forces the
      * host-handoff path (A/B). The pad rows (T..Tp) are matmul-of-zero and never read out. */
     if (!getenv("ROCKET_ENCODER_NOFUSE")) {
         if ((rc = rocket_mlp_fp16_fused(fd, Tp, d, d_ff, d, hp, Wf1, bf1, Wf2,

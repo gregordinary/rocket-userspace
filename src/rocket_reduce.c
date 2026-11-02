@@ -56,20 +56,21 @@ int rocket_reduce_factor_axis(int n, int *f, int cap)
 int rocket_global_avgpool_plan(int C, int H, int W)
 {
     if (C < 1 || H < 1 || W < 1) return ROCKET_E_SHAPE;
-    if (H > ROCKET_REDUCE_MAX_DIM || W > ROCKET_REDUCE_MAX_DIM) return ROCKET_E_NOMEM;
+    if (H > ROCKET_REDUCE_MAX_DIM || W > ROCKET_REDUCE_MAX_DIM) return ROCKET_E_UNSUPPORTED;
     if ((unsigned)(C - 1) >> 13) return ROCKET_E_UNSUPPORTED;    /* PPU CUBE_*_CHANNEL is 13-bit (value-1) */
     int fh[REDUCE_MAX_PASS], fw[REDUCE_MAX_PASS];
     int nh = rocket_reduce_factor_axis(H, fh, REDUCE_MAX_PASS);
     int nw = rocket_reduce_factor_axis(W, fw, REDUCE_MAX_PASS);
-    if (nh < 0) return -4;                       /* H not 16-smooth */
-    if (nw < 0) return -5;                       /* W not 16-smooth */
+    /* A shape the passes cannot decompose is valid, and the entries compute it on the
+     * host: ROCKET_E_TILING, the status a caller may fall back on. */
+    if (nh < 0 || nw < 0) return ROCKET_E_TILING;    /* an axis that is not 16-smooth */
     /* Equal factor count per axis => every pass pools BOTH axes (kernels >= 2) and no
      * axis is reduced to 1 ahead of the other. Combined with ascending order this keeps
      * all intermediates >= 4 and none 1 wide, a chained shape no probe has run. Covers
      * all square maps (H==W -> identical factor lists) and equal-count rectangles; the
      * rare unequal-count case (e.g. 56x8) host-falls-back. nh==nw==0 (1x1) is the
      * trivial identity. */
-    if (nh != nw) return -6;
+    if (nh != nw) return ROCKET_E_TILING;
     return 0;
 }
 

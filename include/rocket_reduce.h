@@ -59,11 +59,17 @@
  * well above any real feature map, and this limit bounds the factor buffers. */
 #define ROCKET_REDUCE_MAX_DIM 8192
 
-/* Returns 0 for a `(C,H,W)` that runs entirely on the NPU, and a negative reason otherwise.
- * To run on the NPU, a shape needs both axes 16-smooth with an equal factor count, and its
- * dimensions in range. A negative result is not an error for `rocket_global_avgpool_fp16`,
- * which then computes on the host. It lets a caller, such as the TFLite delegate, choose
- * the path before the call. The function is pure and touches no hardware. */
+/* Returns 0 for a `(C,H,W)` that runs entirely on the NPU, and a negative `rocket_status`
+ * otherwise. To run on the NPU, a shape needs both axes 16-smooth with an equal factor
+ * count, and its dimensions in range. The statuses:
+ *
+ * - `ROCKET_E_SHAPE`: a dimension below 1
+ * - `ROCKET_E_UNSUPPORTED`: `H` or `W` above `ROCKET_REDUCE_MAX_DIM`, or `C` above 8192
+ * - `ROCKET_E_TILING`: an axis that is not 16-smooth, or unequal factor counts
+ *
+ * A negative result is not an error for `rocket_global_avgpool_fp16`, which then computes
+ * on the host. It lets a caller, such as the TFLite delegate, choose the path before the
+ * call. The function is pure and touches no hardware. */
 
 #ifdef __cplusplus
 extern "C" {

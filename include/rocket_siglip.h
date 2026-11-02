@@ -148,6 +148,10 @@ int  rocket_siglip_encode(int fd, const rocket_siglip_model *m,
  * and a post-LayerNorm cosine similarity of at least 0.99. The test runs the resident path
  * only with `ROCKET_SIGLIP_BENCH` set, and does not compare the two paths with each other.
  *
+ * The reference is the Hugging Face fp32 encoder on a 512x512 synthetic image. Against it the
+ * resident path measures a mean per-layer cosine similarity of 0.999998, and 0.999987 after
+ * the post-LayerNorm. The per-call path measures 0.999983 and 0.999894 [HW sweep].
+ *
  * `rocket_siglip_ctx_create` returns NULL on failure, for example on a weight pack that hit
  * the IOVA limit, or on host scratch that did not allocate.
  *

@@ -21,15 +21,16 @@
  * WHAT ONE SUBMIT COSTS, and what that makes the planner's job. A submit's device time
  * rises with what it carries. At the CBUF feature budget (M*K = 262144 int8 elements),
  * submit to fence is about 0.12 ms at N 32 and 0.91 ms at N 2048, so the device's rate
- * rises almost linearly with N, from about 140 GOP/s to about 1.2 TOP/s. The whole
+ * rises about eightfold over that 64-fold range of N, from about 140 GOP/s to about
+ * 1.2 TOP/s. The whole
  * resident call, host work included, is 1.2 ms at N 32 and 6.7 ms at N 2048. M*K is
  * capped by that budget and K by the resident weight slice at 4608, so N is what the
  * planner should spend. [HW sweep, H96 MAX M9, rocket 1.6.0, 786 MHz, resident weight,
  * pool off, 2026-09-25]
  *
- * THE M AXIS CARRIES NO CONSTRAINT, which is also the opposite of the RK3588. There
- * rows are the conv's spatial height, a height under 4 mis-computes, and software pads
- * M==1 to 4. Here M=1, 2, 3, 5, 7, 17 and 31 are each bit-exact, and so is every
+ * THE M AXIS CARRIES NO CONSTRAINT. On the RK3588 the planners still refuse M%4 and pad
+ * M==1 to 4, a library rule: with the packed feature surface stride that silicon computes
+ * any M too. Here M=1, 2, 3, 5, 7, 17 and 31 are each bit-exact, and so is every
  * factorization of M into a plane — a single row of pixels, a single column, and
  * everything between. The plane is a TILING choice, not a correctness one.
  * [HW sweep, H96 MAX M9]
@@ -460,8 +461,8 @@ int rocket_matmul_plan_int8_rk3576(int M, int K, int N, int *Mt, int *Kt, int *N
  * IOMMU mapping churn inside what the BO-lifetime fixes were written for is
  * unmeasured — so the pool is a measured opt-in, not the shipped path.
  *
- * The knob is read on EVERY allocation (not latched), so an A/B can flip it between
- * arms inside one process. Correctness does not depend on the pool: a pooled BO is
+ * The knob is read once per process (r76_bo_pool_on), so an A/B runs one process per
+ * configuration. Correctness does not depend on the pool: a pooled BO is
  * fully rewritten before use by the same packs that fill a fresh one, and the
  * poisoning sentinel stamps the output BO per task either way — what a pooled BO
  * skips is only the kernel's zero-fill, which the sentinel never relied on.

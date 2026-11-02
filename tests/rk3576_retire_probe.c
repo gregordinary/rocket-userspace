@@ -19,8 +19,8 @@
  *            because the part retires real jobs in ordinary use: a job after a wide-output
  *            writer (the fp16 convolution here) is poisoned, writes nothing and retires at
  *            the backstop. Then the control, the int8 matmul at M 512 K 2240 N 1536, whose
- *            jobs raise no completion on their first submit (chips/rk3576.md §"An int8
- *            matmul job can raise no completion"), must be counted retired, match the
+ *            jobs raise no completion on their first submit (chips/rk3576.md §"int8 matmul
+ *            jobs that raise no completion"), must be counted retired, match the
  *            kernel, and then either refuse or return the exact surface against the DPU's
  *            requant model. The one outcome it must never have is rc 0 over a wrong surface,
  *            which is what the write-check-only guard returned at every stall K of that map

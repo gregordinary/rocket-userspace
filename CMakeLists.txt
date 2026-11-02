@@ -657,7 +657,7 @@ if(ROCKETNPU_BUILD_TESTS)
     # A test that never opens the device. Pure arithmetic cannot skip, so it has no skip
     # code unless SKIP_OFF_PART says it checks one part's planner and skips on another.
     function(rocket_host_test name)
-        cmake_parse_arguments(T "SKIP_OFF_PART" "" "COMMAND" ${ARGN})
+        cmake_parse_arguments(T "SKIP_OFF_PART" "" "COMMAND;ENVIRONMENT" ${ARGN})
         if(NOT T_COMMAND)
             set(T_COMMAND ${name})
         endif()
@@ -666,6 +666,9 @@ if(ROCKETNPU_BUILD_TESTS)
         if(T_SKIP_OFF_PART)
             set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 2)
         endif()
+        if(T_ENVIRONMENT)
+            set_tests_properties(${name} PROPERTIES ENVIRONMENT "${T_ENVIRONMENT}")
+        endif()
     endfunction()
 
     # --- host-only ---------------------------------------------------------------
@@ -673,6 +676,10 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_host_test(chain_layout_rocket)
     rocket_host_test(chain_verify_gate)
     rocket_host_test(matmul_plan_gate SKIP_OFF_PART)    # the RK3588 planners; skips elsewhere
+    # The fp16 whole-tile plan. The streamed plan is the fp16 default and is taken before the
+    # ROCKET_MM_ASYM branch, so the gate above sweeps ASYM over streamed plans only.
+    rocket_host_test(matmul_plan_gate_wholetile SKIP_OFF_PART COMMAND matmul_plan_gate
+                     ENVIRONMENT "ROCKET_MM_STREAM=0")
     # The RK3576 int8 planner's envelope: a prime M returns at once, a task count past
     # INT_MAX refuses rather than wrapping. Forces ROCKET_CHIP=rk3576 itself.
     rocket_host_test(matmul_plan_gate_rk3576 COMMAND matmul_plan_gate rk3576)
@@ -813,6 +820,10 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_npu_test(matmul_tiled_rocket)
     rocket_npu_test(fc_data_bank_sweep_rocket)
     rocket_npu_test(matmul_kacc_chain_rocket)
+    # The same shapes on the whole-tile plan, where they reach the nKt they are listed at
+    # (Gemma FFN-down at 40). The default run above holds some of them at one K pass.
+    rocket_npu_test(matmul_kacc_chain_rocket_wholetile COMMAND matmul_kacc_chain_rocket
+                    ENVIRONMENT "ROCKET_MM_STREAM=0")
     rocket_npu_test(reuse_follower_rocket)
     rocket_npu_test(reuse_follower_rocket_weight COMMAND reuse_follower_rocket ENVIRONMENT ROCKET_REUSE=1)
     rocket_npu_test(reuse_follower_rocket_data COMMAND reuse_follower_rocket ENVIRONMENT ROCKET_REUSE=2)
@@ -827,17 +838,17 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_npu_test(matmul_correctness_matrix_rocket
                     COMMAND matmul_correctness_matrix_rocket 512 1024 768
                     ENVIRONMENT "FULL_ROWS=1")
-    # asymmetric-Nt tiling (ROCKET_MM_ASYM, default ON): gate its bit-exactness on a shape where
-    # it fires (N=4096>cap N-tiled, K=3840 K-tiled => Nt 256->128, Kt 384->512, the last K-tile
-    # partial). The base correctness_matrix above also fires it now that the default is ON; this
-    # pins the firing shape explicitly, and the _sym gate below keeps the symmetric plan (=0)
-    # covered too.
+    # asymmetric-Nt tiling (ROCKET_MM_ASYM, default ON) on a shape where it fires (N=4096>cap
+    # N-tiled, K=3840 K-tiled => Nt 256->128, Kt 384->512, the last K-tile partial), and the
+    # symmetric plan beside it. ASYM applies only to the whole-tile plan, and the streamed plan,
+    # the fp16 default, is taken before it: without ROCKET_MM_STREAM=0 both of these plan the
+    # same 12 streamed tasks and neither reaches the plan it is named for.
     rocket_npu_test(matmul_correctness_matrix_asym
                     COMMAND matmul_correctness_matrix_rocket 512 3840 4096
-                    ENVIRONMENT "ROCKET_MM_ASYM=1;FULL_ROWS=1")
+                    ENVIRONMENT "ROCKET_MM_STREAM=0;ROCKET_MM_ASYM=1;FULL_ROWS=1")
     rocket_npu_test(matmul_correctness_matrix_sym
                     COMMAND matmul_correctness_matrix_rocket 512 3840 4096
-                    ENVIRONMENT "ROCKET_MM_ASYM=0;FULL_ROWS=1")
+                    ENVIRONMENT "ROCKET_MM_STREAM=0;ROCKET_MM_ASYM=0;FULL_ROWS=1")
     rocket_npu_test(crossop_chain_rocket)
 
     # Bit-exact dtype + depthwise gates -- the int8/int4/int16/bf16/tf32 tiled-or-resident
