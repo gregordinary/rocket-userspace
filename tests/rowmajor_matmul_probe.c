@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * rowmajor_matmul_probe.c — can one RK3588 matmul task read A row-major and write C

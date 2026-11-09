@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * regcmd_golden_gate.c — host-only gate: does every regcmd generator still emit, word for

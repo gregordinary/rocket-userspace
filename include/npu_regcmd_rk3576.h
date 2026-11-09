@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * Declares the RK3576 CONV_2D regcmd generator and its variants. It also declares the

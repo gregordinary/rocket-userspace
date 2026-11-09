@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * rowmajor_tile_probe.c — the row-major matmul form at the shapes a tiled path needs.

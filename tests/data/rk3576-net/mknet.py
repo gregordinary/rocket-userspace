@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The rocket-userspace authors
 """
 mknet.py — a per-tensor-quantized TFLite classifier, flattened into the `.rnet` blob

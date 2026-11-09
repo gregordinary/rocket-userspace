@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * cube_transpose_gate.c — the plane <-> cube-group moves in rocket_cube.h against the

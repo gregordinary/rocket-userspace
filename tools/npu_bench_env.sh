@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # npu_bench_env.sh — run a benchmark command and log the machine state around it.
 #
 # WHY: the rocket NPU result is host-orchestration-bound, so a number is only

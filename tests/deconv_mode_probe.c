@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * deconv_mode_probe.c — is CNA_CONV_CON1 bit 16 (DECONV) a live hardware mode?

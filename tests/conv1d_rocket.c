@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * conv1d_rocket.c — HW gate for the Whisper-encoder conv1d front-end (rocket_conv1d_fp16),

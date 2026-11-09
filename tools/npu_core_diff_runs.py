@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The rocket-userspace authors
 """Build and read the lane-0 experiments run through tests/npu_core_diff_probe's raw mode.
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * pool_rk3576_bracket_gate.c — host-only GATE: the RK3576 pooling entry keeps every CPU

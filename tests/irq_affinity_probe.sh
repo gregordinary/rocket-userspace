@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # irq_affinity_probe.sh — measure the NPU dispatch floor (us/submit) as a function
 # of where the 3 NPU completion IRQs land and where the submitting thread runs.
 #

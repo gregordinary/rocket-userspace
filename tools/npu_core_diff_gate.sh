@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The rocket-userspace authors
 #
 # npu_core_diff_gate.sh — one register-setting arm of the lane-0 gating sweep, per pinned core,

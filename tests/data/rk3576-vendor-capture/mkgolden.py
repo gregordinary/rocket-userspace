@@ -166,7 +166,7 @@ def main():
             cases.append(d)
 
     L = []
-    L.append("// SPDX-License-Identifier: GPL-3.0-or-later")
+    L.append("// SPDX-License-Identifier: MIT")
     L.append("// Copyright (C) 2026 The rocket-userspace authors")
     L.append("/*")
     L.append(" * rk3576_vendor_golden.h - GENERATED, do not edit by hand.")

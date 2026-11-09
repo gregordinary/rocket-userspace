@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * dump_dw_regcmd.c — host-only: emit gen_conv2d_dw_fp16's regcmd for a depthwise

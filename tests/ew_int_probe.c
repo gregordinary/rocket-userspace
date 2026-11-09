@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * ew_int_probe.c — does the RK3588 DPU eltwise ALU compute in INTEGER when the whole

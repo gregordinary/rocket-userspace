@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 #ifndef RK3576_CONV_SHAPES_H
 #define RK3576_CONV_SHAPES_H

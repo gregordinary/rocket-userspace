@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Companion to tests/conv_dw_int8_runtime.c and tests/replay_dw_mesa.c. From the Teflon
 # DW capture and its dw_pt.tflite model, (1) check that Mesa's uint8 formulas, applied to
 # the model's int8 bytes, reproduce Mesa's captured weight and bias cubes byte for byte,

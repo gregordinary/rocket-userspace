@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 /*
  * r76_w8a8_hostterm.c -- what a W8A8 ggml path must ADD to the int8 matmul entry,
  * timed on the part's own A72s. No NPU, no library.

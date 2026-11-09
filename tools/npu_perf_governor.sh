@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # npu_perf_governor.sh — pin all CPU cores to the `performance` cpufreq governor.
 #
 # WHY: the rocket NPU workload is host-orchestration-bound (submit ioctl, blocking wait on

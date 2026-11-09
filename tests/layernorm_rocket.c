@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * layernorm_rocket.c — HW gate for on-NPU LayerNorm (rocket_layernorm_fp16),

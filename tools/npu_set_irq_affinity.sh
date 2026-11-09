@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # npu_set_irq_affinity.sh — bind the 3 RK3588 NPU completion IRQs to A76 big core(s).
 #
 # WHY: the default IRQ affinity mask is all-CPUs (`0-7`); GICv3 then services the NPU

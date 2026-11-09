@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * matmul_int16_exact_rocket.c — the BIT-EXACT int16 path: int16 x int16 -> int64

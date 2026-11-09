@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * Declares `npu_out_cvt_pair`, which converts a float requant scale into the DPU `OUT_CVT`

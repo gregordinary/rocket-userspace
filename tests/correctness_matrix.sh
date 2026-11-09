@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The rocket-userspace authors
 #
 # correctness_matrix.sh — packed-layout correctness matrix driver.

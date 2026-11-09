@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * matmul_int8_crossm_rocket.c — cross-M reuse gate for the RESIDENT int8 path: a weight

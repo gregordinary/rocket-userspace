@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The rocket-userspace authors
 """What can tests/rk3576_mm_corr.c's reference surface actually score?
 

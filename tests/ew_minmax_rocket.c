@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * ew_minmax_rocket.c — HW gate for on-NPU elementwise two-tensor MAX/MIN and Clip.

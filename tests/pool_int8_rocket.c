@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * pool_int8_rocket.c — standalone test for on-NPU int8 / uint8 MaxPool / AveragePool.

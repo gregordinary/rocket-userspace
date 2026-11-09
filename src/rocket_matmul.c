@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * rocket_matmul.c — tiled fp16 matmul on the rocket NPU. See rocket_matmul.h.

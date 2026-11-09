@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * regcmd_rk3576_gate.c — host-only gate: does the RK3576 conv emitter reproduce the

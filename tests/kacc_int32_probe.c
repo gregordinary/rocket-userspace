@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * kacc_int32_probe.c -- can the RK3588 DPU add an int32 K-partial to a convolution's int32

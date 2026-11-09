@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * conv_pad_field_gate.c — does a conv pad past 15 ever reach CNA_PAD_CON0?

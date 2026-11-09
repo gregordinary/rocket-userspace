@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * requant_zp_order_probe.c -- on the RK3588's int8-OUTPUT writer, is the output zero point

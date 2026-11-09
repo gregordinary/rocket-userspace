@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * fp16_ew_overflow_probe.c -- what does the RK3588 DPU write when an fp16 EW result passes

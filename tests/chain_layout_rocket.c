@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /* chain_layout_rocket.c — host-only (no NPU): verify the assumptions the batched
  * (chained) submit layout rests on, so a packing bug is caught before it reaches

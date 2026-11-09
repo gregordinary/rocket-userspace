@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * rmsnorm_rocket.c — HW gate for on-NPU RMSNorm (rocket_rmsnorm_fp16) and the per-row

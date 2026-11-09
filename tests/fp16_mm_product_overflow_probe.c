@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * fp16_mm_product_overflow_probe.c -- where does the RK3588 fp16 matmul overflow: in the

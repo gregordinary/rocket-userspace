@@ -527,7 +527,7 @@ optional kernel patches:
 
 ## License and credits
 
-`librocketnpu` is GPL-3.0-or-later.
+`librocketnpu` is MIT-licensed; see [LICENSE](LICENSE).
 
 It builds on prior work:
 

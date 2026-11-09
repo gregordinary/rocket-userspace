@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * npu_core_diff_probe.c — how often do two RK3588 NPU cores compute the same fp16 matmul

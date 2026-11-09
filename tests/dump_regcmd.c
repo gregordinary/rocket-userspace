@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /* dump_regcmd.c — host-only: generate the matmul regcmd for accumulate=0 vs 1
  * and diff them. No hardware. Build:

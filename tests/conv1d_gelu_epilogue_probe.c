@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * conv1d_gelu_epilogue_probe.c -- is the single-pass conv->GELU epilogue usable on a real

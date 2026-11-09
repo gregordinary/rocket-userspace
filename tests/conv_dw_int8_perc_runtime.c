@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * conv_dw_int8_perc_runtime.c — gate for the RK3588 PER-CHANNEL int8 depthwise entry

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * ffn_fused_rocket.c — HW gate for the CROSS-OP cube-resident FFN (rocket_ffn_fp16_fused):

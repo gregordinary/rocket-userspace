@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * conv_pack_cost_probe.c — how much of the RK3588 fp16 conv's and int8 direct conv's per-call

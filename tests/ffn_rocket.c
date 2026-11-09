@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * ffn_rocket.c — HW gate for the on-NPU gated-MLP FFN block (rocket_ffn_fp16) and its

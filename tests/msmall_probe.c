@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * msmall_probe.c — does a one-task fp16 or int8 matmul compute at every M, not only at M%4 == 0?

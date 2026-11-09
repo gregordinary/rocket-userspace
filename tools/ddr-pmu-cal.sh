@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # ddr-pmu-cal.sh — calibrate the rockchip_ddr PMU against a known number of bytes.
 #
 # The PMU's sysfs metadata claims `read-bytes`/`write-bytes`/`bytes` in MB via a

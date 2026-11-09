@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * softmax_rocket.c — HW gate for on-NPU row-wise softmax (rocket_softmax_fp16), the attention

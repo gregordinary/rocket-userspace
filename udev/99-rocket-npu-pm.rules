@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # 99-rocket-npu-pm.rules — let an unprivileged NPU process drive the RK3576 power cycle.
 #
 # WHY THIS EXISTS. On the RK3576 a job that writes a wide DPU output element through a

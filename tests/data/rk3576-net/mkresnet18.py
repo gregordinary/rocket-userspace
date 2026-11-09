@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The rocket-userspace authors
 """
 mkresnet18.py — a per-tensor int8 ResNet-18, built rather than fetched.

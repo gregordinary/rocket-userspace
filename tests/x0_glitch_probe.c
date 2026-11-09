@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * x0_glitch_probe.c — RE probe: does the DPU LUT x≈0 LE/LO sign-mux glitch fire for a

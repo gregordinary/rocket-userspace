@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * conv2d_int8_q_rocket.c — RK3588 gate: rocket_conv2d_int8_q, the direct int8 conv with the

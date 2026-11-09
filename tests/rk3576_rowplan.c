@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /*
  * What row window does the shipped planner choose for a given layer, and how many
  * granules does that window stage? Pure planner arithmetic — no device, no submit —

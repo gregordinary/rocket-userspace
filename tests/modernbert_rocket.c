@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * modernbert_rocket.c — gate for rocket_modernbert: the resident ModernBERT encoder (and its

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Companion to tests/conv_dw_int8_runtime.c: run the Teflon capture's own model
 # (dw_pt.tflite, one per-tensor int8 DEPTHWISE_CONV_2D) under TFLite's REFERENCE kernels on
 # a seeded random int8 input, and write the input and TFLite's output beside the capture,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * prelu_rocket.c — HW gate for on-NPU PReLU (per-channel negative slope), the YOLO/segmentation

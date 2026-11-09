@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * sam_rocket.c — gate + bench for the SAM ViT-Det image encoder (facebook/sam-vit-base) on

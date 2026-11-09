@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * cpend_wzp_probe.c — RK3588 board probe: does DPU_BS_OW_OP (the TRM's "CPEND operand")

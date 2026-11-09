@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 //
 // fc_data_bank_sweep_rocket — RE probe for the CNA_CBUF_CON0 FC_DATA_BANK field [10:8]

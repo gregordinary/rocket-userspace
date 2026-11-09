@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * moe_spike.c — MUL_MAT_ID de-risk micro-bench (NOT a shipped gate).

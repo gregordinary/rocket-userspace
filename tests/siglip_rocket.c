@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * siglip_rocket.c — HW gate + bench for the full SigLIP-B/16 vision encoder on the NPU

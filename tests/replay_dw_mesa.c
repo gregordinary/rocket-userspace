@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 /*
  * Ground-truth replay of the captured Teflon int8 DEPTHWISE conv.
  *
