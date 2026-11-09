@@ -9,7 +9,7 @@
  * generators (experimental/gemm_int16.py, examples/gemm.py) drive the same silicon with A
  * as plain [M][K] rows and C as plain [M][N] rows, by strides alone, and are exact under the
  * vendor driver up to K 4096 once their own caps are lifted. This transcribes that form onto
- * gen_matmul_fp16's program by patching six registers:
+ * gen_gemm_fp16's program by patching six registers:
  *
  *   CNA  CONV_CON1        bit 29 set (GROUP_LINE_OFF)
  *   CNA  DMA_CON1         line stride K/8, one padded row of A
@@ -48,6 +48,7 @@
 #include "rocket_npu.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "test_fill.h"
 
 struct shape { int M, K, N; };
@@ -72,7 +73,7 @@ static int patch(uint64_t *ops, int n, uint16_t target, uint16_t reg, uint32_t v
     for (int i = 0; i < n; i++) {
         if ((uint16_t)(ops[i] >> 48) != target || (uint16_t)(ops[i] & 0xFFFF) != reg) continue;
         uint32_t v = orbits ? (uint32_t)(ops[i] >> 16) | value : value;
-        ops[i] = NPUOP(target, v, reg);
+        ops[i] = REGCMD(target, reg, v);
         return 0;
     }
     return -1;
@@ -86,21 +87,21 @@ static int run_arm(int fd, struct bufs *b, const struct shape *s, int rowmajor,
 {
     const int M = s->M, K = s->K, N = s->N;
     uint64_t ops[256] = { 0 };
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)N,
-        .input_dma = (uint32_t)b->in.dma_address, .weights_dma = (uint32_t)b->w.dma_address,
-        .output_dma = (uint32_t)b->out.dma_address, .tasks = ops, .fp32tofp16 = 0,
+        .input_iova = (uint32_t)b->in.dma_address, .weights_iova = (uint32_t)b->w.dma_address,
+        .output_iova = (uint32_t)b->out.dma_address, .tasks = ops, .fp16_out = 0,
     };
-    if (gen_matmul_fp16(&p) != 0) { printf("  %dx%dx%d: generator refused\n", M, K, N); return -1; }
+    if (gen_gemm_fp16(&p) != 0) { printf("  %dx%dx%d: generator refused\n", M, K, N); return -1; }
     const int n = (int)p.task_count;
     if (rowmajor) {
         const uint32_t notch = (uint32_t)(N / 4 - 1);
-        if (patch(ops, n, OP_REG_CNA, CNA_CONV_CON1, 1u << 29, 1) ||
-            patch(ops, n, OP_REG_CNA, CNA_DMA_CON1, (uint32_t)(K / 8), 0) ||
-            patch(ops, n, OP_REG_CNA, CNA_DMA_CON2, 0, 0) ||
-            patch(ops, n, OP_REG_DPU, DPU_DST_SURF_STRIDE, 1u << 4, 0) ||
-            patch(ops, n, OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, (notch << 16) | notch, 0) ||
-            patch(ops, n, OP_REG_DPU, DPU_SURFACE_ADD, 4u << 4, 0)) {
+        if (patch(ops, n, TARGET_CNA, REG_CNA_CONV_CON1, 1u << 29, 1) ||
+            patch(ops, n, TARGET_CNA, REG_CNA_DMA_CON1, (uint32_t)(K / 8), 0) ||
+            patch(ops, n, TARGET_CNA, REG_CNA_DMA_CON2, 0, 0) ||
+            patch(ops, n, TARGET_DPU, REG_DPU_DST_SURF_STRIDE, 1u << 4, 0) ||
+            patch(ops, n, TARGET_DPU, REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch << 16) | notch, 0) ||
+            patch(ops, n, TARGET_DPU, REG_DPU_SURFACE_ADD, 4u << 4, 0)) {
             printf("  %dx%dx%d: a register to patch is missing from the program\n", M, K, N);
             return -1;
         }
@@ -119,10 +120,10 @@ static int run_arm(int fd, struct bufs *b, const struct shape *s, int rowmajor,
         else
             for (int m = 1; m <= M; m++)
                 for (int k = 1; k <= K; k++)
-                    id[feature_data(K, M, 1, 8, k, m, 1)] = A[(size_t)(m - 1) * K + (k - 1)];
+                    id[feature_index(K, M, 1, 8, k, m, 1)] = A[(size_t)(m - 1) * K + (k - 1)];
         for (int nn = 1; nn <= N; nn++)
             for (int k = 1; k <= K; k++)
-                wd[weight_fp16(K, nn, k)] = B[(size_t)(nn - 1) * K + (k - 1)];
+                wd[gemm_weight_index_fp16(K, nn, k)] = B[(size_t)(nn - 1) * K + (k - 1)];
     }
     rocket_bo_fini(fd, &b->in);
     rocket_bo_fini(fd, &b->w);
@@ -144,7 +145,7 @@ static int run_arm(int fd, struct bufs *b, const struct shape *s, int rowmajor,
     for (int m = 0; m < M; m++)
         for (int nn = 0; nn < N; nn++) {
             size_t at = rowmajor ? (size_t)m * N + nn
-                                 : (size_t)feature_data(N, M, 1, 4, nn + 1, m + 1, 1);
+                                 : (size_t)feature_index(N, M, 1, 4, nn + 1, m + 1, 1);
             double got = o[at];
             if (isnan(got)) unwritten++;
             if (got != want[(size_t)m * N + nn]) { if (first < 0) first = (long)m * N + nn; wrong++; }

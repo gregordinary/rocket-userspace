@@ -38,7 +38,7 @@
  *     mantissa: 10-bit tf32, full fp32, or other. This is the interesting RE result
  *     (analogous to int16's saturate/wrap characterization).
  *
- * Sweep knobs read by gen_matmul_tf32 (this harness only prints them):
+ * Sweep knobs read by gen_gemm_tf32 (this harness only prints them):
  *   ROCKET_TF32_PREC        in/proc precision   (default 7 = tf32; sweep if STAGE1 fails)
  *   ROCKET_TF32_OUT_PREC    output precision    (default 5 = fp32)
  *   ROCKET_TF32_SIZE_E / ROCKET_TF32_SURF_MULT  fp32-out stride (default 3 / 4)
@@ -88,23 +88,19 @@ static inline float round_to_tf32(float f) {
     float r; memcpy(&r, &b, sizeof r); return r;
 }
 
-/* tf32 weight element index, N-group (ng) AND K-group (kg) parameterized. Mirrors
- * weight_fp16's block shape with both group sizes swept for the 4-byte HW tile RE
- * (ng=8,kg=32 == weight_tf32() in npu_regcmd.c). kg is now sweepable too:
- * tf32's weight K-group could be 16 (not 32) for 4-byte, and this only becomes
- * testable at K>kg (K=32 is a single K-group => row-major for ANY ng/kg, which is
- * why the K=32 case could not test the weight layout at all). */
-static int wt_tf32_idx(int C, int k, int c, int ng, int kg) {
-    int kpg = (k-1)/ng;
-    int cpg = (c-1)/kg;
-    int dst = (cpg*kg)*ng + kpg*ng*C;
-    dst += ((c-1)%kg) + (((k-1)%ng)*kg);
-    return dst;
+/* tf32 weight element index, N-group (ng) AND K-group (kg) parameterized: the weight
+ * tile cube of rocket_cube.h's tile_pos() with both group sizes swept for the 4-byte HW
+ * tile RE (ng=16,kg=16, the defaults, == gemm_weight_index_tf32() in npu_regcmd.c). The K-group
+ * only becomes testable at K>kg (K=32 is a single K-group at kg 32 => row-major for ANY
+ * ng/kg, which is why the K=32 case could not test the weight layout at all). */
+static int wt_tf32_idx(int K, int n, int k, int ng, int kg) {
+    n -= 1; k -= 1;   /* the cube's own coordinates are 0-based */
+    return ((n / ng) * K + (k / kg) * kg) * ng + (n % ng) * kg + k % kg;
 }
 
 /* fp32 (de)cube index (element index; cube C2). 1-based n,m to match pack loops. */
 static size_t cube_index(int N, int M, int c2, int n, int m) {
-    return (size_t)feature_data(N, M, 1, c2, n, m, 1);
+    return (size_t)feature_index(N, M, 1, c2, n, m, 1);
 }
 
 static int rup(int x, int a) { return (x + a - 1) / a * a; }
@@ -170,15 +166,15 @@ int main(int argc, char **argv) {
     }
 
     uint64_t npu_regs[256] = {0};
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)N,
-        .input_dma = (uint32_t)input.dma_address,
-        .weights_dma = (uint32_t)weights.dma_address,
-        .output_dma = (uint32_t)output.dma_address,
+        .input_iova = (uint32_t)input.dma_address,
+        .weights_iova = (uint32_t)weights.dma_address,
+        .output_iova = (uint32_t)output.dma_address,
         .tasks = npu_regs,
     };
-    if ((ret = gen_matmul_tf32(&p)) != 0) {
-        fprintf(stderr, "gen_matmul_tf32 = %d (CBUF banks? -1 fd, -2 weight/kernel)\n", ret);
+    if ((ret = gen_gemm_tf32(&p)) != 0) {
+        fprintf(stderr, "gen_gemm_tf32 = %d (CBUF banks? -1 fd, -2 weight/kernel)\n", ret);
         goto out;
     }
     printf("regcmd ops = %u\n", p.task_count);

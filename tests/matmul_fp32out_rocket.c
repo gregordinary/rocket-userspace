@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
     if (!pass) {
         if (nonfin)            printf("  FAIL: %d nonfinite outputs\n", nonfin);
         if (norm32 >= TOL32)   printf("  FAIL: fp32-out norm_err %.4g >= TOL32 %.4g (tiling/readback bug?)\n", norm32, TOL32);
-        if (improve < IMPROVE) printf("  FAIL: fp32-out only %.1fx better than fp16-out (< %.1fx) — is fp32tofp16=0 taking effect?\n", improve, IMPROVE);
+        if (improve < IMPROVE) printf("  FAIL: fp32-out only %.1fx better than fp16-out (< %.1fx) — is fp16_out=0 taking effect?\n", improve, IMPROVE);
     }
     printf("==> %s (fp32-out %s; norm32=%.4g, %.1fx vs fp16-out)\n",
            pass?"PASS":"FAIL",

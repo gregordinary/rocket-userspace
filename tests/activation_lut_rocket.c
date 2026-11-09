@@ -125,7 +125,7 @@ int main(void)
             .out_cvt_minus_exp = 15, .out_cvt_cvt_type = 1, .lut_le_start = 0xffffc000,
             .lut_lo_end = 0x00004000, .le_slope_scale = 23107, .le_slope_shift = 22,
             .le_index_select = 5, .lo_index_select = 5,
-            .input_dma = 0x10000, .output_dma = 0x20000, .tasks = regs };
+            .input_iova = 0x10000, .output_iova = 0x20000, .tasks = regs };
         int g = gen_lut_activation_fp16(&p);
         int ok = (g == 0 && p.task_count > 1030 && p.task_count < 1100);
         printf("regcmd smoke: ret=%d task_count=%d -> %s\n", g, p.task_count, ok ? "OK" : "FAIL");
@@ -135,14 +135,6 @@ int main(void)
         int gb = gen_lut_activation_fp16(&bad);
         printf("regcmd reject n=130: ret=%d -> %s\n", gb, gb == -1 ? "OK" : "FAIL");
         if (gb != -1) fail = 1;
-
-        uint64_t mregs[128] = {0};
-        ew_mul_params_t mp = { .input_a_dma = 0x10000, .input_b_dma = 0x18000,
-            .output_dma = 0x20000, .n = 128, .tasks = mregs };
-        int gm = gen_ew_mul_fp16(&mp);
-        int mok = (gm == 0 && mp.task_count > 20 && mp.task_count < 64);
-        printf("ew_mul smoke: ret=%d task_count=%d -> %s\n", gm, mp.task_count, mok ? "OK" : "FAIL");
-        if (!mok) fail = 1;
     }
 
     int fd = rocket_open();

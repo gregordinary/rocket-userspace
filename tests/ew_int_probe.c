@@ -39,15 +39,10 @@
  *   variant full     the whole bundle (default)
  *           nodis    BRDMA/NRDMA left enabled (not written)
  *           oldprec  INT32 EW sizes with the precision triple at fp16 (our old probes)
- *   ew_int_probe oldgen   gen_ew_mul_fp16 (the library's retained flying multiply, the
- *           source of the "a two-buffer EW needs a conv main feed" reading) verbatim, after
- *           an fp16 arm and after an INT32 arm have left different OUT_CVT values, then with
- *           OUT_CVT written into it. Measured on both RK1s: with its COMB_USE(5) the job never
- *           completes (vendor: rc -110, nothing written), whatever OUT_CVT holds; with
- *           ROCKET_EW_MUL_COMB=0 or 4 it completes and writes the right product on lane 0 of
- *           every 8-channel atom and zero on the other seven, because its DATA_CUBE_CHANNEL
- *           leaves ORIG_CHANNEL at 0. The fp16 MUL arm above, which differs in those fields,
- *           is exact. So the reading was two register fields, not the datapath.
+ * A flying program that leaves DATA_CUBE_CHANNEL's ORIG_CHANNEL at 0 writes the product on
+ * lane 0 of every 8-channel atom and zero on the other seven, and under COMB_USE(5) it never
+ * completes (measured on both RK1s). The full fp16 MUL arm, with ORIG_CHANNEL at C-1 and
+ * COMB_USE 0, is exact, so a two-buffer EW op needs no conv main feed.
  * Env: ROCKET_EWI_OWCFG overrides DPU_BS_OW_CFG (default OD_BYPASS only),
  *      ROCKET_EWI_NOTCH writes RDMA SURF_NOTCH / EW_SURF_NOTCH (default 0),
  *      ROCKET_EWI_ORIGC sets DATA_CUBE_CHANNEL's ORIG_CHANNEL (default C-1),
@@ -65,10 +60,11 @@
 
 #include "npu_activation.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "rocket_npu.h"
 #include "test_fill.h"
 
-#define OP_REG_DPU_RDMA_P  (BLOCK_DPU_RDMA | PC_OP_01)
+#define TARGET_DPU_RDMA_P  (NPU_TARGET_DPU_RDMA | NPU_REG_WRITE)
 #define R_S_POINTER        0x5004
 #define R_CUBE_W           0x500C
 #define R_CUBE_H           0x5010
@@ -125,55 +121,57 @@ static int build(uint64_t *ops, uint32_t out, uint32_t in, uint32_t ew, const dt
     if (o->alu == OPC_MAX || o->alu == OPC_MIN) ewcfg |= 1u << 21;   /* EW_EQUAL_EN */
 
     int i = 0;
-    ops[i++] = NPUOP(OP_REG_DPU, 0xE, DPU_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, 0xE, R_S_POINTER);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_S_POINTER, 0xE);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_S_POINTER, 0xE);
     if (variant != V_NODIS) {
-        ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, 1, R_BRDMA_CFG);   /* BRDMA_DISABLE */
-        ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, 1, R_NRDMA_CFG);   /* NRDMA_DISABLE */
+        ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_BRDMA_CFG, 1);   /* BRDMA_DISABLE */
+        ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_NRDMA_CFG, 1);   /* NRDMA_DISABLE */
     }
-    ops[i++] = NPUOP(OP_REG_DPU, (15u << 5) | (2u << 1) | 1u, DPU_FEATURE_MODE_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, ((uint32_t)prec << 29) | ((uint32_t)prec << 26) |
-                     (uint32_t)prec, DPU_DATA_FORMAT);
-    ops[i++] = NPUOP(OP_REG_DPU, out, DPU_DST_BASE_ADD);
-    ops[i++] = NPUOP(OP_REG_DPU, stride, DPU_DST_SURF_STRIDE);
-    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)(W - 1), DPU_DATA_CUBE_WIDTH);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_DATA_CUBE_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_DATA_CUBE_NOTCH_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU, (origc << 16) | (uint32_t)(C - 1), DPU_DATA_CUBE_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_DPU, (1u << 6) | (1u << 4) | (1u << 1) | 1u, DPU_BS_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_BS_ALU_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_BS_MUL_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, owcfg, DPU_BS_OW_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_BS_OW_OP);
-    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)(C - 1), DPU_WDMA_SIZE_0);
-    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)(W - 1), DPU_WDMA_SIZE_1);
-    ops[i++] = NPUOP(OP_REG_DPU, (1u << 6) | (1u << 4) | (1u << 1) | 1u, DPU_BN_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, ewcfg, DPU_EW_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_EW_CVT_OFFSET_VALUE);
-    ops[i++] = NPUOP(OP_REG_DPU, 1, DPU_EW_CVT_SCALE_VALUE);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_OUT_CVT_OFFSET);
-    ops[i++] = NPUOP(OP_REG_DPU, d->prec == P_FP16 ? (1u << 16) | 1u : 1u, DPU_OUT_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_OUT_CVT_SHIFT);
-    ops[i++] = NPUOP(OP_REG_DPU, stride, DPU_SURFACE_ADD);
-    ops[i++] = NPUOP(OP_REG_DPU, 0, DPU_40C4);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, (uint32_t)(W - 1), R_CUBE_W);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, 0, R_CUBE_H);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, (uint32_t)(C - 1), R_CUBE_C);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, in, R_SRC_BASE);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, (1u << 30) | ((uint32_t)d->esize << 2), R_ERDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, ew, R_EW_BASE);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, stride, R_EW_SURF_STRIDE);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, notch, R_SURF_NOTCH);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, notch, R_EW_SURF_NOTCH);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_FEATURE_MODE_CFG, (15u << 5) | (2u << 1) | 1u);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_DATA_FORMAT,
+                      ((uint32_t)prec << 29) | ((uint32_t)prec << 26) |
+          (uint32_t)prec);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_DST_BASE_ADDR, out);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_DST_SURF_STRIDE, stride);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_DATA_CUBE_WIDTH, (uint32_t)(W - 1));
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_DATA_CUBE_HEIGHT, 0);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_DATA_CUBE_NOTCH_ADDR, 0);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_DATA_CUBE_CHANNEL, (origc << 16) | (uint32_t)(C - 1));
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_BS_CFG, (1u << 6) | (1u << 4) | (1u << 1) | 1u);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_BS_ALU_CFG, 0);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_BS_MUL_CFG, 0);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_BS_OW_CFG, owcfg);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_BS_OW_OP, 0);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_WDMA_SIZE_0, (uint32_t)(C - 1));
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_WDMA_SIZE_1, (uint32_t)(W - 1));
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_BN_CFG, (1u << 6) | (1u << 4) | (1u << 1) | 1u);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_EW_CFG, ewcfg);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_EW_CVT_OFFSET_VALUE, 0);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_EW_CVT_SCALE_VALUE, 1);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_OUT_CVT_OFFSET, 0);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_OUT_CVT_SCALE, d->prec == P_FP16 ? (1u << 16) | 1u : 1u);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_OUT_CVT_SHIFT, 0);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_SURFACE_ADD, stride);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_40C4, 0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_CUBE_W, (uint32_t)(W - 1));
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_CUBE_H, 0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_CUBE_C, (uint32_t)(C - 1));
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_SRC_BASE, in);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_ERDMA_CFG, (1u << 30) | ((uint32_t)d->esize << 2));
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_EW_BASE, ew);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_EW_SURF_STRIDE, stride);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_SURF_NOTCH, notch);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_EW_SURF_NOTCH, notch);
     /* fp16 reads through MRDMA_FP16TOFP32 (bit 3), as the working fp16 flying programs do */
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, ((uint32_t)prec << 15) | (15u << 11) |
-                     ((uint32_t)prec << 5) | (d->prec == P_FP16 ? 1u << 3 : 0u) | (comb << 8) |
-                     1u, R_FEATURE_MODE);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_P, (1u << 24) | (1u << 16) | (1u << 8) | 1u, R_WEIGHT);
-    ops[i++] = NPUOP(OP_NONE, 0, 0);
-    ops[i++] = NPUOP(OP_REG_PC, 0, PC_REGISTER_AMOUNTS);
-    ops[i++] = NPUOP(OP_40, 0, 0);
-    ops[i++] = NPUOP(OP_ENABLE, 0x18, PC_OPERATION_ENABLE);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_FEATURE_MODE,
+                      ((uint32_t)prec << 15) | (15u << 11) |
+   ((uint32_t)prec << 5) | (d->prec == P_FP16 ? 1u << 3 : 0u) | (comb << 8) |
+   1u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_P, R_WEIGHT, (1u << 24) | (1u << 16) | (1u << 8) | 1u);
+    ops[i++] = REGCMD(TARGET_NONE, 0, 0);
+    ops[i++] = REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0);
+    ops[i++] = REGCMD(TARGET_PRE_ENABLE, 0, 0);
+    ops[i++] = REGCMD(TARGET_ENABLE, REG_PC_OPERATION_ENABLE, 0x18);
     return i;
 }
 
@@ -330,53 +328,6 @@ static int run_arm(int fd, rocket_bo *bin, rocket_bo *bew, rocket_bo *bout, rock
     return rc == 0 && wr == 0 && m_sat == N_ELEM;
 }
 
-/* gen_ew_mul_fp16 verbatim (insert_cvt 0), or with OUT_CVT offset 0 / scale fp32->fp16 x1 /
- * shift 0 written before its trailer (insert_cvt 1). Scored against the fp16 product. */
-static void run_oldgen(int fd, rocket_bo *bin, rocket_bo *bew, rocket_bo *bout, rocket_bo *breg,
-                       int insert_cvt, const char *label)
-{
-    rocket_bo_prep(fd, bin, 1, 0);
-    rocket_bo_prep(fd, bew, 1, 0);
-    rocket_bo_prep(fd, bout, 1, 0);
-    fill(bin->ptr, bew->ptr, &DT[3], 0x01d6e5ull);
-    memset(bout->ptr, 0xAA, (size_t)N_ELEM * 2);
-    rocket_bo_fini(fd, bin);
-    rocket_bo_fini(fd, bew);
-    rocket_bo_fini(fd, bout);
-
-    uint64_t ops[128];
-    ew_mul_params_t p = {bin->dma_address, bew->dma_address, bout->dma_address, N_ELEM, ops, 0};
-    if (gen_ew_mul_fp16(&p) != 0) { printf("  %s: gen_ew_mul_fp16 refused\n", label); return; }
-    int n = p.task_count;
-    if (insert_cvt) {   /* before the 4-op trailer */
-        memmove(&ops[n - 1], &ops[n - 4], 4 * sizeof ops[0]);
-        ops[n - 4] = NPUOP(OP_REG_DPU, 0, DPU_OUT_CVT_OFFSET);
-        ops[n - 3] = NPUOP(OP_REG_DPU, (1u << 16) | 1u, DPU_OUT_CVT_SCALE);
-        ops[n - 2] = NPUOP(OP_REG_DPU, 0, DPU_OUT_CVT_SHIFT);
-        n += 3;
-    }
-    rocket_bo_prep(fd, breg, 1, 0);
-    memcpy(breg->ptr, ops, (size_t)n * sizeof ops[0]);
-    rocket_bo_fini(fd, breg);
-    rocket_task_desc t = {(uint32_t)breg->dma_address, (uint32_t)n};
-    uint32_t in_h[3] = {breg->handle, bin->handle, bew->handle}, out_h[1] = {bout->handle};
-    int rc = rocket_submit_tasks(fd, &t, 1, in_h, 3, out_h, 1);
-    int wr = rocket_bo_prep(fd, bout, 0, 2000000000ull);
-    long ok = 0, zero = 0, a_pass = 0, unw = 0, ok_lane0 = 0;
-    for (size_t i = 0; i < N_ELEM; i++) {
-        _Float16 a = ((_Float16 *)bin->ptr)[i], b = ((_Float16 *)bew->ptr)[i];
-        _Float16 g = ((_Float16 *)bout->ptr)[i], want = (_Float16)((float)a * (float)b);
-        ok += memcmp(&g, &want, 2) == 0;
-        ok_lane0 += (i % 8 == 0) && memcmp(&g, &want, 2) == 0;
-        zero += (float)g == 0.0f;
-        a_pass += memcmp(&g, &a, 2) == 0;
-        unw += ((uint16_t *)bout->ptr)[i] == 0xAAAA;
-    }
-    rocket_bo_fini(fd, bout);
-    printf("  %-44s rc %d wait %d | of %d: a*b %ld (lane 0 of each atom: %ld of %d) zero %ld "
-           "a %ld unw %ld\n", label, rc, wr, N_ELEM, ok, ok_lane0, N_ELEM / 8, zero, a_pass, unw);
-}
-
 int main(int argc, char **argv)
 {
     int fd = rocket_open();
@@ -393,18 +344,6 @@ int main(int argc, char **argv)
            "a = main operand passed through, unw = unwritten, none = no model\n", N_ELEM);
 
     int fail = 0;
-    if (argc > 1 && !strcmp(argv[1], "oldgen")) {
-        run_arm(fd, &bin, &bew, &bout, &breg, &DT[3], &OPS[0], V_FULL);   /* fp16 OUT_CVT */
-        run_oldgen(fd, &bin, &bew, &bout, &breg, 0, "gen_ew_mul_fp16 after the fp16 arm");
-        run_arm(fd, &bin, &bew, &bout, &breg, &DT[2], &OPS[0], V_FULL);   /* int OUT_CVT */
-        run_oldgen(fd, &bin, &bew, &bout, &breg, 0, "gen_ew_mul_fp16 after the int32 arm");
-        run_arm(fd, &bin, &bew, &bout, &breg, &DT[2], &OPS[0], V_FULL);
-        run_oldgen(fd, &bin, &bew, &bout, &breg, 1, "... with OUT_CVT written, after int32");
-        rocket_bo_free(fd, &bin); rocket_bo_free(fd, &bew); rocket_bo_free(fd, &bout);
-        rocket_bo_free(fd, &breg);
-        rocket_close(fd);
-        return 0;
-    }
     for (size_t di = 0; di < sizeof DT / sizeof DT[0]; di++) {
         if (argc > 1 && strcmp(argv[1], DT[di].name)) continue;
         for (size_t oi = 0; oi < sizeof OPS / sizeof OPS[0]; oi++) {

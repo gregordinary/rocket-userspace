@@ -16,13 +16,14 @@
  * K-accum ping-pong at all, since no integer EW add is implemented). Everything AROUND it
  * — the pool shape, the slot cache, the fence deadline, the column split and the
  * spawn/join — is rocket_fanout.h's, shared with fp16/int4/bf16. The compute mirrors
- * rocket_matmul_int8's host-int64 K-accum branch (no int8 NPU K-accum is
- * implemented: int32 partials are summed on the host in int64, which is integer-EXACT -> bit-identical
- * to the one-shot path and to the int64 CPU reference).
+ * rocket_matmul_int8's host K-accum (no int8 NPU K-accum is implemented: each K tile's
+ * int32 partial is read back and summed on the host). The per-channel mode sums straight
+ * into C in wrapping 32-bit arithmetic, which equals the int64 sum truncated to int32, so it
+ * is bit-identical to the one-shot path's int64 accumulator and exact while |sum| < 2^31.
  *
  * TWO MODES, one compute core (rki_thread), selected by the weight's `group`:
  *
- *   group == 0  PER-CHANNEL. Raw int32 C[M,N], host int64 K-accum. The W8A8
+ *   group == 0  PER-CHANNEL. Raw int32 C[M,N], host K-accum into C itself. The W8A8
  *               in-model path; the backend owns the per-row/per-channel dequant.
  *   group  > 0  GROUP-WISE. Each K-tile is kept inside ONE quant group, so its
  *               int32 partial can be scaled by that group's a_scale[m,g]*b_scale[n,g]
@@ -50,10 +51,10 @@
  * drm_sched entity per fd -> the 3 NPU cores run in parallel). Each worker owns
  * its scratch and runs serially, so the shared scratch is race-free.
  *
- * int8 tile-layout constants (cf. rocket_matmul.c): input feature cube C2=16,
- * weight k-group 32 (== weight_int8()), int32-output cube C2=4. The index helpers
- * below are duplicated verbatim from rocket_matmul.c (feat_idx_i8/wt_idx_i8/
- * out_idx_i8) and pinned bit-exact by the standalone test vs the one-shot oracle.
+ * int8 tile layout: input feature cube C2=16, weight blocks 32 x 32 (== gemm_weight_index_int8()),
+ * int32-output cube C2=4. The index helpers (feat_idx_i8/wt_idx_i8/out_idx_i8) are
+ * rocket_cube.h's, shared with rocket_matmul.c, and the standalone test pins this path
+ * bit-exact against the one-shot oracle.
  */
 #include <assert.h>
 #include <pthread.h>
@@ -78,7 +79,7 @@
 #define RKI_MAX_WORKERS ROCKET_FANOUT_MAX_WORKERS
 #define I8_BATCH        ROCKET_FANOUT_BATCH
 #define I8_RC_STRIDE    ROCKET_FANOUT_RC_STRIDE
-#define I8_CBUF_BANK    NPU_CBUF_BANK_SIZE /* tail pad so a tile's DMA never runs off the BO end */
+#define I8_CBUF_BANK    RK3588_CBUF_BANK_BYTES /* tail pad so a tile's DMA never runs off the BO end */
 
 /* ============================================================================
  * SECTION — int8 tile-layout index math and small helpers
@@ -96,10 +97,10 @@ typedef struct {
     rocket_bo guard, regcmd, in_all, out_all;   /* shared scratch (NOT the weight)   */
     rocket_task_desc *tasks;                     /* I8_BATCH descriptors              */
     void   *submit_dt;                           /* resident drm_rocket_task[] submit scratch */
-    int64_t *acc;                                /* M*nsub int64 K-accum (per-channel) */
     float   *facc;                               /* M*nsub fp32 K-accum (group-wise)  */
     float   *bsT;                                /* nG*nsub: the call's b_scale slice, group-major */
-    int    *bm0, *bn0, *bMtile, *bNtile, *bg;    /* I8_BATCH each; bg = tile's K-group */
+    int    *bm0, *bn0, *bMtile, *bNtile, *bg;    /* I8_BATCH each; bg = tile's K-group,
+                                                  * or (per-channel) its K-tile index */
     size_t *boff;                                /* I8_BATCH                          */
 } rki_worker;
 
@@ -173,7 +174,7 @@ static void rki_worker_free(int fd, rki_worker *w)
     rocket_bo_free(fd, &w->regcmd);
     rocket_bo_free(fd, &w->in_all);
     rocket_bo_free(fd, &w->out_all);
-    free(w->tasks);  free(w->submit_dt); free(w->acc);   free(w->facc);   free(w->bsT);
+    free(w->tasks);  free(w->submit_dt); free(w->facc);  free(w->bsT);
     free(w->bm0);    free(w->bn0);
     free(w->bMtile); free(w->bNtile); free(w->bg); free(w->boff);
 }
@@ -264,15 +265,14 @@ static int rki_worker_alloc(int fd, rki_worker *w, int M, int tileM, int K, int 
     w->tasks  = malloc(I8_BATCH * sizeof(*w->tasks));
     w->submit_dt = malloc(rocket_submit_scratch_size(I8_BATCH));  /* reused every submit; no per-job calloc */
     if (group > 0) { w->facc = malloc((size_t)M * nsub * sizeof(float));
-                     w->bsT  = malloc((size_t)(K / group) * nsub * sizeof(float));
-                     w->bg   = malloc(I8_BATCH * sizeof(int)); }
-    else             w->acc  = malloc((size_t)M * nsub * sizeof(int64_t));
+                     w->bsT  = malloc((size_t)(K / group) * nsub * sizeof(float)); }
+    w->bg     = malloc(I8_BATCH * sizeof(int));
     w->bm0    = malloc(I8_BATCH * sizeof(int));
     w->bn0    = malloc(I8_BATCH * sizeof(int));
     w->bMtile = malloc(I8_BATCH * sizeof(int));
     w->bNtile = malloc(I8_BATCH * sizeof(int));
     w->boff   = malloc(I8_BATCH * sizeof(size_t));
-    if (!w->tasks || !w->submit_dt || (group > 0 ? (!w->facc || !w->bsT || !w->bg) : !w->acc) ||
+    if (!w->tasks || !w->submit_dt || (group > 0 && (!w->facc || !w->bsT)) || !w->bg ||
         !w->bm0 || !w->bn0 || !w->bMtile || !w->bNtile || !w->boff) {
         ROCKET_LOGE("rki_worker_alloc: host scratch alloc failed\n");
         goto fail;
@@ -645,18 +645,18 @@ static void *rki_thread(void *a)
     if (prof) t_packA = rki_now_ms() - t0;
 
     /* ---- batched tile compute: host K-accumulation (no int8 NPU K-accum is implemented).
-     * Accumulate over this worker's N-slice into acc[M, nsub] (per-channel: int64,
-     * integer-EXACT) or facc[M, nsub] (group-wise: fp32, each tile's int32 partial
+     * Accumulate over this worker's N-slice into C itself (per-channel: wrapping int32,
+     * see below) or facc[M, nsub] (group-wise: fp32, each tile's int32 partial
      * pre-scaled by its quant group's a_scale*b_scale). */
-    int64_t *restrict acc  = w->acc;
     float   *restrict facc = w->facc;
-    /* One K-tile per-channel (every detector 1x1 conv): each output is one tile's int32,
-     * so the tile is gathered straight into C at this worker's columns. The int64 path
-     * would zero M*nsub*8 bytes, read-modify-write each element and copy the whole
-     * accumulator into C again: about 40 bytes of traffic an output against 8. */
-    const int direct = !gw && nKt == 1;
-    if (gw)          memset(facc, 0, (size_t)M * nsub * sizeof(float));
-    else if (!direct) memset(acc,  0, (size_t)M * nsub * sizeof(int64_t));
+    /* Per-channel: every K tile is gathered straight into C at this worker's columns. The
+     * first K tile assigns and each later one adds, in wrapping 32-bit arithmetic: that is
+     * the int64 sum truncated to int32, what an int64 accumulator returns, so the result is
+     * bit-identical to it at any K and exact while |sum| < 2^31. An int64 accumulator would
+     * zero M*nsub*8 bytes, read-modify-write 16 bytes an output per K tile and copy itself
+     * into C at the end: ~60 bytes an output at two K tiles against ~20 here. */
+    const int direct = !gw;
+    if (gw) memset(facc, 0, (size_t)M * nsub * sizeof(float));
     if (gw)                                   /* b_scale is [N][nG]; the readback wants [nG][nsub] */
         for (int g = 0; g < nG; g++)
             for (int n = 0; n < nsub; n++)
@@ -690,14 +690,14 @@ static void *rki_thread(void *a)
 
                 size_t out_off = (size_t)nb * w->out_slot;
                 double tg0 = prof ? rki_now_ms() : 0;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(w->in_all.dma_address + (size_t)(mi*nKt+ki) * w->in_slot),
-                    .weights_dma = (uint32_t)(t->wt->dma_address     + (size_t)(ni*nKt+ki) * w->wt_slot),
-                    .output_dma  = (uint32_t)(w->out_all.dma_address + out_off * sizeof(int32_t)),
+                    .input_iova   = (uint32_t)(w->in_all.dma_address + (size_t)(mi*nKt+ki) * w->in_slot),
+                    .weights_iova = (uint32_t)(t->wt->dma_address     + (size_t)(ni*nKt+ki) * w->wt_slot),
+                    .output_iova  = (uint32_t)(w->out_all.dma_address + out_off * sizeof(int32_t)),
                     .tasks = npu_regs,
                 };
-                if ((t->ret = gen_matmul_int8(&p)) != 0) {
+                if ((t->ret = gen_gemm_int8(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_int8_prepacked: gen failed (%d)\n", t->ret);
                     return NULL;
                 }
@@ -715,7 +715,7 @@ static void *rki_thread(void *a)
                 w->boff[nb] = out_off;
                 /* Kt divides the group, so this K-tile lies wholly inside ONE group —
                  * its partial takes that group's single scale. */
-                if (gw) w->bg[nb] = ki / w->kt_per_group;
+                w->bg[nb] = gw ? ki / w->kt_per_group : ki;
                 nb++; done_tiles++;
 
                 if (nb == I8_BATCH || done_tiles == total) {
@@ -756,16 +756,17 @@ static void *rki_thread(void *a)
                             rki_acc_gw_tile(facc, nsub, slot, w->bMtile[j], w->bNtile[j],
                                             w->bm0[j], w->bn0[j], t->a_scale, nG, g,
                                             w->bsT + (size_t)g * nsub + w->bn0[j]);
-                        } else if (direct) {
+                        } else if (w->bg[j] == 0) {         /* first K tile: assign */
                             int32_t *restrict cj = t->C + (size_t)w->bm0[j] * N
                                                  + (size_t)(w->n0 + w->bn0[j]);
 #define MM_ACC_(h_, nn_, v_) (cj[(size_t)((h_) - 1) * N + ((nn_) - 1)] = (v_))
                             MM_CUBE_GATHER(int32_t, 4, out_idx_i8, slot,
                                            w->bMtile[j], w->bNtile[j], MM_ACC_);
 #undef MM_ACC_
-                        } else {
-#define MM_ACC_(h_, nn_, v_) \
-    (acc[(size_t)(w->bm0[j] + (h_) - 1) * nsub + (w->bn0[j] + (nn_) - 1)] += (int64_t)(v_))
+                        } else {                              /* later K tiles: wrapping add */
+                            uint32_t *restrict cj = (uint32_t *)t->C + (size_t)w->bm0[j] * N
+                                                  + (size_t)(w->n0 + w->bn0[j]);
+#define MM_ACC_(h_, nn_, v_) (cj[(size_t)((h_) - 1) * N + ((nn_) - 1)] += (uint32_t)(v_))
                             MM_CUBE_GATHER(int32_t, 4, out_idx_i8, slot,
                                            w->bMtile[j], w->bNtile[j], MM_ACC_);
 #undef MM_ACC_
@@ -782,10 +783,8 @@ static void *rki_thread(void *a)
     /* scatter this worker's column slice into the full output (the direct path wrote it). */
     if (prof) t0 = rki_now_ms();
     for (int m = 0; !direct && m < M; m++)
-        for (int n = 0; n < nsub; n++) {
-            if (gw) t->Cf[(size_t)m * N + (w->n0 + n)] = facc[(size_t)m * nsub + n];
-            else    t->C [(size_t)m * N + (w->n0 + n)] = (int32_t)acc[(size_t)m * nsub + n];
-        }
+        for (int n = 0; n < nsub; n++)
+            t->Cf[(size_t)m * N + (w->n0 + n)] = facc[(size_t)m * nsub + n];
 
     if (prof) {
         t_read += rki_now_ms() - t0;      /* the de-scatter is part of the readback */

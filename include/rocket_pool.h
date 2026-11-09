@@ -72,6 +72,67 @@ static inline int rocket_pool_oh(const rocket_pool_desc *d)
 static inline int rocket_pool_ow(const rocket_pool_desc *d)
 { return rocket_pool_out_dim(d->iw, d->kw, d->stride_x, d->pad_left, d->pad_right); }
 
+/* Returns 1 if the running kernel retires a job that ends in a pooling program when the PPU
+ * completes, and 0 otherwise. A pooling program raises no DPU completion. A `rocket` driver
+ * that waits only for the DPU's completion retires such a job at its 500 ms job timeout
+ * [HW sweep, RK3588]. The driver then resets the core, and the output is still correct.
+ *
+ * Where it returns 0, `rocket_pool_fp16()`, `rocket_pool_int8()`, `rocket_pool_uint8()` and
+ * `rocket_pool_int8_pack_rk3576()` refuse, and the global pools in `rocket_reduce.h` compute
+ * on the host. The plan functions touch no hardware and do not ask. A frontend that places a
+ * pool on the NPU must therefore ask both: the shape's plan, and this function.
+ *
+ * The answer is the one `rocket_ppu_done_supported()` gives, because the PPU-completion job
+ * flag is how a driver learns that a job ends on the PPU. It is probed once and cached. The
+ * first 0 it returns logs one warning. */
+int rocket_pool_npu_supported(void);
+
+/* The most column bands `rocket_pool_fp16()` cuts one pool into. Each band is one task of
+ * the pool's single job. */
+#define ROCKET_POOL_MAX_BANDS 256
+
+/* Returns the widest output one RK3588 pooling task computes correctly for this window and
+ * stride, or 0 for a window the entries refuse.
+ *
+ * Caution: a PPU task has an allowance on its output width. Past it the task writes a
+ * complete, correctly sized, incorrect output. Most windows also raise no completion there,
+ * and the job retires at the driver's timeout [HW sweep, RK1]. The allowance depends on the
+ * kernel height and the vertical stride, not on the plane's height or channel count. The
+ * measured last exact widths at a stride up to the window:
+ *
+ * - 128 for a 2x2 window at stride 2
+ * - 64 for a 2x2 window at stride 1, and for 3x3 to 8x8 windows at a stride equal to the
+ *   window
+ * - 32 for 3x3 and 4x4 windows at stride 1
+ * - 16 for 5x5 and 8x8 windows at stride 1
+ * - 256 or more for 1x2 and 1x3 windows at stride 1
+ *
+ * A window wider or taller than 8 fails at or near one output column. A stride larger than
+ * the window on either axis fails too: a 2x2 window at stride 3 is incorrect at width 8.
+ *
+ * The value returned is a bound fitted to those cells. It is 64, 32 or 16 as
+ * `ceil(kh/stride_y)` is 1-2, 3-4 or 5-8, and the measured value where a cell above is
+ * larger. It is 0 for a window past 8 on either axis or a stride past the window. Every
+ * window it admits was exact at its bound, padded windows included [HW sweep, RK1]. It is
+ * pure and touches no hardware. */
+unsigned rocket_pool_fp16_max_ow(const rocket_pool_desc *d);
+
+/* Returns how many column bands `rocket_pool_fp16()` runs this pool as. That is 1 for an
+ * output within `rocket_pool_fp16_max_ow()` and more for a wider one. It is 0 where the
+ * window has no allowance or the pool needs more than `ROCKET_POOL_MAX_BANDS`.
+ *
+ * The bands are evenly sized. Only the first band carries the left pad. A band carries the
+ * right pad where its windows reach past the plane. It is pure and touches no hardware. */
+unsigned rocket_pool_fp16_bands(const rocket_pool_desc *d);
+
+/* Describes band `s` of `rocket_pool_fp16_bands(d)`. `*x0` is its first output column and
+ * `*in_col` its first input column. `*band` is the pool it runs as: `*d` with the band's
+ * input width and edge pads. Pooling input columns [`*in_col`, `*in_col` + `band->iw`) with
+ * `*band` gives output columns [`*x0`, `*x0` + `rocket_pool_ow(band)`). Returns 0, or
+ * `ROCKET_E_SHAPE` for an `s` past the last band. It is pure. */
+int rocket_pool_fp16_band(const rocket_pool_desc *d, unsigned s,
+                          unsigned *x0, unsigned *in_col, rocket_pool_desc *band);
+
 /* Checks a descriptor against the supported set: the field widths and the fit in a single
  * job. Returns 0 if the pool can run, and a negative `rocket_status` otherwise:
  *
@@ -79,14 +140,21 @@ static inline int rocket_pool_ow(const rocket_pool_desc *d)
  *   a negative pad, an unknown method, or an empty output)
  * - `ROCKET_E_UNSUPPORTED`: past the PPU's fields (a dimension above 8192, a kernel or
  *   stride above 16, a pad above 7), an average kernel below 2, or `avg_exclude_pad` = 1
+ * - `ROCKET_E_UNSUPPORTED`: a kernel above 8 or a stride above the kernel on either axis
+ * - `ROCKET_E_UNSUPPORTED`: an output needing more than `ROCKET_POOL_MAX_BANDS` bands
  *
- * It is pure and touches no hardware. */
+ * In the last two cases `rocket_pool_fp16_bands()` returns 0. It is pure and touches no
+ * hardware. */
 int rocket_pool_fp16_plan(const rocket_pool_desc *d);
 
 /* Runs the pool on the NPU. `fd` is an open `rocket` device from `rocket_open()`, and `in`
- * and `out` are row-major fp16 in the layouts above. With `fd` < 0 it computes the CPU
- * reference, as a host fallback or an off-device self-check. Returns 0 on success and a
- * negative value on error. */
+ * and `out` are row-major fp16 in the layouts above. An output wider than
+ * `rocket_pool_fp16_max_ow()` runs as `rocket_pool_fp16_bands()` column bands, one task
+ * each in one job. The input columns two bands share are scattered into both.
+ *
+ * With `fd` < 0 it computes the CPU reference, as a host fallback or an off-device
+ * self-check. Returns 0 on success and a negative value on error. With `fd` >= 0 it returns
+ * `ROCKET_E_UNSUPPORTED` without submitting where `rocket_pool_npu_supported()` returns 0. */
 int rocket_pool_fp16(int fd, const rocket_pool_desc *d,
                      const _Float16 *in, _Float16 *out);
 
@@ -111,7 +179,8 @@ void rocket_pool_ref_fp16(const rocket_pool_desc *d,
  *
  * With `fd` < 0 they compute the CPU reference. Returns 0 on success and a negative value
  * on error. The fp16 plan's rule that an average needs a kernel of at least 2
- * (`ROCKET_E_UNSUPPORTED`) still applies. */
+ * (`ROCKET_E_UNSUPPORTED`) still applies. The fp16 entry's refusal where
+ * `rocket_pool_npu_supported()` returns 0 applies too. */
 int rocket_pool_int8(int fd, const rocket_pool_desc *d, const int8_t *in, int8_t *out);
 int rocket_pool_uint8(int fd, const rocket_pool_desc *d, const uint8_t *in, uint8_t *out);
 
@@ -195,6 +264,9 @@ void rocket_pool_ref_int8_rk3576(const rocket_pool_desc *d, int in_zp,
  *
  * `rocket_pool_int8_rk3576()` runs this same sequence, so a prepacked call is
  * bit-identical to a transient one by construction rather than by agreement.
+ *
+ * The pack returns NULL where `rocket_pool_npu_supported()` returns 0, and the transient
+ * entry then returns `ROCKET_E_UNSUPPORTED`.
  *
  * A handle fixes the fd, the geometry and the input zero point. A BO belongs to its file
  * and an IOVA is per fd. The handle therefore refuses a foreign fd rather than submitting

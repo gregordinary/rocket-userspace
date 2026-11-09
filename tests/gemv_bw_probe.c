@@ -9,7 +9,7 @@
  * userspace (rknpu2_matmul_open, vendor driver) runs decode on the NPU with integer
  * weights resident in the tile layout and implies ~24 GB/s over three cores. This
  * measures our side: one task per job whose weight cube streams through the CBUF
- * (gen_matmul_fp16 / gen_matmul_int8), N split across `jobs` jobs submitted in one ioctl,
+ * (gen_gemm_fp16 / gen_gemm_int8), N split across `jobs` jobs submitted in one ioctl,
  * so the kernel places them on separate cores.
  *
  * The first run of each configuration is scored exactly (integer operands: fp16 in [-3, 3]
@@ -81,7 +81,7 @@ int main(int argc, char **argv)
     memset(in.ptr, 0, in.size);
     for (int m = 1; m <= M; m++)
         for (int k = 1; k <= K; k++) {
-            size_t at = feature_data(K, M, 1, c2, k, m, 1), src = (size_t)(m - 1) * K + k - 1;
+            size_t at = feature_index(K, M, 1, c2, k, m, 1), src = (size_t)(m - 1) * K + k - 1;
             if (i8) ((int8_t *)in.ptr)[at] = ((int8_t *)A)[src];
             else    ((_Float16 *)in.ptr)[at] = ((_Float16 *)A)[src];
         }
@@ -96,16 +96,16 @@ int main(int argc, char **argv)
         for (int n = 1; n <= Nj; n++)
             for (int k = 1; k <= K; k++) {
                 size_t src = (size_t)(j * Nj + n - 1) * K + k - 1;
-                if (i8) ((int8_t *)w[j].ptr)[weight_int8(K, n, k)] = ((int8_t *)B)[src];
-                else    ((_Float16 *)w[j].ptr)[weight_fp16(K, n, k)] = ((_Float16 *)B)[src];
+                if (i8) ((int8_t *)w[j].ptr)[gemm_weight_index_int8(K, n, k)] = ((int8_t *)B)[src];
+                else    ((_Float16 *)w[j].ptr)[gemm_weight_index_fp16(K, n, k)] = ((_Float16 *)B)[src];
             }
         rocket_bo_fini(fd, &w[j]);
-        matmul_params_t p = {
+        gemm_params_t p = {
             .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)Nj,
-            .input_dma = (uint32_t)in.dma_address, .weights_dma = (uint32_t)w[j].dma_address,
-            .output_dma = (uint32_t)out[j].dma_address, .tasks = ops, .fp32tofp16 = 0,
+            .input_iova = (uint32_t)in.dma_address, .weights_iova = (uint32_t)w[j].dma_address,
+            .output_iova = (uint32_t)out[j].dma_address, .tasks = ops, .fp16_out = 0,
         };
-        int g = i8 ? gen_matmul_int8(&p) : gen_matmul_fp16(&p);
+        int g = i8 ? gen_gemm_int8(&p) : gen_gemm_fp16(&p);
         if (g != 0) { printf("generator refused %dx%dx%d (%d)\n", M, K, Nj, g); return 1; }
         rocket_bo_prep(fd, &rc[j], 1, 0);
         memcpy(rc[j].ptr, ops, (size_t)p.task_count * 8);
@@ -133,7 +133,7 @@ int main(int argc, char **argv)
             for (int j = 0; j < J; j++)
                 for (int m = 0; m < M; m++)
                     for (int n = 0; n < Nj; n++) {
-                        size_t at = feature_data(Nj, M, 1, 4, n + 1, m + 1, 1);
+                        size_t at = feature_index(Nj, M, 1, 4, n + 1, m + 1, 1);
                         double want = 0, got;
                         for (int k = 0; k < K; k++) {
                             size_t ai = (size_t)m * K + k, bi = (size_t)(j * Nj + n) * K + k;

@@ -8,7 +8,7 @@
  *
  *   out  = A[:,0:Kh] @ B[:,0:Kh]^T          (job 0, plain conv, accumulate=0)
  *   out += A[:,Kh:K] @ B[:,Kh:K]^T          (job 1, eltwise-add, accumulate=1,
- *                                            add_dma = out)
+ *                                            add_iova = out)
  *   verify out == A @ B^T   (full K, CPU reference)
  *
  * TWO SEPARATE JOBS with a fence between them, so a PASS isolates "does the
@@ -17,7 +17,7 @@
  * tasks) is the next test, then the tiled-loop rewrite.
  *
  * Everything is fp16 (accumulator included) to keep this minimal — only the EW
- * add is under test. Switch the accumulator to fp32 (fp32tofp16=0) for the real
+ * add is under test. Switch the accumulator to fp32 (fp16_out=0) for the real
  * 15-deep case after the path is validated.
  *
  * If it FAILS with the NPU producing job-0's result only (no add) or garbage,
@@ -50,17 +50,17 @@ static int run_partial(int fd, int M, int Kt, int N,
                        rocket_bo *regcmd, int accumulate, rocket_bo *add_bo)
 {
     uint64_t ops[256] = {0};
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = M, .k = Kt, .n = N,
-        .input_dma   = (uint32_t)in->dma_address,
-        .weights_dma = (uint32_t)wt->dma_address,
-        .output_dma  = (uint32_t)out->dma_address,
-        .tasks = ops, .fp32tofp16 = 1,
+        .input_iova   = (uint32_t)in->dma_address,
+        .weights_iova = (uint32_t)wt->dma_address,
+        .output_iova  = (uint32_t)out->dma_address,
+        .tasks = ops, .fp16_out = 1,
         .accumulate = accumulate,
-        .add_dma = accumulate ? (uint32_t)add_bo->dma_address : 0,
+        .add_iova = accumulate ? (uint32_t)add_bo->dma_address : 0,
     };
-    int r = gen_matmul_fp16(&p);
-    if (r) { fprintf(stderr, "gen_matmul_fp16 failed (%d)\n", r); return -1; }
+    int r = gen_gemm_fp16(&p);
+    if (r) { fprintf(stderr, "gen_gemm_fp16 failed (%d)\n", r); return -1; }
 
     if (accumulate) {   /* echo the regs THIS binary generated, to defeat stale builds */
         uint32_t ew=0, erd=0, fmc=0, ews=0;
@@ -101,7 +101,7 @@ static void pack_in(int fd, rocket_bo *bo, const _Float16 *A, int M, int K, int 
     _Float16 *ip = bo->ptr;
     for (int h = 1; h <= M; h++)
         for (int c = 1; c <= Kt; c++)
-            ip[feature_data(Kt, M, 1, 8, c, h, 1)] = A[(size_t)(h-1)*K + (k0 + c-1)];
+            ip[feature_index(Kt, M, 1, 8, c, h, 1)] = A[(size_t)(h-1)*K + (k0 + c-1)];
     rocket_bo_fini(fd, bo);
 }
 static void pack_wt(int fd, rocket_bo *bo, const _Float16 *B, int N, int K, int k0, int Kt) {
@@ -109,7 +109,7 @@ static void pack_wt(int fd, rocket_bo *bo, const _Float16 *B, int N, int K, int 
     _Float16 *wp = bo->ptr;
     for (int kk = 1; kk <= N; kk++)
         for (int c = 1; c <= Kt; c++)
-            wp[weight_fp16(Kt, kk, c)] = B[(size_t)(kk-1)*K + (k0 + c-1)];
+            wp[gemm_weight_index_fp16(Kt, kk, c)] = B[(size_t)(kk-1)*K + (k0 + c-1)];
     rocket_bo_fini(fd, bo);
 }
 
@@ -186,7 +186,7 @@ int main(int argc, char **argv)
         float max_abs = 0, max_rel = 0;
         for (int m = 0; m < M; m++)
             for (int n = 0; n < N; n++) {
-                float got = (float)ob[feature_data(N, M, 1, 8, n+1, m+1, 1)];
+                float got = (float)ob[feature_index(N, M, 1, 8, n+1, m+1, 1)];
                 float ad = fabsf(got - ref[m*N+n]);
                 float rd = ad / (fabsf(ref[m*N+n]) + 1e-6f);
                 if (ad > max_abs) max_abs = ad;
@@ -234,7 +234,7 @@ int main(int argc, char **argv)
 
     if (single) {
         /* Disambiguating experiment: SEPARATE constant operand (all = COP) + out
-         * pre-filled with a SENTINEL. One accumulate job, full K, add_dma=operand.
+         * pre-filled with a SENTINEL. One accumulate job, full K, add_iova=operand.
          * The readback classifies every hypothesis at once:
          *   out==sentinel -> job did NOT write (WDMA off in accumulate mode)
          *   out==full+COP -> conv AND operand both work (2-job bug = coherency)
@@ -263,13 +263,13 @@ int main(int argc, char **argv)
         for (size_t z = 0; z < outF.size/sizeof(_Float16); z++) ((_Float16*)outF.ptr)[z] = (_Float16)SENT;
         rocket_bo_fini(fd, &outF);
 
-        /* accumulate job: add_dma = the SEPARATE operand buffer, output -> outF */
+        /* accumulate job: add_iova = the SEPARATE operand buffer, output -> outF */
         uint64_t ops[256] = {0};
-        matmul_params_t p = { .m=M,.k=K,.n=N,
-            .input_dma=(uint32_t)inF.dma_address, .weights_dma=(uint32_t)wtF.dma_address,
-            .output_dma=(uint32_t)outF.dma_address, .tasks=ops, .fp32tofp16=1,
-            .accumulate=1, .add_dma=(uint32_t)opF.dma_address };
-        if (gen_matmul_fp16(&p)) { fprintf(stderr,"gen failed\n"); return 1; }
+        gemm_params_t p = { .m=M,.k=K,.n=N,
+            .input_iova=(uint32_t)inF.dma_address, .weights_iova=(uint32_t)wtF.dma_address,
+            .output_iova=(uint32_t)outF.dma_address, .tasks=ops, .fp16_out=1,
+            .accumulate=1, .add_iova=(uint32_t)opF.dma_address };
+        if (gen_gemm_fp16(&p)) { fprintf(stderr,"gen failed\n"); return 1; }
         rocket_bo_prep(fd, &rcF, 1, 0); memcpy(rcF.ptr, ops, p.task_count*sizeof(uint64_t)); rocket_bo_fini(fd, &rcF);
         rocket_task_desc t = { (uint32_t)rcF.dma_address, p.task_count };
         uint32_t inh[] = { inF.handle, wtF.handle, rcF.handle, opF.handle };
@@ -280,7 +280,7 @@ int main(int argc, char **argv)
         _Float16 *ob = outF.ptr;
         float e_full=0,e_fullcop=0,e_cop=0,e_sent=0,e_zero=0;
         for (int m=0;m<M;m++) for (int n=0;n<N;n++){
-            float got=(float)ob[feature_data(N,M,1,8,n+1,m+1,1)];
+            float got=(float)ob[feature_index(N,M,1,8,n+1,m+1,1)];
             e_full+=fabsf(got-ref[m*N+n]); e_fullcop+=fabsf(got-(ref[m*N+n]+COP));
             e_cop+=fabsf(got-COP); e_sent+=fabsf(got-SENT); e_zero+=fabsf(got);
         }
@@ -295,8 +295,8 @@ int main(int argc, char **argv)
             e_zero   < 1.0f ? "all zero" : "garbage";
         printf("[single] -> %s\n", verdict);
         printf("[single] sample got %.3f %.3f %.3f | full %.3f %.3f %.3f\n",
-               (float)ob[feature_data(N,M,1,8,1,1,1)], (float)ob[feature_data(N,M,1,8,2,1,1)],
-               (float)ob[feature_data(N,M,1,8,3,1,1)], ref[0], ref[1], ref[2]);
+               (float)ob[feature_index(N,M,1,8,1,1,1)], (float)ob[feature_index(N,M,1,8,2,1,1)],
+               (float)ob[feature_index(N,M,1,8,3,1,1)], ref[0], ref[1], ref[2]);
         rocket_bo_free(fd,&inF); rocket_bo_free(fd,&wtF); rocket_bo_free(fd,&outF);
         rocket_bo_free(fd,&opF); rocket_bo_free(fd,&rcF);
         rocket_close(fd); free(A); free(B); free(ref);
@@ -329,7 +329,7 @@ int main(int argc, char **argv)
         _Float16 *ip = ins[part]->ptr;
         for (int h = 1; h <= M; h++)
             for (int c = 1; c <= Kh; c++)
-                ip[feature_data(Kh, M, 1, 8, c, h, 1)] = A[(size_t)(h-1)*K + (k0 + c-1)];
+                ip[feature_index(Kh, M, 1, 8, c, h, 1)] = A[(size_t)(h-1)*K + (k0 + c-1)];
         rocket_bo_fini(fd, ins[part]);
 
         rocket_bo_prep(fd, wts[part], 1, 0);
@@ -337,7 +337,7 @@ int main(int argc, char **argv)
         _Float16 *wp = wts[part]->ptr;
         for (int kk = 1; kk <= N; kk++)
             for (int c = 1; c <= Kh; c++)
-                wp[weight_fp16(Kh, kk, c)] = B[(size_t)(kk-1)*K + (k0 + c-1)];
+                wp[gemm_weight_index_fp16(Kh, kk, c)] = B[(size_t)(kk-1)*K + (k0 + c-1)];
         rocket_bo_fini(fd, wts[part]);
     }
 
@@ -366,7 +366,7 @@ int main(int argc, char **argv)
     float e_full=0, e_p0=0, e_p1=0, max_abs=0, max_rel=0;
     for (int m = 0; m < M; m++)
         for (int n = 0; n < N; n++) {
-            float got = (float)ob[feature_data(N, M, 1, 8, n+1, m+1, 1)];
+            float got = (float)ob[feature_index(N, M, 1, 8, n+1, m+1, 1)];
             e_full += fabsf(got - ref[m*N+n]);
             e_p0   += fabsf(got - p0[m*N+n]);
             e_p1   += fabsf(got - p1[m*N+n]);
@@ -390,7 +390,7 @@ int main(int argc, char **argv)
         for (int m = 0; m < M; m++) {
             printf("   m=%d read:", m);
             for (int n = 0; n < N; n++) {
-                float got = (float)ob[feature_data(N, M, 1, 8, n+1, m+1, 1)];
+                float got = (float)ob[feature_index(N, M, 1, 8, n+1, m+1, 1)];
                 printf(" %6.2f", got - p1[m*N+n]);
             }
             printf("\n   m=%d  p0 :", m);

@@ -6,8 +6,8 @@
  * Two layers, mirroring how the dtype matmul generators were brought up:
  *
  *  1. CUBE-LAYOUT SELF-CHECK (runs anywhere, incl. x86, no NPU). Scatters the
- *     input feature + weights into the native NPU cube layouts (feature_data,
- *     weight_conv_fp16), then computes the convolution by reading THROUGH those
+ *     input feature + weights into the native NPU cube layouts (feature_index,
+ *     conv_weight_index_fp16), then computes the convolution by reading THROUGH those
  *     same index functions exactly as the CNA would (gather the KH*KW*IC window
  *     per output position from the feature cube + the weight from the weight cube),
  *     writes the output cube, de-scatters it, and compares bit-for-bit (fp32
@@ -45,7 +45,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_conv.h"
-#include "npu_matmul.h"   /* feature_data, weight_conv_fp16, gen_conv2d_fp16 */
+#include "npu_matmul.h"   /* feature_index, conv_weight_index_fp16, gen_conv2d_fp16 */
 #include "test_fill.h"
 
 static int dwg(void) { const char *e = getenv("ROCKET_CONV_DW_GROUP"); int g = e?atoi(e):32; return g>0?g:32; }
@@ -76,20 +76,20 @@ static int cube_self_check(const rocket_conv2d_desc *d,
     for (int ic = 0; ic < IC; ic++)
         for (int ih = 0; ih < IH; ih++)
             for (int iw = 0; iw < IW; iw++)
-                in_cube[feature_data(IC, IH, IW, 8, ic+1, ih+1, iw+1)] =
+                in_cube[feature_index(IC, IH, IW, 8, ic+1, ih+1, iw+1)] =
                     in[((size_t)ic*IH+ih)*IW+iw];
     if (DW) {
         for (int c = 0; c < IC; c++)
             for (int kh = 0; kh < KH; kh++)
                 for (int kw = 0; kw < KW; kw++)
-                    wt_cube[weight_conv_dw_fp16(IC, KH, KW, G, c+1, kh+1, kw+1)] =
+                    wt_cube[conv_dw_weight_index_fp16(IC, KH, KW, G, c+1, kh+1, kw+1)] =
                         W[((size_t)c*KH+kh)*KW+kw];
     } else {
         for (int oc = 0; oc < OC; oc++)
             for (int ic = 0; ic < IC; ic++)
                 for (int kh = 0; kh < KH; kh++)
                     for (int kw = 0; kw < KW; kw++)
-                        wt_cube[weight_conv_fp16(OC, IC, KH, KW, oc+1, ic+1, kh+1, kw+1)] =
+                        wt_cube[conv_weight_index_fp16(OC, IC, KH, KW, oc+1, ic+1, kh+1, kw+1)] =
                             W[(((size_t)oc*IC+ic)*KH+kh)*KW+kw];
     }
 
@@ -106,14 +106,14 @@ static int cube_self_check(const rocket_conv2d_desc *d,
                         for (int kw = 0; kw < KW; kw++) {
                             int iw = ow*d->stride_x + kw*d->dil_x - d->pad_left;
                             if (iw < 0 || iw >= IW) continue;
-                            float a = (float)in_cube[feature_data(IC, IH, IW, 8, ic+1, ih+1, iw+1)];
+                            float a = (float)in_cube[feature_index(IC, IH, IW, 8, ic+1, ih+1, iw+1)];
                             float w = DW
-                                ? (float)wt_cube[weight_conv_dw_fp16(IC, KH, KW, G, oc+1, kh+1, kw+1)]
-                                : (float)wt_cube[weight_conv_fp16(OC, IC, KH, KW, oc+1, ic+1, kh+1, kw+1)];
+                                ? (float)wt_cube[conv_dw_weight_index_fp16(IC, KH, KW, G, oc+1, kh+1, kw+1)]
+                                : (float)wt_cube[conv_weight_index_fp16(OC, IC, KH, KW, oc+1, ic+1, kh+1, kw+1)];
                             s += a * w;
                         }
                     }
-                out_cube[feature_data(OC, OH, OW, 8, oc+1, oh+1, ow+1)] = (_Float16)s;
+                out_cube[feature_index(OC, OH, OW, 8, oc+1, oh+1, ow+1)] = (_Float16)s;
             }
 
     /* de-scatter + oracle */
@@ -121,7 +121,7 @@ static int cube_self_check(const rocket_conv2d_desc *d,
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++)
                 got[((size_t)oc*OH+oh)*OW+ow] =
-                    out_cube[feature_data(OC, OH, OW, 8, oc+1, oh+1, ow+1)];
+                    out_cube[feature_index(OC, OH, OW, 8, oc+1, oh+1, ow+1)];
     rocket_conv2d_ref_fp16(d, in, W, ref);
 
     double max_abs = 0; int bad = 0;
@@ -183,7 +183,7 @@ static int run_shape(int fd, const rocket_conv2d_desc *d)
         conv_params_t p = { .ic=d->ic,.ih=d->ih,.iw=d->iw,.oc=d->oc,.oh=OH,.ow=OW,
             .kh=d->kh,.kw=d->kw,.stride_y=d->stride_y,.stride_x=d->stride_x,
             .dil_y=d->dil_y,.dil_x=d->dil_x,.pad_top=d->pad_top,.pad_left=d->pad_left,
-            .input_dma=0x1000,.weights_dma=0x2000,.output_dma=0x3000,.tasks=regs,.fp32tofp16=1,
+            .input_iova=0x1000,.weights_iova=0x2000,.output_iova=0x3000,.tasks=regs,.fp16_out=1,
             .dw_group=(uint8_t)(d->depthwise ? dwg() : 0) };
         int g = d->depthwise ? gen_conv2d_dw_fp16(&p) : gen_conv2d_fp16(&p);
         /* g==-1/-2 = the WHOLE shape overflows one CBUF pass — expected for a

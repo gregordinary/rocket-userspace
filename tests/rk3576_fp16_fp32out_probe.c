@@ -131,7 +131,7 @@ static int run_once(int fd, struct run *r)
     rocket_bo_fini(fd, &w);
 
     rocket_bo_prep(fd, &b, 1, 0);
-    if (rocket_rk3576_pack_coeff_prec(b.ptr, coeff, NULL, ocreg, precision_float16) < 0) {
+    if (rocket_rk3576_pack_coeff_prec(b.ptr, coeff, NULL, ocreg, PREC_FP16) < 0) {
         rocket_bo_fini(fd, &b);
         fprintf(stderr, "coefficient pack refused\n");
         goto out;
@@ -152,10 +152,10 @@ static int run_once(int fd, struct run *r)
     p.ih_full = (uint16_t)r->ih; p.oh_full = (uint16_t)oh;
     p.int8_out = 0;
     p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
-    p.input_dma = (uint32_t)in.dma_address;
-    p.weights_dma = (uint32_t)w.dma_address;
-    p.bias_dma = (uint32_t)b.dma_address;
-    p.output_dma = (uint32_t)o.dma_address;
+    p.input_iova = (uint32_t)in.dma_address;
+    p.weights_iova = (uint32_t)w.dma_address;
+    p.bias_iova = (uint32_t)b.dma_address;
+    p.output_iova = (uint32_t)o.dma_address;
     p.tasks = ops;
 
     if (r->wide) {

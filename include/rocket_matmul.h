@@ -133,7 +133,7 @@ int rocket_mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
 
 /* Computes the fp16 matmul with an fp32 output, fp16 x fp16 -> fp32:
  * `C[M,N] = A[M,K] * B[N,K]^T`, with the same fp16 input packing as `rocket_matmul_fp16`.
- * The DPU writes the full fp32 accumulator (`fp32tofp16=0`) instead of narrowing each K
+ * The DPU writes the full fp32 accumulator (`fp16_out=0`) instead of narrowing each K
  * partial to fp16, and the host sums the K partials in fp64. The entry therefore skips both
  * the fp16 rounding that `rocket_matmul_fp16` applies to each K partial and the final
  * narrowing. The result is the fp32 dot product of the fp16 inputs.
@@ -546,13 +546,14 @@ void rocket_rk3576_i32_last_stats(rocket_rk3576_i32_stats *out);
  * It is a separate program from the fp16 convolution program, which contracts sixteen
  * input channels a task. On its fp16 writer, which costs a power cycle per program, that
  * program measured 30-299x slower than int8 over ordinary shapes. Its fp32-stage default,
- * which costs none, has not been compared with int8. This entry is the matmul form of
- * gahingwoo/charsiu (`524e10a`), transcribed word for word.
+ * which costs none, has not been compared with int8. This entry runs the program
+ * RKLLM-Toolkit compiles an LLM's fp16 attention matmuls to for the RK3576.
  *
  * The limits are `1 <= M <= 2048`, `32 <= K <= 6144` with `K%32 == 0`, and
  * `64 <= N <= 8192` with `N%16 == 0`. Anything else returns `ROCKET_E_UNSUPPORTED` before
- * a buffer is allocated. `K` and `N` are one task's bounds, measured on the RK3576. `K`
- * 6176 never completes, and at `N` 8960 the task writes the first 768 columns and hangs.
+ * a buffer is allocated. `K` and `N` are one task's bounds, measured on the RK3576 with an
+ * earlier form of the program. That form also read a coefficient buffer through the DPU
+ * RDMA. `K` 6176 never completes, and at `N` 8960 the task writes the first 768 columns and hangs.
  * The `M` bound is the test's.
  *
  * One task holds at most 4096/(K/32) rows, since its input must fit the CBUF data window.
@@ -563,8 +564,8 @@ void rocket_rk3576_i32_last_stats(rocket_rk3576_i32_stats *out);
  * The output is exact against a CPU reference whose fills make every sum exact in fp32.
  * The test covers 23 one-task shapes to the bounds (the window at three K, K 6144, N 8192,
  * an 8 MiB weight) and 6 shapes of 2 to 25 tasks, up to 2048x1536x256. A row-major weight
- * control was wrong on 64 of 64 [HW sweep, H96 MAX M9, rocket 1.6.0,
- * `tests/rk3576_mm_fp16_gate`, 2026-09-25].
+ * control was wrong on 64 of 64 [HW sweep, H96 MAX M9, Armbian 7.3.3 `rocket`, NPU at
+ * 594 MHz, `tests/rk3576_mm_fp16_gate`, 2026-11-09].
  *
  * The NPU sums each group of 32 consecutive products along K with no intermediate
  * rounding, and rounds the group sum to fp32. It accumulates the group sums in K order in
@@ -578,7 +579,7 @@ void rocket_rk3576_i32_last_stats(rocket_rk3576_i32_stats *out);
  * The device's share at M 512 K 1536 N 1536 is 4.5 ms, about 2.1x the int8 resident
  * entry's at the same shape. Each task re-reads the whole weight, and this program
  * contracts at about half the int8 program's rate. Per call, the entry allocates, fills
- * and frees five buffers, and `ROCKET_MM_PROFILE` prints its time per phase. [HW sweep,
+ * and frees four buffers, and `ROCKET_MM_PROFILE` prints its time per phase. [HW sweep,
  * H96 MAX M9, 786 MHz, governor performance, `tests/rk3576_mm_fp16_cost`, 2026-09-25]
  *
  * Its fp32 output does not corrupt the next submit, unlike the older int32 writers and the
@@ -596,19 +597,14 @@ int rocket_matmul_fp16_rk3576(int fd, int M, int K, int N,
 unsigned rocket_rk3576_mm_fp16_last_attempts(void);
 
 /* Holds one fp16 weight in a `rocket_rk3576_wbo_fp16`, permuted once into the RK3576's
- * layout in a device BO. The coefficient buffer for its `N` sits beside it.
- * `rocket_matmul_fp16_rk3576_wbo()` is `rocket_matmul_fp16_rk3576()` with that object in
- * place of `B`: the same program, limits, write check and redo. It drops the two buffers
- * the per-call entry allocates, fills and frees every call. Neither changes between
- * calls: the weight permutation is a pass over all N*K elements, and the coefficients
- * depend on `N` alone.
+ * layout in a device BO. `rocket_matmul_fp16_rk3576_wbo()` is `rocket_matmul_fp16_rk3576()`
+ * with that object in place of `B`: the same program, limits, write check and redo. It
+ * drops the weight buffer the per-call entry allocates, fills and frees every call. That
+ * buffer does not change between calls, and its permutation is a pass over all N*K
+ * elements.
  *
- * An object holds two device BOs allocated on `fd`, freed only by
- * `rocket_rk3576_wbo_fp16_free()` or by closing the fd. They are the weight, K*N*2 bytes,
- * and the coefficient buffer, `rocket_rk3576_mm_fp16_coef_bytes(N)`, about 257 KiB
- * whatever `N` is. Nearly all of the coefficient buffer is padding against RDMA reads past
- * its table. Whether the task needs the padding is unmeasured, so a handle per model
- * weight also holds about 257 KiB of padding per weight.
+ * An object holds one device BO allocated on `fd`, the weight, K*N*2 bytes, freed only by
+ * `rocket_rk3576_wbo_fp16_free()` or by closing the fd.
  *
  * Caution: the object is not checked against anything on each call. An object can be
  * created from different bytes than the caller assumes, or outlive the weight it was
@@ -705,8 +701,8 @@ int rocket_matmul_int8_groupwise(int fd, int M, int K, int N,
  * Hadamard rotation. `C` is the raw int32 accumulation.
  *
  * int4 differs from int8 in its feature cube (C2=32), its weight layout (N/64,K/32,64,32)
- * [weight_int4] and its int16 output cube (C2=8). The input and weight are nibble-packed,
- * 2 int4 values a byte. The alignment is `K%32`, `N%64` (int4's N-group is 64, not int8's
+ * [gemm_weight_index_int4] and its int16 output cube (C2=8). The input and weight are
+ * nibble-packed, 2 int4 values a byte. The alignment is `K%32`, `N%64` (int4's N-group is 64, not int8's
  * 32) and (M%4||1). `rocket_matmul_plan_int4` previews the tiling without touching the
  * hardware.
  *
@@ -743,8 +739,9 @@ int rocket_matmul_int4_groupwise(int fd, int M, int K, int N,
                                  float *Cf, int group);
 
 /* Previews the int16 tile shape without touching the hardware. int16 has fp16's input
- * geometry (feature cube C2=8, weight (N/16,K/32,16,32) [weight_int16 == weight_fp16],
- * 2-byte elements) with a 4-byte output cube (C2=4), and the bf16 path reuses this plan.
+ * geometry (feature cube C2=8, weight (N/16,K/32,16,32) [gemm_weight_index_int16 ==
+ * gemm_weight_index_fp16], 2-byte elements) with a 4-byte output cube (C2=4), and the bf16
+ * path reuses this plan.
  * The alignment is `K%32`, `N%16` and (M%4||1).
  *
  * The single-task generator writes int16 x int16 -> int32 natively and saturates to int32,
@@ -836,7 +833,7 @@ int rocket_matmul_bf16_stream(rocket_bf16_stream *s, int M, int K, int N,
  * tile (N/16,K/16,16,16), banks 4 B/elem and data_entries K/16. The K-group halves to 16,
  * and the N-group stays 16. The alignment is `K%16`, `N%16` and (M%4||1).
  *
- * `gen_matmul_tf32` sets the per-stage precision (CNA/CORE=7 tf32, DPU=fp32). tf32 has the
+ * `gen_gemm_tf32` sets the per-stage precision (CNA/CORE=7 tf32, DPU=fp32). tf32 has the
  * lowest value of the datatypes: its MAC runs at half rate, and bf16 already gives fp32
  * range at full speed. It exists for completeness, not for a workload, and no in-model
  * backend uses it. `rocket_matmul_plan_tf32` previews the tiling without touching the
@@ -1017,8 +1014,10 @@ int rocket_matmul_fp16_stream_fused(rocket_stream *s, int M, int K,
  *
  * The int8 convention is that of `rocket_matmul_int8`. `A` and `B` are int8 that the caller
  * has already quantized. The caller is responsible for the per-row and per-channel scales
- * and any Hadamard rotation. `C` is the raw int32 accumulation. The host sums K in int64,
- * and no NPU integer K-accumulation is implemented.
+ * and any Hadamard rotation. `C` is the raw int32 accumulation: the exact sum while
+ * |sum| < 2^31, and the sum modulo 2^32 past it, as the one-shot entry's int64 sum truncated
+ * to int32. No NPU integer K-accumulation is implemented. The host adds each K tile's int32
+ * partial into `C`.
  *
  * The alignment is `K%32`, `N%32` and `M%4==0`. The resident paths do not pad `M`==1, so a
  * caller must pad a single vector to 4. The per-worker N slice is rounded to a multiple of

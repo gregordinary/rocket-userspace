@@ -58,18 +58,18 @@ static void *worker(void *arg)
 
     rocket_bo_prep(fd,&in,1,0); memset(in.ptr,0,in.size);
     for(int h=1;h<=M;h++)for(int c=1;c<=K;c++)
-        ((_Float16*)in.ptr)[feature_data(K,M,1,8,c,h,1)]=(_Float16)(0.01f*((h+c)%7));
+        ((_Float16*)in.ptr)[feature_index(K,M,1,8,c,h,1)]=(_Float16)(0.01f*((h+c)%7));
     rocket_bo_fini(fd,&in);
     rocket_bo_prep(fd,&wt,1,0); memset(wt.ptr,0,wt.size);
     for(int k=1;k<=N;k++)for(int c=1;c<=K;c++)
-        ((_Float16*)wt.ptr)[weight_fp16(K,k,c)]=(_Float16)(0.01f*((k*c)%5));
+        ((_Float16*)wt.ptr)[gemm_weight_index_fp16(K,k,c)]=(_Float16)(0.01f*((k*c)%5));
     rocket_bo_fini(fd,&wt);
 
     uint64_t ops[256]={0};
-    matmul_params_t p={.m=M,.k=K,.n=N,.input_dma=(uint32_t)in.dma_address,
-        .weights_dma=(uint32_t)wt.dma_address,.output_dma=(uint32_t)out.dma_address,
-        .tasks=ops,.fp32tofp16=1};
-    if(gen_matmul_fp16(&p)){fprintf(stderr,"[t%ld] gen failed\n",id);return NULL;}
+    gemm_params_t p={.m=M,.k=K,.n=N,.input_iova=(uint32_t)in.dma_address,
+        .weights_iova=(uint32_t)wt.dma_address,.output_iova=(uint32_t)out.dma_address,
+        .tasks=ops,.fp16_out=1};
+    if(gen_gemm_fp16(&p)){fprintf(stderr,"[t%ld] gen failed\n",id);return NULL;}
     rocket_bo_prep(fd,&rc,1,0); memcpy(rc.ptr,ops,p.task_count*sizeof(uint64_t)); rocket_bo_fini(fd,&rc);
 
     rocket_task_desc *tasks=malloc(TASKS_PER_JOB*sizeof(*tasks));

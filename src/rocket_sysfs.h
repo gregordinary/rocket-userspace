@@ -30,4 +30,21 @@ int rocket_sysfs_bound_devices(char names[][ROCKET_SYSFS_NAME_MAX], int max);
 /* How many NPU cores the driver has bound. */
 int rocket_sysfs_bound_core_count(void);
 
+/* The DRM interface minor the capability probes may act on, given the one the kernel
+ * `reported` and the sysfs root (`"/sys"`; a test passes a fake tree).
+ *
+ * The minors 1.1 and up name this library's kernel patch series: each private job flag,
+ * the ranged cache sync and the PPU completion appear at a minor of that series, and both
+ * the RK3588 and the RK3576 series take 1.1 from the batched-submit patch, which also
+ * creates the `rocket_batch_submit` module parameter. Upstream numbers its own interface,
+ * and a minor it raises for its own reasons names none of those features: sending a flag
+ * word to a kernel that does not know it fails every submit with -EINVAL. So a minor
+ * above 0 counts only where `<sys_root>/module/rocket/parameters/rocket_batch_submit`
+ * exists, and reads as 0 where the module directory is visible and the parameter is not.
+ * Where `<sys_root>/module` itself is absent (sysfs not mounted, as in some containers)
+ * there is nothing to ask, and the reported minor stands.
+ *
+ * A `reported` of 0 or below (stock, or not rocket) is returned unchanged. */
+int rocket_sysfs_trusted_minor(int reported, const char *sys_root);
+
 #endif /* ROCKET_SYSFS_H */

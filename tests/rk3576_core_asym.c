@@ -19,7 +19,7 @@
  *
  *   The TRIGGER is not capacity. An aggressor whose whole feature plane is FOUR
  *   granules -- 256 bytes against a 448 KiB pool -- corrupts 62-76% of the victim's
- *   calls. Nothing is being exhausted; the collision is unconditional.
+ *   calls over the three runs (71.9-75.6% over the two whose tables were kept). Nothing is being exhausted; the collision is unconditional.
  *
  *   The EXTENT is the aggressor's FEATURE PLANE, and nothing else. Damage per corrupted
  *   call is monotone in its granules: 0.6-0.7% of the victim's surface at 4, 2.7-3.0% at

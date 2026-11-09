@@ -94,8 +94,8 @@
 #define C2       16
 #define SENTINEL 0xAA
 
-int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
-int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+int feature_index(int C, int H, int W, int C2_, int c, int h, int w);
+int conv_weight_index_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
 
 /* ============================================================================
  * SECTION — the shape table
@@ -133,7 +133,7 @@ static void sleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
-/* The output cube index. NOT feature_data(): that assumes surfaces sit exactly
+/* The output cube index. NOT feature_index(): that assumes surfaces sit exactly
  * ow*oh apart, and the depthwise writer advances by the plane rounded up to four. */
 static size_t out_index(unsigned surf_elems, unsigned ow, unsigned c,
                         unsigned y, unsigned x)
@@ -280,7 +280,7 @@ static int run_shape(int fd, const shape_t *s, struct run_stat *st)
     for (c = 0; c < ic; c++)
         for (y = 0; y < ih; y++)
             for (x = 0; x < iw; x++)
-                in_cube[feature_data((int)ic, (int)ih, (int)iw, C2,
+                in_cube[feature_index((int)ic, (int)ih, (int)iw, C2,
                                      (int)c + 1, (int)y + 1, (int)x + 1)] = INP(c, y, x);
     if (s->dw) {
         /* The RK3576's own cube: channels grouped by 32, tap-major inside a group,
@@ -298,7 +298,7 @@ static int run_shape(int fd, const shape_t *s, struct run_stat *st)
             for (i = 0; i < ic; i++)
                 for (kh = 0; kh < k; kh++)
                     for (kw = 0; kw < k; kw++)
-                        w_cube[weight_conv_int8((int)oc, (int)ic, (int)k, (int)k,
+                        w_cube[conv_weight_index_int8((int)oc, (int)ic, (int)k, (int)k,
                                                 (int)c + 1, (int)i + 1,
                                                 (int)kh + 1, (int)kw + 1)] =
                             WD(c, i, kh, kw);
@@ -346,10 +346,10 @@ static int run_shape(int fd, const shape_t *s, struct run_stat *st)
     p.output_zero_point = 0x80;
     p.weight_zero_point = 0x80;
     p.tasks       = ops;
-    p.input_dma   = in_bo.dma_address;
-    p.weights_dma = w_bo.dma_address;
-    p.bias_dma    = b_bo.dma_address;
-    p.output_dma  = o_bo.dma_address;
+    p.input_iova   = in_bo.dma_address;
+    p.weights_iova = w_bo.dma_address;
+    p.bias_iova    = b_bo.dma_address;
+    p.output_iova  = o_bo.dma_address;
 
     in_h[0] = in_bo.handle; in_h[1] = w_bo.handle;
     in_h[2] = b_bo.handle;  in_h[3] = r_bo.handle;
@@ -389,8 +389,8 @@ static int run_shape(int fd, const shape_t *s, struct run_stat *st)
             int wrote = 0;
             q.ih = plan[t].ih; q.oh = plan[t].oh;
             q.pad_top = plan[t].pad_top;
-            q.input_dma  = p.input_dma  + plan[t].feature_off;
-            q.output_dma = p.output_dma + plan[t].output_off;
+            q.input_iova  = p.input_iova  + plan[t].feature_off;
+            q.output_iova = p.output_iova + plan[t].output_off;
             /* ALWAYS, not just when the plan split. A single-task plan's window is
              * still shorter than the plane whenever the last output row does not
              * reach the bottom input row — any stride > 1 whose output does not
@@ -576,7 +576,7 @@ static int dw_map(int fd)
         int8_t *f = in_bo.ptr;
         unsigned c;
         for (c = 0; c < c_n; c++)
-            f[feature_data((int)creg, (int)ih, (int)iw, C2,
+            f[feature_index((int)creg, (int)ih, (int)iw, C2,
                            (int)c + 1, (int)y0 + 1, (int)x0 + 1)] = 64;
     }
     rocket_bo_fini(fd, &in_bo);
@@ -593,10 +593,10 @@ static int dw_map(int fd)
     p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 64.0f;  /* out == the weight byte */
     p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
     p.tasks       = ops;
-    p.input_dma   = in_bo.dma_address;
-    p.weights_dma = w_bo.dma_address;
-    p.bias_dma    = b_bo.dma_address;
-    p.output_dma  = o_bo.dma_address;
+    p.input_iova   = in_bo.dma_address;
+    p.weights_iova = w_bo.dma_address;
+    p.bias_iova    = b_bo.dma_address;
+    p.output_iova  = o_bo.dma_address;
     p.ih_full = (uint16_t)ih; p.oh_full = (uint16_t)oh;
 
     in_h[0] = in_bo.handle; in_h[1] = w_bo.handle;
@@ -804,7 +804,7 @@ static int fc_map(int fd)
 
     rocket_bo_prep(fd, &b_bo, 1, 0);
     rocket_rk3576_pack_coeff_prec(b_bo.ptr, coeff, bias, oc,
-                                  fp16 ? precision_float16 : precision_int8);
+                                  fp16 ? PREC_FP16 : PREC_INT8);
     rocket_bo_fini(fd, &b_bo);
 
     p.ic = (uint16_t)ic; p.ih = (uint16_t)ih; p.iw = (uint16_t)iw;
@@ -819,10 +819,10 @@ static int fc_map(int fd)
     p.output_zero_point = (uint8_t)(fp16 ? 0 : 0x80);
     p.weight_zero_point = (uint8_t)(fp16 ? 0 : 0x80);
     p.tasks       = ops;
-    p.input_dma   = in_bo.dma_address;
-    p.weights_dma = w_bo.dma_address;
-    p.bias_dma    = b_bo.dma_address;
-    p.output_dma  = o_bo.dma_address;
+    p.input_iova   = in_bo.dma_address;
+    p.weights_iova = w_bo.dma_address;
+    p.bias_iova    = b_bo.dma_address;
+    p.output_iova  = o_bo.dma_address;
     p.ih_full = (uint16_t)ih; p.oh_full = (uint16_t)oh;
 
     in_h[0] = in_bo.handle; in_h[1] = w_bo.handle;
@@ -1075,10 +1075,10 @@ static int dw_bias(int fd, int dw)
     p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
     p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
     p.tasks       = ops;
-    p.input_dma   = bo_in.dma_address;
-    p.weights_dma = bo_w.dma_address;
-    p.bias_dma    = bo_b.dma_address;
-    p.output_dma  = bo_o.dma_address;
+    p.input_iova   = bo_in.dma_address;
+    p.weights_iova = bo_w.dma_address;
+    p.bias_iova    = bo_b.dma_address;
+    p.output_iova  = bo_o.dma_address;
     p.ih_full = (uint16_t)ih; p.oh_full = (uint16_t)oh;
 
     in_h[0] = bo_in.handle; in_h[1] = bo_w.handle;
@@ -1174,7 +1174,7 @@ done:
  * the reference image, makes a per-position delta meaningful whatever the baseline
  * looks like.
  *
- * And it reads the RAW BO. feature_data() is the direct path's cube, so scoring a
+ * And it reads the RAW BO. feature_index() is the direct path's cube, so scoring a
  * depthwise surface through it hides exactly the permutation this mode is looking
  * for. A changed byte is reported at its own offset, folded to (surface, lane) with
  * the pixel count, so a map falls out of the report rather than being fitted to it.
@@ -1255,10 +1255,10 @@ static int dw_coeff(int fd, int dw)
     p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = (float)oscale;
     p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
     p.tasks       = ops;
-    p.input_dma   = bo_in.dma_address;
-    p.weights_dma = bo_w.dma_address;
-    p.bias_dma    = bo_b.dma_address;
-    p.output_dma  = bo_o.dma_address;
+    p.input_iova   = bo_in.dma_address;
+    p.weights_iova = bo_w.dma_address;
+    p.bias_iova    = bo_b.dma_address;
+    p.output_iova  = bo_o.dma_address;
     p.ih_full = (uint16_t)ih; p.oh_full = (uint16_t)oh;
 
     in_h[0] = bo_in.handle; in_h[1] = bo_w.handle;
@@ -1373,7 +1373,7 @@ done:
 /* ============================================================================
  * SECTION — dwout: read the depthwise OUTPUT CUBE off the hardware
  *
- * Every other depthwise probe here reads the surface through feature_data(), the
+ * Every other depthwise probe here reads the surface through feature_index(), the
  * direct path's NC1HWC2 cube — so every one of them is scored through a layout it
  * cannot itself check, and a channel permutation and a wrong descatter are
  * indistinguishable in their output. This one does not descatter at all.
@@ -1472,10 +1472,10 @@ static int dw_out(int fd, int dw)
     p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = (float)oscale;
     p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
     p.tasks       = ops;
-    p.input_dma   = bo_in.dma_address;
-    p.weights_dma = bo_w.dma_address;
-    p.bias_dma    = bo_b.dma_address;
-    p.output_dma  = bo_o.dma_address;
+    p.input_iova   = bo_in.dma_address;
+    p.weights_iova = bo_w.dma_address;
+    p.bias_iova    = bo_b.dma_address;
+    p.output_iova  = bo_o.dma_address;
     p.ih_full = (uint16_t)ih; p.oh_full = (uint16_t)oh;
 
     in_h[0] = bo_in.handle; in_h[1] = bo_w.handle;

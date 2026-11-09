@@ -93,7 +93,7 @@ static void bo_fill(int fd, rocket_bo *bo, size_t n, int byte)
 }
 
 static int prog_init(int fd, struct prog *pr, unsigned seed,
-                     uint32_t in_dma, uint32_t out_dma)
+                     uint32_t in_iova, uint32_t out_iova)
 {
     unsigned icreg = rocket_rk3576_pad_ic(G_IC), ocreg = rocket_rk3576_pad_oc(G_OC);
     unsigned surf_elems = rocket_rk3576_out_surf_elems(G_IW, G_IH, 0);
@@ -124,7 +124,7 @@ static int prog_init(int fd, struct prog *pr, unsigned seed,
     if (!bias) return -1;
     for (i = 0; i < ocreg; i++) bias[i] = (int32_t)(i % 7u) - 3;
     rocket_bo_prep(fd, &pr->b, 1, 0);
-    rocket_rk3576_pack_coeff_prec(pr->b.ptr, coeff, bias, ocreg, precision_int8);
+    rocket_rk3576_pack_coeff_prec(pr->b.ptr, coeff, bias, ocreg, PREC_INT8);
     rocket_bo_fini(fd, &pr->b);
     free(bias);
 
@@ -138,10 +138,10 @@ static int prog_init(int fd, struct prog *pr, unsigned seed,
     pr->p.in_scale = 1.0f; pr->p.w_scale = 1.0f; pr->p.out_scale = 256.0f;
     pr->p.input_zero_point = 0; pr->p.output_zero_point = 0; pr->p.weight_zero_point = 0;
     pr->p.ih_full = (uint16_t)G_IH; pr->p.oh_full = (uint16_t)G_IH;
-    pr->p.input_dma   = in_dma;
-    pr->p.weights_dma = (uint32_t)pr->w.dma_address;
-    pr->p.bias_dma    = (uint32_t)pr->b.dma_address;
-    pr->p.output_dma  = out_dma;
+    pr->p.input_iova   = in_iova;
+    pr->p.weights_iova = (uint32_t)pr->w.dma_address;
+    pr->p.bias_iova    = (uint32_t)pr->b.dma_address;
+    pr->p.output_iova  = out_iova;
     pr->p.tasks = pr->ops;
     pr->p.task_count = 0;
     if (gen_conv2d_int8_rk3576(&pr->p) != 0) {

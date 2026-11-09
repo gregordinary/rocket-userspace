@@ -69,7 +69,7 @@
  *
  * Program kinds: int8fc fp16fc int8d fp16d i32 i32w dw mmf16
  *
- * `mmf16` is the matmul-form fp16 program (gen_matmul_fp16_rk3576), one job at M 1, K 256,
+ * `mmf16` is the matmul-form fp16 program (gen_gemm_fp16_rk3576), one job at M 1, K 256,
  * N 64 with an fp32 output: the first transcription run's repeat shape. It is not a convolution, so it carries
  * no conv_params_t geometry and `scan`, `heal` and `xadd` do not apply to it; `pair`,
  * `chain` and `scope` do.
@@ -149,6 +149,7 @@ struct prog {
     conv_params_t p;
     uint64_t     ops[RK3576_CONV_TASK_OPS];
     uint32_t     in_h[4], out_h[1];
+    unsigned     n_in;        /* handles in in_h: 3 for the matmul form, 4 for a conv */
     size_t       obytes;      /* the whole output allocation, which is what is scanned */
     int          live;
 };
@@ -216,8 +217,8 @@ static int prog_emit(int fd, struct prog *pr)
     switch (pr->kind) {
     case PK_MMF16: {
         const struct geom *g = &KIND_GEOM[PK_MMF16];
-        rc = gen_matmul_fp16_rk3576(pr->ops, g->ih, g->ic, g->oc, pr->p.input_dma,
-                                    pr->p.weights_dma, pr->p.output_dma, pr->p.bias_dma);
+        rc = gen_gemm_fp16_rk3576(pr->ops, g->ih, g->ic, g->oc, pr->p.input_iova,
+                                    pr->p.weights_iova, pr->p.output_iova);
         if (rc != RK3576_MM_FP16_OPS) return -1;
         pr->p.task_count = RK3576_MM_FP16_OPS;
         rc = 0;
@@ -263,12 +264,10 @@ static int prog_init(int fd, struct prog *pr, int kind)
     if (kind == PK_MMF16) {
         unsigned m = g->ih, k = g->ic, n = g->oc;
         size_t wb = rocket_rk3576_mm_fp16_weight_bytes(k, n);
-        size_t cb = rocket_rk3576_mm_fp16_coef_bytes(n);
         size_t ib = rocket_rk3576_mm_fp16_in_bytes(m, k);
         pr->obytes = rocket_rk3576_mm_fp16_out_bytes(m, n);
         if (rocket_bo_alloc(fd, ib, &pr->in) < 0) return -1;
         if (rocket_bo_alloc(fd, wb, &pr->w) < 0) return -1;
-        if (rocket_bo_alloc(fd, cb, &pr->b) < 0) return -1;
         if (rocket_bo_alloc(fd, pr->obytes, &pr->o) < 0) return -1;
         if (rocket_bo_alloc(fd, sizeof pr->ops, &pr->r) < 0) return -1;
         rocket_bo_prep(fd, &pr->in, 1, 0);
@@ -278,15 +277,12 @@ static int prog_init(int fd, struct prog *pr, int kind)
         rocket_bo_prep(fd, &pr->w, 1, 0);
         for (i = 0; i < wb / 2; i++) ((uint16_t *)pr->w.ptr)[i] = 0x3C00;
         rocket_bo_fini(fd, &pr->w);
-        rocket_bo_prep(fd, &pr->b, 1, 0);
-        rocket_rk3576_mm_fp16_pack_coef(pr->b.ptr, cb, n);
-        rocket_bo_fini(fd, &pr->b);
-        pr->p.input_dma   = (uint32_t)pr->in.dma_address;
-        pr->p.weights_dma = (uint32_t)pr->w.dma_address;
-        pr->p.bias_dma    = (uint32_t)pr->b.dma_address;
-        pr->p.output_dma  = (uint32_t)pr->o.dma_address;
+        pr->p.input_iova   = (uint32_t)pr->in.dma_address;
+        pr->p.weights_iova = (uint32_t)pr->w.dma_address;
+        pr->p.output_iova  = (uint32_t)pr->o.dma_address;
         pr->in_h[0] = pr->in.handle; pr->in_h[1] = pr->w.handle;
-        pr->in_h[2] = pr->b.handle;  pr->in_h[3] = pr->r.handle;
+        pr->in_h[2] = pr->r.handle;
+        pr->n_in = 3;
         pr->out_h[0] = pr->o.handle;
         if (prog_emit(fd, pr) != 0) return -1;
         pr->live = 1;
@@ -336,10 +332,10 @@ static int prog_init(int fd, struct prog *pr, int kind)
     for (i = 0; i < ocreg; i++) bias[i] = (int32_t)i + 1;
     rocket_bo_prep(fd, &pr->b, 1, 0);
     if (dw)
-        rocket_rk3576_pack_coeff_dw_prec(pr->b.ptr, coeff, bias, ocreg, precision_int8);
+        rocket_rk3576_pack_coeff_dw_prec(pr->b.ptr, coeff, bias, ocreg, PREC_INT8);
     else
         rocket_rk3576_pack_coeff_prec(pr->b.ptr, coeff, bias, ocreg,
-                                      fp16 ? precision_float16 : precision_int8);
+                                      fp16 ? PREC_FP16 : PREC_INT8);
     rocket_bo_fini(fd, &pr->b);
     free(bias);
 
@@ -354,13 +350,14 @@ static int prog_init(int fd, struct prog *pr, int kind)
     pr->p.in_scale = 1.0f; pr->p.w_scale = 1.0f; pr->p.out_scale = 64.0f;
     pr->p.input_zero_point = 0; pr->p.output_zero_point = 0; pr->p.weight_zero_point = 0;
     pr->p.ih_full = (uint16_t)g->ih; pr->p.oh_full = (uint16_t)oh;
-    pr->p.input_dma   = (uint32_t)pr->in.dma_address;
-    pr->p.weights_dma = (uint32_t)pr->w.dma_address;
-    pr->p.bias_dma    = (uint32_t)pr->b.dma_address;
-    pr->p.output_dma  = (uint32_t)pr->o.dma_address;
+    pr->p.input_iova   = (uint32_t)pr->in.dma_address;
+    pr->p.weights_iova = (uint32_t)pr->w.dma_address;
+    pr->p.bias_iova    = (uint32_t)pr->b.dma_address;
+    pr->p.output_iova  = (uint32_t)pr->o.dma_address;
 
     pr->in_h[0] = pr->in.handle; pr->in_h[1] = pr->w.handle;
     pr->in_h[2] = pr->b.handle;  pr->in_h[3] = pr->r.handle;
+    pr->n_in = 4;
     pr->out_h[0] = pr->o.handle;
 
     if (prog_emit(fd, pr) != 0) return -1;
@@ -381,7 +378,7 @@ static void prog_stamp(int fd, struct prog *pr)
 static int prog_submit(int fd, struct prog *pr)
 {
     return rocket_submit_matmul(fd, &pr->r, pr->p.task_count,
-                                pr->in_h, 4, pr->out_h, 1, 2000);
+                                pr->in_h, pr->n_in, pr->out_h, 1, 2000);
 }
 
 /* `wait_us`, when asked for, is the time the PREP_BO blocked — which is where a submit
@@ -491,7 +488,7 @@ static int autosuspend_ms(void)
 struct regval { unsigned reg; uint32_t val; };
 
 /* Every register write a program carries, minus the per-run addresses and the
- * OP_NONE padding. */
+ * TARGET_NONE padding. */
 static int prog_regs(const struct prog *pr, struct regval *out, int max)
 {
     int i, n = 0;

@@ -253,13 +253,15 @@ set(ROCKETNPU_PUBLIC_HEADERS
     include/rocket_sam.h       # rocket_sam_encode (SAM ViT-Det image encoder end to end)
     include/rocket_modernbert.h # rocket_modernbert_encode (ModernBERT text encoder, variable-length batch)
     include/rocket_activation.h # rocket_activation_fp16 (DPU LUT elementwise)
-    include/npu_matmul.h       # matmul_params_t + gen_matmul_fp16 / gen_conv2d_* (low-level)
+    include/npu_matmul.h       # gemm_params_t + gen_gemm_fp16 / gen_conv2d_* (low-level)
     include/npu_pool.h         # pool_params_t + gen_pool_fp16 (low-level PPU pooling)
     include/npu_activation.h   # lut_act_params_t + gen_lut_activation_fp16 (low-level)
     # internal headers, but #included (transitively) by the public ones above — must be
     # installed or a consumer of the installed pkg (e.g. the tflite-rocket delegate .so)
-    # fails to find them. npu_matmul.h / rocket_activation.h -> npu_dpu.h; keep npu_cna.h /
-    # npu_hw.h alongside (register/descriptor defs the low-level API leans on).
+    # fails to find them. npu_matmul.h / rocket_activation.h -> npu_dpu.h, and
+    # npu_matmul.h / rocket_hw_profile.h -> npu_hw.h (the regcmd word, the precision codes,
+    # the CBUF geometry). npu_cna.h includes npu_hw.h. The register map (src/npu_regmap.h,
+    # src/rkt_registers.h) is not installed.
     include/npu_dpu.h
     include/npu_cna.h
     include/npu_hw.h)
@@ -341,6 +343,7 @@ if(ROCKETNPU_BUILD_TESTS)
             activation_concurrent_rocket # GATE: LeakyReLU slopes and ELU/SELU from two threads at once, each vs its serial result
             recip_rsqrt_rocket     # positive-domain LUT (sqrt/rsqrt/reciprocal) + on-NPU Div accuracy gate
             lut_tanh_rocket        # SIGNED-output LUT (tanh bias-trick) — OUT_CVT affine HW gate/RE
+            lut_tanh_scale_probe   # probe: the tanh LUT's index scale against its error over every fp16 input in [-8,8] (hand-run, not a gate)
             exp_lut_rocket         # EXP DPU-LUT (shifted single-table) + softmax-sum end to end
             ew_mul_rocket          # fully-on-NPU elementwise multiply (conv-main EW op) bit-exact gate
             ew_minmax_rocket       # on-NPU elementwise two-tensor MAX/MIN (EW ALU algo) + Clip, bit-exact
@@ -417,6 +420,7 @@ if(ROCKETNPU_BUILD_TESTS)
             matmul_kacc_chain_bench # cross-ki KACC chaining warm-loop perf probe (hand-run, not a gate)
             matmul_accum_rocket    # DPU eltwise K-accum experiment (fp16)
             matmul_accum_int8_rocket # isolate int32 DPU eltwise-add for int8 K-accum
+            kacc_int32_probe       # board: int32 K-accumulation, a conv's CACC result plus an int32 partial on the EW ALU
             multicore_probe        # 1 fd, N jobs -> serial (scheduling probe)
             multicore_threads      # N fds/threads -> parallel cores
             ctx_pool_throughput    # multi-instance context-pool throughput sweep (detection)
@@ -429,22 +433,27 @@ if(ROCKETNPU_BUILD_TESTS)
             regcmd_persist_rocket  # the one-task-after delta arm (lands in an unwritten group); see regcmd_delta_probe
             regcmd_delta_probe     # probe: a delta task in its own register group, three pointer modes
             # host-only regcmd dumpers + a standalone fp16 test + a DRAM microbench: tools, not CTest gates
-            matmul_fp16_rocket     # standalone fp16 x fp16 single-task test (gen_matmul_fp16 path)
+            matmul_fp16_rocket     # standalone fp16 x fp16 single-task test (gen_gemm_fp16 path)
             dump_regcmd            # host-only: diff the matmul regcmd accumulate=0 vs 1 (no HW)
             dump_dw_regcmd         # host-only: emit depthwise-conv regcmd for the Mesa decoder
             chain_layout_rocket    # host-only GATE: batched-submit contiguous layout + trailer link (no HW)
             chain_verify_gate      # host-only GATE: rkt_chain_verify catches a wrong next_count (no HW)
+            regcmd_golden_gate     # host-only GATE: every regcmd generator's words against a golden hash file (no HW)
             matmul_plan_gate       # host-only GATE: the shared matmul tiling policy's invariants (no HW)
             cube_transpose_gate    # host-only GATE: the plane <-> cube-group transposes vs the per-channel loop (no HW)
+            cube_index_gate        # host-only GATE: rocket_cube.h's index helpers and weight scatters vs npu_regcmd.c (no HW)
             regcmd_rk3576_gate     # host-only GATE: RK3576 conv regcmd vs the vendor capture (no HW)
             pool_rk3576_bracket_gate # host-only GATE: the RK3576 pool's PREP/FINI brackets against a mock provider (no HW)
+            pool_stock_kernel_gate # host-only GATE: no pool reaches a driver without the PPU completion (mock provider, no HW)
+            iface_minor_trust_gate # host-only GATE: a private interface minor counts only with its patch series (no HW)
             rk3576_first_light     # RK3576 board: does the RK3576 emitter make the NPU compute?
             rk3576_conv_gate       # RK3576 board GATE: the int8 conv envelope + row windows + depthwise
             rk3576_conv_lib_gate   # RK3576 board GATE: the same envelope through the LIBRARY entries
             rk3576_fp16_sweep      # RK3576 board: settle the fp16 / asymmetric encodings against a CPU model
             rk3576_matmul_probe    # RK3576 board: the matmul-as-1x1-conv envelope (M axis, cost, precision)
             rk3576_matmul_gate     # RK3576 board GATE: the int8 matmul library entry vs a CPU model
-            rk3576_mm_fp16_gate    # RK3576 GATE: the matmul-form fp16 program vs charsiu (host) and a CPU reference (board)
+            rk3576_mm_fp16_gate    # RK3576 GATE: the matmul-form fp16 program's form (host) and a CPU reference (board)
+            rk3576_mm_fp16_vendor_gate # host-only GATE: the matmul-form fp16 program vs Rockchip's compiled programs in a .rkllm (no HW)
             rk3576_mm_fp16_cost    # RK3576 board: what the fp16 matmul costs per call, against the int8 entry
             rk3576_mm_fp16_envelope # RK3576 board: where one task of the fp16 matmul program stops being exact
             rk3576_mm_fp16_round   # RK3576 board: how the fp16 matmul rounds an fp32 sum that is not exact
@@ -500,6 +509,10 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_rowplan         # RK3576 host: the row window the planner chooses for one layer, and what it stages
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
             requant_edge_probe     # board: does the OUT_CVT program the float scale at the derivation's carry edge?
+            requant_zp_order_probe # board: on the int8-out writer, is the zero point added before the OUT_CVT rounding?
+            fp16_ew_overflow_probe # board: does an fp16 EW result past 65504 write inf or saturate?
+            fp16_mm_product_overflow_probe # board: does a single fp16 matmul product past 65504 overflow before the output narrowing?
+            conv1d_gelu_epilogue_probe # board: the single-pass conv->GELU epilogue on a real Whisper front end (tools/whisper_frontend_dump.py)
             pool_int8_native_probe # board: does the PPU pool natively in int8? (the precision PAIR, as a map)
             hostload               # host memory-system load generator: run any gate under DDR / L1 / spin pressure
             membench               # DRAM bandwidth + NPU readback de-tile microbench
@@ -573,9 +586,9 @@ if(ROCKETNPU_BUILD_TESTS)
               rk3576_lut_probe rk3576_add_probe rk3576_mm_requant rk3576_w8a8_route
               pool_int8_native_probe deconv_extent_probe matmul_bf16_stream_rocket
               replay_dump rk3576_mm_fp16_envelope rk3576_mm_bf16_probe
-              rk3576_conv_width_probe cube_transpose_gate rk3576_stallk_map
+              rk3576_conv_width_probe cube_transpose_gate cube_index_gate rk3576_stallk_map
               conv_dw_int8_perc_runtime conv2d_int8_q_perc_rocket conv_model_bench
-              open_guard_race_rocket matmul_batch_rocket)
+              open_guard_race_rocket matmul_batch_rocket iface_minor_trust_gate)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
@@ -587,6 +600,19 @@ if(ROCKETNPU_BUILD_TESTS)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rk3576-vendor-capture)
+        endif()
+    endforeach()
+
+    # Tests that build or patch a register program by hand take the register map
+    # (src/npu_regmap.h over Mesa's generated src/rkt_registers.h), which is private to the
+    # library and not installed.
+    foreach(t chain_layout_rocket chain_verify_gate conv_i8out_probe cpend_wzp_probe
+              dw_perc_probe ew_int_probe pool_int8_native_probe
+              regcmd_delta_probe regcmd_persist_rocket regcmd_rk3576_gate replay_dw_mesa
+              rk3576_fc_vendor rowmajor_kacc_chain_probe rowmajor_matmul_probe
+              rowmajor_tile_probe weight_stream_probe)
+        if(TARGET ${t})
+            target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
     endforeach()
 
@@ -684,10 +710,44 @@ if(ROCKETNPU_BUILD_TESTS)
     # INT_MAX refuses rather than wrapping. Forces ROCKET_CHIP=rk3576 itself.
     rocket_host_test(matmul_plan_gate_rk3576 COMMAND matmul_plan_gate rk3576)
     rocket_host_test(cube_transpose_gate)
+    rocket_host_test(cube_index_gate)
     rocket_host_test(regcmd_rk3576_gate)                # forces ROCKET_CHIP=rk3576 itself
+    # Every RK3588 and RK3576 generator over a fixed sweep, at default settings and under each
+    # diagnostic environment variable, against the hashes recorded in the golden file. Each
+    # sweep forks and sets its own ROCKET_CHIP, so the test runs the same on any host.
+    rocket_host_test(regcmd_golden_gate COMMAND regcmd_golden_gate
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/regcmd-golden/golden.txt)
+    # The RK3576 fp16 matmul's program against the programs RKLLM-Toolkit compiles, read out
+    # of a .rkllm, which is not committed (the test names the file its table came from).
+    # Name one at configure time and the gate runs; leave it unset and it skips.
+    set(ROCKETNPU_RK3576_RKLLM "" CACHE FILEPATH "An RK3576 .rkllm for rk3576_mm_fp16_vendor_gate")
+    if(ROCKETNPU_RK3576_RKLLM)
+        rocket_host_test(rk3576_mm_fp16_vendor_gate COMMAND rk3576_mm_fp16_vendor_gate
+                         ${ROCKETNPU_RK3576_RKLLM})
+    else()
+        add_test(NAME rk3576_mm_fp16_vendor_gate COMMAND rk3576_mm_fp16_vendor_gate)
+        set_tests_properties(rk3576_mm_fp16_vendor_gate PROPERTIES SKIP_RETURN_CODE 2 TIMEOUT 300)
+    endif()
+    # src/rkt_registers.h against what third_party/mesa-rocket generates from registers.xml.
+    # Only where Python 3 is present: the build itself never runs the generator.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME regmap_current
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/regmap_current.py
+                         ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/regmap)
+        set_tests_properties(regmap_current PROPERTIES TIMEOUT 60)
+    endif()
     # Every PREP/FINI the RK3576 pool takes, on every path, against a host-memory provider
     # defined in the test itself. Forces ROCKET_CHIP=rk3576 itself.
     rocket_host_test(pool_rk3576_bracket_gate)
+
+    # On a driver without the PPU completion, no pool entry allocates or submits, against a
+    # mock provider whose rocket_ppu_done_supported() answers 0. Forces ROCKET_CHIP=rk3576.
+    rocket_host_test(pool_stock_kernel_gate)
+
+    # A private interface minor counts only where the series' rocket_batch_submit parameter
+    # exists, against sysfs trees the test builds in a temporary directory.
+    rocket_host_test(iface_minor_trust_gate)
 
     # --- the DPU LUT and elementwise ops -----------------------------------------
     rocket_npu_test(activation_lut_rocket)
@@ -900,6 +960,17 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_npu_test(matmul_int4_crossm_rocket)
     rocket_npu_test(matmul_int16_exact_rocket COMMAND matmul_int16_exact_rocket 512 3840 4096)
     rocket_npu_test(matmul_int16_rocket COMMAND matmul_int16_rocket 36 512 112)
+    # The int8 planner streams its weights by default, so the gates above run the streamed
+    # plan. These pin its whole-tile plan, which ROCKET_MM_STREAM_INT8=0 still selects.
+    rocket_npu_test(matmul_int8_tiled_rocket_wholetile COMMAND matmul_int8_tiled_rocket
+                    ENVIRONMENT "ROCKET_MM_STREAM_INT8=0")
+    rocket_npu_test(matmul_int8_prepacked_rocket_wholetile COMMAND matmul_int8_prepacked_rocket
+                    ENVIRONMENT "ROCKET_MM_STREAM_INT8=0")
+    rocket_npu_test(matmul_int8_crossm_rocket_wholetile COMMAND matmul_int8_crossm_rocket
+                    ENVIRONMENT "ROCKET_MM_STREAM_INT8=0")
+    rocket_npu_test(matmul_int16_exact_rocket_wholetile
+                    COMMAND matmul_int16_exact_rocket 512 3840 4096
+                    ENVIRONMENT "ROCKET_MM_STREAM_INT8=0")
     rocket_npu_test(replay_dw_mesa)
     rocket_npu_test(conv_dw_int8_runtime)
     rocket_npu_test(conv_dw_int8_perc_runtime)

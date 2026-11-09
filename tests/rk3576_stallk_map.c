@@ -195,18 +195,18 @@ static int run_arm(int fd, const struct arm *a)
     p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f / scale;
     p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
     p.tasks = ops;
-    p.input_dma = in.dma_address;
-    p.weights_dma = w.dma_address + a->woff;
-    p.bias_dma = co.dma_address;
-    p.output_dma = out.dma_address;
+    p.input_iova = in.dma_address;
+    p.weights_iova = w.dma_address + a->woff;
+    p.bias_iova = co.dma_address;
+    p.output_iova = out.dma_address;
     in_h[0] = in.handle; in_h[1] = w.handle; in_h[2] = co.handle; in_h[3] = rc.handle;
     out_h[0] = out.handle;
 
     printf("arm K %u N %u plane %ux%u (M %u) rows %u (Mt %u) woff %u  S %u B  w iova 0x%llx "
            "(base phase %llu B)  %u of %u tasks\n",
            K, N, iw, ih, M, a->rows, iw * a->rows, a->woff, S,
-           (unsigned long long)p.weights_dma,
-           (unsigned long long)(p.weights_dma % 65536u), ntask, ntask_all);
+           (unsigned long long)p.weights_iova,
+           (unsigned long long)(p.weights_iova % 65536u), ntask, ntask_all);
     fflush(stdout);
 
     rocket_rk3576_power_idle();
@@ -226,8 +226,8 @@ static int run_arm(int fd, const struct arm *a)
         const unsigned char *o;
 
         q.ih = (uint16_t)oh; q.oh = (uint16_t)oh;
-        q.input_dma = p.input_dma + (uint64_t)oy0 * iw * C2;
-        q.output_dma = p.output_dma + (uint64_t)oy0 * iw * C2;
+        q.input_iova = p.input_iova + (uint64_t)oy0 * iw * C2;
+        q.output_iova = p.output_iova + (uint64_t)oy0 * iw * C2;
         q.ih_full = (uint16_t)ih; q.oh_full = (uint16_t)ih;
         if (gen_conv2d_int8_rk3576(&q) != 0) {
             printf("  task %u: the emitter refused this task\n", t);
@@ -294,7 +294,7 @@ static int run_arm(int fd, const struct arm *a)
         }
         rocket_bo_fini(fd, &out);
         rel = f == ~0u ? -2 : model_stall(0, S, (3072u - f) / 1024u * 65536u, nreg / 32u);
-        abs_ = f == ~0u ? -2 : model_stall(p.weights_dma, S, (3072u - f) / 1024u * 65536u,
+        abs_ = f == ~0u ? -2 : model_stall(p.weights_iova, S, (3072u - f) / 1024u * 65536u,
                                            nreg / 32u);
         printf("  task %2u rows %u-%u  %7.1f ms %s  F %4u  exact %2u grp  first %4u",
                t, oy0, oy0 + oh - 1, ns / 1e6, ns >= BACKSTOP_NS ? "RETIRED" : "done   ",

@@ -36,8 +36,8 @@
 
 const struct rocket_hw_profile rocket_hw_rk3588 = {
     .name           = "rk3588",
-    .cbuf_banks     = NPU_CBUF_BANKS,      /* 12 — mirrors npu_hw.h so the literal lives once */
-    .cbuf_bank_size = NPU_CBUF_BANK_SIZE,  /* 32768 */
+    .cbuf_banks     = RK3588_CBUF_BANKS,      /* 12 — mirrors npu_hw.h so the literal lives once */
+    .cbuf_bank_size = RK3588_CBUF_BANK_BYTES,  /* 32768 */
     .max_tile       = 256,                 /* Mt/Nt cap. 256 (not 384) lets Kt grow to 384 in
                                             * the CBUF (nKt 15->10), cutting readback: measured
                                             * 48.3->56.4 GFLOP/s on 512x3840x4096. Below 256,
@@ -50,10 +50,10 @@ const struct rocket_hw_profile rocket_hw_rk3588 = {
     /* All eight native encodings are HW-validated on the RK3588 (int4/int8/int16/
      * fp16/bf16/int32/fp32/tf32 — the datatype matrix is complete), so the mask is
      * all-ones over the precision_* range. A chip lacking one clears its bit. */
-    .dtype_supported = ROCKET_DT_BIT(precision_int8)    | ROCKET_DT_BIT(precision_int16)
-                     | ROCKET_DT_BIT(precision_float16) | ROCKET_DT_BIT(precision_bfloat16)
-                     | ROCKET_DT_BIT(precision_int32)   | ROCKET_DT_BIT(precision_float32)
-                     | ROCKET_DT_BIT(precision_int4)    | ROCKET_DT_BIT(precision_tf32),
+    .dtype_supported = ROCKET_DT_BIT(PREC_INT8)    | ROCKET_DT_BIT(PREC_INT16)
+                     | ROCKET_DT_BIT(PREC_FP16) | ROCKET_DT_BIT(PREC_BF16)
+                     | ROCKET_DT_BIT(PREC_INT32)   | ROCKET_DT_BIT(PREC_FP32)
+                     | ROCKET_DT_BIT(PREC_INT4)    | ROCKET_DT_BIT(PREC_TF32),
 
     .default_workers = 8,
     .slow_wait_ms    = 450,               /* under the 500 ms job watchdog */
@@ -88,7 +88,7 @@ const struct rocket_hw_profile rocket_hw_rk3576 = {
     .name           = "rk3576",
     .cbuf_banks     = 8,                   /* default data allocation, not the pool:
                                             * 8 x 32768 = 262144 B = 4096 granules  */
-    .cbuf_bank_size = NPU_CBUF_BANK_SIZE,  /* 32768, assumed equal to the RK3588's  */
+    .cbuf_bank_size = RK3588_CBUF_BANK_BYTES,  /* 32768, assumed equal to the RK3588's  */
 
     /* Matmul parameters, measured on this part against rocket_matmul_int8_rk3576.
      *
@@ -125,8 +125,8 @@ const struct rocket_hw_profile rocket_hw_rk3576 = {
      * 2026-09-26], but no entry emits it, so its bit stays unset. Every other precision
      * is unexercised here, and an unset bit on a bring-up chip means unvalidated, which
      * is the same thing as unsupported. */
-    .dtype_supported = ROCKET_DT_BIT(precision_int8) |
-                       ROCKET_DT_BIT(precision_float16),
+    .dtype_supported = ROCKET_DT_BIT(PREC_INT8) |
+                       ROCKET_DT_BIT(PREC_FP16),
 
     .select_warning =
         "rk3576: machine parameters are measured. CONV_2D computes — direct at int8 "

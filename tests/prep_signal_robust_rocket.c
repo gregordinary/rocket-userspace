@@ -104,13 +104,13 @@ static int setup(void)
     if (ret) { fprintf(stderr, "bo alloc failed\n"); return -1; }
 
     uint64_t npu_regs[256] = {0};
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = g_M, .k = g_K, .n = g_N,
-        .input_dma = g_input.dma_address, .weights_dma = g_weights.dma_address,
-        .output_dma = g_output.dma_address, .tasks = npu_regs, .fp32tofp16 = 1,
+        .input_iova = g_input.dma_address, .weights_iova = g_weights.dma_address,
+        .output_iova = g_output.dma_address, .tasks = npu_regs, .fp16_out = 1,
     };
-    if ((ret = gen_matmul_fp16(&p)) != 0) {
-        fprintf(stderr, "gen_matmul_fp16 = %d (shape exceeds one CBUF task; pick a "
+    if ((ret = gen_gemm_fp16(&p)) != 0) {
+        fprintf(stderr, "gen_gemm_fp16 = %d (shape exceeds one CBUF task; pick a "
                         "smaller M*K + N*K)\n", ret);
         return ret;
     }
@@ -124,17 +124,21 @@ static int setup(void)
     g_A = malloc((size_t)g_M*g_K*2);
     g_B = malloc((size_t)g_N*g_K*2);
     g_Cref = malloc((size_t)g_M*g_N*2);
-    srand(1234);
-    for (int i = 0; i < g_M*g_K; i++) g_A[i] = (_Float16)(int)(10.0 * rand()/(float)RAND_MAX);
-    for (int i = 0; i < g_N*g_K; i++) g_B[i] = (_Float16)(int)(10.0 * rand()/(float)RAND_MAX);
+    /* Operands 0..9 from a fixed xorshift32 stream: every sum stays an exact integer. */
+    uint32_t x = 1234u;
+    for (int i = 0; i < g_M*g_K + g_N*g_K; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        _Float16 v = (_Float16)(int)(x % 10u);
+        if (i < g_M*g_K) g_A[i] = v; else g_B[i - g_M*g_K] = v;
+    }
 
     _Float16 *wdst = g_weights.ptr, *idst = g_input.ptr;
     memset(g_input.ptr, 0, g_input.size);
     memset(g_weights.ptr, 0, g_weights.size);
     for (int n = 1; n <= g_N; n++)
-        for (int k = 1; k <= g_K; k++) wdst[weight_fp16(g_K, n, k)] = g_B[(n-1)*g_K + (k-1)];
+        for (int k = 1; k <= g_K; k++) wdst[gemm_weight_index_fp16(g_K, n, k)] = g_B[(n-1)*g_K + (k-1)];
     for (int m = 1; m <= g_M; m++)
-        for (int k = 1; k <= g_K; k++) idst[feature_data(g_K, g_M, 1, 8, k, m, 1)] = g_A[(m-1)*g_K + (k-1)];
+        for (int k = 1; k <= g_K; k++) idst[feature_index(g_K, g_M, 1, 8, k, m, 1)] = g_A[(m-1)*g_K + (k-1)];
 
     rocket_bo_fini(g_fd, &g_regcmd);
     rocket_bo_fini(g_fd, &g_input);
@@ -160,7 +164,7 @@ static int check_output(void)
     int bad = 0;
     for (int m = 1; m <= g_M && bad < 8; m++)
         for (int n = 1; n <= g_N; n++) {
-            _Float16 act = od[feature_data(g_N, g_M, 1, 8, n, m, 1)];
+            _Float16 act = od[feature_index(g_N, g_M, 1, 8, n, m, 1)];
             _Float16 exp = g_Cref[(m-1)*g_N + (n-1)];
             if (act != exp && ++bad >= 8) break;
         }

@@ -9,30 +9,17 @@ prints only the registers that MOVE, which is what names the fields.
     python3 decode_add.py            # every comparison
     python3 decode_add.py <a> <b>    # two tags
 """
-import sys, os, struct, collections
+import sys, os, collections
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BLOCKS = {0x0101: "PC", 0x0201: "CNA", 0x0801: "CORE", 0x1001: "DPU",
-          0x2001: "DPU_RDMA", 0x4001: "PPU", 0x8001: "PPU_RDMA",
-          0x0041: "SYNC", 0x0081: "BCAST"}
+sys.path.insert(0, os.path.dirname(HERE))
+from regcmd_scan import ALL_TARGETS, BLOCK_NAMES, regcmd_programs  # noqa: E402
 
 
 def runs(path, min_run=12):
-    data = open(path, "rb").read()
-    w = struct.unpack("<%dQ" % (len(data) // 8), data[:len(data) // 8 * 8])
-    out, i, n = [], 0, len(w)
-    while i < n:
-        if ((w[i] >> 48) & 0xffff) in BLOCKS:
-            j = i
-            while j < n and ((w[j] >> 48) & 0xffff) in BLOCKS:
-                j += 1
-            if j - i >= min_run:
-                out.append([(BLOCKS[int((x >> 48) & 0xffff)], int(x & 0xffff),
-                             int((x >> 16) & 0xffffffff)) for x in w[i:j]])
-            i = j
-        else:
-            i += 1
-    return out
+    """The programs in `path`, each command's target given by its block name."""
+    return [[(BLOCK_NAMES[t], r, v) for t, r, v in prog]
+            for prog in regcmd_programs(path, ALL_TARGETS, min_run)]
 
 
 def regs(run, blocks=("DPU", "DPU_RDMA")):

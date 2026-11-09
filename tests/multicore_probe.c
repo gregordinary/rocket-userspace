@@ -63,18 +63,18 @@ int main(void)
         /* pack arbitrary fp16 data (values irrelevant — we time scheduling) */
         rocket_bo_prep(fd, &in[c], 1, 0); memset(in[c].ptr, 0, in[c].size);
         for (int h = 1; h <= M; h++) for (int x = 1; x <= K; x++)
-            ((_Float16*)in[c].ptr)[feature_data(K, M, 1, 8, x, h, 1)] = (_Float16)(0.01f*((h+x)%7));
+            ((_Float16*)in[c].ptr)[feature_index(K, M, 1, 8, x, h, 1)] = (_Float16)(0.01f*((h+x)%7));
         rocket_bo_fini(fd, &in[c]);
         rocket_bo_prep(fd, &wt[c], 1, 0); memset(wt[c].ptr, 0, wt[c].size);
         for (int k = 1; k <= N; k++) for (int x = 1; x <= K; x++)
-            ((_Float16*)wt[c].ptr)[weight_fp16(K, k, x)] = (_Float16)(0.01f*((k*x)%5));
+            ((_Float16*)wt[c].ptr)[gemm_weight_index_fp16(K, k, x)] = (_Float16)(0.01f*((k*x)%5));
         rocket_bo_fini(fd, &wt[c]);
 
         uint64_t ops[256] = {0};
-        matmul_params_t p = { .m=M,.k=K,.n=N, .input_dma=(uint32_t)in[c].dma_address,
-            .weights_dma=(uint32_t)wt[c].dma_address, .output_dma=(uint32_t)out[c].dma_address,
-            .tasks=ops, .fp32tofp16=1 };
-        if (gen_matmul_fp16(&p)) { fprintf(stderr, "gen failed\n"); return 1; }
+        gemm_params_t p = { .m=M,.k=K,.n=N, .input_iova=(uint32_t)in[c].dma_address,
+            .weights_iova=(uint32_t)wt[c].dma_address, .output_iova=(uint32_t)out[c].dma_address,
+            .tasks=ops, .fp16_out=1 };
+        if (gen_gemm_fp16(&p)) { fprintf(stderr, "gen failed\n"); return 1; }
         rocket_bo_prep(fd, &regcmd[c], 1, 0);
         memcpy(regcmd[c].ptr, ops, p.task_count*sizeof(uint64_t));
         rocket_bo_fini(fd, &regcmd[c]);

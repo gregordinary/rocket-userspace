@@ -29,6 +29,7 @@
 
 #include "rocket_chain.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "rocket_log.h"
 
 static int fails;
@@ -39,16 +40,16 @@ static int fails;
 #define BO_IOVA   0x10000000u    /* arbitrary, low enough to encode in 32 bits */
 
 /* A synthetic program with the trailer shape the chain rewrite claims:
- *   [... , OP_NONE, PC_REGISTER_AMOUNTS, OP_40, OP_ENABLE]
+ *   [... , TARGET_NONE, PC_REGISTER_AMOUNTS, TARGET_PRE_ENABLE, TARGET_ENABLE]
  * Only the trailer matters to pack/verify; the body is filler that is never read. */
 static void synth(uint64_t *ops, uint32_t count)
 {
     for (uint32_t i = 0; i < count - 4; i++)
-        ops[i] = NPUOP(OP_REG_DPU, i, DPU_S_POINTER);
-    ops[count - 4] = NPUOP(OP_NONE, 0x0, 0x0);
-    ops[count - 3] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
-    ops[count - 2] = NPUOP(OP_40, 0x0, 0x0);
-    ops[count - 1] = NPUOP(OP_ENABLE, 0x0, 0x0);
+        ops[i] = REGCMD(TARGET_DPU, REG_DPU_S_POINTER, i);
+    ops[count - 4] = REGCMD(TARGET_NONE, 0x0, 0x0);
+    ops[count - 3] = REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x0);
+    ops[count - 2] = REGCMD(TARGET_PRE_ENABLE, 0x0, 0x0);
+    ops[count - 1] = REGCMD(TARGET_ENABLE, 0x0, 0x0);
 }
 
 /* A rocket_bo backed by plain host memory. handle must be nonzero or
@@ -117,19 +118,19 @@ int main(void)
         const int last = (i == 2);
         const uint32_t want_amount = ((last ? COUNTS[i] : COUNTS[i + 1]) + 1) / 2 - 1;
         const uint64_t amt = w[n - 3], base = w[n - 4];
-        CHECK((uint16_t)(amt >> 48) == OP_REG_PC && (uint16_t)(amt & 0xffff) == PC_REGISTER_AMOUNTS,
+        CHECK((uint16_t)(amt >> 48) == TARGET_PC && (uint16_t)(amt & 0xffff) == REG_PC_REGISTER_AMOUNTS,
               "task %d: the amount op is not a PC_REGISTER_AMOUNTS write (0x%016llx)", i,
               (unsigned long long)amt);
         CHECK((uint32_t)(amt >> 16) == want_amount,
               "task %d: PC_DATA_AMOUNT is %u, the kernel's encoding of %u words is %u", i,
               (uint32_t)(amt >> 16), last ? COUNTS[i] : COUNTS[i + 1], want_amount);
         if (last) {
-            CHECK((uint16_t)(base >> 48) == OP_NONE,
-                  "task %d (last): the link slot is not the inert OP_NONE (0x%016llx)", i,
+            CHECK((uint16_t)(base >> 48) == TARGET_NONE,
+                  "task %d (last): the link slot is not the inert TARGET_NONE (0x%016llx)", i,
                   (unsigned long long)base);
         } else {
             const uint32_t want_base = BO_IOVA + (uint32_t)(OFFS[i + 1] * sizeof(uint64_t));
-            CHECK((uint16_t)(base >> 48) == OP_REG_PC && (uint16_t)(base & 0xffff) == PC_BASE_ADDRESS,
+            CHECK((uint16_t)(base >> 48) == TARGET_PC && (uint16_t)(base & 0xffff) == REG_PC_BASE_ADDRESS,
                   "task %d: the link op is not a PC_BASE_ADDRESS write (0x%016llx)", i,
                   (unsigned long long)base);
             CHECK((uint32_t)(base >> 16) == want_base,

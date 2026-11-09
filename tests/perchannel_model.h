@@ -184,7 +184,7 @@ static inline int epilogue_bs(int64_t acc_plus_a, int64_t c, unsigned bs, unsign
     int64_t v = requant_round_shift(acc_plus_a * c, bs);
     if (v >  (int64_t)INT32_MAX) v = INT32_MAX;
     if (v <  (int64_t)INT32_MIN) v = INT32_MIN;
-    return requant_sat8(requant_round_shift(v * (int64_t)mul, shift) + out_zp);
+    return requant_sat8(requant_round_shift_zp(v * (int64_t)mul, shift, out_zp));
 }
 
 #endif /* ROCKET_TESTS_PERCHANNEL_MODEL_H */

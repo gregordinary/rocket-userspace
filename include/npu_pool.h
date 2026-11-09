@@ -17,8 +17,8 @@
  * whole of `C` is one task.
  *
  * Max pooling is bit-exact, and average pooling is within fp16-reciprocal tolerance [HW sweep].
- * The register program and the average `RECIP_KERNEL` format agree with the allbilly
- * register-level pooling generator [source-confirmed].
+ * The register program and the average `RECIP_KERNEL` format agree with the program
+ * RKNN-Toolkit2 compiles for the same pool on the RK3588 [source-confirmed].
  *
  * In the emitted program, every geometry field contains the value minus 1, and strides are in
  * bytes, 16-aligned. The PC enable trailer writes 0x60, `PPU_OP_EN|PPU_RDMA_OP_EN`, the global
@@ -54,11 +54,11 @@ typedef struct {
    * The generator ignores it unless `method` is AVG. Build it with `ppu_recip_kernel_fp16(k)`. */
   uint32_t recip_w, recip_h;
 
-  uint32_t input_dma;    /* NPU IOVA of the input  NC1HWC2 cube  */
-  uint32_t output_dma;   /* NPU IOVA of the output NC1HWC2 cube  */
+  uint32_t input_iova;    /* NPU IOVA of the input  NC1HWC2 cube  */
+  uint32_t output_iova;   /* NPU IOVA of the output NC1HWC2 cube  */
 
   uint64_t *tasks;       /* OUT: regcmd op stream                */
-  uint32_t  task_count;  /* OUT: number of NPUOP words written   */
+  uint32_t  task_count;  /* OUT: number of regcmd words written   */
 } pool_params_t;
 
 /* Returns the fp16 average reciprocal for a kernel extent `k`: the fp16 bit pattern of

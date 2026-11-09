@@ -7,7 +7,7 @@
  * the last thing every int8 program does and a gate that models it differently from its
  * neighbour is a gate that disagrees with the part for a reason that is not the part.
  *
- *     out = sat8( round_half_to_even(acc * MUL >> SHIFT) + offset )
+ *     out = sat8( round_half_to_even(acc * MUL / 2^SHIFT + offset) )
  *
  * MUL and SHIFT come from the caller's fp32 scale through npu_out_cvt_pair()
  * (include/npu_requant.h), the one derivation the emitters program. So this model cannot
@@ -19,6 +19,15 @@
  * used to spell, which takes ties toward +inf, and not the round-half-away-from-zero the
  * ancestor IP's documentation specifies [nvdla.org/hw/v1/ias/precision.html]. Inherited
  * datapath semantics are worth a prediction and not a conclusion.
+ *
+ * THE OFFSET JOINS BEFORE THE ROUNDING. At CVT_ROUND 0, the setting the emitters program,
+ * the converter adds the offset to the truncated quotient and then decides a tie by the
+ * parity of that sum, so a tie lands on the even neighbor of quotient + offset
+ * (tests/requant_zp_order_probe on the RK1: 1024 of 1024 outputs at eight zero points, both
+ * tie scales, 2026-11-07). A model that rounds first and adds after is one count off at a
+ * tie with an odd zero point. Under CVT_ROUND 1 the two orders differ
+ * elsewhere, and this model does not cover that setting. The RK3576's order is unmeasured;
+ * its tie rule is the RK3588's, so the same order is expected there.
  *
  * A TIE IS RARE AND IS NOT REACHABLE FROM A ROUND SCALE. The derivation ends in `+1`, so
  * MUL is odd for every power-of-two scale, and an odd multiplier moves an exact half off
@@ -68,11 +77,19 @@ static inline int requant_apply(int64_t acc, unsigned mul, unsigned shift)
     return requant_sat8(requant_round_shift(acc * (int64_t)mul, shift));
 }
 
-/* The same, then the output zero point the OUT_CVT offset carries. Saturation is after
- * the offset, which is where the DPU applies it. */
+/* The rounder with the OUT_CVT offset: `p / 2^shift + offset` to nearest, ties to even. The
+ * offset is an integer at the output scale, so adding `offset * 2^shift` to `p` puts it in
+ * the sum the tie is decided on, which is where the converter adds it. */
+static inline int64_t requant_round_shift_zp(int64_t p, unsigned shift, int offset)
+{
+    return requant_round_shift(p + (int64_t)offset * ((int64_t)1 << shift), shift);
+}
+
+/* The same with the output zero point the OUT_CVT offset carries. Saturation is after the
+ * offset, which is where the DPU applies it. */
 static inline int requant_apply_zp(int64_t acc, unsigned mul, unsigned shift, int out_zp)
 {
-    return requant_sat8(requant_round_shift(acc * (int64_t)mul, shift) + out_zp);
+    return requant_sat8(requant_round_shift_zp(acc * (int64_t)mul, shift, out_zp));
 }
 
 /* Scale to result in one call, for the gates that carry the float rather than the pair. */

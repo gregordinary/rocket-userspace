@@ -77,7 +77,7 @@
 #include "rocket_hw_profile.h"
 #include "requant_model.h"
 #include "rocket_graph_rk3576.h"
-#include "npu_matmul.h"          /* conv_params_t, precision_int8 */
+#include "npu_matmul.h"          /* conv_params_t, PREC_INT8 */
 #include "npu_regcmd_rk3576.h"   /* the raw int32-output program the poison injects */
 
 /* ---- the blob ------------------------------------------------------------------ */
@@ -1920,17 +1920,17 @@ static int poison_once(int fd)
         rocket_bo_prep(fd, &w, 1, 0);  memset(w.ptr, 1, w.size);   rocket_bo_fini(fd, &w);
         for (i = 0; i < P_C; i++) bias[i] = (int32_t)i + 1;
         rocket_bo_prep(fd, &b, 1, 0);
-        rocket_rk3576_pack_coeff_prec(b.ptr, coeff, bias, P_C, precision_int8);
+        rocket_rk3576_pack_coeff_prec(b.ptr, coeff, bias, P_C, PREC_INT8);
         rocket_bo_fini(fd, &b);
         p.ic = P_C; p.oc = P_C; p.ih = P_HW; p.iw = P_HW; p.oh = P_HW; p.ow = P_HW;
         p.kh = 1; p.kw = 1; p.stride_y = 1; p.stride_x = 1;
         p.int8_out = 1;
         p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 64.0f;
         p.ih_full = P_HW; p.oh_full = P_HW;
-        p.input_dma   = (uint32_t)in.dma_address;
-        p.weights_dma = (uint32_t)w.dma_address;
-        p.bias_dma    = (uint32_t)b.dma_address;
-        p.output_dma  = (uint32_t)o.dma_address;
+        p.input_iova   = (uint32_t)in.dma_address;
+        p.weights_iova = (uint32_t)w.dma_address;
+        p.bias_iova    = (uint32_t)b.dma_address;
+        p.output_iova  = (uint32_t)o.dma_address;
         p.tasks = ops;
         if (gen_conv2d_int8_rk3576_i32out(&p) != 0) return -1;
         rocket_bo_prep(fd, &r, 1, 0);

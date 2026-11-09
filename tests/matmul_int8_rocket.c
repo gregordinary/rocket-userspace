@@ -9,8 +9,8 @@
  * It is matmul_fp16_rocket.c's submit skeleton (rocket_npu shim: open / bo_alloc
  * / prep / fini / submit_matmul) with the int8 specifics:
  *   - int8 input + int8 weights BOs (1 B/elem), int32 output BO (4 B/elem)
- *   - gen_matmul_int8() instead of gen_matmul_fp16()
- *   - feature-data input atom C2=16 (int8) and weight k-group 32 (weight_int8)
+ *   - gen_gemm_int8() instead of gen_gemm_fp16()
+ *   - feature-data input atom C2=16 (int8) and weight k-group 32 (gemm_weight_index_int8)
  *   - int32-output cube C2=4 on readback
  *   - CPU reference matmul_int (int8xint8 -> int32)
  *
@@ -19,18 +19,18 @@
  *   single-task generator must fit the 12 x 32KB CBUF banks (gen returns <0).
  *
  *   int8 N-alignment is 32, NOT 16 (fp16's value). The int8 weight k-group is
- *   32 (weight_int8), so weight_int8 only packs into exactly N*K when N%32==0;
+ *   32 (gemm_weight_index_int8), so gemm_weight_index_int8 only packs into exactly N*K when N%32==0;
  *   with N=16 it reserves a full 32-kernel group, over-runs the logical buffer,
  *   and the NPU (reading N=16 kernels) sees a layout that disagrees -> garbage.
  *   Confirmed on HW: 4x64x16 FAILED (N=16), 256x384x256 PASSED.
  *
- * size_e / surf_add open question: gen_matmul_int8 defaults to the legacy
+ * size_e / surf_add open question: gen_gemm_int8 defaults to the legacy
  * template's size_e=7 / surf_add*8 (== 8-byte output element), which is
  * inconsistent with int32=4 B and the fp16 path's "size_e=bytes-1, mult=bytes"
  * encoding. If this test FAILS (esp. output untouched, or values right but
  * strided/duplicated), re-run with the fp16-consistent values:
  *     ROCKET_INT8_SIZE_E=3 ROCKET_INT8_SURF_MULT=4 sudo -E ./build/matmul_int8_rocket M K N
- * One build, both hypotheses. See npu_regcmd.c gen_matmul_int8 header.
+ * One build, both hypotheses. See npu_regcmd.c gen_gemm_int8 header.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
     printf("dma  in=%lx  w=%lx  out=%lx  regcmd=%lx\n",
            input.dma_address, weights.dma_address, output.dma_address, regcmd.dma_address);
 
-    /* Addresses are programmed into 32-bit NPUOP value fields / uint32_t *_dma —
+    /* Addresses are programmed into 32-bit regcmd value fields / uint32_t *_dma —
      * every BO VA must fit the low 4GB of NPU IOVA space (else silent truncation). */
     if ((input.dma_address | weights.dma_address | output.dma_address | regcmd.dma_address) >> 32) {
         fprintf(stderr, "ERROR: a BO dma_address exceeds 32 bits — see fp16 test note\n");
@@ -110,15 +110,15 @@ int main(int argc, char **argv) {
 
     /* Build the int8 register program (npu_regcmd.c). */
     uint64_t npu_regs[256] = {0};
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)N,
-        .input_dma = (uint32_t)input.dma_address,
-        .weights_dma = (uint32_t)weights.dma_address,
-        .output_dma = (uint32_t)output.dma_address,
+        .input_iova = (uint32_t)input.dma_address,
+        .weights_iova = (uint32_t)weights.dma_address,
+        .output_iova = (uint32_t)output.dma_address,
         .tasks = npu_regs,
     };
-    if ((ret = gen_matmul_int8(&p)) != 0) {
-        fprintf(stderr, "gen_matmul_int8 = %d (likely exceeds CBUF banks — needs tiling)\n", ret);
+    if ((ret = gen_gemm_int8(&p)) != 0) {
+        fprintf(stderr, "gen_gemm_int8 = %d (likely exceeds CBUF banks — needs tiling)\n", ret);
         goto out;
     }
     printf("regcmd ops = %u (int8, incl. DPU_RDMA block)\n", p.task_count);
@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < M*K; i++) A[i] = rand_i8();
     for (int i = 0; i < N*K; i++) B[i] = rand_i8();
 
-    /* Pack into NPU native int8 layouts: weights k-group 32 (weight_int8),
+    /* Pack into NPU native int8 layouts: weights k-group 32 (gemm_weight_index_int8),
      * feature atom C2=16. Bracket the CPU writes with prep(write)/fini(flush). */
     CK(rocket_bo_prep(fd, &regcmd, 1, 0));
     CK(rocket_bo_prep(fd, &input,  1, 0));
@@ -143,9 +143,9 @@ int main(int argc, char **argv) {
     int8_t *wdst = weights.ptr, *idst = input.ptr;
     memset(input.ptr, 0, input.size); memset(weights.ptr, 0, weights.size);
     for (int n = 1; n <= N; n++)
-        for (int k = 1; k <= K; k++) wdst[weight_int8(K, n, k)] = B[(n-1)*K + (k-1)];
+        for (int k = 1; k <= K; k++) wdst[gemm_weight_index_int8(K, n, k)] = B[(n-1)*K + (k-1)];
     for (int m = 1; m <= M; m++)
-        for (int k = 1; k <= K; k++) idst[feature_data(K, M, 1, 16, k, m, 1)] = A[(m-1)*K + (k-1)];
+        for (int k = 1; k <= K; k++) idst[feature_index(K, M, 1, 16, k, m, 1)] = A[(m-1)*K + (k-1)];
 
     CK(rocket_bo_fini(fd, &regcmd));
     CK(rocket_bo_fini(fd, &input));
@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
     int bad = 0;
     for (int m = 1; m <= M && bad < 10; m++)
         for (int n = 1; n <= N; n++) {
-            int32_t act = od[feature_data(N, M, 1, 4, n, m, 1)];   /* int32 cube C2=4 */
+            int32_t act = od[feature_index(N, M, 1, 4, n, m, 1)];   /* int32 cube C2=4 */
             int32_t exp = C[(m-1)*N + (n-1)];
             if (act != exp) {
                 printf("mismatch m=%d n=%d exp=%d act=%d\n", m, n, exp, act);

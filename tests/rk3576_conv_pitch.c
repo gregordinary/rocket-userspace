@@ -89,7 +89,7 @@ struct prog {
     unsigned  ic, oc, ih, iw, kh, kw, sx, sy, pt, pl;
     unsigned  icreg, ocreg, ow, oh, surf_elems, gcube;
     size_t    surf_bytes;
-    uint64_t  ops[MAX_ROWS * RK3576_CONV_TASK_OPS];
+    uint64_t  ops[MAX_ROWS * RK3576_CONV_TASK_SLOT];
 };
 
 /* How the feature buffer is laid out for one arm. */
@@ -171,14 +171,14 @@ static int prog_init(int fd, struct prog *p, unsigned ic, unsigned oc,
     if (!bias) return -1;
     for (i = 0; i < p->ocreg; i++) bias[i] = (int32_t)(i % 7u) - 3;
     rocket_bo_prep(fd, &p->b, 1, 0);
-    rocket_rk3576_pack_coeff_prec(p->b.ptr, coeff, bias, p->ocreg, precision_int8);
+    rocket_rk3576_pack_coeff_prec(p->b.ptr, coeff, bias, p->ocreg, PREC_INT8);
     rocket_bo_fini(fd, &p->b);
     free(bias);
     return 0;
 }
 
 static void prog_params(const struct prog *p, conv_params_t *q,
-                        uint32_t in_dma, uint32_t out_dma, const struct told *t)
+                        uint32_t in_iova, uint32_t out_iova, const struct told *t)
 {
     memset(q, 0, sizeof *q);
     q->ic = (uint16_t)p->icreg; q->oc = (uint16_t)p->ocreg;
@@ -197,10 +197,10 @@ static void prog_params(const struct prog *p, conv_params_t *q,
     q->out_scale = t->unit ? 1.0f : 256.0f;
     q->input_zero_point = 0; q->weight_zero_point = 0;
     q->output_zero_point = t->unit ? 0x80 : 0;
-    q->input_dma   = in_dma;
-    q->weights_dma = (uint32_t)p->w.dma_address;
-    q->bias_dma    = (uint32_t)p->b.dma_address;
-    q->output_dma  = out_dma;
+    q->input_iova   = in_iova;
+    q->weights_iova = (uint32_t)p->w.dma_address;
+    q->bias_iova    = (uint32_t)p->b.dma_address;
+    q->output_iova  = out_iova;
 }
 
 /* Emit and submit the whole row plan. `row_pitch` is the element count a row task's
@@ -221,15 +221,15 @@ static int prog_run(int fd, struct prog *p, rocket_bo *in, size_t in_off,
     q = base;
     if (rocket_rk3576_plan_rows(&q, 0, plan, MAX_ROWS, &ntask) < 0) return -1;
 
-    slot = RK3576_CONV_TASK_OPS;
+    slot = RK3576_CONV_TASK_SLOT;   /* even: each task 16-byte aligned */
     for (i = 0; i < ntask; i++) {
         q = base;
         q.ih = plan[i].ih; q.oh = plan[i].oh;
         q.pad_top = plan[i].pad_top;
         /* The row offset is a row COUNT times the buffer's pitch, not the plane's
          * width — the one place a pitched buffer changes the caller's arithmetic. */
-        q.input_dma  = base.input_dma + (uint32_t)plan[i].iy0 * row_pitch * C2;
-        q.output_dma = base.output_dma + plan[i].output_off;
+        q.input_iova  = base.input_iova + (uint32_t)plan[i].iy0 * row_pitch * C2;
+        q.output_iova = base.output_iova + plan[i].output_off;
         q.ih_full = (uint16_t)p->ih; q.oh_full = (uint16_t)p->oh;
         q.tasks = p->ops + (size_t)i * slot;
         q.task_count = 0;
@@ -684,7 +684,7 @@ static int map_mode(int fd, unsigned wic, int only, unsigned iw, unsigned ih,
         int32_t *z = calloc(p.ocreg, sizeof *z);
         if (!z) return -1;
         rocket_bo_prep(fd, &p.b, 1, 0);
-        rocket_rk3576_pack_coeff_prec(p.b.ptr, coeff, z, p.ocreg, precision_int8);
+        rocket_rk3576_pack_coeff_prec(p.b.ptr, coeff, z, p.ocreg, PREC_INT8);
         rocket_bo_fini(fd, &p.b);
         free(z);
     }

@@ -327,7 +327,7 @@ const char *rocket_activation_name(int kind);
  * fills `lut` (1026 entries) and `ep`, setting `ep->lut = lut`. The caller allocates `lut`
  * and must keep it alive while `ep` is in use. The same parameters drive the standalone DPU op
  * (`rocket_activation_fp16`) and the conv->activation fusion (`conv_params_t.act`,
- * `gen_conv2d_task`).
+ * `gen_conv2d_fp16`).
  *
  * Returns 0 on success. If `kind` is not single-pass, it returns a negative value.
  *

@@ -2,13 +2,22 @@
 """Extract the RK3576 vendor register programs from the .rknn captures into a C
 header the host-only gate can compile against.
 
-Two capture sets, both RKNN-Toolkit2 output for rk3576 with the register program
-embedded verbatim:
+Four capture sets, all RKNN-Toolkit2 output for rk3576 with the register program
+embedded verbatim, and all MANUFACTURED here from ONNX that each directory's own
+mk*.py writes:
 
-  - github.com/gahingwoo/linux-rk3576-npu, vendor-capture/*.rknn — found captures,
-    of real convolutions including a MobileNet-shaped stem.
-  - dw/*.rknn — depthwise captures MANUFACTURED here (dw/mkdw.py), because the found
-    ones confound the channel count with the stride and are all k=3.
+  - int8/*.rknn (int8/mkint8.py) — the quantized convolutions at planes the compiler
+    splits into row windows: the packed-image first conv, a 16->128 k5 s2 direct conv,
+    a k3 depthwise, and a MobileNet-shaped stem compiled as one graph.
+  - dw/*.rknn (dw/mkdw.py) — depthwise at channel counts from 8 to 256, both strides
+    and kernels 1/3/5/7, which the int8/ set alone confounds (every C=32 program in it
+    is stride 1, every C=64 one stride 2, and every one k=3).
+  - float/*.rknn (float/mkfloat.py) — the fp16 direct path.
+  - argb/*.rknn (argb/mkargb.py) — the fp16 packed-image first conv.
+
+The header is generated from them in that order:
+
+    mkgolden.py int8 dw float argb rk3576_vendor_golden.h
 
 Every register program in every capture is emitted, not one per file: a windowed
 convolution is split into several tasks and each task is its own program, so the
@@ -18,10 +27,9 @@ emitter from the capture instead of from a hand-written table.
 
 Usage: mkgolden.py <dir with *.rknn> [more dirs ...] <output header>
 """
-import struct, sys, os, glob
+import sys, os, glob
 
-TARGETS = {0x0201: "CNA", 0x0801: "CORE", 0x1001: "DPU", 0x2001: "RDMA",
-           0x0041: "SYNC", 0x0081: "BCAST"}
+from regcmd_scan import BLOCK_NAMES, CONV_TARGETS, regcmd_programs
 
 # A full conv task programs ~139 registers; the vendor also emits short delta
 # programs (~32 writes) that re-drive only what changed between two tasks. Only
@@ -30,22 +38,12 @@ FULL_RUN_MIN = 100
 
 
 def runs(path, min_run=20):
-    data = open(path, "rb").read()
-    n = len(data) // 8
-    words = struct.unpack("<%dQ" % n, data[:n * 8])
-    out, i = [], 0
-    while i < n:
-        if ((words[i] >> 48) & 0xffff) in TARGETS:
-            j = i
-            while j < n and ((words[j] >> 48) & 0xffff) in TARGETS:
-                j += 1
-            if j - i >= min_run:
-                out.append([(int((w >> 48) & 0xffff), int(w & 0xffff),
-                             int((w >> 16) & 0xffffffff)) for w in words[i:j]])
-            i = j
-        else:
-            i += 1
-    return out
+    return regcmd_programs(path, CONV_TARGETS, min_run)
+
+
+def label(t):
+    """The block name in the header's comments, which call the DPU's read DMA RDMA."""
+    return "RDMA" if t == 0x2001 else BLOCK_NAMES[t]
 
 
 def decode(run):
@@ -121,10 +119,11 @@ def decode(run):
     return d
 
 
-# The isolated-op models are a convolution PLUS a DPU epilogue stage (bias, scale,
-# eltwise sum). Their geometry duplicates conv2d's, and the registers they move are
-# the epilogue ones, so they are reference material for the DPU stages rather than
-# an oracle for a plain conv emitter.
+# The iso_* models are conv2d's geometry compiled with PER-TENSOR weight
+# quantization, which programs a different BS-stage arrangement (0x4044, 0x4050,
+# 0x501C) from the per-channel compile. Their geometry duplicates conv2d's, so they
+# are reference material for that stage rather than an oracle for a plain conv
+# emitter.
 EPILOGUE_SOURCES = ("iso_bias", "iso_scale", "iso_sum")
 
 
@@ -173,9 +172,9 @@ def main():
     L.append(" * rk3576_vendor_golden.h - GENERATED, do not edit by hand.")
     L.append(" *")
     L.append(" * RK3576 vendor register programs, decoded from RKNN-Toolkit2 .rknn captures")
-    L.append(" * (the gahingwoo vendor-capture set, plus the manufactured ones here: dw/ for")
-    L.append(" * depthwise, float/ for the fp16 direct path, argb/ for the fp16 first conv,")
-    L.append(" * rebuilt by their own mk*.py). Each table is one")
+    L.append(" * manufactured here and rebuilt by their own mk*.py: int8/ for the quantized")
+    L.append(" * first, direct and depthwise convs, dw/ for depthwise, float/ for the fp16")
+    L.append(" * direct path, argb/ for the fp16 first conv. Each table is one")
     L.append(" * task's complete CNA+CORE+DPU+DPU_RDMA register program, in stream order, as")
     L.append(" * (target, reg, value) triples. These are the acceptance oracle for the RK3576")
     L.append(" * regcmd emitter: what the vendor toolkit programs for a known conv geometry.")
@@ -221,7 +220,7 @@ def main():
         L.append(" * source: %s, %d entries */" % (d['source'], len(d['ops'])))
         L.append("static const struct rk3576_golden_op rk3576_golden_%s[] = {" % d['name'])
         for t, r, v in d['ops']:
-            L.append("    { 0x%04x, 0x%04x, 0x%08xu },  /* %s */" % (t, r, v, TARGETS[t]))
+            L.append("    { 0x%04x, 0x%04x, 0x%08xu },  /* %s */" % (t, r, v, label(t)))
         L.append("};")
         L.append("")
 

@@ -10,6 +10,7 @@
  * (MAX bit-exact; AVG within fp16-reciprocal tolerance). See rocket_pool.h.
  */
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,12 +18,181 @@
 
 #include "rocket_npu.h"
 #include "rocket_pool.h"
-#include "npu_matmul.h"   /* feature_data (NC1HWC2 cube index) */
+#include "npu_matmul.h"   /* feature_index (NC1HWC2 cube index) */
 #include "rocket_op.h"      /* the shared one-shot scaffolding */
 #include "rocket_log.h"     // centralized log channel
 
 /* slack past the scattered cube, so a DMA burst over-read can't run off the BO */
 #define POOL_BO_SLACK 32768
+/* One band's regcmd slot in words: gen_pool_fp16 writes 30, and an even slot keeps every
+ * task's address 16-byte aligned, which the submit check requires. */
+#define POOL_TASK_SLOT 64
+
+/* ============================================================================
+ * SECTION — Whether the running kernel can retire a pool
+ * ==========================================================================*/
+
+/* A pooling program enables PPU and PPU_RDMA only (0x60), so it raises no DPU completion.
+ * A rocket driver without the PPU-completion flag arms only the DPU pair, nothing it waits
+ * for ever fires, and drm_sched retires the job at JOB_TIMEOUT_MS through a core reset:
+ * ~507 ms a submit on the RK1, output correct (rockchip-npu-notes perf/pool-completion.md). The
+ * stock driver is in that class at interface 1.0, and so is the RK3576 upstream series as
+ * Armbian's edge kernel carries it. The host computes a pool in microseconds, so refusing
+ * is the whole fix there.
+ *
+ * Keyed on rocket_ppu_done_supported() rather than on the interface version directly: that
+ * probe is part of the submit seam, so the vendor provider answers for its own driver (1,
+ * since it waits on whichever block the task's interrupt mask names). The plan functions
+ * stay pure and never call this; the entries and the frontends' claims do. */
+int rocket_pool_npu_supported(void)
+{
+    static _Atomic int warned = 0;
+    int ok = rocket_ppu_done_supported();
+
+    if (!ok && !atomic_exchange(&warned, 1))
+        ROCKET_LOGW("rocket: this driver has no PPU completion, so it would retire each "
+                    "pooling job at its 500 ms job timeout with a core reset. The pool "
+                    "entries refuse and the global pools compute on the host.\n");
+    return ok;
+}
+
+/* ============================================================================
+ * SECTION — The PPU's per-task output-width allowance and the column bands
+ * ==========================================================================*/
+
+/*
+ * HOW MANY OUTPUT COLUMNS ONE RK3588 POOLING TASK MAY PRODUCE.
+ *
+ * Past this a task writes a complete, correctly sized surface that is wrong across the
+ * whole output, and most windows also raise no completion, so the job retires at the
+ * driver's timeout (rockchip-npu-notes encodings/ppu-pooling.md, "Output-width allowance").
+ * The allowance depends on the kernel height and the vertical stride, not on the plane's
+ * height or channel count. MEASURED, last exact output width [HW sweep, RK1, 928 MHz,
+ * 2026-11-02, fp16, no pad]:
+ *
+ *     2x2 s2 128      2x2 s1, 2x1 s1, 2x2 sy1 sx2  64      3x3 s1, 3x1 s1  32
+ *     3x3 s2, s3 64   4x4 s1 32    4x4 s2, s4 64    5x5 s1, 8x8 s1 16
+ *     5x5..8x8 at a stride equal to the window 64   1x2 s1, 1x3 s1  256 and more
+ *     1x1 MAX to an input width of 8191
+ *
+ * and every window past 8 on either axis fails at or near a width of one (12x12, 16x16,
+ * 16x1 and 1x16 at a stride equal to the window). The cells the bound below admits that
+ * the table does not carry were each exact at the bound, one task, MAX and four also AVG:
+ * 6x6 and 7x7 at stride 1 (16); 5x5 to 8x8 at stride 2, 6x6 and 8x8 at stride 3 (32);
+ * 4x4 to 6x6 at stride 3, 7x7 and 8x8 at stride 4 (64); 8x2 (16), 4x2 (32), 2x8 (64),
+ * 1x5, 1x8 and 1x8 at stride 8 (64); 3x3 at stride 1x2 (32); padded 3x3 stride 2 (56),
+ * 5x5 stride 1 (16) and 3x3 stride 1 (32) [HW sweep, RK1, 928 MHz, 2026-11-06].
+ *
+ * What fits every measured cell is a budget keyed on the output rows in flight over one
+ * input row, o = ceil(kh / stride_y), the same axis the RK3576's allowance is keyed on
+ * (rocket_pool_int8_rk3576_max_ow): 64 at o 1-2, 32 at o 3-4, 16 at o 5-8, with the
+ * measured 2x2-stride-2 and one-row cells above it [hypothesis for the cells between
+ * the measured ones]. Being under costs a band; being over costs a silent wrong surface,
+ * so a window past 8 on either axis gets 0 and is refused.
+ */
+unsigned rocket_pool_fp16_max_ow(const rocket_pool_desc *d)
+{
+    unsigned kh, kw, sy, sx, o;
+
+    if (!d || d->kh < 1 || d->kw < 1 || d->stride_y < 1 || d->stride_x < 1) return 0u;
+    kh = (unsigned)d->kh; kw = (unsigned)d->kw;
+    sy = (unsigned)d->stride_y; sx = (unsigned)d->stride_x;
+    if (kh > 8u || kw > 8u) return 0u;
+    /* A STRIDE PAST THE WINDOW, on either axis, is its own failure and not a narrower
+     * allowance: a 2x2 window at stride 3x3, 2x3 or 3x2 is wrong at an output width of 8
+     * and retires at the job timeout, and exact only at a 1x1 output [HW sweep, RK1,
+     * 928 MHz, 2026-11-06]. A 1x1 window at stride 2 was exact at width 8, one run, so it
+     * is refused with the rest rather than admitted on that. */
+    if (sy > kh || sx > kw) return 0u;
+    if (kh == 1u) {
+        if (kw == 1u && sx == 1u) return 8192u;
+        if (kw <= 3u && sx == 1u) return 256u;
+        return 64u;
+    }
+    if (kh == 2u && sy == 2u && sx == 2u) return 128u;
+    o = (kh + sy - 1u) / sy;
+    if (o <= 2u) return 64u;
+    if (o <= 4u) return 32u;
+    return 16u;
+}
+
+/*
+ * One band's geometry. Band `s` of `n` produces output columns [x0, x0+ow_s). The input
+ * columns its windows reach are [x0*stride_x - pad_left, (x0+ow_s-1)*stride_x + kw -
+ * pad_left), clipped to the plane, and what the clip removed becomes that band's own
+ * pad, so only a band at an edge carries the edge's pad. The bands are evenly sized with
+ * the remainder spread over the leading ones, so every band is inside the allowance.
+ * Returns n, or 0 if the window has no allowance.
+ */
+static unsigned pool_band(const rocket_pool_desc *d, unsigned s,
+                          unsigned *x0, unsigned *ow_s, unsigned *in_col,
+                          unsigned *iw_s, int *pad_l, int *pad_r)
+{
+    unsigned ow = (unsigned)rocket_pool_ow(d);
+    unsigned allow = rocket_pool_fp16_max_ow(d);
+    unsigned n, i, x = 0, w;
+
+    if (!allow) return 0u;
+    n = (ow + allow - 1u) / allow;
+    if (n == 0u) n = 1u;
+    if (s >= n) return n;
+    for (i = 0; i < s; i++) x += ow / n + (i < ow % n ? 1u : 0u);
+    w = ow / n + (s < ow % n ? 1u : 0u);
+    {
+        long lo = (long)x * d->stride_x - d->pad_left;
+        long hi = ((long)x + (long)w - 1) * d->stride_x + d->kw - d->pad_left;
+        int pl = 0, pr = 0;
+        if (lo < 0) { pl = (int)(-lo); lo = 0; }
+        if (hi > d->iw) { pr = (int)(hi - d->iw); hi = d->iw; }
+        *x0 = x; *ow_s = w;
+        *in_col = (unsigned)lo;
+        *iw_s = (unsigned)(hi - lo);
+        *pad_l = pl; *pad_r = pr;
+    }
+    return n;
+}
+
+/* The band's own descriptor: the caller's, narrowed to the band's input columns. */
+static rocket_pool_desc pool_band_desc(const rocket_pool_desc *d, unsigned iw_s,
+                                       int pad_l, int pad_r)
+{
+    rocket_pool_desc b = *d;
+    b.iw = (int)iw_s; b.pad_left = pad_l; b.pad_right = pad_r;
+    return b;
+}
+
+unsigned rocket_pool_fp16_bands(const rocket_pool_desc *d)
+{
+    unsigned x0, ows, col, iws, n, s;
+    int pl, pr;
+
+    if (!d || rocket_pool_ow(d) < 1) return 0u;
+    n = pool_band(d, 0, &x0, &ows, &col, &iws, &pl, &pr);
+    if (!n || n > ROCKET_POOL_MAX_BANDS) return 0u;
+    /* Every band's own descriptor must derive back to the width it was cut to; one that
+     * does not is refused rather than run on a geometry nobody checked. */
+    for (s = 0; s < n; s++) {
+        rocket_pool_desc b;
+        pool_band(d, s, &x0, &ows, &col, &iws, &pl, &pr);
+        b = pool_band_desc(d, iws, pl, pr);
+        if ((unsigned)rocket_pool_ow(&b) != ows || ows > rocket_pool_fp16_max_ow(&b))
+            return 0u;
+    }
+    return n;
+}
+
+int rocket_pool_fp16_band(const rocket_pool_desc *d, unsigned s,
+                          unsigned *x0, unsigned *in_col, rocket_pool_desc *band)
+{
+    unsigned n = rocket_pool_fp16_bands(d), bx, ows, col, iws;
+    int pl, pr;
+
+    if (!n || s >= n || !x0 || !in_col || !band) return ROCKET_E_SHAPE;
+    pool_band(d, s, &bx, &ows, &col, &iws, &pl, &pr);
+    *x0 = bx; *in_col = col;
+    *band = pool_band_desc(d, iws, pl, pr);
+    return 0;
+}
 
 /* ============================================================================
  * SECTION — Geometry validation and CPU references
@@ -56,6 +226,16 @@ int rocket_pool_fp16_plan(const rocket_pool_desc *d)
     /* AVG reciprocal fp16(65536/k) overflows fp16 at k=1, so an average needs k>=2 per
      * axis (a 1-wide average kernel is degenerate anyway). MAX is fine with k=1. */
     if (d->method == POOL_METHOD_AVG && (d->kw < 2 || d->kh < 2)) return ROCKET_E_UNSUPPORTED;
+    /* A window past 8 on either axis has no measured allowance (it fails at or near one
+     * output column), and a plane past the allowance needs more bands than one job
+     * carries: both refused here so a frontend declines at claim time. */
+    if (rocket_pool_fp16_bands(d) == 0u) {
+        ROCKET_LOGD("rocket_pool_fp16: a %dx%d window at stride %dx%d to an output width "
+                    "of %d has no column banding inside the PPU's allowance (%u a task, "
+                    "%d bands at most)\n", d->kh, d->kw, d->stride_y, d->stride_x,
+                    ow, rocket_pool_fp16_max_ow(d), ROCKET_POOL_MAX_BANDS);
+        return ROCKET_E_UNSUPPORTED;
+    }
     return 0;
 }
 
@@ -173,20 +353,39 @@ int rocket_pool_fp16(int fd, const rocket_pool_desc *d, const _Float16 *in, _Flo
 
     /* No device: the CPU oracle (host fallback / off-device self-check). */
     if (fd < 0) { rocket_pool_ref_fp16(d, in, out); return 0; }
+    /* A driver that cannot retire the job: refuse before any BO is allocated, so the
+     * caller's own host kernel runs instead of a 500 ms timeout. */
+    if (!rocket_pool_npu_supported()) return ROCKET_E_UNSUPPORTED;
 
     const int C2 = 8;
     const int C1 = (C + C2 - 1) / C2;
-    size_t in_cube_elems  = (size_t)C1 * IH * IW * C2;
-    size_t out_cube_elems = (size_t)C1 * OH * OW * C2;
+    /* A plane wider than the PPU's per-task allowance runs as column bands, one task each,
+     * all in one job. Each band is scattered into its own dense cube, so a band is an
+     * ordinary pool and the generator's program for it is the one a lone pool of that
+     * width gets; a plane inside the allowance is one band and runs the program it always
+     * did. The input columns two bands' windows share are scattered into both. */
+    const unsigned nb = rocket_pool_fp16_bands(d);    /* > 0: the plan above checked it */
+    typedef struct { unsigned x0, ow, col, iw; int pl, pr; size_t in_off, out_off; } band_t;
+    band_t *bd = calloc(nb, sizeof(*bd));
+    rocket_task_desc *tasks = calloc(nb, sizeof(*tasks));
+    size_t in_elems = 0, out_elems = 0;
 
     rocket_bo guard = {0}, in_bo = {0}, rc_bo = {0}, out_bo = {0};
-    uint64_t regs[64] = {0};
     int rc = -1, ret = -1;
 
+    if (!bd || !tasks) { ROCKET_LOGE("rocket_pool_fp16: out of memory\n"); goto out; }
+    for (unsigned s = 0; s < nb; s++) {
+        band_t *b = &bd[s];
+        pool_band(d, s, &b->x0, &b->ow, &b->col, &b->iw, &b->pl, &b->pr);
+        b->in_off = in_elems;   b->out_off = out_elems;
+        in_elems  += (size_t)C1 * IH * b->iw * C2;
+        out_elems += (size_t)C1 * OH * b->ow * C2;
+    }
+
     if (rocket_bo_alloc(fd, 4096, &guard) ||                                  /* off IOVA 0 */
-        rocket_bo_alloc(fd, in_cube_elems * sizeof(_Float16) + POOL_BO_SLACK, &in_bo) ||
-        rocket_bo_alloc(fd, sizeof(regs), &rc_bo) ||
-        rocket_bo_alloc(fd, out_cube_elems * sizeof(_Float16) + POOL_BO_SLACK, &out_bo)) {
+        rocket_bo_alloc(fd, in_elems * sizeof(_Float16) + POOL_BO_SLACK, &in_bo) ||
+        rocket_bo_alloc(fd, (size_t)nb * POOL_TASK_SLOT * sizeof(uint64_t), &rc_bo) ||
+        rocket_bo_alloc(fd, out_elems * sizeof(_Float16) + POOL_BO_SLACK, &out_bo)) {
         ROCKET_LOGE("rocket_pool_fp16: BO alloc failed\n"); goto out;
     }
     {
@@ -194,39 +393,56 @@ int rocket_pool_fp16(int fd, const rocket_pool_desc *d, const _Float16 *in, _Flo
         if (rocket_op_iova_overflow("rocket_pool_fp16", set, 3)) goto out;
     }
 
-    /* scatter input feature -> NC1HWC2 cube (C2=8) */
+    /* scatter each band's input columns -> its own NC1HWC2 cube (C2=8) */
     rocket_bo_prep(fd, &in_bo, 1, 0);
     memset(in_bo.ptr, 0, in_bo.size);
-    {
-        _Float16 *dst = in_bo.ptr;
+    for (unsigned s = 0; s < nb; s++) {
+        const band_t *b = &bd[s];
+        _Float16 *dst = (_Float16 *)in_bo.ptr + b->in_off;
         for (int c = 0; c < C; c++)
             for (int h = 0; h < IH; h++)
-                for (int w = 0; w < IW; w++)
-                    dst[feature_data(C, IH, IW, 8, c + 1, h + 1, w + 1)] =
-                        in[((size_t)c * IH + h) * IW + w];
+                for (int w = 0; w < (int)b->iw; w++)
+                    dst[feature_index(C, IH, (int)b->iw, 8, c + 1, h + 1, w + 1)] =
+                        in[((size_t)c * IH + h) * IW + b->col + (unsigned)w];
     }
     rocket_bo_fini(fd, &in_bo);
 
-    pool_params_t p = {
-        .c = C, .ih = IH, .iw = IW, .oh = OH, .ow = OW,
-        .kh = d->kh, .kw = d->kw,
-        .stride_y = d->stride_y, .stride_x = d->stride_x,
-        .pad_top = d->pad_top, .pad_left = d->pad_left,
-        .pad_bottom = d->pad_bottom, .pad_right = d->pad_right,
-        .method = (uint8_t)d->method,
-        .recip_w = ppu_recip_kernel_fp16(d->kw),
-        .recip_h = ppu_recip_kernel_fp16(d->kh),
-        .input_dma  = (uint32_t)in_bo.dma_address,
-        .output_dma = (uint32_t)out_bo.dma_address,
-        .tasks = regs,
-    };
-    if ((ret = gen_pool_fp16(&p)) != 0) {
-        ROCKET_LOGE("rocket_pool_fp16: gen failed (%d)\n", ret); goto out;
+    /* one program per band, each in its own 16-byte-aligned slot of the regcmd BO */
+    rocket_bo_prep(fd, &rc_bo, 1, 0);
+    memset(rc_bo.ptr, 0, rc_bo.size);
+    for (unsigned s = 0; s < nb; s++) {
+        const band_t *b = &bd[s];
+        uint64_t regs[POOL_TASK_SLOT];
+        pool_params_t p = {
+            .c = C, .ih = IH, .iw = (uint16_t)b->iw, .oh = OH, .ow = (uint16_t)b->ow,
+            .kh = d->kh, .kw = d->kw,
+            .stride_y = d->stride_y, .stride_x = d->stride_x,
+            .pad_top = d->pad_top, .pad_left = (uint8_t)b->pl,
+            .pad_bottom = d->pad_bottom, .pad_right = (uint8_t)b->pr,
+            .method = (uint8_t)d->method,
+            .recip_w = ppu_recip_kernel_fp16(d->kw),
+            .recip_h = ppu_recip_kernel_fp16(d->kh),
+            .input_iova  = (uint32_t)(in_bo.dma_address + b->in_off * sizeof(_Float16)),
+            .output_iova = (uint32_t)(out_bo.dma_address + b->out_off * sizeof(_Float16)),
+            .tasks = regs,
+        };
+        if ((ret = gen_pool_fp16(&p)) != 0) {
+            ROCKET_LOGE("rocket_pool_fp16: gen failed (%d)\n", ret);
+            rocket_bo_fini(fd, &rc_bo);
+            goto out;
+        }
+        if (p.task_count == 0 || p.task_count > POOL_TASK_SLOT) {   /* bound regs[] */
+            ROCKET_LOGE("rocket_pool_fp16: regcmd overflow (task_count %u)\n", p.task_count);
+            rocket_bo_fini(fd, &rc_bo);
+            ret = -1; goto out;
+        }
+        memcpy((uint64_t *)rc_bo.ptr + (size_t)s * POOL_TASK_SLOT, regs,
+               (size_t)p.task_count * sizeof(uint64_t));
+        tasks[s].regcmd = (uint32_t)(rc_bo.dma_address +
+                                     (size_t)s * POOL_TASK_SLOT * sizeof(uint64_t));
+        tasks[s].regcmd_count = p.task_count;
     }
-    if (p.task_count > sizeof(regs)/sizeof(regs[0])) {   /* bound the stack regs[] */
-        ROCKET_LOGE("rocket_pool_fp16: regcmd overflow (task_count %u)\n", p.task_count);
-        ret = -1; goto out;
-    }
+    rocket_bo_fini(fd, &rc_bo);
 
     /* Prezero the output: a partial channel group's dead lanes are read back with the
      * live ones, and the de-scatter below indexes past them. */
@@ -235,22 +451,28 @@ int rocket_pool_fp16(int fd, const rocket_pool_desc *d, const _Float16 *in, _Flo
     rocket_bo_fini(fd, &out_bo);
 
     {
-        rocket_bo *const ins[] = { &in_bo };
+        uint32_t in_h[]  = { in_bo.handle, rc_bo.handle };
+        uint32_t out_h[] = { out_bo.handle };
         /* This program is a POOL: it finishes on the PPU, not the DPU. Naming the
          * block costs the mainline driver's grace period nothing to skip and is what
          * lets a driver that waits for the named block retire the job at all. */
-        ret = rocket_op_submit_one_flags(fd, "rocket_pool_fp16", &rc_bo, regs,
-                                         p.task_count, ins, 1, &out_bo,
-                                         rocket_ppu_done_supported() ? ROCKET_JOB_PPU_DONE : 0u);
+        ret = rocket_submit_tasks_flags(fd, tasks, nb, in_h, 2, out_h, 1,
+                                        rocket_ppu_done_supported() ? ROCKET_JOB_PPU_DONE : 0u);
+        if (ret) { ROCKET_LOGE("rocket_pool_fp16: submit failed (%d)\n", ret); goto out; }
+        if ((ret = rocket_bo_prep(fd, &out_bo, 0, ROCKET_OP_WAIT_NS)) != 0) {
+            ROCKET_LOGE("rocket_pool_fp16: the output fence did not signal within %llu ms "
+                        "(%d)\n", (unsigned long long)(ROCKET_OP_WAIT_NS / 1000000ULL), ret);
+            goto out;
+        }
     }
-    if (ret) goto out;
-    {
-        _Float16 *src = out_bo.ptr;
+    for (unsigned s = 0; s < nb; s++) {
+        const band_t *b = &bd[s];
+        const _Float16 *src = (const _Float16 *)out_bo.ptr + b->out_off;
         for (int c = 0; c < C; c++)
             for (int oh = 0; oh < OH; oh++)
-                for (int ow = 0; ow < OW; ow++)
-                    out[((size_t)c * OH + oh) * OW + ow] =
-                        src[feature_data(C, OH, OW, 8, c + 1, oh + 1, ow + 1)];
+                for (int ow = 0; ow < (int)b->ow; ow++)
+                    out[((size_t)c * OH + oh) * OW + b->x0 + (unsigned)ow] =
+                        src[feature_index(C, OH, (int)b->ow, 8, c + 1, oh + 1, ow + 1)];
     }
     rocket_bo_fini(fd, &out_bo);
     rc = 0;
@@ -260,5 +482,7 @@ out:
     rocket_bo_free(fd, &rc_bo);
     rocket_bo_free(fd, &in_bo);
     rocket_bo_free(fd, &guard);
+    free(tasks);
+    free(bd);
     return rc ? (ret ? ret : -1) : 0;
 }

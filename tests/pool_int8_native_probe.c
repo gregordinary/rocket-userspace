@@ -40,14 +40,15 @@
 
 #include "rocket_npu.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "npu_pool.h"
-#include "npu_matmul.h"   /* feature_data */
+#include "npu_matmul.h"   /* feature_index */
 #include "rocket_op.h"
 
 /* The two PPU block opcodes, spelled as npu_regcmd.c spells them (they are defined in
  * the .c, not the header, so a probe that emits its own program restates them). */
-#define OP_REG_PPU       (BLOCK_PPU | PC_OP_01)        /* 0x4001 */
-#define OP_REG_PPU_RDMA  (BLOCK_PPU_RDMA | PC_OP_01)   /* 0x8001 */
+#define TARGET_PPU       (NPU_TARGET_PPU | NPU_REG_WRITE)        /* 0x4001 */
+#define TARGET_PPU_RDMA  (NPU_TARGET_PPU_RDMA | NPU_REG_WRITE)   /* 0x8001 */
 
 #define C2_I8   16        /* int8 feature cube channel atom */
 #define BO_SLACK 256
@@ -122,7 +123,7 @@ static void golden(const shape_t *s, const int8_t *in, int OH, int OW, int *out,
  * parameters. Everything else is gen_pool_fp16's validated sequence with the int8
  * cube's strides (C2=16, one byte an element). */
 static uint32_t emit(uint64_t *ops, const shape_t *s, int OH, int OW,
-                     uint32_t in_dma, uint32_t out_dma,
+                     uint32_t in_iova, uint32_t out_iova,
                      unsigned proc_prec, unsigned in_prec, int int_recip)
 {
     uint32_t i = 0;
@@ -130,24 +131,24 @@ static uint32_t emit(uint64_t *ops, const shape_t *s, int OH, int OW,
     const uint32_t in_surf  = (uint32_t)s->ih * s->iw * C2_I8;
     const uint32_t out_surf = (uint32_t)OH * OW * C2_I8;
 
-    ops[i++] = NPUOP(OP_REG_PPU,      0xE, PPU_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, 0xE, PPU_RDMA_S_POINTER);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_S_POINTER, 0xE);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, REG_PPU_RDMA_RDMA_S_POINTER, 0xE);
 
-    ops[i++] = NPUOP(OP_REG_PPU, (s->iw - 1) & 0x1FFF, PPU_DATA_CUBE_IN_WIDTH);
-    ops[i++] = NPUOP(OP_REG_PPU, (s->ih - 1) & 0x1FFF, PPU_DATA_CUBE_IN_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_PPU, (s->c  - 1) & 0x1FFF, PPU_DATA_CUBE_IN_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_PPU, (OW - 1) & 0x1FFF, PPU_DATA_CUBE_OUT_WIDTH);
-    ops[i++] = NPUOP(OP_REG_PPU, (OH - 1) & 0x1FFF, PPU_DATA_CUBE_OUT_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_PPU, (s->c  - 1) & 0x1FFF, PPU_DATA_CUBE_OUT_CHANNEL);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DATA_CUBE_IN_WIDTH, (s->iw - 1) & 0x1FFF);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DATA_CUBE_IN_HEIGHT, (s->ih - 1) & 0x1FFF);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DATA_CUBE_IN_CHANNEL, (s->c  - 1) & 0x1FFF);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DATA_CUBE_OUT_WIDTH, (OW - 1) & 0x1FFF);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DATA_CUBE_OUT_HEIGHT, (OH - 1) & 0x1FFF);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DATA_CUBE_OUT_CHANNEL, (s->c  - 1) & 0x1FFF);
 
-    ops[i++] = NPUOP(OP_REG_PPU, (1u << 4) | ((uint32_t)s->method & 0x3),
-                     PPU_OPERATION_MODE_CFG);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_OPERATION_MODE_CFG,
+                      (1u << 4) | ((uint32_t)s->method & 0x3));
 
-    ops[i++] = NPUOP(OP_REG_PPU,
-                     ((uint32_t)(s->kw - 1) & 0xF)
-                   | (((uint32_t)(s->kh - 1) & 0xF) << 8)
-                   | (((uint32_t)(s->sx - 1) & 0xF) << 16)
-                   | (((uint32_t)(s->sy - 1) & 0xF) << 20), PPU_POOLING_KERNEL_CFG);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_POOLING_KERNEL_CFG,
+                      ((uint32_t)(s->kw - 1) & 0xF)
+                    | (((uint32_t)(s->kh - 1) & 0xF) << 8)
+                    | (((uint32_t)(s->sx - 1) & 0xF) << 16)
+                    | (((uint32_t)(s->sy - 1) & 0xF) << 20));
 
     /* The average's per-axis reciprocal. The fp16 encoding is what ships; the integer
      * Q16 one is what an integer datapath wants and what the RK3576 pool programs. */
@@ -156,42 +157,42 @@ static uint32_t emit(uint64_t *ops, const shape_t *s, int OH, int OW,
         rw = int_recip ? (0x10000u / (unsigned)s->kw) : ppu_recip_kernel_fp16(s->kw);
         rh = int_recip ? (0x10000u / (unsigned)s->kh) : ppu_recip_kernel_fp16(s->kh);
     }
-    ops[i++] = NPUOP(OP_REG_PPU, rw & 0x1FFFF, PPU_RECIP_KERNEL_WIDTH);
-    ops[i++] = NPUOP(OP_REG_PPU, rh & 0x1FFFF, PPU_RECIP_KERNEL_HEIGHT);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_RECIP_KERNEL_WIDTH, rw & 0x1FFFF);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_RECIP_KERNEL_HEIGHT, rh & 0x1FFFF);
 
     uint32_t pad = ((uint32_t)s->pl & 0x7)
                  | (((uint32_t)s->pt & 0x7) << 4)
                  | (((uint32_t)s->pr & 0x7) << 8)
                  | (((uint32_t)s->pb & 0x7) << 12);
-    ops[i++] = NPUOP(OP_REG_PPU, pad, PPU_POOLING_PADDING_CFG);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_POOLING_PADDING_CFG, pad);
     /* Pad fill. On the integer path the "never wins" value is the dtype minimum in the
      * sign-extended field the RK3576 pool uses (0x7ff80 == -128); on the fp16 path it is
      * -inf. Only reached when this shape actually pads. */
     uint32_t fill = 0;
     if (pad && s->method == POOL_METHOD_MAX) fill = (proc_prec == 2) ? 0x0000FC00u : 0x0007FF80u;
     if (pad && s->method == POOL_METHOD_MIN) fill = (proc_prec == 2) ? 0x00007C00u : 0x0000007Fu;
-    ops[i++] = NPUOP(OP_REG_PPU, fill, PPU_PADDING_VALUE_1_CFG);
-    ops[i++] = NPUOP(OP_REG_PPU, 0x0,  PPU_PADDING_VALUE_2_CFG);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_PADDING_VALUE_1_CFG, fill);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_PADDING_VALUE_2_CFG, 0x0);
 
-    ops[i++] = NPUOP(OP_REG_PPU, out_dma, PPU_DST_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_PPU, out_surf, PPU_DST_SURF_STRIDE);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DST_BASE_ADDR, out_iova);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DST_SURF_STRIDE, out_surf);
     /* INDEX_ADD[31:4] carries the out surf stride; PROC_PRECISION is [2:0]. The stride
      * is 16-aligned for a C2=16 byte cube, so the OR stays clean. */
-    ops[i++] = NPUOP(OP_REG_PPU, out_surf | (proc_prec & 0x7), PPU_DATA_FORMAT);
-    ops[i++] = NPUOP(OP_REG_PPU, 0x3, PPU_MISC_CTRL);
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_DATA_FORMAT, out_surf | (proc_prec & 0x7));
+    ops[i++] = REGCMD(TARGET_PPU, REG_PPU_MISC_CTRL, 0x3);
 
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, (s->iw - 1) & 0x1FFF, PPU_RDMA_CUBE_IN_WIDTH);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, (s->ih - 1) & 0x1FFF, PPU_RDMA_CUBE_IN_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, (s->c  - 1) & 0x1FFF, PPU_RDMA_CUBE_IN_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, in_dma,   PPU_RDMA_SRC_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, in_line,  PPU_RDMA_SRC_LINE_STRIDE);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, in_surf,  PPU_RDMA_SRC_SURF_STRIDE);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, in_prec & 0x3, PPU_RDMA_DATA_FORMAT);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, REG_PPU_RDMA_RDMA_CUBE_IN_WIDTH, (s->iw - 1) & 0x1FFF);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, REG_PPU_RDMA_RDMA_CUBE_IN_HEIGHT, (s->ih - 1) & 0x1FFF);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, REG_PPU_RDMA_RDMA_CUBE_IN_CHANNEL, (s->c  - 1) & 0x1FFF);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, REG_PPU_RDMA_RDMA_SRC_BASE_ADDR, in_iova);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, REG_PPU_RDMA_RDMA_SRC_LINE_STRIDE, in_line);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, REG_PPU_RDMA_RDMA_SRC_SURF_STRIDE, in_surf);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, REG_PPU_RDMA_RDMA_DATA_FORMAT, in_prec & 0x3);
 
-    ops[i++] = NPUOP(OP_NONE, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
-    ops[i++] = NPUOP(OP_40, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_ENABLE, 0x60, PC_OPERATION_ENABLE);
+    ops[i++] = REGCMD(TARGET_NONE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x0);
+    ops[i++] = REGCMD(TARGET_PRE_ENABLE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_ENABLE, REG_PC_OPERATION_ENABLE, 0x60);
     return i;
 }
 
@@ -222,7 +223,7 @@ static int run_cell(int fd, const shape_t *s, const int8_t *in, const int *gold,
       for (int c = 0; c < s->c; c++)
         for (int h = 0; h < s->ih; h++)
           for (int w = 0; w < s->iw; w++)
-            dst[feature_data(s->c, s->ih, s->iw, C2_I8, c+1, h+1, w+1)] =
+            dst[feature_index(s->c, s->ih, s->iw, C2_I8, c+1, h+1, w+1)] =
                 in[((size_t)c*s->ih + h)*s->iw + w]; }
     rocket_bo_fini(fd, &in_bo);
 
@@ -248,7 +249,7 @@ static int run_cell(int fd, const shape_t *s, const int8_t *in, const int *gold,
         for (int oh = 0; oh < OH; oh++)
           for (int ow = 0; ow < OW; ow++) {
             size_t idx = ((size_t)c*OH + oh)*OW + ow;
-            int v = src[feature_data(s->c, OH, OW, C2_I8, c+1, oh+1, ow+1)];
+            int v = src[feature_index(s->c, OH, OW, C2_I8, c+1, oh+1, ow+1)];
             int e = v - gold[idx];  if (e < 0) e = -e;
             int e2 = v - gold2[idx]; if (e2 < 0) e2 = -e2;
             if (v != 0) *allzero = 0;

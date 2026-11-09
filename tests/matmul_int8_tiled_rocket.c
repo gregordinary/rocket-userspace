@@ -7,7 +7,7 @@
  * K-accumulation), checked BIT-EXACT against an int64 CPU reference.
  *
  * This is the step-3 test (after the single-task matmul_int8_rocket test): it
- * proves the int8 tiling — weight_int8 / C2=16 / C2=4 layouts, banks_for x1, and
+ * proves the int8 tiling — gemm_weight_index_int8 / C2=16 / C2=4 layouts, banks_for x1, and
  * host K-accum — composes correctly across tiles.
  *
  * Usage: matmul_int8_tiled_rocket [M K N]   (default 128 1024 1024)

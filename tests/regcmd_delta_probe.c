@@ -82,12 +82,13 @@
 
 #include "rocket_npu.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "npu_matmul.h"
 #include "test_fill.h"
 
 #define NT_MAX 6
 #define STRIDE 256               /* words a program slot holds; a full program is ~110 */
-#define OP_REG_DPU_RDMA_ (BLOCK_DPU_RDMA | PC_OP_01)
+#define TARGET_DPU_RDMA_ (NPU_TARGET_DPU_RDMA | NPU_REG_WRITE)
 #define DPU_RDMA_S_POINTER_ 0x5004
 
 enum { P_SHIP, P_ZERO, P_ZEROB };
@@ -151,14 +152,14 @@ static void cpu_ref(const int8_t *A, const int8_t *B, int M, int K, int N, int32
 /* The full program for slot t at n output columns, into ops. Returns its length or -1. */
 static int gen_full(const struct probe *p, int t, int n, uint64_t *ops)
 {
-    matmul_params_t mp = {
+    gemm_params_t mp = {
         .m = (uint16_t)p->M, .k = (uint16_t)p->K, .n = (uint16_t)n,
-        .input_dma = (uint32_t)(p->in.dma_address + (size_t)t * p->in_slot),
-        .weights_dma = (uint32_t)(p->w.dma_address + (size_t)t * p->w_slot),
-        .output_dma = (uint32_t)(p->out.dma_address + (size_t)t * p->out_slot),
+        .input_iova = (uint32_t)(p->in.dma_address + (size_t)t * p->in_slot),
+        .weights_iova = (uint32_t)(p->w.dma_address + (size_t)t * p->w_slot),
+        .output_iova = (uint32_t)(p->out.dma_address + (size_t)t * p->out_slot),
         .tasks = ops,
     };
-    if (gen_matmul_int8(&mp) != 0 || mp.task_count + 2 > STRIDE) return -1;
+    if (gen_gemm_int8(&mp) != 0 || mp.task_count + 2 > STRIDE) return -1;
     return (int)mp.task_count;
 }
 
@@ -169,11 +170,11 @@ static int pointer_prologue(int pm, uint64_t *ops)
     const uint32_t v = pm == P_SHIP ? 0xE : 0x30;
     if (pm != P_SHIP) {
         const uint32_t cb = pm == P_ZEROB ? 0x10000000u : 0;
-        ops[i++] = NPUOP(OP_REG_CNA, v | cb, CNA_S_POINTER);
-        ops[i++] = NPUOP(OP_REG_CORE, v | cb, CORE_S_POINTER);
+        ops[i++] = REGCMD(TARGET_CNA, REG_CNA_S_POINTER, v | cb);
+        ops[i++] = REGCMD(TARGET_CORE, REG_CORE_S_POINTER, v | cb);
     }
-    ops[i++] = NPUOP(OP_REG_DPU, v, DPU_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA_, v, DPU_RDMA_S_POINTER_);
+    ops[i++] = REGCMD(TARGET_DPU, REG_DPU_S_POINTER, v);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA_, DPU_RDMA_S_POINTER_, v);
     return i;
 }
 
@@ -185,8 +186,8 @@ static int apply_pointers(int pm, uint64_t *ops, int n)
     int i, j = pointer_prologue(pm, tmp);
     for (i = 0; i < n; i++) {
         const uint16_t reg = (uint16_t)(ops[i] & 0xffff);
-        if (reg == DPU_S_POINTER || reg == DPU_RDMA_S_POINTER_ ||
-            reg == CNA_S_POINTER || reg == CORE_S_POINTER)
+        if (reg == REG_DPU_S_POINTER || reg == DPU_RDMA_S_POINTER_ ||
+            reg == REG_CNA_S_POINTER || reg == REG_CORE_S_POINTER)
             continue;
         tmp[j++] = ops[i];
     }
@@ -227,7 +228,7 @@ static int gen_delta(const struct probe *p, int t, int pm, uint64_t *ops)
                 ops[i++] = full[k];
                 break;
             }
-    if ((full[n - 1] & 0xffff) != PC_OPERATION_ENABLE) return -1;
+    if ((full[n - 1] & 0xffff) != REG_PC_OPERATION_ENABLE) return -1;
     for (int k = n - 4; k < n; k++) ops[i++] = full[k];
     return i;
 }
@@ -240,10 +241,10 @@ static void pack_slot(struct probe *p, int t)
     memset(w, 0, p->w_slot);
     for (int n = 1; n <= p->N; n++)
         for (int k = 1; k <= p->K; k++)
-            w[weight_int8(p->K, n, k)] = p->B[t][(size_t)(n - 1) * p->K + (k - 1)];
+            w[gemm_weight_index_int8(p->K, n, k)] = p->B[t][(size_t)(n - 1) * p->K + (k - 1)];
     for (int m = 1; m <= p->M; m++)
         for (int k = 1; k <= p->K; k++)
-            in[feature_data(p->K, p->M, 1, 16, k, m, 1)] = p->A[t][(size_t)(m - 1) * p->K + (k - 1)];
+            in[feature_index(p->K, p->M, 1, 16, k, m, 1)] = p->A[t][(size_t)(m - 1) * p->K + (k - 1)];
 }
 
 struct score {
@@ -258,7 +259,7 @@ static void score_slot(const struct probe *p, int t, int ncols, struct score *s)
     memset(s, 0, sizeof(*s));
     for (int m = 1; m <= p->M; m++)
         for (int n = 1; n <= p->N; n++) {
-            const int32_t v = od[feature_data(p->N, p->M, 1, 4, n, m, 1)];
+            const int32_t v = od[feature_index(p->N, p->M, 1, 4, n, m, 1)];
             const int32_t want = p->ref[t][(size_t)(m - 1) * p->N + (n - 1)];
             const int unw = (uint32_t)v == 0xAAAAAAAAu;
             if (n <= ncols) {

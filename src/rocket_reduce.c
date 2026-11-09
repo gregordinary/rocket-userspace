@@ -4,8 +4,8 @@
  * rocket_reduce.c — on-NPU spatial reductions (GlobalAveragePool / Mean / ReduceMean
  * over [H,W]) built on the PPU pooling engine.
  *
- * The PPU pool window is capped at 16x16 (4-bit kernel field), so a global/large mean
- * cannot run as one pool. This decomposes the global mean into a CHAIN of small
+ * The PPU pool window is capped at 16x16 (4-bit kernel field), and past 8x8 it computes
+ * incorrect output on the RK3588, so a global/large mean cannot run as one pool. This decomposes the global mean into a CHAIN of small
  * non-overlapping average pools and telescopes them — the average of equal-sized
  * group-averages is the grand average — keeping the intermediates resident in the
  * NC1HWC2 cube between passes (input scattered once, 1x1xC result de-scattered once).
@@ -19,59 +19,108 @@
 
 #include "rocket_npu.h"
 #include "rocket_reduce.h"
+#include "rocket_pool.h"   /* rocket_pool_npu_supported, rocket_pool_fp16_max_ow */
 #include "rocket_op.h"   /* rocket_op_iova_overflow — one 32-bit IOVA rule */
 #include "rocket_matmul.h" /* rocket_matmul_fp16_f32out (the feature-axis ones-matmul reduce) */
 #include "npu_pool.h"     /* gen_pool_fp16, pool_params_t, ppu_recip_kernel_fp16, POOL_METHOD_AVG */
-#include "npu_matmul.h"   /* feature_data (NC1HWC2 cube index) */
+#include "npu_matmul.h"   /* feature_index (NC1HWC2 cube index) */
 #include "rocket_log.h"     // centralized log channel
 
 #define REDUCE_BO_SLACK 32768      /* DMA burst over-read slack past the cube */
 #define REDUCE_MAX_PASS 24         /* factors-of-H + factors-of-W upper bound  */
+/* The largest window a pass uses. The PPU's kernel field takes 16, but a window past 8 on
+ * either axis fails at or near one output column on the RK3588 (rocket_pool_fp16_max_ow()),
+ * so each axis factors into kernels in [2,8]. */
+#define REDUCE_MAX_KERNEL 8
 
 int rocket_reduce_factor_axis(int n, int *f, int cap)
 {
     if (n < 1) return ROCKET_E_SHAPE;
     int c = 0;
-    while (n > 16) {
+    while (n > REDUCE_MAX_KERNEL) {
         int d = 0;
-        for (int x = 16; x >= 2; x--) if (n % x == 0) { d = x; break; }
-        if (d == 0) return ROCKET_E_SHAPE;                 /* prime factor > 16: not 16-smooth */
+        for (int x = REDUCE_MAX_KERNEL; x >= 2; x--) if (n % x == 0) { d = x; break; }
+        if (d == 0) return ROCKET_E_SHAPE;                 /* prime factor > 8: not 8-smooth */
         if (c >= cap) return ROCKET_E_SHAPE;
         f[c++] = d; n /= d;
     }
     if (n >= 2) { if (c >= cap) return ROCKET_E_SHAPE; f[c++] = n; }
     /* Sort ASCENDING (smallest kernel first). This keeps the running quotient large for
      * as long as possible: after pass i it equals the product of the remaining (larger)
-     * factors, hence >= the largest factor. For any axis > 16 the largest factor is >= 4,
-     * so NO intermediate spatial dim is < 4. A chained pass reads a PPU-written 2x2 or 3x3
-     * cube correctly on the current driver (tests/ppu_sub4_chain_probe, two-pass square
-     * chains, MAX and AVG, with and without the PPU completion class), so the order is kept for the
-     * shapes that probe did not reach -- 1-wide intermediates and longer chains -- rather
-     * than for a known defect. */
+     * factors, hence >= the largest factor. For any axis > 8 the largest factor is >= 3,
+     * so NO intermediate spatial dim is < 3, and it is 3 only on a power of 3. A chained
+     * pass reads a PPU-written 2x2 or 3x3 cube correctly on the current driver
+     * (tests/ppu_sub4_chain_probe, two-pass square chains, MAX and AVG, with and without
+     * the PPU completion class), so the order is kept for the shapes that probe did not
+     * reach -- 1-wide intermediates and longer chains -- rather than for a known defect. */
     for (int i = 1; i < c; i++)
         for (int j = i; j > 0 && f[j-1] > f[j]; j--) { int t = f[j]; f[j] = f[j-1]; f[j-1] = t; }
     return c;                                  /* n==1 -> 0 (no pooling on this axis) */
 }
 
-int rocket_global_avgpool_plan(int C, int H, int W)
+/* Does every pass of this order stay inside the PPU's output-width allowance? Each pass
+ * is one PPU task, and a pass past it writes a full, incorrect cube that the passes after
+ * it reduce into a plausible wrong mean (216, 256, 288 and 512 square planes were wrong
+ * this way when the passes took windows to 16). */
+static int reduce_passes_fit(int C, int W, const int *fh, const int *fw, int n)
+{
+    for (int i = 0, cw = W; i < n; i++) {
+        rocket_pool_desc pd = { .c = C, .ih = 1, .iw = cw, .kh = fh[i], .kw = fw[i],
+                                .stride_y = fh[i], .stride_x = fw[i],
+                                .method = POOL_METHOD_AVG };
+        cw /= fw[i];
+        if ((unsigned)cw > rocket_pool_fp16_max_ow(&pd)) return 0;
+    }
+    return 1;
+}
+
+/* The pass windows a shape runs as, written to fh[]/fw[] in run order: the pass count, or a
+ * negative rocket_status. The plan and both chains take their passes from here, so what
+ * the plan accepted is what runs. */
+static int reduce_passes(int C, int H, int W, int *fh, int *fw)
 {
     if (C < 1 || H < 1 || W < 1) return ROCKET_E_SHAPE;
     if (H > ROCKET_REDUCE_MAX_DIM || W > ROCKET_REDUCE_MAX_DIM) return ROCKET_E_UNSUPPORTED;
     if ((unsigned)(C - 1) >> 13) return ROCKET_E_UNSUPPORTED;    /* PPU CUBE_*_CHANNEL is 13-bit (value-1) */
-    int fh[REDUCE_MAX_PASS], fw[REDUCE_MAX_PASS];
     int nh = rocket_reduce_factor_axis(H, fh, REDUCE_MAX_PASS);
     int nw = rocket_reduce_factor_axis(W, fw, REDUCE_MAX_PASS);
     /* A shape the passes cannot decompose is valid, and the entries compute it on the
      * host: ROCKET_E_TILING, the status a caller may fall back on. */
-    if (nh < 0 || nw < 0) return ROCKET_E_TILING;    /* an axis that is not 16-smooth */
+    if (nh < 0 || nw < 0) return ROCKET_E_TILING;    /* an axis that is not 8-smooth */
     /* Equal factor count per axis => every pass pools BOTH axes (kernels >= 2) and no
-     * axis is reduced to 1 ahead of the other. Combined with ascending order this keeps
-     * all intermediates >= 4 and none 1 wide, a chained shape no probe has run. Covers
-     * all square maps (H==W -> identical factor lists) and equal-count rectangles; the
-     * rare unequal-count case (e.g. 56x8) host-falls-back. nh==nw==0 (1x1) is the
-     * trivial identity. */
+     * axis is reduced to 1 ahead of the other, so no intermediate is 1 wide, a chained
+     * shape no probe has run. Covers all square maps (H==W -> identical factor lists) and
+     * equal-count rectangles; the rare unequal-count case (e.g. 56x8) host-falls-back.
+     * nh==nw==0 (1x1) is the trivial identity. */
     if (nh != nw) return ROCKET_E_TILING;
-    return 0;
+    /* Smallest window first keeps the intermediates large (rocket_reduce_factor_axis()).
+     * Where that puts a pass past its allowance -- a wide plane whose smallest factor is
+     * small, such as 216 (3x3 first, to 72) -- largest first narrows the first pass most;
+     * its intermediates are then >= the last factor, so still never 1 wide. */
+    if (reduce_passes_fit(C, W, fh, fw, nw)) return nw;
+    for (int i = 0, j = nw - 1; i < j; i++, j--) {
+        int t = fh[i]; fh[i] = fh[j]; fh[j] = t;
+        t = fw[i]; fw[i] = fw[j]; fw[j] = t;
+    }
+    if (reduce_passes_fit(C, W, fh, fw, nw)) return nw;
+    return ROCKET_E_TILING;
+}
+
+int rocket_global_avgpool_plan(int C, int H, int W)
+{
+    int fh[REDUCE_MAX_PASS], fw[REDUCE_MAX_PASS];
+    int n = reduce_passes(C, H, W, fh, fw);
+    return n < 0 ? n : 0;
+}
+
+int rocket_global_pool_passes(int C, int H, int W, int *kh, int *kw, int cap)
+{
+    int fh[REDUCE_MAX_PASS], fw[REDUCE_MAX_PASS];
+    int n = reduce_passes(C, H, W, fh, fw);
+    if (n < 0) return n;
+    if (!kh || !kw || n > cap) return ROCKET_E_SHAPE;
+    for (int i = 0; i < n; i++) { kh[i] = fh[i]; kw[i] = fw[i]; }
+    return n;
 }
 
 void rocket_global_avgpool_ref_fp16(int C, int H, int W,
@@ -102,15 +151,15 @@ int rocket_global_avgpool_fp16(int fd, int C, int H, int W,
                                const _Float16 *in, _Float16 *out)
 {
     /* Non-decomposable shape, or no device: exact host reduction (always correct). */
-    if (fd < 0 || rocket_global_avgpool_plan(C, H, W) != 0) {
+    if (fd < 0 || rocket_global_avgpool_plan(C, H, W) != 0 || !rocket_pool_npu_supported()) {
         rocket_global_avgpool_ref_fp16(C, H, W, in, out);
         return 0;
     }
 
     int fh[REDUCE_MAX_PASS], fw[REDUCE_MAX_PASS];
-    int nh = rocket_reduce_factor_axis(H, fh, REDUCE_MAX_PASS);
-    int nw = rocket_reduce_factor_axis(W, fw, REDUCE_MAX_PASS);
-    int npass = nh > nw ? nh : nw;
+    int npass = reduce_passes(C, H, W, fh, fw);   /* > 0 or 0: the plan accepted it */
+    if (npass < 0) return npass;
+    int nh = npass, nw = npass;
 
     const int C2 = 8;
     const int C1 = (C + C2 - 1) / C2;
@@ -140,7 +189,7 @@ int rocket_global_avgpool_fp16(int fd, int C, int H, int W,
         for (int c = 0; c < C; c++)
             for (int h = 0; h < H; h++)
                 for (int w = 0; w < W; w++)
-                    dst[feature_data(C, H, W, 8, c + 1, h + 1, w + 1)] =
+                    dst[feature_index(C, H, W, 8, c + 1, h + 1, w + 1)] =
                         in[((size_t)c * H + h) * W + w];
     }
     rocket_bo_fini(fd, &A);
@@ -166,8 +215,8 @@ int rocket_global_avgpool_fp16(int fd, int C, int H, int W,
             .stride_y = (uint8_t)kh, .stride_x = (uint8_t)kw,   /* non-overlapping tile */
             .pad_top = 0, .pad_left = 0, .pad_bottom = 0, .pad_right = 0,
             .method = POOL_METHOD_AVG, .recip_w = rw, .recip_h = rh,
-            .input_dma = (uint32_t)src->dma_address,
-            .output_dma = (uint32_t)dst->dma_address,
+            .input_iova = (uint32_t)src->dma_address,
+            .output_iova = (uint32_t)dst->dma_address,
             .tasks = regs,
         };
         if ((ret = gen_pool_fp16(&p)) != 0) {
@@ -225,7 +274,7 @@ int rocket_global_avgpool_fp16(int fd, int C, int H, int W,
     {
         _Float16 *src = final_bo->ptr;     /* already invalidated by the last prep(read) */
         for (int c = 0; c < C; c++)
-            out[c] = src[feature_data(C, ch, cw, 8, c + 1, 1, 1)];
+            out[c] = src[feature_index(C, ch, cw, 8, c + 1, 1, 1)];
     }
     rc = 0;
 
@@ -272,9 +321,9 @@ static int run_global_extrema_pool(int fd, int C, int H, int W, int method,
                                    const _Float16 *in, _Float16 *out)
 {
     int fh[REDUCE_MAX_PASS], fw[REDUCE_MAX_PASS];
-    int nh = rocket_reduce_factor_axis(H, fh, REDUCE_MAX_PASS);
-    int nw = rocket_reduce_factor_axis(W, fw, REDUCE_MAX_PASS);
-    int npass = nh > nw ? nh : nw;
+    int npass = reduce_passes(C, H, W, fh, fw);   /* > 0 or 0: the plan accepted it */
+    if (npass < 0) return npass;
+    int nh = npass, nw = npass;
 
     const int C2 = 8;
     const int C1 = (C + C2 - 1) / C2;
@@ -304,7 +353,7 @@ static int run_global_extrema_pool(int fd, int C, int H, int W, int method,
         for (int c = 0; c < C; c++)
             for (int h = 0; h < H; h++)
                 for (int w = 0; w < W; w++)
-                    dst[feature_data(C, H, W, 8, c + 1, h + 1, w + 1)] =
+                    dst[feature_index(C, H, W, 8, c + 1, h + 1, w + 1)] =
                         in[((size_t)c * H + h) * W + w];
     }
     rocket_bo_fini(fd, &A);
@@ -326,8 +375,8 @@ static int run_global_extrema_pool(int fd, int C, int H, int W, int method,
             .stride_y = (uint8_t)kh, .stride_x = (uint8_t)kw,
             .pad_top = 0, .pad_left = 0, .pad_bottom = 0, .pad_right = 0,
             .method = (uint8_t)method, .recip_w = 0, .recip_h = 0,   /* recip ignored for MAX/MIN */
-            .input_dma = (uint32_t)src->dma_address,
-            .output_dma = (uint32_t)dst->dma_address,
+            .input_iova = (uint32_t)src->dma_address,
+            .output_iova = (uint32_t)dst->dma_address,
             .tasks = regs,
         };
         if ((ret = gen_pool_fp16(&p)) != 0) {
@@ -365,7 +414,7 @@ static int run_global_extrema_pool(int fd, int C, int H, int W, int method,
     {
         _Float16 *src = final_bo->ptr;
         for (int c = 0; c < C; c++)
-            out[c] = src[feature_data(C, ch, cw, 8, c + 1, 1, 1)];
+            out[c] = src[feature_index(C, ch, cw, 8, c + 1, 1, 1)];
     }
     rc = 0;
 
@@ -380,7 +429,7 @@ out:
 int rocket_global_maxpool_fp16(int fd, int C, int H, int W,
                                const _Float16 *in, _Float16 *out)
 {
-    if (fd < 0 || rocket_global_avgpool_plan(C, H, W) != 0) {
+    if (fd < 0 || rocket_global_avgpool_plan(C, H, W) != 0 || !rocket_pool_npu_supported()) {
         rocket_global_maxpool_ref_fp16(C, H, W, in, out);
         return 0;
     }
@@ -390,7 +439,7 @@ int rocket_global_maxpool_fp16(int fd, int C, int H, int W,
 int rocket_global_minpool_fp16(int fd, int C, int H, int W,
                                const _Float16 *in, _Float16 *out)
 {
-    if (fd < 0 || rocket_global_avgpool_plan(C, H, W) != 0) {
+    if (fd < 0 || rocket_global_avgpool_plan(C, H, W) != 0 || !rocket_pool_npu_supported()) {
         rocket_global_minpool_ref_fp16(C, H, W, in, out);
         return 0;
     }

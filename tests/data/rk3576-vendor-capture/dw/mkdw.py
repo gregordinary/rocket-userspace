@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Manufacture RK3576 vendor DEPTHWISE captures.
 
-The eight .rknn captures in the parent directory carry twenty depthwise programs
+The eight int8 captures in ../int8 carry twenty depthwise programs
 between them, and they confound almost everything worth separating: every C=32
 program in them is stride 1 and every C=64 one is stride 2, every one is k=3, and
 every one is a multiple of 32 channels. A vendor capture can be manufactured

@@ -337,7 +337,7 @@ int rocket_ctx_nthreads(const struct rocket_ctx *ctx);
  * [M][N] at element i*M*N of Crm when c_block is 0; with c_block set it is the plan's
  * nNt N tiles (rocket_matmul_plan's Nt), each a [M][Nt] block, block j of item i at
  * element (i*nNt + j)*M*Nt, the last block at the Nt pitch too. The device reads and writes
- * them through the row-major form (matmul_params_t.a_row_atoms / c_row_atoms), so the
+ * them through the row-major form (gemm_params_t.a_row_atoms / c_row_atoms), so the
  * values are the cube path's.
  *
  * Crm needs a plan with one K tile (ROCKET_E_SHAPE otherwise). Its contract with the CPU

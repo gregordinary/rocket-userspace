@@ -29,7 +29,7 @@
  * the submit, the guard and the de-scatter — because that is what a caller pays.
  * The part's own time is the SUBMIT bucket inside it: run with
  * ROCKET_RK3576_INT8_PROF=1 for the split, or load the job-timing debug module
- * (rocket-userspace/tools/rk3576-job-timing-debug.patch) and read `stat_exec_us`,
+ * (the patches repo's rk3576/npu/debug/job-timing.patch) and read `stat_exec_us`,
  * which is the only instrument that sees inside the fence wait. `bytes` is the
  * feature cube this call's row plan actually READS — the sum of the task windows,
  * not the plane — so arm A's fixed-bytes claim is checked here rather than assumed.

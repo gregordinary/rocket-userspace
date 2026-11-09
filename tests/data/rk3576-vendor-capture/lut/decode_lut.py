@@ -17,7 +17,10 @@ entries for fitting against the mathematical function.
 
     ../dw/venv/bin/python decode_lut.py *.rknn
 """
-import struct, sys, collections
+import os, sys, collections
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from regcmd_scan import ALL_TARGETS, BLOCK_NAMES as BLOCKS, regcmd_programs  # noqa: E402
 
 DPU = 0x1001
 LUT_ACCESS_CFG, LUT_ACCESS_DATA, LUT_CFG, LUT_INFO = 0x4100, 0x4104, 0x4108, 0x410c
@@ -26,28 +29,9 @@ LUT_LO_START, LUT_LO_END = 0x4118, 0x411c
 LUT_LE_SLOPE_SCALE, LUT_LE_SLOPE_SHIFT = 0x4120, 0x4124
 LUT_LO_SLOPE_SCALE, LUT_LO_SLOPE_SHIFT = 0x4128, 0x412c
 
-BLOCKS = {0x0101: "PC", 0x0201: "CNA", 0x0801: "CORE", 0x1001: "DPU",
-          0x2001: "DPU_RDMA", 0x4001: "PPU", 0x8001: "PPU_RDMA",
-          0x0041: "SYNC", 0x0081: "BCAST"}
-
 
 def ops(path):
-    data = open(path, "rb").read()
-    n = len(data) // 8
-    w = struct.unpack("<%dQ" % n, data[:n * 8])
-    out, i = [], 0
-    while i < n:
-        if ((w[i] >> 48) & 0xffff) in BLOCKS:
-            j = i
-            while j < n and ((w[j] >> 48) & 0xffff) in BLOCKS:
-                j += 1
-            if j - i >= 12:
-                out.append([(int((x >> 48) & 0xffff), int(x & 0xffff),
-                             int((x >> 16) & 0xffffffff)) for x in w[i:j]])
-            i = j
-        else:
-            i += 1
-    return out
+    return regcmd_programs(path, ALL_TARGETS, 12)
 
 
 def bursts(run):

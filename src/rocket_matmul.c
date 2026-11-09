@@ -224,8 +224,10 @@ static int kacc_on(void) {
  * ki-block. With gcap = BATCH/nKt >= 3 that intra-block overlap hides the serial
  * stalls and the fence savings win (~5% at nKt 12-21 [HW sweep]); at gcap <= 2 the
  * stalls dominate and wait balloons (+18% at nKt 40, gcap 1). So:
- *   1 = adaptive: chain only in the winning regime (gcap >= 3), else per-ki — never
- *       regresses, the production setting.
+ *   1 = adaptive: chain only in the winning regime (gcap >= 3), else per-ki. That regime
+ *       wins in the micro, but on the streamed plan the setting costs 2-3% end to end
+ *       (Gemma-4-12B F16 pp2048 at 0.97-0.98x the default, 928 MHz [HW sweep 2026-11-02]),
+ *       so the default stays 0.
  *   2 = force: chain for any fitting nKt (<= BATCH); for the correctness gate, which
  *       must exercise the fully-serial gcap=1 case (the strictest RAW test).
  * Read FRESH per matmul call (not cached) so one process can A/B mid-run (the gate +
@@ -342,7 +344,7 @@ static int reuse_mode_for(int nMt, int nNt, int chained) {
 }
 
 /* Whether an fp16 plan's weight tile is streamed: larger than the CBUF banks its input
- * tile leaves, so a task holds only one weight atom at a time (gen_matmul_fp16). */
+ * tile leaves, so a task holds only one weight atom at a time (gen_gemm_fp16). */
 static int mm_plan_streams(const mm_plan *pl)
 {
     const long bank = rocket_hw_current()->cbuf_bank_size;
@@ -381,7 +383,7 @@ static int reuse_mode_plan(const mm_plan *pl, int chained)
  * active hardware profile (rocket_hw_current(): cbuf_banks / max_tile), so those
  * chip-specific values live in ONE place rather than as bare 12 / 256 literals — which
  * is also why there is one tiling policy (mm_plan_geom) rather than one per dtype. */
-#define CBUF_BANK   NPU_CBUF_BANK_SIZE
+#define CBUF_BANK   RK3588_CBUF_BANK_BYTES
 #define BATCH       64           /* tiles (tasks) per NPU job                      */
 #define RC_STRIDE   128          /* u64 words reserved per task in the regcmd BO   */
 
@@ -407,7 +409,7 @@ static int rup(int x, int a) { return ((x + a - 1) / a) * a; }
  * the PC advances per task — it reads (regcmd_count+1)/2 128-bit chunks — and each
  * task's trailer is rewritten to carry the NEXT task's address (an embedded
  * PC_BASE_ADDRESS op) and stream length (PC_REGISTER_AMOUNTS), so after each
- * OP_ENABLE the PC follows the link to the next task. The PC_BASE_ADDRESS redirect
+ * TARGET_ENABLE the PC follows the link to the next task. The PC_BASE_ADDRESS redirect
  * is load-bearing: with the address left pointing at task 0 the PC runs task 0 and
  * stops, regardless of the amount. Every matmul tile shares one data-independent
  * regcmd word count, so the stride is uniform and tasks[i].regcmd = base+i*stride.
@@ -428,18 +430,6 @@ static inline int mm_pack_regcmd(int chained, rocket_bo *rcbo, rocket_task_desc 
 }
 static inline void mm_seal_chain(int chained, rocket_bo *rcbo, int nb, uint32_t count) {
     rkt_chain_seal(chained, rcbo, nb, count);
-}
-
-/* Inlined NPU layout-index math — identical to feature_data()/weight_fp16() in
- * npu_regcmd.c, but inlined to kill the per-element out-of-line call+divide
- * in the pack/readback loops (those run tens of millions of times and were ~67%
- * of wall time). feat: input/output cube (W=1, C2=8). wt: (N/16,K/32,16,32). */
-static inline size_t feat_idx(int H, int ch, int h) {
-    return ((size_t)(ch - 1) / 8) * (size_t)H * 8 + 8 * (size_t)(h - 1) + (ch - 1) % 8;
-}
-static inline size_t wt_idx(int C, int k, int c) {
-    return (size_t)((c - 1) / 32) * 32 * 16 + (size_t)((k - 1) / 16) * 16 * C
-         + (size_t)((c - 1) % 32) + (size_t)((k - 1) % 16) * 32;
 }
 
 /* Readback de-tile gather. Accumulate one output tile's Ntile columns x
@@ -580,20 +570,20 @@ static inline void feat_scatter_tile(_Float16 *restrict slot, const _Float16 *re
     }
 }
 
-/* packB scatter of ONE weight row `k` from a row-major source `brow` (already offset
- * to [.., k0]) into the (N/16,K/32,16,32) wt_idx cube. Each 32-wide K-block is 32
- * CONTIGUOUS fp16 in both source and cube -> four 128-bit fp16 copies per block,
- * hoisting the per-element wt_idx divide/mod out of the hot loop. Bit-identical to the
- * scalar slot[wt_idx(Ktile,k,c)] = brow[c-1]. Shared by wt_scatter_tile (contiguous
+/* packB scatter of ONE weight row, kernel `n`, from a row-major source `brow` (already
+ * offset to [.., k0]) into the (N/16,K/32,16,32) wt_idx cube. Each 32-wide K-block is 32
+ * CONTIGUOUS fp16 in both source and cube -> four 128-bit fp16 copies per block, and
+ * one kernel's consecutive blocks sit one 16 x 32 block apart, so the row's position is
+ * taken once and the per-element wt_idx divide/mod leaves the hot loop. Bit-identical to
+ * the scalar slot[wt_idx(Ktile,n,k)] = brow[k-1]. Shared by wt_scatter_tile (contiguous
  * weight) and mm_pack_weights_seg (per-row segment-resolved weight). Ktile is normally
  * a multiple of 32 (K%32 offload constraint); the tail covers the remainder. */
 static inline void wt_scatter_row(_Float16 *restrict slot, const _Float16 *restrict brow,
-                                  int k, int Ktile) {
-    const int C = Ktile;
-    const size_t kbase = (size_t)((k - 1) / 16) * 16 * C + (size_t)((k - 1) % 16) * 32;
+                                  int n, int Ktile) {
+    const size_t row0 = wt_idx(Ktile, n, 1);
     int c = 1;
     for (; c + 31 <= Ktile; c += 32) {   /* full 32-block: 32 contiguous fp16 */
-        _Float16 *d = slot + (size_t)((c - 1) / 32) * 32 * 16 + kbase;
+        _Float16 *d = slot + row0 + (size_t)(c - 1) * 16;   /* (c-1)/32 blocks of 16 x 32 */
         const _Float16 *sB = brow + (c - 1);
 #ifdef ROCKET_HAVE_NEON
         vst1q_f16((__fp16 *)(d),      vld1q_f16((const __fp16 *)(sB)));
@@ -605,7 +595,7 @@ static inline void wt_scatter_row(_Float16 *restrict slot, const _Float16 *restr
 #endif
     }
     for (; c <= Ktile; c++)   /* partial-block tail (and the non-NEON build) */
-        slot[wt_idx(Ktile, k, c)] = brow[c - 1];
+        slot[wt_idx(Ktile, n, c)] = brow[c - 1];
 }
 
 /* packB scatter of a contiguous B[N,K] weight tile -> wt_idx cube (the weight sibling
@@ -630,7 +620,7 @@ static inline void wt_scatter_tile(_Float16 *restrict slot, const _Float16 *rest
  * lever) apply to every dtype instead of to whichever copy got the attention.
  *
  * `bank_slack` is the one field that is a hardware fact rather than a layout fact:
- * gen_matmul_int8 sets data_bank = fd_banks+1 to dodge the int8 feature-DMA tail-row
+ * gen_gemm_int8 sets data_bank = fd_banks+1 to dodge the int8 feature-DMA tail-row
  * resonance, so an int8 plan must leave that bank free. */
 enum {
     MM_GEOM_ASYM_NT = 1u << 0,   /* the asymmetric-Nt heuristic applies (see asym_on) */
@@ -667,7 +657,7 @@ static const struct mm_geom mm_geom_int8 = {
      * The group-wise plan has no such coupling: its Kt can never exceed the quant group.
      * Applying it here is a real lever for dense-int8 model fit, but it is its own change,
      * with its own gate run — int8 CBUF edges are where the feature-DMA resonance lived.
-     * Streams only under ROCKET_MM_STREAM_INT8 (stream_on_geom). */
+     * Streams unless ROCKET_MM_STREAM_INT8=0 (stream_on_geom). */
     "int8", 1, 1, 32, 32, 16384, 1, MM_GEOM_STREAM, 4, 1 };
 static const struct mm_geom mm_geom_int8_gw = {
     "int8 group-wise", 1, 1, 32, 32, 16384, 1, MM_GEOM_PICK_NT | MM_GEOM_GROUPED, 4, 1 };
@@ -678,7 +668,7 @@ static const struct mm_geom mm_geom_int16 = {
     "int16", 2, 1, 16, 32, 16384, 0, 0, 4, 0 };
 static const struct mm_geom mm_geom_tf32 = {
     /* 4 B/elem halves the Kt ceiling: weight_bytes_per_kernel = Kt*4 must stay <= 32768
-     * (gen_matmul_tf32 refuses above that), so Kt <= 8192. K-group is 16, not 32. */
+     * (gen_gemm_tf32 refuses above that), so Kt <= 8192. K-group is 16, not 32. */
     "tf32", 4, 1, 16, 16, 8192, 0, 0, 4, 0 };
 
 /* CBUF banks a `rows` x Kt operand tile of this dtype occupies. */
@@ -748,7 +738,7 @@ static int mm_pick_nt(int N, int max_tile, int na)
  * Read once.
  *
  * The whole-tile rule (mm_fits) makes the weight tile share the CBUF with the input tile,
- * which caps Nt and multiplies the task count. gen_matmul_fp16 instead streams a weight
+ * which caps Nt and multiplies the task count. gen_gemm_fp16 instead streams a weight
  * cube larger than its banks: the input tile stays resident, the weights cycle through
  * the banks it leaves (at least npu_stream_weight_banks()), and one task covers a whole N
  * slice. On one core with every task its own
@@ -768,15 +758,18 @@ static int stream_on(void) {
     return v;
 }
 
-/* Whether a geometry's plan streams. int8 streams only under ROCKET_MM_STREAM_INT8=1 (read
- * once) as well. Through the resident entry at M 512 it is 0.99-2.43x the whole-tile plan
- * at LLM projection shapes, bit-exact at 18 shapes [HW sweep 2026-10-21], but tflite-rocket
- * routes detector 1x1 convs to the same entry and those shapes are unmeasured. */
+/* Whether a geometry's plan streams. int8 streams by default too; ROCKET_MM_STREAM_INT8=0
+ * selects its whole-tile plan (read once). Through the resident entry at M 512 it is
+ * 0.99-2.43x the whole-tile plan at LLM projection shapes, bit-exact at 18 shapes
+ * [HW sweep 2026-10-21]. In a model, ggml-rocket's resident int8 route prefills 1.49-1.55x
+ * faster on two 3 B F16 models at pp512 and pp2048; tflite-rocket's routed detector 1x1
+ * convs give byte-identical outputs and identical COCO mAP at 0.993-1.015x the latency
+ * [HW sweep 2026-11-06]. */
 static int stream_on_geom(const struct mm_geom *g) {
     static _Atomic int i8 = -1;
     if (!(g->flags & MM_GEOM_STREAM) || !stream_on()) return 0;
     if (g->obytes != 4) return 1;
-    if (i8 < 0) { const char *e = getenv("ROCKET_MM_STREAM_INT8"); i8 = e && atoi(e) > 0; }
+    if (i8 < 0) { const char *e = getenv("ROCKET_MM_STREAM_INT8"); i8 = e ? atoi(e) > 0 : 1; }
     return i8;
 }
 
@@ -1518,16 +1511,16 @@ static int mm_compute_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, size
 
                 ts = now_ms();
                 size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = Mtile, .k = Ktile, .n = Ntile,
-                    .input_dma  = (uint32_t)(b->in_all.dma_address +
+                    .input_iova  = (uint32_t)(b->in_all.dma_address +
                                   (size_t)(mi * nKt + ki) * in_slot * sizeof(_Float16)),
-                    .weights_dma = (uint32_t)(b->wt_all.dma_address +
+                    .weights_iova = (uint32_t)(b->wt_all.dma_address +
                                   (size_t)(ni * nKt + ki) * wt_slot * sizeof(_Float16)),
-                    .output_dma = (uint32_t)(b->out_all.dma_address + out_off * sizeof(_Float16)),
-                    .tasks = npu_regs, .fp32tofp16 = 1,
+                    .output_iova = (uint32_t)(b->out_all.dma_address + out_off * sizeof(_Float16)),
+                    .tasks = npu_regs, .fp16_out = 1,
                 };
-                if ((ret = gen_matmul_fp16(&p)) != 0) {
+                if ((ret = gen_gemm_fp16(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul: gen failed (%d)\n", ret); goto done;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto done; }
@@ -1560,7 +1553,7 @@ static int mm_compute_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C, size
                     t_wait += w_ms;
                     if (ret) {
                         ROCKET_LOGE("rocket_matmul: WAIT TIMEOUT (%d) after %.0fms "
-                                "fd=%d out_h=%u out_dma=0x%llx M=%d K=%d N=%d batch=%d tiles=%d/%d\n",
+                                "fd=%d out_h=%u out_iova=0x%llx M=%d K=%d N=%d batch=%d tiles=%d/%d\n",
                                 ret, w_ms, fd, b->out_all.handle,
                                 (unsigned long long)b->out_all.dma_address,
                                 M, K, N, nb, done_tiles, total);
@@ -1703,17 +1696,17 @@ int mm_compute_reuse(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
 
         ts = now_ms();
         size_t out_off = (size_t)nb * out_slot;
-        matmul_params_t p = {
+        gemm_params_t p = {
             .m = Mtile, .k = Ktile, .n = Ntile,
-            .input_dma  = (uint32_t)(b->in_all.dma_address +
+            .input_iova  = (uint32_t)(b->in_all.dma_address +
                           (size_t)(mi * nKt + ki) * in_slot * sizeof(_Float16)),
-            .weights_dma = (uint32_t)(b->wt_all.dma_address +
+            .weights_iova = (uint32_t)(b->wt_all.dma_address +
                           (size_t)(ni * nKt + ki) * wt_slot * sizeof(_Float16)),
-            .output_dma = (uint32_t)(b->out_all.dma_address + out_off * sizeof(_Float16)),
-            .tasks = npu_regs, .fp32tofp16 = 1,
+            .output_iova = (uint32_t)(b->out_all.dma_address + out_off * sizeof(_Float16)),
+            .tasks = npu_regs, .fp16_out = 1,
             .weight_reuse = wreuse, .data_reuse = dreuse,
         };
-        if ((ret = gen_matmul_fp16(&p)) != 0) {
+        if ((ret = gen_gemm_fp16(&p)) != 0) {
             ROCKET_LOGE("rocket_matmul(reuse): gen failed (%d)\n", ret); goto done;
         }
         if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto done; }
@@ -1839,16 +1832,16 @@ static int pipe_build_batch(int fd, const mm_plan *pl, mm_bos *b, int slot,
         int n0 = ni * Nt, Ntile = (N - n0 < Nt) ? (N - n0) : Nt;
         int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
         size_t out_off = (size_t)nb * out_slot;
-        matmul_params_t p = {
+        gemm_params_t p = {
             .m = Mtile, .k = Ktile, .n = Ntile,
-            .input_dma  = (uint32_t)(b->in_all.dma_address +
+            .input_iova  = (uint32_t)(b->in_all.dma_address +
                           (size_t)(mi * nKt + ki) * in_slot * sizeof(_Float16)),
-            .weights_dma = (uint32_t)(b->wt_all.dma_address +
+            .weights_iova = (uint32_t)(b->wt_all.dma_address +
                           (size_t)(ni * nKt + ki) * wt_slot * sizeof(_Float16)),
-            .output_dma = (uint32_t)(obuf->dma_address + out_off * sizeof(_Float16)),
-            .tasks = npu_regs, .fp32tofp16 = 1,
+            .output_iova = (uint32_t)(obuf->dma_address + out_off * sizeof(_Float16)),
+            .tasks = npu_regs, .fp16_out = 1,
         };
-        if (gen_matmul_fp16(&p) != 0) {
+        if (gen_gemm_fp16(&p) != 0) {
             ROCKET_LOGE("rocket_matmul(pipe): gen failed\n");
             *t_gen += now_ms() - ts;
             return -1;
@@ -1993,7 +1986,7 @@ done:
  *
  * Tiles are processed in groups of <=BATCH so the regcmd BO and the two ping-pong
  * BOs stay bounded. Any M tile accumulates: the EW read's surface stride is the
- * partial's own, M (gen_matmul_fp16). ==========*/
+ * partial's own, M (gen_gemm_fp16). ==========*/
 static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
                               size_t ldc_planes, double t_pack)
 {
@@ -2072,7 +2065,7 @@ static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
      * K-tiled moderate matmul does nKt under-filled submits today -> one full
      * kick); huge nTiles already fills each unchained submit, so it converges to
      * the same kick count. accumulate=0 (ki=0) and accumulate=1 (ki>0) emit the
-     * same regcmd op count (the gen_matmul_task accumulate branches are
+     * same regcmd op count (emit_conv_task's accumulate branches are
      * op-count-symmetric), so the uniform chained stride is valid across the ki
      * boundary. fp16 EW-add accumulation carries each partial through DRAM, so it does
      * not depend on the CACC across tasks (independent int8 tasks chain bit-exactly
@@ -2105,20 +2098,20 @@ static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
                     int dims_ok = (Mtile == p_Mt && Ntile == p_Nt);
                     int wreuse = (rmode == 1 && gi > 0 && dims_ok && ni == p_ni);
                     int dreuse = (rmode == 2 && gi > 0 && dims_ok && mi == p_mi);
-                    matmul_params_t p = {
+                    gemm_params_t p = {
                         .m = Mtile, .k = Ktile, .n = Ntile,
-                        .input_dma  = (uint32_t)(b->in_all.dma_address +
+                        .input_iova  = (uint32_t)(b->in_all.dma_address +
                                       (size_t)(mi * nKt + ki) * in_slot * sizeof(_Float16)),
-                        .weights_dma = (uint32_t)(b->wt_all.dma_address +
+                        .weights_iova = (uint32_t)(b->wt_all.dma_address +
                                       (size_t)(ni * nKt + ki) * wt_slot * sizeof(_Float16)),
-                        .output_dma = (uint32_t)(dst->dma_address + out_off * sizeof(_Float16)),
-                        .tasks = npu_regs, .fp32tofp16 = 1,
+                        .output_iova = (uint32_t)(dst->dma_address + out_off * sizeof(_Float16)),
+                        .tasks = npu_regs, .fp16_out = 1,
                         .accumulate = (ki > 0),
-                        .add_dma = (ki > 0) ? (uint32_t)(src->dma_address + out_off * sizeof(_Float16)) : 0,
+                        .add_iova = (ki > 0) ? (uint32_t)(src->dma_address + out_off * sizeof(_Float16)) : 0,
                         .weight_reuse = wreuse, .data_reuse = dreuse,
                     };
                     p_mi = mi; p_ni = ni; p_Mt = Mtile; p_Nt = Ntile;
-                    if ((ret = gen_matmul_fp16(&p)) != 0) {
+                    if ((ret = gen_gemm_fp16(&p)) != 0) {
                         ROCKET_LOGE("rocket_matmul(kacc-chain): gen failed (%d)\n", ret); goto done;
                     }
                     if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto done; }
@@ -2199,20 +2192,20 @@ static int mm_compute_kacc_to(int fd, const mm_plan *pl, mm_bos *b, _Float16 *C,
                 int dims_ok = (Mtile == p_Mt && Ntile == p_Nt);
                 int wreuse = (rmode == 1 && gi > 0 && dims_ok && ni == p_ni);
                 int dreuse = (rmode == 2 && gi > 0 && dims_ok && mi == p_mi);
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = Mtile, .k = Ktile, .n = Ntile,
-                    .input_dma  = (uint32_t)(b->in_all.dma_address +
+                    .input_iova  = (uint32_t)(b->in_all.dma_address +
                                   (size_t)(mi * nKt + ki) * in_slot * sizeof(_Float16)),
-                    .weights_dma = (uint32_t)(b->wt_all.dma_address +
+                    .weights_iova = (uint32_t)(b->wt_all.dma_address +
                                   (size_t)(ni * nKt + ki) * wt_slot * sizeof(_Float16)),
-                    .output_dma = (uint32_t)(dst->dma_address + out_off * sizeof(_Float16)),
-                    .tasks = npu_regs, .fp32tofp16 = 1,
+                    .output_iova = (uint32_t)(dst->dma_address + out_off * sizeof(_Float16)),
+                    .tasks = npu_regs, .fp16_out = 1,
                     .accumulate = (ki > 0),
-                    .add_dma = (ki > 0) ? (uint32_t)(src->dma_address + out_off * sizeof(_Float16)) : 0,
+                    .add_iova = (ki > 0) ? (uint32_t)(src->dma_address + out_off * sizeof(_Float16)) : 0,
                     .weight_reuse = wreuse, .data_reuse = dreuse,
                 };
                 p_mi = mi; p_ni = ni; p_Mt = Mtile; p_Nt = Ntile;
-                if ((ret = gen_matmul_fp16(&p)) != 0) {
+                if ((ret = gen_gemm_fp16(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul(kacc): gen failed (%d)\n", ret); goto done;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto done; }
@@ -2369,23 +2362,23 @@ int mm_compute_kacc_cube(int fd, const mm_plan *pl, mm_bos *b, rocket_bo *cube, 
             size_t out_off = (size_t)gi * out_slot;       /* == (mi*nNt+ni)*out_slot */
             int dims_ok = (Mtile == p_Mt && Ntile == p_Nt);
             /* The (mi,ni) DECODE above is the mandatory part, not the CBUF bit: the bit
-             * only says "skip the re-fetch", and input_dma is programmed either way. So
+             * only says "skip the re-fetch", and input_iova is programmed either way. So
              * it drops out where the batch is not one job without moving an output. */
             int dreuse  = (gi > 0 && dims_ok && mi == p_mi && reuse_ok(batch_chained));
-            matmul_params_t p = {
+            gemm_params_t p = {
                 .m = Mtile, .k = Ktile, .n = Ntile,
-                .input_dma  = (uint32_t)(b->in_all.dma_address +
+                .input_iova  = (uint32_t)(b->in_all.dma_address +
                               (size_t)(mi * nKt + ki) * in_slot * sizeof(_Float16)),
-                .weights_dma = (uint32_t)(b->wt_all.dma_address +
+                .weights_iova = (uint32_t)(b->wt_all.dma_address +
                               (size_t)(ni * nKt + ki) * wt_slot * sizeof(_Float16)),
-                .output_dma = (uint32_t)(dst->dma_address + out_off * sizeof(_Float16)),
-                .tasks = npu_regs, .fp32tofp16 = 1,
+                .output_iova = (uint32_t)(dst->dma_address + out_off * sizeof(_Float16)),
+                .tasks = npu_regs, .fp16_out = 1,
                 .accumulate = (ki > 0),
-                .add_dma = (ki > 0) ? (uint32_t)(src->dma_address + out_off * sizeof(_Float16)) : 0,
+                .add_iova = (ki > 0) ? (uint32_t)(src->dma_address + out_off * sizeof(_Float16)) : 0,
                 .data_reuse = dreuse,
             };
             p_mi = mi; p_Mt = Mtile; p_Nt = Ntile;
-            if ((ret = gen_matmul_fp16(&p)) != 0) {
+            if ((ret = gen_gemm_fp16(&p)) != 0) {
                 ROCKET_LOGE("rocket_matmul(kacc_cube): gen failed (%d)\n", ret); goto done;
             }
             if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto done; }
@@ -2483,7 +2476,7 @@ int rocket_matmul_fp16(int fd, int M, int K, int N,
     /* dtype capability gate: a chip declares its usable datatype menu in the hw
      * profile. RK3588's mask is all-ones (the datatype matrix is complete), so this
      * never fires here; it states the chip-dependency by construction. */
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_float16))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_FP16))
         return ROCKET_E_UNSUPPORTED;
     /* M==1 (single-vector GEMV): the planner tiles rows in multiples of 4, a library
      * rule (the generators compute any M with the packed feature surface stride;
@@ -2657,7 +2650,7 @@ static int mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
     if (!b) return ROCKET_E_SHAPE;
     if (nbatch < 1 || (!A && !Arm) || !B || (!C && !Crm)) return ROCKET_E_SHAPE;
     if (nbatch == 1 && !Arm && !Crm) return rocket_matmul_fp16(b->fd, M, K, N, A[0], B[0], C[0]);
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_float16))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_FP16))
         return ROCKET_E_UNSUPPORTED;
     const int fd = b->fd;
 
@@ -2790,27 +2783,27 @@ static int mm_batch_run(rocket_mm_batch *b, int M, int K, int N, int nbatch,
                     size_t out_off = (size_t)nb * out_slot;
                     /* A row-major operand is addressed at the tile's first element, with the
                      * line (notch) at one row of the item's whole A (C). */
-                    const uint64_t in_dma = Arm
+                    const uint64_t in_iova = Arm
                         ? Arm->dma_address + ((size_t)it * M * K + (size_t)m0 * K + k0) * sizeof(_Float16)
                         : b->in_all.dma_address +
                           (in_base + (size_t)(mi * nKt + ki) * in_slot) * sizeof(_Float16);
                     const size_t c_at = (size_t)it * c_item + (c_block
                         ? (size_t)ni * M * c_pitch + (size_t)m0 * c_pitch
                         : (size_t)m0 * c_pitch + n0);
-                    const uint64_t out_dma = Crm
+                    const uint64_t out_iova = Crm
                         ? Crm->dma_address + c_at * sizeof(_Float16)
                         : b->out_all.dma_address + out_off * sizeof(_Float16);
-                    matmul_params_t p = {
+                    gemm_params_t p = {
                         .m = Mtile, .k = Ktile, .n = Ntile,
-                        .input_dma   = (uint32_t)in_dma,
-                        .weights_dma = (uint32_t)(b->wt_all.dma_address +
+                        .input_iova   = (uint32_t)in_iova,
+                        .weights_iova = (uint32_t)(b->wt_all.dma_address +
                                        (wt_base + (size_t)(ni * nKt + ki) * wt_slot) * sizeof(_Float16)),
-                        .output_dma  = (uint32_t)out_dma,
-                        .tasks = npu_regs, .fp32tofp16 = 1,
+                        .output_iova  = (uint32_t)out_iova,
+                        .tasks = npu_regs, .fp16_out = 1,
                         .a_row_atoms = Arm ? (uint32_t)(K * sizeof(_Float16) / 16) : 0,
                         .c_row_atoms = Crm ? (uint32_t)(c_pitch * sizeof(_Float16) / 16) : 0,
                     };
-                    if ((ret = gen_matmul_fp16(&p)) != 0) {
+                    if ((ret = gen_gemm_fp16(&p)) != 0) {
                         ROCKET_LOGE("rocket_matmul: batch gen failed (%d)\n", ret); goto fail;
                     }
                     if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = ROCKET_E_DEVICE; goto fail; }
@@ -2953,7 +2946,7 @@ int rocket_matmul_fp16_batch(int fd, int M, int K, int N, int nbatch,
  * Shares the fp16 path's tiling policy (mm_geom_int8) and forks only where the
  * datapath does: in/wt BOs are 1 B (int8) and the out BO 4 B (int32); the bank cost
  * is x1 not x2, so Kt runs ~2x wider; input cube C2=16, weight k-group 32
- * (weight_int8), int32-output cube C2=4; gen_matmul_int8; K-partials summed on the
+ * (gemm_weight_index_int8), int32-output cube C2=4; gen_gemm_int8; K-partials summed on the
  * host in int64. A/B are pre-quantized, C is the raw int32 result.
  * ==========================================================================*/
 
@@ -3012,7 +3005,7 @@ int rocket_matmul_int8_groupwise(int fd, int M, int K, int N,
                                  const float *a_scale, const float *b_scale,
                                  float *Cf, int group)
 {
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_INT8))
         return ROCKET_E_UNSUPPORTED;
     int Mt, Kt, Nt;
     if (rocket_matmul_plan_int8_gw(M, K, N, group, &Mt, &Kt, &Nt) < 0) {
@@ -3096,14 +3089,14 @@ int rocket_matmul_int8_groupwise(int fd, int M, int K, int N,
                 if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
 
                 size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot),
-                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot),
-                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(int32_t)),
+                    .input_iova   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot),
+                    .weights_iova = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot),
+                    .output_iova  = (uint32_t)(out_all.dma_address + out_off * sizeof(int32_t)),
                     .tasks = npu_regs,
                 };
-                if ((ret = gen_matmul_int8(&p)) != 0) {
+                if ((ret = gen_gemm_int8(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_int8_groupwise: gen failed (%d)\n", ret); goto free_host;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
@@ -3173,7 +3166,7 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
     if (mm_wrong_encoding("rocket_matmul_int8", "rocket_matmul_int8_rk3576, whose "
                           "output is int8 through the requant rather than raw int32"))
         return ROCKET_E_UNSUPPORTED;
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_INT8))
         return ROCKET_E_UNSUPPORTED;
     /* M==1 GEMV: the planner takes M in multiples of 4 (same as fp16, see
      * mm_plan_geom). Pad to a 4-row tile (zero pad rows contribute 0 to the
@@ -3278,14 +3271,14 @@ int rocket_matmul_int8(int fd, int M, int K, int N,
                 if (nb == 0) { tsx = now_ms(); rocket_bo_prep(fd, &regcmd, 1, 0); t_sync += now_ms() - tsx; }
 
                 size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma  = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot),
-                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot),
-                    .output_dma = (uint32_t)(out_all.dma_address + out_off * sizeof(int32_t)),
+                    .input_iova  = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot),
+                    .weights_iova = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot),
+                    .output_iova = (uint32_t)(out_all.dma_address + out_off * sizeof(int32_t)),
                     .tasks = npu_regs,
                 };
-                if ((ret = gen_matmul_int8(&p)) != 0) {
+                if ((ret = gen_gemm_int8(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_int8: gen failed (%d)\n", ret); goto free_host;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
@@ -3361,13 +3354,13 @@ free_bos:
  *
  * Self-contained sibling of the int8 path above (same zero-regression stance).
  * Deltas vs int8: in/wt are NIBBLE-packed (2 int4 per byte); feature cube C2=32
- * (vs 16); weight layout (N/64,K/32,64,32) [weight_int4, N-group 64 vs int8's 32];
+ * (vs 16); weight layout (N/64,K/32,64,32) [gemm_weight_index_int4, N-group 64 vs int8's 32];
  * output is int16 (2 B, cube C2=8) NOT int32. K-partials are read back as int16
  * and host-summed in int64 -> int32 C. int8's int32-out quirk size_e=7 carries to
  * int16 (HW-confirmed). NPU K-accum (DPU-EW) is deferred (int16 partials stay within
  * fp32's exact-integer range, so a float-path EW add could be bit-exact — moot while
  * prefill is not readback-bound); this is the host-accum
- * oracle. Encodings live in gen_matmul_int4 (npu_regcmd.c).
+ * oracle. Encodings live in gen_gemm_int4 (npu_regcmd.c).
  *
  * Each K-tile's int16 output SATURATES if |Kt-partial| > 32767; the host can't
  * recover a saturated partial, so a bit-exact test must keep Kt small enough (or
@@ -3383,7 +3376,7 @@ int rocket_matmul_plan_int4(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 int rocket_matmul_int4_ex(int fd, int M, int K, int N,
                           const int8_t *A, const int8_t *B, int32_t *C, int kt_cap)
 {
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int4))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_INT4))
         return ROCKET_E_UNSUPPORTED;
     if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, int8_t, int32_t, rocket_matmul_int4);
@@ -3467,14 +3460,14 @@ int rocket_matmul_int4_ex(int fd, int M, int K, int N,
                 if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
 
                 size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * (in_slot / 2)),
-                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * (wt_slot / 2)),
-                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(int16_t)),
+                    .input_iova   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * (in_slot / 2)),
+                    .weights_iova = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * (wt_slot / 2)),
+                    .output_iova  = (uint32_t)(out_all.dma_address + out_off * sizeof(int16_t)),
                     .tasks = npu_regs,
                 };
-                if ((ret = gen_matmul_int4(&p)) != 0) {
+                if ((ret = gen_gemm_int4(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_int4: gen failed (%d)\n", ret); goto free_host;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
@@ -3555,7 +3548,7 @@ int rocket_matmul_int4_groupwise(int fd, int M, int K, int N,
                                  const float *a_scale, const float *b_scale,
                                  float *Cf, int group)
 {
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int4))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_INT4))
         return ROCKET_E_UNSUPPORTED;
     if (group < 32 || group % 32 || K % group || M % 4 || 49 * group >= 32767) {
         ROCKET_LOGE("rocket_matmul_int4_groupwise: bad group=%d (need %%32, |K, "
@@ -3636,14 +3629,14 @@ int rocket_matmul_int4_groupwise(int fd, int M, int K, int N,
                 int k0 = ki * Kt, Ktile = (K - k0 < Kt) ? (K - k0) : Kt;
                 if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
                 size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * (in_slot / 2)),
-                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * (wt_slot / 2)),
-                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(int16_t)),
+                    .input_iova   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * (in_slot / 2)),
+                    .weights_iova = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * (wt_slot / 2)),
+                    .output_iova  = (uint32_t)(out_all.dma_address + out_off * sizeof(int16_t)),
                     .tasks = npu_regs,
                 };
-                if ((ret = gen_matmul_int4(&p)) != 0) {
+                if ((ret = gen_gemm_int4(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_int4_groupwise: gen failed (%d)\n", ret); goto free_host;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
@@ -3699,12 +3692,12 @@ free_bos:
  * int16 NPU geometry: the tiling plan + cube index helpers.
  *
  * int16 = fp16's INPUT geometry (in/wt are 2 B whole elements; feature cube C2=8;
- * weight layout (N/16,K/32,16,32) [weight_int16 == weight_fp16, N-group 16];
+ * weight layout (N/16,K/32,16,32) [gemm_weight_index_int16 == gemm_weight_index_fp16, N-group 16];
  * 2 B/elem, so the bank cost matches fp16's) with a 4 B output cube (C2=4, == int8). The bf16
  * and tf32 tiled paths below reuse this plan and these index helpers — they share
  * the 2-byte input geometry and the C2=4 output de-tile, differing only in dtype.
  *
- * The single-task generator gen_matmul_int16 writes int16 x int16 -> int32 natively,
+ * The single-task generator gen_gemm_int16 writes int16 x int16 -> int32 natively,
  * SATURATING to int32, so it is exact only while |sum| < 2^31 per task (see
  * tests/int16_native_probe). No tiled native entry exists. The int64-exact int16 matmul
  * is rocket_matmul_int16_exact (int8 byte-decomposition, below). No NPU K-accum (DPU-EW)
@@ -3735,7 +3728,7 @@ int rocket_matmul_int16_exact(int fd, int M, int K, int N,
 {
     /* int16_exact decomposes into FOUR int8 matmuls, so its hardware requirement is
      * int8, not the native int16 output. Gate on int8. */
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_int8))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_INT8))
         return ROCKET_E_UNSUPPORTED;
     if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, int16_t, int64_t, rocket_matmul_int16_exact);
@@ -3792,7 +3785,7 @@ done:
  * through and TRUNCATES to bf16 during the tile scatter (the scatter already
  * touches every element -> the truncation is free; no separate pack pass, no
  * scale/unscale). C is fp32 [M*N] row-major. Alignment K%32, N%16, (M%4||1) —
- * same as fp16/int16. gen_matmul_bf16 carries the HW-validated encodings.
+ * same as fp16/int16. gen_gemm_bf16 carries the HW-validated encodings.
  * ==========================================================================*/
 
 /* fp32 -> bf16 by truncation (high 16 bits). Matches matmul_bf16_rocket's
@@ -3807,7 +3800,7 @@ int rocket_matmul_plan_bf16(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 int rocket_matmul_bf16(int fd, int M, int K, int N,
                        const float *A, const float *B, float *C)
 {
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_bfloat16))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_BF16))
         return ROCKET_E_UNSUPPORTED;
     if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, float, float, rocket_matmul_bf16);
@@ -3888,14 +3881,14 @@ int rocket_matmul_bf16(int fd, int M, int K, int N,
                 if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
 
                 size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot * sizeof(uint16_t)),
-                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot * sizeof(uint16_t)),
-                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(float)),
+                    .input_iova   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot * sizeof(uint16_t)),
+                    .weights_iova = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot * sizeof(uint16_t)),
+                    .output_iova  = (uint32_t)(out_all.dma_address + out_off * sizeof(float)),
                     .tasks = npu_regs,
                 };
-                if ((ret = gen_matmul_bf16(&p)) != 0) {
+                if ((ret = gen_gemm_bf16(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_bf16: gen failed (%d)\n", ret); goto free_host;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
@@ -3956,7 +3949,7 @@ free_bos:
  * the 2-byte fp16 INPUTS, which output precision does not change (the result leaves
  * via WDMA to DRAM, not the CBUF). The ONLY deltas vs the fp16 path are on the
  * output side:
- *   - gen_matmul_fp16 with fp32tofp16=0  -> DPU emits the full fp32 accumulator
+ *   - gen_gemm_fp16 with fp16_out=0  -> DPU emits the full fp32 accumulator
  *     (size_e=3, surf_add*4) instead of narrowing it to fp16 (size_e=1, surf_add*2);
  *   - the output cube is therefore C2=4 (16 B / 4-byte elem), read back with
  *     out_idx_i16 (the same C2=4 de-tile the int32/bf16/tf32 paths use), not the
@@ -3971,7 +3964,7 @@ free_bos:
 int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
                               const _Float16 *A, const _Float16 *B, float *C)
 {
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_float16))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_FP16))
         return ROCKET_E_UNSUPPORTED;
     if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, _Float16, float, rocket_matmul_fp16_f32out);
@@ -4050,14 +4043,14 @@ int rocket_matmul_fp16_f32out(int fd, int M, int K, int N,
                 if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
 
                 size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot * sizeof(_Float16)),
-                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot * sizeof(_Float16)),
-                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(float)),
-                    .tasks = npu_regs, .fp32tofp16 = 0,   /* <-- full fp32 accumulator out */
+                    .input_iova   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot * sizeof(_Float16)),
+                    .weights_iova = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot * sizeof(_Float16)),
+                    .output_iova  = (uint32_t)(out_all.dma_address + out_off * sizeof(float)),
+                    .tasks = npu_regs, .fp16_out = 0,   /* <-- full fp32 accumulator out */
                 };
-                if ((ret = gen_matmul_fp16(&p)) != 0) {
+                if ((ret = gen_gemm_fp16(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_fp16_f32out: gen failed (%d)\n", ret); goto free_host;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }
@@ -4121,7 +4114,7 @@ free_bos:
  * (vs bf16's 8), weight tile (N/16, K/16, 16, 16) — K-group HALVES to 16 for 4-byte
  * (N-group stays 16), banks count 4 B/elem, AND there is NO truncation on the
  * scatter (bf16 narrowed to its 16 high bits; tf32 stores the raw fp32, the HW
- * rounds). gen_matmul_tf32 carries the per-stage precision (CNA/CORE=7, DPU=fp32)
+ * rounds). gen_gemm_tf32 carries the per-stage precision (CNA/CORE=7, DPU=fp32)
  * + data_entries=K/16. Alignment K%16, N%16, (M%4||1). HW-validated
  * (single-task test matmul_tf32_rocket; this is its tiled sibling).
  *
@@ -4138,7 +4131,7 @@ int rocket_matmul_plan_tf32(int M, int K, int N, int *pMt, int *pKt, int *pNt)
 int rocket_matmul_tf32(int fd, int M, int K, int N,
                        const float *A, const float *B, float *C)
 {
-    if (!rocket_hw_dtype_supported(rocket_hw_current(), precision_tf32))
+    if (!rocket_hw_dtype_supported(rocket_hw_current(), PREC_TF32))
         return ROCKET_E_UNSUPPORTED;
     if (M == 1)   /* the plans take M in 4s; pad to 4 rows, return row 0 */
         MM_PAD_M1(fd, K, N, A, B, C, float, float, rocket_matmul_tf32);
@@ -4219,14 +4212,14 @@ int rocket_matmul_tf32(int fd, int M, int K, int N,
                 if (nb == 0) rocket_bo_prep(fd, &regcmd, 1, 0);
 
                 size_t out_off = (size_t)nb * out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot * sizeof(float)),
-                    .weights_dma = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot * sizeof(float)),
-                    .output_dma  = (uint32_t)(out_all.dma_address + out_off * sizeof(float)),
+                    .input_iova   = (uint32_t)(in_all.dma_address + (size_t)(mi*nKt+ki) * in_slot * sizeof(float)),
+                    .weights_iova = (uint32_t)(wt_all.dma_address + (size_t)(ni*nKt+ki) * wt_slot * sizeof(float)),
+                    .output_iova  = (uint32_t)(out_all.dma_address + out_off * sizeof(float)),
                     .tasks = npu_regs,
                 };
-                if ((ret = gen_matmul_tf32(&p)) != 0) {
+                if ((ret = gen_gemm_tf32(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_tf32: gen failed (%d)\n", ret); goto free_host;
                 }
                 if (MM_REGCMD_OVERFLOWS(p.task_count, RC_STRIDE)) { ret = -1; goto free_host; }

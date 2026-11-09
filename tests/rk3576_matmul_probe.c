@@ -47,8 +47,8 @@
 #define C2       16
 #define SENTINEL 0xAA
 
-int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
-int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+int feature_index(int C, int H, int W, int C2_, int c, int h, int w);
+int conv_weight_index_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
 
 static int env_int(const char *name, int dflt)
 {
@@ -80,7 +80,7 @@ static void sleep_ms(int ms)
  * product of input row m with weight row n. As a conv:
  *
  *   feature cube   channel k, pixel m at (m/iw, m%iw), C2 = 16 int8 lanes per atom
- *   weight cube    weight_conv_int8(N, K, 1, 1, n+1, k+1, 1, 1)
+ *   weight cube    conv_weight_index_int8(N, K, 1, 1, n+1, k+1, 1, 1)
  *   output cube    channel n, pixel m, the same C2 = 16 surface the conv path writes
  *
  * The plane is the free parameter: any (iw, ih) with iw*ih == M carries the same M
@@ -179,12 +179,12 @@ static int mm_int8_ex(int fd, unsigned M, unsigned K, unsigned N,
 
     for (m = 0; m < M; m++)
         for (k = 0; k < K; k++)
-            in_cube[feature_data((int)K, (int)ih, (int)iw, C2,
+            in_cube[feature_index((int)K, (int)ih, (int)iw, C2,
                                  (int)k + 1, (int)(m / iw) + 1, (int)(m % iw) + 1)] =
                 A[(size_t)m * K + k];
     for (n = 0; n < N; n++)
         for (k = 0; k < K; k++)
-            w_cube[weight_conv_int8((int)N, (int)K, 1, 1,
+            w_cube[conv_weight_index_int8((int)N, (int)K, 1, 1,
                                     (int)n + 1, (int)k + 1, 1, 1)] =
                 B[(size_t)n * K + k];
 
@@ -211,10 +211,10 @@ static int mm_int8_ex(int fd, unsigned M, unsigned K, unsigned N,
     p.output_zero_point = 0x80;
     p.weight_zero_point = 0x80;
     p.tasks       = ops;
-    p.input_dma   = in_bo.dma_address;
-    p.weights_dma = w_bo.dma_address;
-    p.bias_dma    = b_bo.dma_address;
-    p.output_dma  = o_bo.dma_address;
+    p.input_iova   = in_bo.dma_address;
+    p.weights_iova = w_bo.dma_address;
+    p.bias_iova    = b_bo.dma_address;
+    p.output_iova  = o_bo.dma_address;
 
     in_h[0] = in_bo.handle; in_h[1] = w_bo.handle;
     in_h[2] = b_bo.handle;  in_h[3] = r_bo.handle;
@@ -233,8 +233,8 @@ static int mm_int8_ex(int fd, unsigned M, unsigned K, unsigned N,
             conv_params_t r = p;
             r.ih = plan[t].ih; r.oh = plan[t].oh;
             r.pad_top = plan[t].pad_top;
-            r.input_dma  = p.input_dma  + plan[t].feature_off;
-            r.output_dma = p.output_dma + plan[t].output_off;
+            r.input_iova  = p.input_iova  + plan[t].feature_off;
+            r.output_iova = p.output_iova + plan[t].output_off;
             r.ih_full = (uint16_t)ih; r.oh_full = (uint16_t)ih;
             rc = i32out ? gen_conv2d_int8_rk3576_i32out(&r)
                         : gen_conv2d_int8_rk3576(&r);
@@ -399,13 +399,13 @@ static int mm_fp16(int fd, unsigned M, unsigned K, unsigned N,
 
     rocket_bo_prep(fd, &in_bo, 1, 0); memcpy(in_bo.ptr, in_cube, in_bytes); rocket_bo_fini(fd, &in_bo);
     rocket_bo_prep(fd, &b_bo, 1, 0);
-    rocket_rk3576_pack_coeff_prec(b_bo.ptr, coeff_bytes, NULL, nreg, precision_float16);
+    rocket_rk3576_pack_coeff_prec(b_bo.ptr, coeff_bytes, NULL, nreg, PREC_FP16);
     rocket_bo_fini(fd, &b_bo);
 
-    p.input_dma   = in_bo.dma_address;
-    p.weights_dma = w_bo.dma_address;
-    p.bias_dma    = b_bo.dma_address;
-    p.output_dma  = o_bo.dma_address;
+    p.input_iova   = in_bo.dma_address;
+    p.weights_iova = w_bo.dma_address;
+    p.bias_iova    = b_bo.dma_address;
+    p.output_iova  = o_bo.dma_address;
     p.tasks       = ops;
     p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
 
@@ -429,7 +429,7 @@ static int mm_fp16(int fd, unsigned M, unsigned K, unsigned N,
         rocket_bo_prep(fd, &o_bo, 1, 0); memset(o_bo.ptr, 0, obytes); rocket_bo_fini(fd, &o_bo);
 
         q.ic = (uint16_t)tasks[s].ic;
-        q.input_dma = p.input_dma + tasks[s].feature_off;
+        q.input_iova = p.input_iova + tasks[s].feature_off;
         rc = gen_conv2d_fp16_rk3576(&q);
         if (rc != 0) { printf("  fp16 generator failed: %d\n", rc); goto done; }
         rocket_bo_prep(fd, &r_bo, 1, 0);
@@ -893,7 +893,7 @@ static int mode_out32(int fd)
 
         for (m = 0; m < M; m++)
             for (k = 0; k < K; k++)
-                in_cube[feature_data((int)K, (int)ih, (int)iw, C2, (int)k + 1,
+                in_cube[feature_index((int)K, (int)ih, (int)iw, C2, (int)k + 1,
                                      (int)(m / iw) + 1, (int)(m % iw) + 1)] =
                     A[(size_t)m * K + k];
         /* ROCKET_MP_SCATTER leaves the UNDELIVERED channels of every sixteen at zero,
@@ -909,7 +909,7 @@ static int mode_out32(int fd)
                 continue;
             }
             for (k = 0; k < K; k++)
-                w_cube[weight_conv_int8((int)N, (int)K, 1, 1, (int)n + 1, (int)k + 1, 1, 1)] =
+                w_cube[conv_weight_index_int8((int)N, (int)K, 1, 1, (int)n + 1, (int)k + 1, 1, 1)] =
                     B[(size_t)n * K + k];
         }
 
@@ -936,8 +936,8 @@ static int mode_out32(int fd)
         p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;   /* unity requant */
         p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
         p.tasks = ops;
-        p.input_dma = in_bo.dma_address; p.weights_dma = w_bo.dma_address;
-        p.bias_dma = b_bo.dma_address;   p.output_dma = o_bo.dma_address;
+        p.input_iova = in_bo.dma_address; p.weights_iova = w_bo.dma_address;
+        p.bias_iova = b_bo.dma_address;   p.output_iova = o_bo.dma_address;
 
         /* Patch the width AFTER emission, so the transcribed program is untouched when
          * the knob is not driven and the capture gate still holds it. */

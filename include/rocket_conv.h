@@ -181,11 +181,15 @@ int rocket_conv2d_fp16(int fd, const rocket_conv2d_desc *d,
  *     out[oc][t] = sum_{ic,kw} W[oc][ic][kw] * in[ic][t*stride + kw - pad]   (zero-padded)
  *
  * Whisper's two front-end convs are this op (KW=3, pad=1, conv1 at stride 1 and conv2 at
- * stride 2), each followed by GELU. For the GELU, use the conv->act epilogue rather than the
- * standalone op. The entry is a pure descriptor wrapper, so it inherits conv2d's
- * bit-exactness, alignment and tiling. The matching CPU reference is
- * `rocket_conv2d_ref_fp16` on the same width-1 descriptor. Returns 0 on success and a
- * negative value on error. */
+ * stride 2), each followed by a bias and GELU. Run the GELU as the two-pass
+ * `rocket_activation_fp16(ROCKET_ACTIVATION_GELU)`, not the conv->act epilogue. On Whisper
+ * base's front end over real speech, the epilogue is off by up to 128 at 2.4% and 6.2% of the
+ * two convs' outputs. The two-pass form is within 0.0016 of erf-GELU, and the epilogue's
+ * cosine is 0.009-0.012 [HW sweep, RK3588, 2026-11-07, tests/conv1d_gelu_epilogue_probe.c].
+ *
+ * The entry is a pure descriptor wrapper, so it inherits conv2d's bit-exactness, alignment
+ * and tiling. The matching CPU reference is `rocket_conv2d_ref_fp16` on the same width-1
+ * descriptor. Returns 0 on success and a negative value on error. */
 int rocket_conv1d_fp16(int fd, int ic, int it, int oc, int kw, int stride, int pad,
                        const _Float16 *in, const _Float16 *W, _Float16 *out);
 
@@ -239,8 +243,11 @@ int rocket_conv2d_fp16_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
  * |x| >= 0.02 and, for GELU, x >= -3.
  *
  * Caution: every single-pass kind spikes in a narrow band around a conv output of 0 (|x|
- * below about 0.0015), where the LUT's sign-based LE/LO mux switches. The two-pass path of
- * `rocket_activation_fp16` has no such band. */
+ * below about 0.0015), where the LUT's sign-based LE/LO mux switches. GELU also spikes in its
+ * flat negative tail. On Whisper's front end, 34-73% of the conv outputs below -3 are off by
+ * more than 1 [HW sweep, RK3588, 2026-11-07, tests/conv1d_gelu_epilogue_probe.c]. A conv whose
+ * outputs reach either region needs the two-pass path of `rocket_activation_fp16`, which has
+ * neither. */
 int rocket_conv2d_act_fp16(int fd, const rocket_conv2d_desc *d, int kind,
                            const _Float16 *in, const _Float16 *W, _Float16 *out);
 int rocket_conv2d_act_fp16_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d, int kind,
@@ -309,9 +316,11 @@ int rocket_conv2d_int8_mt(rocket_conv_pool *pool, const rocket_conv2d_desc *d,
  * - The OUT_CVT multiplier and shift
  *
  * The entry computes `acc = bias + sum (x - in_zp)(w - w_zp)`, where a padded tap
- * contributes nothing, and then `out = sat8(rne(acc * MUL >> SHIFT) + out_zp)`. `MUL` and
+ * contributes nothing, and then `out = sat8(rne(acc * MUL / 2^SHIFT + out_zp))`. `MUL` and
  * `SHIFT` are the OUT_CVT pair derived from `in_scale*w_scale/out_scale`, a 15-bit
- * multiplier with ties to even. The accumulator is exactly TFLite's. The requant is the
+ * multiplier with ties to even. The zero point joins before the rounding, so a tie goes to
+ * the even neighbor of the quotient plus `out_zp` [HW sweep, RK1, 2026-11-07,
+ * tests/requant_zp_order_probe.c]. The accumulator is exactly TFLite's. The requant is the
  * OUT_CVT's, so an output can differ from TFLite's by one where it sits at a rounding
  * boundary.
  *
@@ -359,7 +368,7 @@ int rocket_conv2d_int8_q_mt(rocket_conv_pool *pool, const rocket_conv2d_desc *d,
  * The BS stage multiplies channel c's biased accumulator by an int16 `C[c]` and shifts. The
  * OUT_CVT then applies one gain per job:
  *
- *     sat8(rne(sat32(rne(acc*C[c] >> s)) * MUL >> SHIFT) + out_zp)
+ *     sat8(rne(sat32(rne(acc*C[c] / 2^s)) * MUL / 2^SHIFT + out_zp))
  *
  * The channels are sorted by scale and cut into jobs where a channel's `C` would fall under
  * `ROCKET_DW_PERC_MIN_C` (default 2048, a gain within 2^-12). Every job runs whole 32-kernel
@@ -452,7 +461,7 @@ int rocket_conv2d_dw_int8_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d,
  * applies one base gain per job, with the product held wide and both shifts rounding half to
  * even [HW sweep, RK1, tests/dw_perc_probe.c]:
  *
- *     sat8(rne(sat32(rne(acc*C[c] >> s)) * MUL >> SHIFT) + out_zp)
+ *     sat8(rne(sat32(rne(acc*C[c] / 2^s)) * MUL / 2^SHIFT + out_zp))
  *
  * The job's largest channel sits at `C` = 32767, so channel c resolves its gain to
  * 0.5/C[c]. An output is within one count of TFLite where a value sits near a rounding

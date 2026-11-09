@@ -90,7 +90,7 @@ static int pool_pass(int fd, rocket_bo *rc, rocket_bo *src, rocket_bo *dst, int 
         .kh = (uint8_t)k, .kw = (uint8_t)k, .stride_y = (uint8_t)k, .stride_x = (uint8_t)k,
         .method = (uint8_t)method,
         .recip_w = ppu_recip_kernel_fp16(k), .recip_h = ppu_recip_kernel_fp16(k),
-        .input_dma = (uint32_t)src->dma_address, .output_dma = (uint32_t)dst->dma_address,
+        .input_iova = (uint32_t)src->dma_address, .output_iova = (uint32_t)dst->dma_address,
         .tasks = regs,
     };
     if (gen_pool_fp16(&p) != 0 || p.task_count > 64) { printf("    generator refused\n"); return -1; }
@@ -153,7 +153,7 @@ static int run_case(int fd, const struct pcase *pc, uint32_t flags, uint64_t see
     for (int c = 0; c < C; c++)
         for (int h = 0; h < H; h++)
             for (int w = 0; w < H; w++)
-                ((_Float16 *)A.ptr)[feature_data(C, H, H, 8, c + 1, h + 1, w + 1)] = x[((size_t)c * H + h) * H + w];
+                ((_Float16 *)A.ptr)[feature_index(C, H, H, 8, c + 1, h + 1, w + 1)] = x[((size_t)c * H + h) * H + w];
     rocket_bo_fini(fd, &A);
     if (tf_sentinel_bo(fd, &B) || tf_sentinel_bo(fd, &D) || tf_sentinel_bo(fd, &T)) goto out;
 
@@ -166,7 +166,7 @@ static int run_case(int fd, const struct pcase *pc, uint32_t flags, uint64_t see
     for (int c = 0; c < C; c++)
         for (int h = 0; h < m1; h++)
             for (int w = 0; w < m1; w++) {
-                const _Float16 v = ((_Float16 *)B.ptr)[feature_data(C, m1, m1, 8, c + 1, h + 1, w + 1)];
+                const _Float16 v = ((_Float16 *)B.ptr)[feature_index(C, m1, m1, 8, c + 1, h + 1, w + 1)];
                 const double wv = want1[((size_t)c * m1 + h) * m1 + w];
                 mid[((size_t)c * m1 + h) * m1 + w] = v;
                 const int ok = pc->method == POOL_METHOD_MAX ? (double)v == wv
@@ -183,7 +183,7 @@ static int run_case(int fd, const struct pcase *pc, uint32_t flags, uint64_t see
     for (int c = 0; c < C; c++)
         for (int h = 0; h < m1; h++)
             for (int w = 0; w < m1; w++)
-                ((_Float16 *)S.ptr)[feature_data(C, m1, m1, 8, c + 1, h + 1, w + 1)] = mid[((size_t)c * m1 + h) * m1 + w];
+                ((_Float16 *)S.ptr)[feature_index(C, m1, m1, 8, c + 1, h + 1, w + 1)] = mid[((size_t)c * m1 + h) * m1 + w];
     rocket_bo_fini(fd, &S);
     if (pool_pass(fd, &rc, &S, &T, C, m1, pc->k2, pc->method, flags, &ms3)) goto out;
     const int slow = rocket_fence_wait_slow_count() != slow0;
@@ -194,8 +194,8 @@ static int run_case(int fd, const struct pcase *pc, uint32_t flags, uint64_t see
     long diff = 0, zero = 0, sentinel = 0, first = -1, off_model = 0;
     double worst = 0;
     for (int c = 0; c < C; c++) {
-        const _Float16 d = ((_Float16 *)D.ptr)[feature_data(C, 1, 1, 8, c + 1, 1, 1)];
-        const _Float16 t = ((_Float16 *)T.ptr)[feature_data(C, 1, 1, 8, c + 1, 1, 1)];
+        const _Float16 d = ((_Float16 *)D.ptr)[feature_index(C, 1, 1, 8, c + 1, 1, 1)];
+        const _Float16 t = ((_Float16 *)T.ptr)[feature_index(C, 1, 1, 8, c + 1, 1, 1)];
         if (f16_bits(d) != f16_bits(t)) { diff++; if (first < 0) first = c; }
         if (f16_bits(d) == 0 && f16_bits(t) != 0) zero++;
         if (tf_is_sentinel_f16(d)) sentinel++;

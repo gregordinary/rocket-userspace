@@ -69,6 +69,7 @@
 #include "rocket_npu.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "test_fill.h"
 
 enum dtype { F16F32, F16F16, I8I32 };
@@ -129,7 +130,7 @@ static int patch(uint64_t *ops, int n, uint16_t target, uint16_t reg, uint32_t v
     for (int i = 0; i < n; i++) {
         if ((uint16_t)(ops[i] >> 48) != target || (uint16_t)(ops[i] & 0xFFFF) != reg) continue;
         uint32_t v = orbits ? (uint32_t)(ops[i] >> 16) | value : value;
-        ops[i] = NPUOP(target, v, reg);
+        ops[i] = REGCMD(target, reg, v);
         return 0;
     }
     return -1;
@@ -250,7 +251,7 @@ static void stage_inputs(int fd, const struct arm *a, const struct host *h, stru
             for (int m = 1; m <= a->M; m++)
                 for (int k = 1; k <= a->Kt; k++) {
                     const size_t src = (size_t)(a->m0 + m - 1) * a->Kf + a->k0 + sl * a->Kt + k - 1;
-                    const size_t dst = slot + (size_t)feature_data(a->Kt, a->M, 1, c2, k, m, 1);
+                    const size_t dst = slot + (size_t)feature_index(a->Kt, a->M, 1, c2, k, m, 1);
                     if (a->dt == I8I32) ((int8_t *)b->in.ptr)[dst] = ((int8_t *)h->A)[src];
                     else ((_Float16 *)b->in.ptr)[dst] = ((_Float16 *)h->A)[src];
                 }
@@ -262,9 +263,9 @@ static void stage_inputs(int fd, const struct arm *a, const struct host *h, stru
             for (int k = 1; k <= a->Kt; k++) {
                 const size_t src = (size_t)(a->n0 + n - 1) * a->Kf + a->k0 + sl * a->Kt + k - 1;
                 if (a->dt == I8I32)
-                    ((int8_t *)b->w.ptr)[slot + (size_t)weight_int8(a->Kt, n, k)] = ((int8_t *)h->B)[src];
+                    ((int8_t *)b->w.ptr)[slot + (size_t)gemm_weight_index_int8(a->Kt, n, k)] = ((int8_t *)h->B)[src];
                 else
-                    ((_Float16 *)b->w.ptr)[slot + (size_t)weight_fp16(a->Kt, n, k)] = ((_Float16 *)h->B)[src];
+                    ((_Float16 *)b->w.ptr)[slot + (size_t)gemm_weight_index_fp16(a->Kt, n, k)] = ((_Float16 *)h->B)[src];
             }
     }
     rocket_bo_fini(fd, &b->in);
@@ -277,36 +278,36 @@ static int run_task(int fd, const struct arm *a, struct bufs *b, int sl, double 
     const int nsl = a->kacc ? 2 : 1, isz = in_size(a->dt), osz = out_size(a->dt);
     const int final = (sl == nsl - 1);
     uint64_t ops[256] = { 0 };
-    uint32_t in_dma = (uint32_t)b->in.dma_address +
+    uint32_t in_iova = (uint32_t)b->in.dma_address +
         (uint32_t)(a->rm_in ? ((size_t)a->m0 * a->Kf + a->k0 + (size_t)sl * a->Kt) * isz
                             : (size_t)sl * a->M * a->Kt * isz);
-    uint32_t out_dma = final
+    uint32_t out_iova = final
         ? (uint32_t)b->out.dma_address + (uint32_t)(a->rm_out ? ((size_t)a->m0 * a->Nf + a->n0) * osz : 0)
         : (uint32_t)b->part.dma_address;
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)a->M, .k = (uint16_t)a->Kt, .n = (uint16_t)a->N,
-        .input_dma = in_dma,
-        .weights_dma = (uint32_t)b->w.dma_address + (uint32_t)((size_t)sl * a->N * a->Kt * isz),
-        .output_dma = out_dma, .tasks = ops,
-        .fp32tofp16 = (a->dt == F16F16) ? 1 : 0,
-        .accumulate = (uint8_t)(sl > 0), .add_dma = sl > 0 ? (uint32_t)b->part.dma_address : 0,
+        .input_iova = in_iova,
+        .weights_iova = (uint32_t)b->w.dma_address + (uint32_t)((size_t)sl * a->N * a->Kt * isz),
+        .output_iova = out_iova, .tasks = ops,
+        .fp16_out = (a->dt == F16F16) ? 1 : 0,
+        .accumulate = (uint8_t)(sl > 0), .add_iova = sl > 0 ? (uint32_t)b->part.dma_address : 0,
     };
-    int rc = a->dt == I8I32 ? gen_matmul_int8(&p) : gen_matmul_fp16(&p);
+    int rc = a->dt == I8I32 ? gen_gemm_int8(&p) : gen_gemm_fp16(&p);
     if (rc != 0) { printf("  %s: generator refused (%d)\n", a->name, rc); return -1; }
     const int n = (int)p.task_count;
     if (a->rm_in &&
-        (patch(ops, n, OP_REG_CNA, CNA_CONV_CON1, 1u << 29, 1) ||
-         patch(ops, n, OP_REG_CNA, CNA_DMA_CON1, (uint32_t)(a->Kf * isz / 16), 0) ||
-         patch(ops, n, OP_REG_CNA, CNA_DMA_CON2, 0, 0))) {
+        (patch(ops, n, TARGET_CNA, REG_CNA_CONV_CON1, 1u << 29, 1) ||
+         patch(ops, n, TARGET_CNA, REG_CNA_DMA_CON1, (uint32_t)(a->Kf * isz / 16), 0) ||
+         patch(ops, n, TARGET_CNA, REG_CNA_DMA_CON2, 0, 0))) {
         printf("  %s: an input register to patch is missing\n", a->name); return -1;
     }
     if (final && a->rm_out) {
         const uint32_t notch = a->notch ? (uint32_t)a->notch : (uint32_t)(a->Nf * osz / 16 - 1);
         const uint32_t sadd = a->sadd ? (uint32_t)a->sadd : (uint32_t)(out_group(a->dt) * osz / 16);
-        if (patch(ops, n, OP_REG_DPU, DPU_DST_SURF_STRIDE, 1u << 4, 0) ||
-            patch(ops, n, OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR,
+        if (patch(ops, n, TARGET_DPU, REG_DPU_DST_SURF_STRIDE, 1u << 4, 0) ||
+            patch(ops, n, TARGET_DPU, REG_DPU_DATA_CUBE_NOTCH_ADDR,
                   (a->nhalf == 1 ? 0 : notch << 16) | (a->nhalf == 2 ? 0 : notch), 0) ||
-            patch(ops, n, OP_REG_DPU, DPU_SURFACE_ADD, sadd << 4, 0)) {
+            patch(ops, n, TARGET_DPU, REG_DPU_SURFACE_ADD, sadd << 4, 0)) {
             printf("  %s: an output register to patch is missing\n", a->name); return -1;
         }
     }
@@ -334,7 +335,7 @@ static int run_task(int fd, const struct arm *a, struct bufs *b, int sl, double 
 /* The element (m, n) of the tile, as an offset in output elements from the BO's start. */
 static size_t out_index(const struct arm *a, int m, int n)
 {
-    if (!a->rm_out) return (size_t)feature_data(a->N, a->M, 1, 16 / out_size(a->dt), n + 1, m + 1, 1);
+    if (!a->rm_out) return (size_t)feature_index(a->N, a->M, 1, 16 / out_size(a->dt), n + 1, m + 1, 1);
     if (a->abmap) return (size_t)(a->m0 + m) * (2 * a->Nf) + (size_t)((a->n0 + n) / 16) * 32 + (a->n0 + n) % 16;
     return (size_t)(a->m0 + m) * a->Nf + a->n0 + n;
 }

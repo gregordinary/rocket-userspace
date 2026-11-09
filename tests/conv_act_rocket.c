@@ -3,7 +3,7 @@
 /*
  * conv_act_rocket.c — conv -> activation FUSION gate (single NPU job).
  *
- * The conv->activation fusion ports the DPU LUT epilogue into gen_conv2d_task so a
+ * The conv->activation fusion ports the DPU LUT epilogue into the conv program so a
  * DIRECT fp16 conv post-processes its own result with a SMOOTH activation f(x)
  * (SiLU / tanh / GELU) in the SAME NPU job: out = f(conv(x)), no second round-trip.
  *
@@ -66,7 +66,7 @@ static int regcmd_smoke(const rocket_conv2d_desc *d)
     conv_params_t base = { .ic=d->ic,.ih=d->ih,.iw=d->iw,.oc=d->oc,.oh=OH,.ow=OW,
         .kh=d->kh,.kw=d->kw,.stride_y=d->stride_y,.stride_x=d->stride_x,
         .dil_y=d->dil_y,.dil_x=d->dil_x,.pad_top=d->pad_top,.pad_left=d->pad_left,
-        .input_dma=0x1000,.weights_dma=0x2000,.output_dma=0x3000,.fp32tofp16=1 };
+        .input_iova=0x1000,.weights_iova=0x2000,.output_iova=0x3000,.fp16_out=1 };
     conv_params_t pp = base; pp.tasks = rp;
     conv_params_t pa = base; pa.tasks = ra; pa.act = &ep;
     int gp = gen_conv2d_fp16(&pp), ga = gen_conv2d_fp16(&pa);

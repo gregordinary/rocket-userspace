@@ -6,7 +6,7 @@
  * Three layers, mirroring the conv/matmul bring-ups:
  *
  *  1. CUBE-LAYOUT SELF-CHECK (runs anywhere, incl. x86, no NPU). Scatters the input into
- *     the NC1HWC2 cube (feature_data, C2=8), pools by reading the kernel window THROUGH
+ *     the NC1HWC2 cube (feature_index, C2=8), pools by reading the kernel window THROUGH
  *     those same cube indices (the PPU's view), writes + de-scatters the output cube, and
  *     compares to a naive NCHW oracle. A PASS proves the scatter / window-index /
  *     de-scatter math expresses the pool — the part verifiable off-hardware.
@@ -18,7 +18,10 @@
  *     per-axis fp16(65536/k) reciprocal).
  *
  * The sweep exercises max & avg, kernels 2/3, stride 1/2, single- and multi-C-plane
- * (C=8/16/24), global pooling, and (max) padding.
+ * (C=8/16/24), global pooling, (max) padding, and outputs wider than one task's
+ * output-width allowance, which run as column bands. Two host checks run first: the
+ * allowance against every cell measured on the RK1, and each shape's band split against
+ * the reference.
  *
  * Usage: pool_fp16_rocket
  *        pool_fp16_rocket METHOD C IH IW KH KW SY SX PT PL PB PR  (one shape; METHOD max|avg)
@@ -31,7 +34,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_pool.h"
-#include "npu_matmul.h"   /* feature_data */
+#include "npu_matmul.h"   /* feature_index */
 #include "test_fill.h"
 
 static const char *mname(int m) { return m == POOL_METHOD_MAX ? "max" : "avg"; }
@@ -54,7 +57,7 @@ static int cube_self_check(const rocket_pool_desc *d, const _Float16 *in)
     for (int c = 0; c < C; c++)
         for (int h = 0; h < IH; h++)
             for (int w = 0; w < IW; w++)
-                in_cube[feature_data(C, IH, IW, 8, c+1, h+1, w+1)] = in[((size_t)c*IH+h)*IW+w];
+                in_cube[feature_index(C, IH, IW, 8, c+1, h+1, w+1)] = in[((size_t)c*IH+h)*IW+w];
 
     for (int c = 0; c < C; c++)
         for (int oh = 0; oh < OH; oh++)
@@ -66,19 +69,19 @@ static int cube_self_check(const rocket_pool_desc *d, const _Float16 *in)
                     for (int kw = 0; kw < d->kw; kw++) {
                         int iw = ow*d->stride_x + kw - d->pad_left;
                         if (iw < 0 || iw >= IW) continue;
-                        float v = (float)in_cube[feature_data(C, IH, IW, 8, c+1, ih+1, iw+1)];
+                        float v = (float)in_cube[feature_index(C, IH, IW, 8, c+1, ih+1, iw+1)];
                         if (d->method == POOL_METHOD_MAX) { if (v > acc) acc = v; }
                         else acc += v;
                     }
                 }
                 float o = (d->method == POOL_METHOD_AVG) ? acc/(float)(d->kh*d->kw) : acc;
-                out_cube[feature_data(C, OH, OW, 8, c+1, oh+1, ow+1)] = (_Float16)o;
+                out_cube[feature_index(C, OH, OW, 8, c+1, oh+1, ow+1)] = (_Float16)o;
             }
 
     for (int c = 0; c < C; c++)
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++)
-                got[((size_t)c*OH+oh)*OW+ow] = out_cube[feature_data(C, OH, OW, 8, c+1, oh+1, ow+1)];
+                got[((size_t)c*OH+oh)*OW+ow] = out_cube[feature_index(C, OH, OW, 8, c+1, oh+1, ow+1)];
     rocket_pool_ref_fp16(d, in, ref);
 
     double max_abs = 0;
@@ -90,6 +93,101 @@ static int cube_self_check(const rocket_pool_desc *d, const _Float16 *in)
     printf("  cube-self-check: OH=%d OW=%d max_abs=%.5f -> %s\n",
            OH, OW, max_abs, max_abs == 0.0 ? "PASS" : "FAIL");
     return max_abs == 0.0 ? 0 : 1;
+}
+
+/* The column bands rocket_pool_fp16() runs a wide pool as, checked on the host: pooling
+ * each band's input columns with the band's own descriptor and placing the result at its
+ * first output column must reproduce the whole pool's reference exactly, and every band
+ * must be inside the allowance. A PASS proves the split's columns and edge pads. */
+static int band_split_check(const rocket_pool_desc *d, const _Float16 *in)
+{
+    const int C = d->c, IH = d->ih, IW = d->iw;
+    const int OH = rocket_pool_oh(d), OW = rocket_pool_ow(d);
+    const unsigned nb = rocket_pool_fp16_bands(d);
+    size_t out_n = (size_t)C * OH * OW;
+    _Float16 *ref = malloc(out_n * sizeof(_Float16)), *got = malloc(out_n * sizeof(_Float16));
+    int fail = 0;
+
+    if (!ref || !got) { fprintf(stderr, "oom\n"); free(ref); free(got); return 1; }
+    rocket_pool_ref_fp16(d, in, ref);
+    tf_sentinel_f16(got, out_n);
+    for (unsigned s = 0; s < nb && !fail; s++) {
+        unsigned x0, col;
+        rocket_pool_desc b;
+        if (rocket_pool_fp16_band(d, s, &x0, &col, &b) != 0) { fail = 1; break; }
+        int bow = rocket_pool_ow(&b);
+        if (bow < 1 || (unsigned)bow > rocket_pool_fp16_max_ow(&b) ||
+            b.pad_left > d->pad_left || b.pad_right > d->pad_right ||
+            col + (unsigned)b.iw > (unsigned)IW || x0 + (unsigned)bow > (unsigned)OW) {
+            printf("  band %u: x0=%u col=%u iw=%d ow=%d pads %d,%d out of range\n",
+                   s, x0, col, b.iw, bow, b.pad_left, b.pad_right);
+            fail = 1; break;
+        }
+        _Float16 *bi = malloc((size_t)C * IH * b.iw * sizeof(_Float16));
+        _Float16 *bo = malloc((size_t)C * OH * bow * sizeof(_Float16));
+        if (!bi || !bo) { free(bi); free(bo); fail = 1; break; }
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < IH; h++)
+                memcpy(bi + ((size_t)c * IH + h) * b.iw, in + ((size_t)c * IH + h) * IW + col,
+                       (size_t)b.iw * sizeof(_Float16));
+        rocket_pool_ref_fp16(&b, bi, bo);
+        for (int c = 0; c < C; c++)
+            for (int oh = 0; oh < OH; oh++)
+                memcpy(got + ((size_t)c * OH + oh) * OW + x0, bo + ((size_t)c * OH + oh) * bow,
+                       (size_t)bow * sizeof(_Float16));
+        free(bi); free(bo);
+    }
+    if (!fail && memcmp(got, ref, out_n * sizeof(_Float16)) != 0) fail = 1;
+    printf("  band-split: %u band(s) at <= %u columns -> %s\n",
+           nb, rocket_pool_fp16_max_ow(d), fail ? "FAIL" : "PASS");
+    free(ref); free(got);
+    return fail;
+}
+
+/* The allowance against every cell measured on the RK1 (rockchip-npu-notes
+ * encodings/ppu-pooling.md, "Output-width allowance", 2026-11-02 and 2026-11-06): it must
+ * never exceed a measured last exact width, and a window that fails at one output column,
+ * or a stride past its window, must be refused by the plan. Host-only. */
+static int allowance_table_check(void)
+{
+    static const struct { int kh, kw, sy, sx, exact; } cell[] = {
+        {2,2,2,2,128}, {2,2,2,1,65}, {2,2,1,1,64}, {2,1,1,1,64}, {2,2,1,2,64},
+        {3,3,1,1,32}, {3,1,1,1,32}, {3,3,2,2,64}, {3,3,3,3,64},
+        {4,4,1,1,32}, {4,4,2,2,64}, {4,4,4,4,64},
+        {5,5,1,1,16}, {8,8,1,1,16},
+        {5,5,5,5,64}, {6,6,6,6,64}, {7,7,7,7,64}, {8,8,8,8,64},
+        {1,2,1,1,256}, {1,3,1,1,256},
+    };
+    static const struct { int kh, kw, sy, sx; } wrong_at_one[] = {
+        {1,16,1,16}, {16,1,16,1}, {12,12,12,12}, {16,16,16,16}, {16,16,1,1}, {9,9,9,9},
+        /* a stride past the window, either axis: wrong from an output width of 8 (2026-11-06) */
+        {2,2,3,3}, {2,2,2,3}, {2,2,3,2},
+    };
+    int fail = 0;
+    for (size_t i = 0; i < sizeof(cell)/sizeof(cell[0]); i++) {
+        rocket_pool_desc d = { .method=POOL_METHOD_MAX, .c=16, .ih=8, .iw=64,
+            .kh=cell[i].kh, .kw=cell[i].kw, .stride_y=cell[i].sy, .stride_x=cell[i].sx };
+        unsigned a = rocket_pool_fp16_max_ow(&d);
+        if (a == 0 || a > (unsigned)cell[i].exact) {
+            printf("  allowance %dx%d s%dx%d = %u, measured exact to %d -> FAIL\n",
+                   cell[i].kh, cell[i].kw, cell[i].sy, cell[i].sx, a, cell[i].exact);
+            fail = 1;
+        }
+    }
+    for (size_t i = 0; i < sizeof(wrong_at_one)/sizeof(wrong_at_one[0]); i++) {
+        rocket_pool_desc d = { .method=POOL_METHOD_MAX, .c=16, .ih=32, .iw=32,
+            .kh=wrong_at_one[i].kh, .kw=wrong_at_one[i].kw,
+            .stride_y=wrong_at_one[i].sy, .stride_x=wrong_at_one[i].sx };
+        if (rocket_pool_fp16_max_ow(&d) != 0 || rocket_pool_fp16_plan(&d) != ROCKET_E_UNSUPPORTED) {
+            printf("  %dx%d s%dx%d is admitted -> FAIL\n", wrong_at_one[i].kh,
+                   wrong_at_one[i].kw, wrong_at_one[i].sy, wrong_at_one[i].sx);
+            fail = 1;
+        }
+    }
+    printf("allowance table: %zu measured cells, %zu refused shapes -> %s\n\n",
+           sizeof(cell)/sizeof(cell[0]), sizeof(wrong_at_one)/sizeof(wrong_at_one[0]),
+           fail ? "FAIL" : "PASS");
+    return fail;
 }
 
 /* Cases that actually reached the driver and were compared against the reference.
@@ -124,6 +222,7 @@ static int run_shape(int fd, const rocket_pool_desc *d, int neg)
     }
 
     int fail = cube_self_check(d, in);
+    fail |= band_split_check(d, in);
 
     {   /* regcmd smoke */
         uint64_t regs[64] = {0};
@@ -131,7 +230,7 @@ static int run_shape(int fd, const rocket_pool_desc *d, int neg)
             .stride_y=d->stride_y,.stride_x=d->stride_x,.pad_top=d->pad_top,.pad_left=d->pad_left,
             .pad_bottom=d->pad_bottom,.pad_right=d->pad_right,.method=(uint8_t)d->method,
             .recip_w=ppu_recip_kernel_fp16(d->kw),.recip_h=ppu_recip_kernel_fp16(d->kh),
-            .input_dma=0x1000,.output_dma=0x3000,.tasks=regs };
+            .input_iova=0x1000,.output_iova=0x3000,.tasks=regs };
         int g = gen_pool_fp16(&p);
         const char *gs = (g==0 && p.task_count>0) ? "OK" : "FAIL";
         printf("  gen_pool_fp16: ret=%d task_count=%u -> %s\n", g, p.task_count, gs);
@@ -176,7 +275,7 @@ int main(int argc, char **argv)
     if (fd < 0)
         printf("note: no /dev/accel/accel0 (%d) — cube self-check + regcmd smoke only\n\n", fd);
 
-    int fail = 0;
+    int fail = allowance_table_check();
     if (argc == 13) {
         rocket_pool_desc d = { .method=parse_method(argv[1]),
             .c=atoi(argv[2]),.ih=atoi(argv[3]),.iw=atoi(argv[4]),
@@ -215,6 +314,29 @@ int main(int argc, char **argv)
         };
         for (size_t i = 0; i < sizeof(negmax)/sizeof(negmax[0]); i++) {
             fail |= run_shape(fd, &negmax[i], 1);
+            printf("\n");
+        }
+        /* Wider than one task's allowance, so each runs as column bands in one job: the
+         * widest single-task cell, banded stride-1 and stride-equal windows, and padded
+         * windows whose pads land on the first and last bands only. Before the bands each
+         * of these was one task past the allowance, a full incorrect surface. */
+        rocket_pool_desc wide[] = {
+            { .method=POOL_METHOD_MAX,.c=8, .ih=4, .iw=256,.kh=2,.kw=2,.stride_y=2,.stride_x=2 },   /* 128: one band */
+            { .method=POOL_METHOD_MAX,.c=8, .ih=4, .iw=512,.kh=2,.kw=2,.stride_y=2,.stride_x=2 },   /* 2 bands */
+            { .method=POOL_METHOD_AVG,.c=16,.ih=4, .iw=130,.kh=3,.kw=3,.stride_y=1,.stride_x=1 },   /* 4 bands of 32 */
+            { .method=POOL_METHOD_AVG,.c=8, .ih=7, .iw=896,.kh=7,.kw=7,.stride_y=7,.stride_x=7 },   /* 2 bands of 64 */
+            { .method=POOL_METHOD_MAX,.c=24,.ih=20,.iw=20, .kh=5,.kw=5,.stride_y=1,.stride_x=1,.pad_top=2,.pad_left=2,.pad_bottom=2,.pad_right=2 }, /* SPPF */
+            { .method=POOL_METHOD_MAX,.c=16,.ih=8, .iw=224,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.pad_bottom=1,.pad_right=1 }, /* 2 bands of 56 */
+        };
+        for (size_t i = 0; i < sizeof(wide)/sizeof(wide[0]); i++) {
+            fail |= run_shape(fd, &wide[i], 0);
+            printf("\n");
+        }
+        rocket_pool_desc wideneg[] = {
+            { .method=POOL_METHOD_MAX,.c=8, .ih=6, .iw=80, .kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.pad_bottom=1,.pad_right=1 }, /* 3 bands, padded */
+        };
+        for (size_t i = 0; i < sizeof(wideneg)/sizeof(wideneg[0]); i++) {
+            fail |= run_shape(fd, &wideneg[i], 1);
             printf("\n");
         }
     }

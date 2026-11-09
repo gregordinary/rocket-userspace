@@ -13,7 +13,7 @@
  * project convolution can take its skip as the tail of its own input cube.
  *
  * The arithmetic says it is free: the de-scatter reads channel group `g` at
- * `g*surf_elems*16` and a row task is already programmed as `output_dma + output_off`, so
+ * `g*surf_elems*16` and a row task is already programmed as `output_iova + output_off`, so
  * a group offset is the same addition on the same register. But the row-task offset proves
  * offsets work along ONE axis, and the emitter derives the DDR group stride from the FULL
  * plane rather than from the base — so whether the base may sit inside a larger buffer is
@@ -63,7 +63,7 @@ struct prog {
     unsigned  ic, oc, ih, iw, kh, kw, sx, sy, pt, pl;
     unsigned  icreg, ocreg, ow, oh, surf_elems;
     size_t    cube_bytes, surf_bytes;
-    uint64_t  ops[MAX_ROWS * RK3576_CONV_TASK_OPS];
+    uint64_t  ops[MAX_ROWS * RK3576_CONV_TASK_SLOT];
 };
 
 static void bo_fill(int fd, rocket_bo *bo, size_t off, size_t n, int byte)
@@ -117,14 +117,14 @@ static int prog_init(int fd, struct prog *p, unsigned ic, unsigned oc,
     if (!bias) return -1;
     for (i = 0; i < p->ocreg; i++) bias[i] = (int32_t)(i % 7u) - 3;
     rocket_bo_prep(fd, &p->b, 1, 0);
-    rocket_rk3576_pack_coeff_prec(p->b.ptr, coeff, bias, p->ocreg, precision_int8);
+    rocket_rk3576_pack_coeff_prec(p->b.ptr, coeff, bias, p->ocreg, PREC_INT8);
     rocket_bo_fini(fd, &p->b);
     free(bias);
     return 0;
 }
 
 static void prog_params(const struct prog *p, conv_params_t *q,
-                        uint32_t in_dma, uint32_t out_dma)
+                        uint32_t in_iova, uint32_t out_iova)
 {
     memset(q, 0, sizeof *q);
     q->ic = (uint16_t)p->icreg; q->oc = (uint16_t)p->ocreg;
@@ -137,10 +137,10 @@ static void prog_params(const struct prog *p, conv_params_t *q,
     q->int8_out = 1;
     q->in_scale = 1.0f; q->w_scale = 1.0f; q->out_scale = 256.0f;
     q->input_zero_point = 0; q->output_zero_point = 0; q->weight_zero_point = 0;
-    q->input_dma   = in_dma;
-    q->weights_dma = (uint32_t)p->w.dma_address;
-    q->bias_dma    = (uint32_t)p->b.dma_address;
-    q->output_dma  = out_dma;
+    q->input_iova   = in_iova;
+    q->weights_iova = (uint32_t)p->w.dma_address;
+    q->bias_iova    = (uint32_t)p->b.dma_address;
+    q->output_iova  = out_iova;
 }
 
 /* Emit and submit the whole row plan for one placement. Returns the task count, or -1. */
@@ -159,13 +159,13 @@ static int prog_run(int fd, struct prog *p, rocket_bo *in, size_t in_off,
     q = base;
     if (rocket_rk3576_plan_rows(&q, 0, plan, MAX_ROWS, &ntask) < 0) return -1;
 
-    slot = RK3576_CONV_TASK_OPS;
+    slot = RK3576_CONV_TASK_SLOT;   /* even: each task 16-byte aligned */
     for (t = 0; t < ntask; t++) {
         q = base;
         q.ih = plan[t].ih; q.oh = plan[t].oh;
         q.pad_top = plan[t].pad_top;
-        q.input_dma  = base.input_dma  + plan[t].feature_off;
-        q.output_dma = base.output_dma + plan[t].output_off;
+        q.input_iova  = base.input_iova  + plan[t].feature_off;
+        q.output_iova = base.output_iova + plan[t].output_off;
         q.ih_full = (uint16_t)p->ih; q.oh_full = (uint16_t)p->oh;
         q.tasks = p->ops + (size_t)t * slot;
         q.task_count = 0;

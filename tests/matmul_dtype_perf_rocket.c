@@ -4,13 +4,14 @@
  * matmul_dtype_perf_rocket.c — raw resident-multicore throughput of fp16 vs
  * int8 vs int4 at a matched shape (no model). All three use their RESIDENT
  * path (weights packed ONCE into NPU BOs, N fanned across worker fds), so the
- * timing isolates NPU compute + readback — the apples-to-apples to the in-model
- * resident bars (fp16 ~15.1, int8 ~9.1 t/s). PURE TIMING (correctness gated
- * elsewhere).
+ * timing isolates NPU compute + readback, each precision on the plan the library
+ * picks by default. PURE TIMING (correctness gated elsewhere).
  *
- * The headline negative result: all precisions TIE at ~460 GOP/s — the NPU
- * is DMA/dispatch-bound, not MAC-bound, so int8's 2x and int4's 4x MAC don't
- * express. (int16 is absent: its native int32 output saturates and has no tiled
+ * At the default shape, 928 MHz, five worker fds [HW sweep 2026-11-02]: fp16 with
+ * streamed weights 947-966 GOP/s, int8 streamed 1098-1107, int4 (whole-tile) 1121-1140;
+ * whole-tile fp16 706-721 and int8 (ROCKET_MM_STREAM_INT8=0) 506-574. The NPU is
+ * DMA/dispatch-bound, not MAC-bound, so int8's 2x and int4's 4x MAC rate express as
+ * 1.14-1.20x fp16. (int16 is absent: its native int32 output saturates and has no tiled
  * entry, and the full-precision int16 path is the int8 byte-decomposition, ~4x int8.)
  * The plan/tiling env knobs (ROCKET_MM_MT/NT/KT, ROCKET_N_THREADS) apply to all.
  *

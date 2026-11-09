@@ -116,20 +116,20 @@ static int pack_task(int fd, struct probe *p, int t, int zero_input)
     memset(in, 0, p->in_slot);
     memset(w, 0, p->w_slot);
     for (int n = 1; n <= N; n++)
-        for (int k = 1; k <= K; k++) w[weight_int8(K, n, k)] = p->B[t][(size_t)(n - 1) * K + (k - 1)];
+        for (int k = 1; k <= K; k++) w[gemm_weight_index_int8(K, n, k)] = p->B[t][(size_t)(n - 1) * K + (k - 1)];
     if (!zero_input)
         for (int m = 1; m <= M; m++)
             for (int k = 1; k <= K; k++)
-                in[feature_data(K, M, 1, 16, k, m, 1)] = p->A[t][(size_t)(m - 1) * K + (k - 1)];
+                in[feature_index(K, M, 1, 16, k, m, 1)] = p->A[t][(size_t)(m - 1) * K + (k - 1)];
     {
-        matmul_params_t mp = {
+        gemm_params_t mp = {
             .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)N,
-            .input_dma = (uint32_t)(p->in.dma_address + (size_t)t * p->in_slot),
-            .weights_dma = (uint32_t)(p->w.dma_address + (size_t)t * p->w_slot),
-            .output_dma = (uint32_t)(p->out.dma_address + (size_t)t * p->out_slot),
+            .input_iova = (uint32_t)(p->in.dma_address + (size_t)t * p->in_slot),
+            .weights_iova = (uint32_t)(p->w.dma_address + (size_t)t * p->w_slot),
+            .output_iova = (uint32_t)(p->out.dma_address + (size_t)t * p->out_slot),
             .tasks = p->ops[t],
         };
-        if (gen_matmul_int8(&mp) != 0 || mp.task_count > GAPPED_STRIDE) return -1;
+        if (gen_gemm_int8(&mp) != 0 || mp.task_count > GAPPED_STRIDE) return -1;
         p->count = mp.task_count;
     }
     return 0;
@@ -142,7 +142,7 @@ static void read_task(const struct probe *p, int t, int32_t *o, size_t *unwritte
     *unwritten = 0;
     for (int m = 1; m <= p->M; m++)
         for (int n = 1; n <= p->N; n++) {
-            int32_t v = od[feature_data(p->N, p->M, 1, 4, n, m, 1)];
+            int32_t v = od[feature_index(p->N, p->M, 1, 4, n, m, 1)];
             if ((uint32_t)v == 0xAAAAAAAAu) (*unwritten)++;
             o[(size_t)(m - 1) * p->N + (n - 1)] = v;
         }

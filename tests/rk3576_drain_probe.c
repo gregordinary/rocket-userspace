@@ -224,7 +224,7 @@ static int prog_build(int fd, struct prog *pr)
     }
     rocket_bo_prep(fd, &pr->b, 1, 0);
     rc = rocket_rk3576_pack_coeff_prec(pr->b.ptr, coeff, bias, ocreg,
-                                       fp16 ? precision_float16 : precision_int8);
+                                       fp16 ? PREC_FP16 : PREC_INT8);
     rocket_bo_fini(fd, &pr->b);
     free(bias);
     if (rc < 0) { fprintf(stderr, "coefficient pack refused\n"); return -1; }
@@ -239,10 +239,10 @@ static int prog_build(int fd, struct prog *pr)
     pr->p.ih_full = (uint16_t)pr->ih; pr->p.oh_full = (uint16_t)oh;
     pr->p.int8_out = (uint8_t)(fp16 ? 0 : 1);
     pr->p.in_scale = 1.0f; pr->p.w_scale = 1.0f; pr->p.out_scale = fp16 ? 1.0f : 64.0f;
-    pr->p.input_dma   = (uint32_t)pr->in.dma_address;
-    pr->p.weights_dma = (uint32_t)pr->w.dma_address;
-    pr->p.bias_dma    = (uint32_t)pr->b.dma_address;
-    pr->p.output_dma  = (uint32_t)pr->o.dma_address;
+    pr->p.input_iova   = (uint32_t)pr->in.dma_address;
+    pr->p.weights_iova = (uint32_t)pr->w.dma_address;
+    pr->p.bias_iova    = (uint32_t)pr->b.dma_address;
+    pr->p.output_iova  = (uint32_t)pr->o.dma_address;
     pr->p.tasks = pr->ops;
     switch (pr->kind) {
     case K_FP16D: case K_FP16FC: rc = gen_conv2d_fp16_rk3576(&pr->p); break;

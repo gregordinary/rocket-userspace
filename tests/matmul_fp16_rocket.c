@@ -1,196 +1,206 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The rocket-userspace authors
 /*
- * matmul_fp16_rocket.c — standalone fp16 x fp16 -> fp16/fp32 single-task test on
- * the rocket NPU. Exercises gen_matmul_fp16() / weight_fp16() / feature_data()
- * (npu_regcmd.c) through the rocket_npu shim. Usage: matmul_fp16_rocket <M> <K> <N>
+ * matmul_fp16_rocket.c — one gen_gemm_fp16() task on the NPU, against the CPU.
  *
- * Constraints inherited from the single-task generator (no tiling yet):
- *   M multiple of 4 (or 1), K multiple of 32, N multiple of 16 (or 1),
- *   and M*K + N*K must fit the 12 x 32KB CBUF banks (gen returns <0 otherwise).
+ *     matmul_fp16_rocket <M> <K> <N>
+ *
+ * Builds C[M][N] = A[M][K] * B[N][K]^T as a single register program, with no tiling, so
+ * the shape must fit one task: M a multiple of 4 (or 1), K a multiple of 32, N a multiple
+ * of 16, and the operands within the CBUF (the generator refuses otherwise). The operands
+ * are small integers, 0 to 9, so every product and every partial sum the shapes reach is
+ * an exact fp32 integer and the fp16 result is one rounding of it: the device must match
+ * the host bit for bit.
+ *
+ * ROCKET_TEST_SEED fixes the operands; the seed in use is printed either way.
+ *
+ * Exit status: 0 when every element matches, 1 on a mismatch or a failed step, 2 with no
+ * device.
  */
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sys/time.h>
 
 #include "rocket_npu.h"
 #include "npu_matmul.h"
 
-/* regcmd_count = the TOTAL number of NPUOP words the PC must execute, INCLUDING
- * the 4-op control trailer (OP_NONE / PC_REGISTER_AMOUNTS / OP_40 / OP_ENABLE).
- * gen_matmul_fp16() returns it in task_count: 122 + 4 = 126, the trailer at
- * ops[122..125]. The final OP_ENABLE writes PC_OPERATION_ENABLE = 0x1D, a block
- * bitmap laid out as the global enable register at 0xF008 (CNA b0 | CORE b2 |
- * DPU b3 | DPU_RDMA b4), which is what actually TRIGGERS the compute; the
- * kernel's own MMIO write of PC_OPERATION_ENABLE=0x1 only starts the PC
- * sequencer. If the PC stops before that OP_ENABLE the pipeline is configured but
- * never fired -> DPU never completes -> "NPU job timed out" (observed with a count
- * four words short).
- *
- * The hardware PC_DATA_AMOUNT confirms the count (scale = 2):
- *   (regcmd_count + 1)/2 - 1 = (126 + 1)/2 - 1 = 62. */
+/* The operands' generator: xorshift32, reduced to 0..9. */
+static uint32_t rng_state;
 
-/* Report any nonzero (negative-errno) return from a shim call. */
-#define CK(call) do { int _r = (call); \
-    if (_r) fprintf(stderr, "%s -> %d (%s)\n", #call, _r, strerror(-_r)); } while (0)
-
-static int64_t now_us(void) {
-    struct timeval tv; gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+static int next_digit(void)
+{
+    uint32_t x = rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    rng_state = x;
+    return (int)(x % 10u);
 }
 
-static void ref_matmul(int m, int k, int n, _Float16 *A, _Float16 *B, _Float16 *C) {
-    for (int i = 0; i < m; i++)
-        for (int j = 0; j < n; j++) {
-            float s = 0;
-            for (int l = 0; l < k; l++) s += (float)A[i*k+l] * (float)B[j*k+l];
-            C[i*n+j] = (_Float16)s;
-        }
+static double ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (double)(t1.tv_sec - t0->tv_sec) * 1e3 + (double)(t1.tv_nsec - t0->tv_nsec) * 1e-6;
 }
 
-int main(int argc, char **argv) {
-    if (argc != 4) { printf("usage: %s <M> <K> <N>\n", argv[0]); return -1; }
-    int M = atoi(argv[1]), K = atoi(argv[2]), N = atoi(argv[3]);
-
-    int fd = rocket_open();
-    if (fd < 0) return fd;
-
-    rocket_bo guard = {0}, regcmd = {0}, input = {0}, weights = {0}, output = {0};
-    int ret = 0;
-    /* PROBE (IOVA-0 hypothesis): the first allocation lands at NPU IOVA 0x0
-     * (regcmd=0 in the first runs). If the PC treats BASE_ADDRESS=0 as "no
-     * program" or IOVA 0 is unmapped, it executes an empty program and writes
-     * nothing — exactly the observed untouched (0xAA) output. Reserve IOVA 0
-     * with a throwaway BO so every real buffer gets a nonzero address. */
-    rocket_bo_alloc(fd, 4096, &guard);
-    ret |= rocket_bo_alloc(fd, 4096,                  &regcmd);
-    ret |= rocket_bo_alloc(fd, (size_t)M*K*sizeof(_Float16), &input);
-    ret |= rocket_bo_alloc(fd, (size_t)N*K*sizeof(_Float16), &weights);
-    ret |= rocket_bo_alloc(fd, (size_t)M*N*sizeof(_Float16), &output);
-    if (ret) { fprintf(stderr, "bo alloc failed\n"); goto out; }
-    printf("dma  in=%lx  w=%lx  out=%lx  regcmd=%lx\n",
-           input.dma_address, weights.dma_address, output.dma_address, regcmd.dma_address);
-
-    /* The NPU programs addresses into 32-bit registers (NPUOP value is 32-bit,
-     * and matmul_params_t stores *_dma as uint32_t). Every BO's device VA must
-     * therefore fit in the low 4GB of the NPU IOVA space. Verify rather than
-     * silently truncate. If this
-     * trips, the rocket driver is handing out >32-bit IOVAs and the address
-     * programming needs revisiting (possible shift, or a CREATE_BO flag to
-     * request a 32-bit-addressable BO). */
-    if ((input.dma_address | weights.dma_address | output.dma_address | regcmd.dma_address) >> 32) {
-        fprintf(stderr, "ERROR: a BO dma_address exceeds 32 bits — see note above\n");
-        ret = -1; goto out;
+int main(int argc, char **argv)
+{
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s <M> <K> <N>\n", argv[0]);
+        return 1;
+    }
+    const int M = atoi(argv[1]), K = atoi(argv[2]), N = atoi(argv[3]);
+    if (M <= 0 || K <= 0 || N <= 0) {
+        fprintf(stderr, "M, K and N must be positive\n");
+        return 1;
     }
 
-    /* Build the register program (npu_regcmd.c).
-     * Sized well past the generator's 126 words. */
-    uint64_t npu_regs[256] = {0};
-    matmul_params_t p = {
-        .m = M, .k = K, .n = N,
-        .input_dma = input.dma_address, .weights_dma = weights.dma_address,
-        .output_dma = output.dma_address, .tasks = npu_regs, .fp32tofp16 = 1,
-    };
-    if ((ret = gen_matmul_fp16(&p)) != 0) {
-        fprintf(stderr, "gen_matmul_fp16 = %d (likely exceeds CBUF banks — needs tiling)\n", ret);
-        goto out;
-    }
-    printf("regcmd ops = %u (incl. DPU_RDMA block)\n", p.task_count);
+    uint64_t program[256];
+    gemm_params_t p;
+    memset(&p, 0, sizeof p);
+    p.m = (uint16_t)M; p.k = (uint16_t)K; p.n = (uint16_t)N;
+    p.tasks = program;
+    p.fp16_out = 1;
 
-    /* Fill device buffers (CPU writes -> flush via fini before submit).
-     * These BOs have no in-flight job yet, so timeout 0 is fine here. */
-    CK(rocket_bo_prep(fd, &regcmd, 1, 0));
-    CK(rocket_bo_prep(fd, &input,  1, 0));
-    CK(rocket_bo_prep(fd, &weights,1, 0));
-
-    memcpy(regcmd.ptr, npu_regs, (size_t)p.task_count * sizeof(uint64_t));
-
-    /* host reference inputs */
-    _Float16 *A = malloc((size_t)M*K*2), *B = malloc((size_t)N*K*2), *C = malloc((size_t)M*N*2);
-    /* Log (and allow overriding) the RNG seed so a failing run is reproducible:
-     * re-run with ROCKET_TEST_SEED=<printed value> to regenerate the exact inputs. */
-    const char *seed_env = getenv("ROCKET_TEST_SEED");
-    unsigned seed = seed_env ? (unsigned)strtoul(seed_env, NULL, 0) : (unsigned)time(NULL);
-    printf("seed = %u%s\n", seed, seed_env ? " (from ROCKET_TEST_SEED)" : "");
-    srand(seed);
-    for (int i = 0; i < M*K; i++) A[i] = (_Float16)(int)(10.0 * rand()/(float)RAND_MAX);
-    for (int i = 0; i < N*K; i++) B[i] = (_Float16)(int)(10.0 * rand()/(float)RAND_MAX);
-
-    /* repack into NPU native layouts (reused from npu_matmul.c) */
-    _Float16 *wdst = weights.ptr, *idst = input.ptr;
-    memset(input.ptr, 0, input.size); memset(weights.ptr, 0, weights.size);
-    for (int n = 1; n <= N; n++)
-        for (int k = 1; k <= K; k++) wdst[weight_fp16(K, n, k)] = B[(n-1)*K + (k-1)];
-    for (int m = 1; m <= M; m++)
-        for (int k = 1; k <= K; k++) idst[feature_data(K, M, 1, 8, k, m, 1)] = A[(m-1)*K + (k-1)];
-
-    CK(rocket_bo_fini(fd, &regcmd));
-    CK(rocket_bo_fini(fd, &input));
-    CK(rocket_bo_fini(fd, &weights));
-
-    /* Sentinel-fill output so the next run distinguishes the failure modes:
-     *   pattern 0xAA intact -> NPU never wrote output (job didn't run/route)
-     *   all zeros           -> NPU wrote, but computed zeros (addr/enable)
-     *   correct values      -> success */
-    CK(rocket_bo_prep(fd, &output, 1, 0));
-    memset(output.ptr, 0xAA, output.size);
-    CK(rocket_bo_fini(fd, &output));
-
-    ref_matmul(M, K, N, A, B, C);
-
-    /* Submit: NPU reads input+weights+regcmd, writes output. */
-    uint32_t in_h[]  = { input.handle, weights.handle, regcmd.handle };
-    uint32_t out_h[] = { output.handle };
-    int64_t t0 = now_us();
-    ret = rocket_submit_matmul(fd, &regcmd, p.task_count,
-                               in_h, 3, out_h, 1, 6000);
-    int64_t us = now_us() - t0;
-    printf("ROCKET_SUBMIT = %d  (%.3f ms)\n", ret, us / 1000.0);
-    if (ret) goto out_free;
-
-    /* SUBMIT is asynchronous (note the sub-ms "submit" time above): it returns
-     * once the job is queued. PREP_BO on the output BO is what blocks on the
-     * job's completion fence, so it MUST get a real timeout — passing 0 does not
-     * wait and reads the BO before the NPU writes it (the original all-zeros). */
-    int prc = rocket_bo_prep(fd, &output, 0, 2000000000LL); /* 2s */
-    if (prc) {
-        fprintf(stderr, "PREP_BO(output) = %d (%s): job never completed — DPU "
-                "completion IRQ likely never fired (block-enable / HW path)\n",
-                prc, strerror(-prc));
-        ret = prc; goto out_free;
+    const int fd = rocket_open();
+    if (fd < 0) {
+        printf("no NPU device (%d): skipped\n", fd);
+        return 2;
     }
 
-    /* Did the NPU touch the output at all? */
-    int touched = 0;
-    for (size_t i = 0; i < output.size; i++)
-        if (((uint8_t *)output.ptr)[i] != 0xAA) { touched = 1; break; }
-    if (!touched)
-        printf("DIAGNOSTIC: output still 0xAA sentinel — NPU did not write output\n");
+    /* Buffers. The first one holds IOVA 0, which no program may point at: a register
+     * program at address 0 runs as an empty one and the output is never written. */
+    struct { rocket_bo zero, prog, a, b, c; } bo;
+    memset(&bo, 0, sizeof bo);
+    _Float16 *A = NULL, *B = NULL;
+    float *ref = NULL;
+    long wrong = 0;
+    int status = 1;
+    if (rocket_bo_alloc(fd, 4096, &bo.zero) ||
+        rocket_bo_alloc(fd, sizeof program, &bo.prog) ||
+        rocket_bo_alloc(fd, (size_t)M * K * sizeof(_Float16), &bo.a) ||
+        rocket_bo_alloc(fd, (size_t)N * K * sizeof(_Float16), &bo.b) ||
+        rocket_bo_alloc(fd, (size_t)M * N * sizeof(_Float16), &bo.c)) {
+        fprintf(stderr, "buffer allocation failed\n");
+        goto close;
+    }
+    /* Every address register is 32 bits wide. */
+    if ((bo.prog.dma_address | bo.a.dma_address | bo.b.dma_address | bo.c.dma_address) >> 32) {
+        fprintf(stderr, "a buffer's IOVA is above 4 GiB; the program cannot address it\n");
+        goto close;
+    }
 
-    _Float16 *od = output.ptr;
-    int bad = 0;
-    for (int m = 1; m <= M && bad < 10; m++)
-        for (int n = 1; n <= N; n++) {   /* 1-based: must include the final column n==N */
-            _Float16 act = od[feature_data(N, M, 1, 8, n, m, 1)];
-            _Float16 exp = C[(m-1)*N + (n-1)];
-            if (act != exp) {
-                printf("mismatch m=%d n=%d exp=%f act=%f\n", m, n, (float)exp, (float)act);
-                if (++bad >= 10) break;
-            }
+    p.input_iova = (uint32_t)bo.a.dma_address;
+    p.weights_iova = (uint32_t)bo.b.dma_address;
+    p.output_iova = (uint32_t)bo.c.dma_address;
+    int g = gen_gemm_fp16(&p);
+    if (g != 0) {
+        fprintf(stderr, "gen_gemm_fp16 refused %dx%dx%d (%d): the shape needs tiling\n",
+                M, K, N, g);
+        goto close;
+    }
+    /* task_count includes the four-word PC trailer whose last word starts the blocks; a
+     * submit that stops short of it configures the task and never runs it. */
+    printf("program: %u words\n", p.task_count);
+
+    /* Operands, row-major, and the host result. */
+    const char *se = getenv("ROCKET_TEST_SEED");
+    const uint32_t seed = se ? (uint32_t)strtoul(se, NULL, 0) : (uint32_t)time(NULL);
+    rng_state = seed ? seed : 1u;
+    printf("seed: %u\n", seed);
+    A = malloc((size_t)M * K * sizeof *A);
+    B = malloc((size_t)N * K * sizeof *B);
+    ref = calloc((size_t)M * N, sizeof *ref);
+    if (!A || !B || !ref) {
+        fprintf(stderr, "host allocation failed\n");
+        goto free_host;
+    }
+    for (size_t i = 0; i < (size_t)M * K; i++) A[i] = (_Float16)next_digit();
+    for (size_t i = 0; i < (size_t)N * K; i++) B[i] = (_Float16)next_digit();
+    for (int kk = 0; kk < K; kk++)
+        for (int r = 0; r < M; r++) {
+            const float a = (float)A[(size_t)r * K + kk];
+            for (int col = 0; col < N; col++)
+                ref[(size_t)r * N + col] += a * (float)B[(size_t)col * K + kk];
         }
-    rocket_bo_fini(fd, &output);
-    printf(bad ? "FAILED (%d mismatches shown)\n" : "OK: [%d,%d]x[%d,%d]\n",
-           bad ? bad : M, bad ? 0 : K, N, K);
 
-out_free:
-    free(A); free(B); free(C);
-out:
-    rocket_bo_free(fd, &guard);
-    rocket_bo_free(fd, &regcmd); rocket_bo_free(fd, &input);
-    rocket_bo_free(fd, &weights); rocket_bo_free(fd, &output);
+    /* Into the device layouts: A as a feature cube one pixel wide, B as N 1x1 kernels. The
+     * index helpers count from 1. */
+    rocket_bo_prep(fd, &bo.prog, 1, 0);
+    rocket_bo_prep(fd, &bo.a, 1, 0);
+    rocket_bo_prep(fd, &bo.b, 1, 0);
+    memcpy(bo.prog.ptr, program, (size_t)p.task_count * sizeof *program);
+    memset(bo.a.ptr, 0, bo.a.size);
+    memset(bo.b.ptr, 0, bo.b.size);
+    _Float16 *a_cube = bo.a.ptr, *b_cube = bo.b.ptr;
+    for (int r = 0; r < M; r++)
+        for (int kk = 0; kk < K; kk++)
+            a_cube[feature_index(K, M, 1, 8, kk + 1, r + 1, 1)] = A[(size_t)r * K + kk];
+    for (int col = 0; col < N; col++)
+        for (int kk = 0; kk < K; kk++)
+            b_cube[gemm_weight_index_fp16(K, col + 1, kk + 1)] = B[(size_t)col * K + kk];
+    rocket_bo_fini(fd, &bo.prog);
+    rocket_bo_fini(fd, &bo.a);
+    rocket_bo_fini(fd, &bo.b);
+
+    /* A sentinel in C tells "never written" (0xAA bytes survive) from "written wrong". */
+    rocket_bo_prep(fd, &bo.c, 1, 0);
+    memset(bo.c.ptr, 0xAA, bo.c.size);
+    rocket_bo_fini(fd, &bo.c);
+
+    uint32_t reads[] = { bo.prog.handle, bo.a.handle, bo.b.handle };
+    uint32_t writes[] = { bo.c.handle };
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = rocket_submit_matmul(fd, &bo.prog, p.task_count, reads, 3, writes, 1, 6000);
+    if (rc) {
+        fprintf(stderr, "submit failed: %d (%s)\n", rc, strerror(-rc));
+        goto free_host;
+    }
+    /* The submit returns once the job is queued; waiting on C's fence, with a real
+     * deadline, is what waits for the NPU. */
+    rc = rocket_bo_prep(fd, &bo.c, 0, 2000000000LL);
+    printf("submit + wait: %.3f ms\n", ms_since(&t0));
+    if (rc) {
+        fprintf(stderr, "the job did not complete: %d (%s)\n", rc, strerror(-rc));
+        goto free_host;
+    }
+
+    const uint8_t *raw = bo.c.ptr;
+    size_t untouched = 0;
+    for (size_t i = 0; i < bo.c.size; i++) untouched += raw[i] == 0xAA;
+    if (untouched == bo.c.size) printf("C still holds the sentinel: the NPU wrote nothing\n");
+
+    const _Float16 *c_cube = bo.c.ptr;
+    for (int r = 0; r < M; r++)
+        for (int col = 0; col < N; col++) {
+            const _Float16 got = c_cube[feature_index(N, M, 1, 8, col + 1, r + 1, 1)];
+            const _Float16 want = (_Float16)ref[(size_t)r * N + col];
+            if (got == want) continue;
+            if (wrong < 8)
+                printf("C[%d][%d] = %g, want %g\n", r, col, (double)got, (double)want);
+            wrong++;
+        }
+    rocket_bo_fini(fd, &bo.c);
+    if (wrong)
+        printf("FAIL: %ld of %d elements differ\n", wrong, M * N);
+    else
+        printf("OK: %dx%d times %dx%d, every element exact\n", M, K, K, N);
+    status = wrong ? 1 : 0;
+
+free_host:
+    free(A);
+    free(B);
+    free(ref);
+close:
+    rocket_bo_free(fd, &bo.zero);
+    rocket_bo_free(fd, &bo.prog);
+    rocket_bo_free(fd, &bo.a);
+    rocket_bo_free(fd, &bo.b);
+    rocket_bo_free(fd, &bo.c);
     rocket_close(fd);
-    return ret;
+    return status;
 }

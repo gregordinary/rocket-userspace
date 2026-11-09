@@ -31,8 +31,9 @@
  *   `load`  a caller's own shape quiet, and then under three host loads that differ
  *           only in how far down the memory hierarchy the host's work reaches. This
  *           is the mode that answered the mechanism: the drop rate goes from 11.0% of
- *           row tasks to 44.8% under four streaming-memcpy threads while the count of
- *           atoms never emitted at all barely moves, so it is a write-path race the
+ *           row tasks to 44.8% under four streaming-memcpy threads in a two-point run
+ *           (5.8% and 51.7% in the same day's ladder, which added the two controls),
+ *           while the count of atoms never emitted at all barely moves, so it is a write-path race the
  *           memory system makes worse and a different hazard from the poisoning. The
  *           two control loads say whether "the memory system" or merely "a busy host"
  *           is the right reading of that.

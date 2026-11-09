@@ -135,8 +135,8 @@ static int pool_run(int fd, const struct geom *g, unsigned ow, unsigned oh,
     p.pad_left = p.pad_right = p.pad_top = p.pad_bottom = (uint8_t)g->pad;
     p.mode = (uint8_t)g->mode;
     p.input_zero_point = 0;
-    p.input_dma  = in->dma_address + (uint32_t)base_off;
-    p.output_dma = out->dma_address;
+    p.input_iova  = in->dma_address + (uint32_t)base_off;
+    p.output_iova = out->dma_address;
     p.src_surf_elems = surf;
     p.src_line_elems = pitch;
     p.tasks = ops;

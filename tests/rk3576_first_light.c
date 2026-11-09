@@ -118,8 +118,8 @@
 #define C2   16                 /* int8 cube channel atom */
 #define SENTINEL 0xAA
 
-int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
-int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+int feature_index(int C, int H, int W, int C2_, int c, int h, int w);
+int conv_weight_index_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
 
 /* Runtime geometry. Set once in main from the environment; every buffer, the CPU
  * model and the register program all read these, so a shape change is one place. */
@@ -319,10 +319,10 @@ static int submit_once(int fd, const struct job *j, int8_t *out)
     rocket_bo_prep(fd, &o_bo,  1, 0); memset(o_bo.ptr,  SENTINEL, (size_t)OBYTES); rocket_bo_fini(fd, &o_bo);
 
     p.tasks       = ops;
-    p.input_dma   = in_bo.dma_address;
-    p.weights_dma = w_bo.dma_address;
-    p.bias_dma    = b_bo.dma_address;
-    p.output_dma  = o_bo.dma_address;
+    p.input_iova   = in_bo.dma_address;
+    p.weights_iova = w_bo.dma_address;
+    p.bias_iova    = b_bo.dma_address;
+    p.output_iova  = o_bo.dma_address;
     if (env_int("ROCKET_FL_ADDRS", 0))
         printf("  IOVA: in %#llx  w %#llx  bias %#llx  out %#llx\n",
                (unsigned long long)in_bo.dma_address, (unsigned long long)w_bo.dma_address,
@@ -367,8 +367,8 @@ static int submit_once(int fd, const struct job *j, int8_t *out)
             conv_params_t q = p;
             q.ih = plan[t].ih;  q.oh = plan[t].oh;
             q.pad_top = plan[t].pad_top;
-            q.input_dma  = p.input_dma  + plan[t].feature_off;
-            q.output_dma = p.output_dma + plan[t].output_off;
+            q.input_iova  = p.input_iova  + plan[t].feature_off;
+            q.output_iova = p.output_iova + plan[t].output_off;
             /* Always, not only for a split: a single-task PLAN still carries a window
              * shorter than the plane whenever the last output row does not reach the
              * last input row (any stride > 1 that leaves trailing rows unread). The
@@ -551,7 +551,7 @@ int main(int argc, char **argv)
     /* ICREG/OCREG tell the REGISTERS a different channel count than the data
      * carries. Both cubes already hold exactly what the padded count wants — the
      * feature cube is calloc'd and sized to the 32-channel group, and
-     * weight_conv_int8's index depends on the counts only through ceil(n/32), so an
+     * conv_weight_index_int8's index depends on the counts only through ceil(n/32), so an
      * IC=16 cube is byte-identical to an IC=32 cube with the upper channels zero.
      * The only thing this changes is the register program (and, for OCREG, the
      * output and coefficient allocations), which separates a channel-rounding rule
@@ -756,12 +756,12 @@ int main(int argc, char **argv)
     for (ic = 0; ic < IC; ic++)
         for (y = 0; y < IH; y++)
             for (x = 0; x < IW; x++)
-                in_cube[feature_data(IC, IH, IW, C2, ic + 1, y + 1, x + 1)] = INP(ic, y, x);
+                in_cube[feature_index(IC, IH, IW, C2, ic + 1, y + 1, x + 1)] = INP(ic, y, x);
     for (oc = 0; oc < OC; oc++)
         for (ic = 0; ic < IC; ic++)
             for (kh = 0; kh < K; kh++)
                 for (kw = 0; kw < K; kw++)
-                    w_cube[weight_conv_int8(OC, IC, K, K, oc + 1, ic + 1, kh + 1, kw + 1)] =
+                    w_cube[conv_weight_index_int8(OC, IC, K, K, oc + 1, ic + 1, kh + 1, kw + 1)] =
                         WP(oc, ic, kh, kw);
 
     j.in_cube = in_cube; j.w_cube = w_cube; j.bias = bias;
@@ -821,7 +821,7 @@ int main(int argc, char **argv)
         printf("  out[c][0][0] by channel:");
         for (oc = 0; oc < OC; oc++) {
             if (oc % 16 == 0) printf("\n    c%2d:", oc);
-            printf("%5d", out[0][feature_data(OC, OH, OW, C2, oc + 1, 1, 1)]);
+            printf("%5d", out[0][feature_index(OC, OH, OW, C2, oc + 1, 1, 1)]);
         }
         printf("\n");
     }
@@ -850,7 +850,7 @@ int main(int argc, char **argv)
                             }
                     raw  = requant_raw(acc, scale, shift_reg, 0);
                     want = requant_apply_zp(acc, scale, shift_reg, 0);
-                    got  = out[0][feature_data(OC, OH, OW, C2, oc + 1, y + 1, x + 1)];
+                    got  = out[0][feature_index(OC, OH, OW, C2, oc + 1, y + 1, x + 1)];
                     /* Which saturation domain reproduces this pixel. Counted over
                      * every pixel, not just the mismatches, because the two rules
                      * agree on everything already inside [0,127] and only their
@@ -909,7 +909,7 @@ int main(int argc, char **argv)
                                       ? INP(ic, iy, ix) : pad_val;
                             acc += (int64_t)tap * WP(oc, ic, kh, kw);
                         }
-                got = out[0][feature_data(OC, OH, OW, C2, oc + 1, 1, 1)];
+                got = out[0][feature_index(OC, OH, OW, C2, oc + 1, 1, 1)];
                 printf("    c%2d: acc %8lld  raw %6lld  want %4d  got %4d%s\n", oc,
                        (long long)acc,
                        (long long)requant_raw(acc, scale, shift_reg, 0),
@@ -939,7 +939,7 @@ int main(int argc, char **argv)
                                 acc += (int64_t)tap * WP(0, ic, kh, kw);
                             }
                     raw = requant_raw(acc, scale, shift_reg, 0);
-                    got = out[0][feature_data(OC, OH, OW, C2, 1, y + 1, x + 1)];
+                    got = out[0][feature_index(OC, OH, OW, C2, 1, y + 1, x + 1)];
                     delta = (int)(got - raw);
                     if (run && delta == prev_got) { run++; prev_raw = raw; continue; }
                     if (run) {
@@ -977,7 +977,7 @@ int main(int argc, char **argv)
                                     acc += (int64_t)tap * WP(c, ic, kh, kw);
                                 }
                         raw = requant_raw(acc, scale, shift_reg, 0);
-                        got = out[0][feature_data(OC, OH, OW, C2, c + 1, y + 1, x + 1)];
+                        got = out[0][feature_index(OC, OH, OW, C2, c + 1, y + 1, x + 1)];
                         if (raw < 0) {
                             if (!nlo) { lo_got = got; lo_min = lo_max = raw; }
                             else { if (raw < lo_min) lo_min = raw; if (raw > lo_max) lo_max = raw;
@@ -1002,7 +1002,7 @@ int main(int argc, char **argv)
             fail++;
             printf("  channel 0 row 0 got : ");
             for (x = 0; x < OW && x < 16; x++)
-                printf("%5d", out[0][feature_data(OC, OH, OW, C2, 1, 1, x + 1)]);
+                printf("%5d", out[0][feature_index(OC, OH, OW, C2, 1, 1, x + 1)]);
             printf("\n  channel 0 row 0 want: ");
             for (x = 0; x < OW && x < 16; x++) {
                 int64_t acc = bias[0];

@@ -13,8 +13,7 @@
  *
  * The encoder shares these with `npu_regcmd.c`:
  *
- * - The descriptor structs (`npu_cna_desc`, `npu_core_desc` and `npu_dpu_desc`)
- * - The `NPUOP` word format
+ * - The regcmd word format
  * - The block targets
  * - The `S_POINTER` value
  * - The `PC_OPERATION_ENABLE` trailer that starts execution
@@ -61,6 +60,13 @@ extern "C" {
  * the vendor stream never touches. */
 #define RK3576_CONV_TASK_OPS 175
 
+/* Words one task occupies where several tasks share a regcmd BO: `RK3576_CONV_TASK_OPS`
+ * rounded up to an even count. The PC takes a task's regcmd address from bits 31:4 of
+ * `PC_BASE_ADDRESS`, so software must start each task on a 16-byte boundary. From Linux
+ * 7.4, the `rocket` driver refuses an unaligned task address with -EINVAL
+ * [source-confirmed, the driver's submit validation]. */
+#define RK3576_CONV_TASK_SLOT ((RK3576_CONV_TASK_OPS + 1u) & ~1u)
+
 /* Emits one int8 or uint8 CONV_2D task for the RK3576. `_dw` is the depthwise variant.
  *
  * The geometry comes from `conv_params_t`. The RK3576 stream distinguishes the task's row
@@ -93,7 +99,7 @@ int gen_conv2d_dw_int8_rk3576(conv_params_t *params);
  * partials cannot be summed without quantizing each one.
  *
  * Two fields change, and neither is geometry. DPU 0x4010's output width takes
- * `precision_int32`, and OUT_CVT is pinned to exact unity. The quant scale fields are
+ * `PREC_INT32`, and OUT_CVT is pinned to exact unity. The quant scale fields are
  * therefore ignored here.
  *
  * The output's byte layout is unchanged. The int8 writer puts 16 lanes in a 16-byte atom
@@ -221,7 +227,7 @@ int rocket_rk3576_i32_wide_word(unsigned ow, unsigned oh_full, unsigned c, unsig
  * reach DDR. Above it two channels collide in one slot, and the odd ones are lost.
  * `rocket_rk3576_plan_ic()` below is the split around the bound.
  *
- * At `precision_int8` every one of those fields is zero, so the int8 program is
+ * At `PREC_INT8` every one of those fields is zero, so the int8 program is
  * byte-identical to the transcribed one. The capture test still checks it.
  *
  * Caution: a wrong precision field does not fault. It writes a complete output of the
@@ -267,12 +273,12 @@ int rocket_rk3576_weight_conv_fp16(unsigned oc_total, unsigned ic_total,
                                    unsigned oc, unsigned ic, unsigned kh, unsigned kw);
 
 /* Returns the channel counts to program, given the logical ones. Both round up to a
- * multiple of 32, the group `weight_conv_int8` pads its two channel axes to. Otherwise a
+ * multiple of 32, the group `conv_weight_index_int8` pads its two channel axes to. Otherwise a
  * convolution whose channel counts are not multiples of 32 produces wrong output at every
  * geometry [HW sweep, H96 MAX M9]. No vendor capture shows this, because every captured
  * geometry already satisfies it.
  *
- * The weight cube needs nothing extra. `weight_conv_int8` already pads both channel axes
+ * The weight cube needs nothing extra. `conv_weight_index_int8` already pads both channel axes
  * to 32, and its index depends on either count only through ceil(n/32). A cube packed at
  * the logical count is therefore byte-identical to one packed at the padded count. The
  * caller must size the surrounding buffers to match:
@@ -434,7 +440,7 @@ size_t rocket_rk3576_weight_dw_bytes(unsigned c_total, unsigned kh, unsigned kw)
  *
  * - The feature cube is shared, and nothing is repacked. At C2 = 8 its channel groups are
  *   contiguous planes of iw*ih_full 16-byte atoms, so slice s is the same BO at
- *   `input_dma + t[s].feature_off`.
+ *   `input_iova + t[s].feature_off`.
  * - The weight cube is per-slice, and it is not a sub-cube of the whole conv's. Each slice
  *   is its own convolution, so its group count follows the slice.
  *   `rocket_rk3576_fp16_pack_slice_weights()` builds it from row-major OIHW weights. The
@@ -442,7 +448,7 @@ size_t rocket_rk3576_weight_dw_bytes(unsigned c_total, unsigned kh, unsigned kw)
  *   the input-channel groups of 16, a partial group taking a whole one. A 16-channel slice,
  *   the only width the planner emits, fills exactly one group.
  * - The coefficient buffer is shared, packed once with
- *   `rocket_rk3576_pack_coeff_prec(..., precision_float16)` so that C contains fp16 1.0.
+ *   `rocket_rk3576_pack_coeff_prec(..., PREC_FP16)` so that C contains fp16 1.0.
  *   If it contains a bias, the caller must give it to the first slice only and pass a NULL
  *   bias to the rest. Every slice adds the whole A term, so a bias on all of them is added
  *   ic/16 times.
@@ -452,7 +458,7 @@ size_t rocket_rk3576_weight_dw_bytes(unsigned c_total, unsigned kh, unsigned kw)
  * To emit slice s, copy the `conv_params_t`, set these fields, and call
  * `gen_conv2d_fp16_rk3576()`:
  *
- *     ic = t[s].ic,  input_dma += t[s].feature_off,  weights_dma = the slice cube
+ *     ic = t[s].ic,  input_iova += t[s].feature_off,  weights_iova = the slice cube
  *
  * Accumulation is on the host.
  *
@@ -654,8 +660,8 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
  * `gen_conv2d_int8_rk3576()` or `_dw()` as usual:
  *
  *     ih = t.ih, oh = t.oh, ih_full/oh_full = the full plane, pad_top = t.pad_top,
- *     input_dma  += t.feature_off,
- *     output_dma += t.output_off,
+ *     input_iova  += t.feature_off,
+ *     output_iova += t.output_off,
  *
  * Caution: the caller must set `ih_full` and `oh_full` on every task, not only when
  * `*count` > 1. A plan of one task still has a window shorter than the plane whenever the
@@ -716,7 +722,7 @@ int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
  * - On the packed-image first conv, the feature offsets, because a float packed image is
  *   `ic` interleaved halfwords per pixel where an int8 one is bytes
  *
- * `rocket_rk3576_plan_rows()` is this function at `precision_int8`. */
+ * `rocket_rk3576_plan_rows()` is this function at `PREC_INT8`. */
 int rocket_rk3576_plan_rows_prec(const conv_params_t *p, int dw, unsigned prec,
                                  rocket_rk3576_row_task *out, unsigned max_tasks,
                                  unsigned *count);
@@ -744,7 +750,7 @@ int rocket_rk3576_plan_rows_cap(const conv_params_t *p, int dw, unsigned row_cap
  * - The CBUF window starts at `cbuf_resident - entries*retained` granules.
  * - Fetching resumes at `cbuf_resident`.
  * - The feature address points at the first new row, not at the window start. The caller
- *   must pass `input_dma` advanced by (iy0 + retained) rows, not by iy0.
+ *   must pass `input_iova` advanced by (iy0 + retained) rows, not by iy0.
  *
  * The arithmetic reproduces all six of the vendor's two-task splits exactly, at three
  * kernel sizes and both strides. The six include the k=1 case, where the overlap is zero
@@ -829,7 +835,7 @@ int rocket_rk3576_pack_coeff(void *dst, size_t dst_bytes, const int32_t *bias, u
  * silent failure C=0 gives on the integer path.
  *
  * The caller must pass the precision the conv will be emitted at, and the unit multiplier
- * follows. `rocket_rk3576_pack_coeff()` is this function at `precision_int8`
+ * follows. `rocket_rk3576_pack_coeff()` is this function at `PREC_INT8`
  * [HW sweep, H96 MAX M9].
  */
 int rocket_rk3576_pack_coeff_prec(void *dst, size_t dst_bytes, const int32_t *bias,
@@ -905,7 +911,7 @@ typedef struct {
     uint8_t  pad_left, pad_right, pad_top, pad_bottom;
     uint8_t  mode;               /* ROCKET_RK3576_POOL_*                           */
     int32_t  input_zero_point;   /* the average path's pad value, unused for max   */
-    uint32_t input_dma, output_dma;
+    uint32_t input_iova, output_iova;
     uint16_t ppu_dst_reg;        /* 0 = 0x6070, the destination base, above        */
     /* Elements per input channel group: the source surface stride, in the units
      * PPU_RDMA programs. A value of 0 takes round4(iw*ih), which the vendor's own pooling
@@ -968,7 +974,7 @@ int gen_pool_rk3576(pool_params_rk3576_t *p);
  * The entries are the function's output. The vendor compiler writes Q15 of it, and pairs
  * that with an OUT_CVT that converts Q15 to the op's own quantization.
  *
- * `scratch_dma` is where the dummy cube's 16 bytes are written. The vendor stores zero,
+ * `scratch_iova` is where the dummy cube's 16 bytes are written. The vendor stores zero,
  * which is a real IOVA in this stack. The caller must pass a BO of its own, and not
  * inherit whatever buffer is at IOVA 0 [source-confirmed: RKNN-Toolkit2 capture, rk3576]. */
 #define RK3576_LUT_ENTRIES   513
@@ -977,7 +983,7 @@ int gen_pool_rk3576(pool_params_rk3576_t *p);
 typedef struct {
     const int16_t *lo;           /* RK3576_LUT_ENTRIES entries, table 0x00020000   */
     const int16_t *hi;           /* RK3576_LUT_ENTRIES entries, table 0x00030000   */
-    uint32_t scratch_dma;        /* the dummy cube's destination and source        */
+    uint32_t scratch_iova;        /* the dummy cube's destination and source        */
     uint64_t *tasks;             /* at least RK3576_LUT_TASK_OPS words             */
     uint32_t task_count;         /* words written                                  */
 } lut_load_params_rk3576_t;
@@ -1227,9 +1233,9 @@ enum {
 typedef struct {
     uint16_t w, h, c;            /* the plane and channel count, c a multiple of 16 */
     uint8_t  mode;               /* ROCKET_RK3576_EW_*                             */
-    uint32_t src_dma;            /* programmed, and measured not to be read        */
-    uint32_t ew_dma;             /* the operand cube, NC1HWC2                      */
-    uint32_t dst_dma;            /* the output surface                             */
+    uint32_t src_iova;            /* programmed, and measured not to be read        */
+    uint32_t ew_iova;             /* the operand cube, NC1HWC2                      */
+    uint32_t dst_iova;            /* the output surface                             */
     /* Elements per channel group. A value of 0 takes w*h, which the vendor's own programs
      * contain and a convolution's output surface has. A requantization joined to a
      * convolution's cube therefore needs no copy at either end. The RK3576 has one
@@ -1272,19 +1278,17 @@ int64_t rocket_rk3576_ew_params(double gain,
  * activation row-major, [m][k], with CNA 0x1090 = k/8 and bit 29 of CNA 0x100C set. It
  * takes the w4a16 output stage (CORE 0x3018 = 0x10000200).
  *
- * The program is charsiu's (gahingwoo/charsiu `524e10a`, `charsiu_emit_job` with no
- * `CHARSIU_*` environment variable set), transcribed word for word. It is 148 words in
- * charsiu's order, 23 of them closed forms of (m, k, n) and five of them buffer
- * addresses. The host half of `tests/rk3576_mm_fp16_gate.c` checks the stream, the
- * coefficient buffer and the weight permutation against charsiu's own output at every
- * tested shape.
+ * The program is the one RKLLM-Toolkit compiles an LLM's fp16 attention matmuls to for
+ * the RK3576. It is 118 register words and the PC trailer, 122 words in the compiler's
+ * order.
+ * Of them, 21 are closed forms of (m, k, n) and three are buffer addresses. It programs no
+ * DPU RDMA and reads no coefficient buffer. `tests/rk3576_mm_fp16_vendor_gate.c` holds
+ * the stream to every such program in a `.rkllm` the caller names, word for word.
  *
  * The program reads these buffers:
  *
  * - The activation, row-major fp16, m*k*2 bytes plus a 4 KiB tail
  * - The weights, [n/16][k/32][n%16][k%32] with two-byte elements, k*n*2 bytes
- * - The coefficient buffer, `rocket_rk3576_mm_fp16_coef_bytes(n)`, which depends on n
- *   alone and can be built once per n
  * - The output, m rows of n fp32 values, row-major, plus a 4 KiB tail
  *
  * One task takes at most `rocket_rk3576_mm_fp16_task_rows(k)` rows. Its input surface,
@@ -1294,38 +1298,33 @@ int64_t rocket_rk3576_ew_params(double gain,
  * Caution: a task past the data window produces wrong output on every row, and does not
  * fail.
  *
- * `rocket_rk3576_mm_fp16_task_ok()` checks those limits, and `gen_matmul_fp16_rk3576()`
+ * `rocket_rk3576_mm_fp16_task_ok()` checks those limits, and `gen_gemm_fp16_rk3576()`
  * refuses a task outside them. `rocket_rk3576_mm_fp16_shape_ok()` checks the limits of the
  * matmul entry, which tiles M over tasks. Each bound was measured on the RK3576, and the
- * evidence is beside the definitions in `npu_regcmd_rk3576.c`. */
-#define RK3576_MM_FP16_OPS 148
+ * evidence is beside the definitions in `npu_regcmd_rk3576.c`. The slot is an even number
+ * of words, so tasks laid end to end in one regcmd BO each start on a 16-byte boundary. */
+#define RK3576_MM_FP16_OPS 122
 
 unsigned rocket_rk3576_mm_fp16_task_rows(unsigned k);   /* 0 for a k no task takes */
 int rocket_rk3576_mm_fp16_task_ok(unsigned m, unsigned k, unsigned n);
 int rocket_rk3576_mm_fp16_shape_ok(unsigned m, unsigned k, unsigned n);
-int gen_matmul_fp16_rk3576(uint64_t *ops, unsigned m, unsigned k, unsigned n,
-                           uint32_t in_dma, uint32_t weight_dma, uint32_t out_dma,
-                           uint32_t coef_dma);
+int gen_gemm_fp16_rk3576(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                           uint32_t in_iova, uint32_t weight_iova, uint32_t out_iova);
 /* Emits the same stream with no limits check, for probes that map where the limits can
  * go. It refuses only what the closed forms cannot express:
  *
  * - An `m` of 0
  * - A `k` under 32 or off a multiple of 32
- * - An `n` under 16 or off a multiple of 16
- *
- * Past charsiu's swept range (m 32, k 4096, n 1024), every shape word is the closed form
- * extrapolated, not a transcription. */
-int gen_matmul_fp16_rk3576_unchecked(uint64_t *ops, unsigned m, unsigned k, unsigned n,
-                                     uint32_t in_dma, uint32_t weight_dma,
-                                     uint32_t out_dma, uint32_t coef_dma);
+ * - An `n` under 16 or off a multiple of 16 */
+int gen_gemm_fp16_rk3576_unchecked(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                                     uint32_t in_iova, uint32_t weight_iova,
+                                     uint32_t out_iova);
 size_t rocket_rk3576_mm_fp16_in_bytes(unsigned m, unsigned k);
 size_t rocket_rk3576_mm_fp16_weight_bytes(unsigned k, unsigned n);
 size_t rocket_rk3576_mm_fp16_out_bytes(unsigned m, unsigned n);
-size_t rocket_rk3576_mm_fp16_coef_bytes(unsigned n);
 /* `B` is n rows of k fp16 bit patterns, and the pack is a permutation of them. */
 int rocket_rk3576_mm_fp16_pack_weights(void *dst, size_t dst_bytes, const uint16_t *B,
                                        unsigned k, unsigned n);
-int rocket_rk3576_mm_fp16_pack_coef(void *dst, size_t dst_bytes, unsigned n);
 
 #ifdef __cplusplus
 }

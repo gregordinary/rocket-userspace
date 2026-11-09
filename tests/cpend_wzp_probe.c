@@ -49,10 +49,11 @@
 #include "rocket_npu.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "test_fill.h"
 #include "requant_model.h"
 
-#define PADB NPU_CBUF_BANK_SIZE
+#define PADB RK3588_CBUF_BANK_BYTES
 #define DW_G 64
 
 static int rup(int a, int b) { return ((a + b - 1) / b) * b; }
@@ -80,7 +81,7 @@ static int reg_set(uint64_t *ops, unsigned n, unsigned blockop, unsigned reg, ui
     int k = 0;
     for (unsigned i = 0; i < n; i++)
         if ((unsigned)(ops[i] >> 48) == (blockop & 0xffffu) && (unsigned)(ops[i] & 0xffffu) == reg) {
-            ops[i] = NPUOP(blockop, v, reg);
+            ops[i] = REGCMD(blockop, reg, v);
             k++;
         }
     return k;
@@ -147,7 +148,7 @@ static int run_dw(int fd, const shape_t *s, const int8_t *x, const int8_t *w, co
     for (int c = 0; c < C; c++)
         for (int ih = 0; ih < IH; ih++)
             for (int iw = 0; iw < IW; iw++)
-                ((int8_t *)in_bo.ptr)[feature_data(C, IHj, IW, 16, c + 1, ih + 1, iw + 1)] =
+                ((int8_t *)in_bo.ptr)[feature_index(C, IHj, IW, 16, c + 1, ih + 1, iw + 1)] =
                     x[((size_t)c * IH + ih) * IW + iw];
     rocket_bo_fini(fd, &in_bo);
 
@@ -156,7 +157,7 @@ static int run_dw(int fd, const shape_t *s, const int8_t *x, const int8_t *w, co
     for (int c = 0; c < C; c++)
         for (int kh = 0; kh < KH; kh++)
             for (int kw = 0; kw < KW; kw++)
-                ((int8_t *)wt_bo.ptr)[weight_conv_dw_int8(C, KH, KW, DW_G, c + 1, kh + 1, kw + 1)] =
+                ((int8_t *)wt_bo.ptr)[conv_dw_weight_index_int8(C, KH, KW, DW_G, c + 1, kh + 1, kw + 1)] =
                     w[((size_t)c * KH + kh) * KW + kw];
     rocket_bo_fini(fd, &wt_bo);
 
@@ -176,19 +177,19 @@ static int run_dw(int fd, const shape_t *s, const int8_t *x, const int8_t *w, co
             .ic = C, .ih = IHj, .iw = IW, .oc = C, .oh = OH, .ow = OW,
             .kh = KH, .kw = KW, .stride_y = s->sy, .stride_x = s->sx,
             .dil_y = 1, .dil_x = 1, .pad_top = s->pt, .pad_left = s->pl,
-            .input_dma = (uint32_t)in_bo.dma_address, .weights_dma = (uint32_t)wt_bo.dma_address,
-            .output_dma = (uint32_t)out_bo.dma_address, .tasks = regs,
+            .input_iova = (uint32_t)in_bo.dma_address, .weights_iova = (uint32_t)wt_bo.dma_address,
+            .output_iova = (uint32_t)out_bo.dma_address, .tasks = regs,
             .dw_group = DW_G, .int8_out = 1,
             .in_scale = in_s, .w_scale = w_s, .out_scale = out_s,
             .input_zero_point = zx + 0x80, .output_zero_point = zo + 0x80,
             .weight_zero_point = zw + 0x80,
-            .bias_dma = (uint32_t)bs_bo.dma_address,
+            .bias_iova = (uint32_t)bs_bo.dma_address,
         };
         int g = gen_conv2d_dw_int8(&p);
         if (g != 0) { fprintf(stderr, "  gen_conv2d_dw_int8 failed (%d)\n", g); goto out; }
-        int k = reg_find(regs, p.task_count, OP_REG_DPU, DPU_BS_OW_OP);
+        int k = reg_find(regs, p.task_count, TARGET_DPU, REG_DPU_BS_OW_OP);
         if (k < 0) { fprintf(stderr, "  no DPU_BS_OW_OP word\n"); goto out; }
-        if (override) reg_set(regs, p.task_count, OP_REG_DPU, DPU_BS_OW_OP, op & 0xffffu);
+        if (override) reg_set(regs, p.task_count, TARGET_DPU, REG_DPU_BS_OW_OP, op & 0xffffu);
         *op_emitted = reg_get(regs, k);
 
         rocket_bo_prep(fd, &rc_bo, 1, 0);
@@ -210,7 +211,7 @@ static int run_dw(int fd, const shape_t *s, const int8_t *x, const int8_t *w, co
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++)
                 got[((size_t)c * OH + oh) * OW + ow] =
-                    ((const int8_t *)out_bo.ptr)[feature_data(C, OH, OW, 16, c + 1, oh + 1, ow + 1)];
+                    ((const int8_t *)out_bo.ptr)[feature_index(C, OH, OW, 16, c + 1, oh + 1, ow + 1)];
     rocket_bo_fini(fd, &out_bo);
     ret = 0;
 out:
@@ -318,7 +319,7 @@ static long stride2(const int32_t *raw, size_t nraw, const int64_t *R, const int
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++) {
                 size_t o = ((size_t)oc * OH + oh) * OW + ow;
-                size_t a = (size_t)feature_data(OCp, OH, OW, 4, oc + 1, oh + 1, ow + 1) * 2;
+                size_t a = (size_t)feature_index(OCp, OH, OW, 4, oc + 1, oh + 1, ow + 1) * 2;
                 if (a < nraw && (int64_t)raw[a] == R[o] + (int64_t)v * S[o]) k++;
             }
     return k;
@@ -381,7 +382,7 @@ static void direct_arm(int fd, const direct_arm_t *a, uint64_t seed, int is_cont
     for (int ic = 0; ic < IC; ic++)
         for (int ih = 0; ih < IH; ih++)
             for (int iw = 0; iw < IW; iw++)
-                ((int8_t *)in_bo.ptr)[feature_data(IC, IH, IW, 16, ic + 1, ih + 1, iw + 1)] =
+                ((int8_t *)in_bo.ptr)[feature_index(IC, IH, IW, 16, ic + 1, ih + 1, iw + 1)] =
                     x[((size_t)ic * IH + ih) * IW + iw];
     rocket_bo_fini(fd, &in_bo);
     rocket_bo_prep(fd, &wt_bo, 1, 0);
@@ -390,7 +391,7 @@ static void direct_arm(int fd, const direct_arm_t *a, uint64_t seed, int is_cont
         for (int ic = 0; ic < IC; ic++)
             for (int kh = 0; kh < KH; kh++)
                 for (int kw = 0; kw < KW; kw++)
-                    ((int8_t *)wt_bo.ptr)[weight_conv_int8(OCp, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
+                    ((int8_t *)wt_bo.ptr)[conv_weight_index_int8(OCp, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
                         w[(((size_t)oc * IC + ic) * KH + kh) * KW + kw];
     rocket_bo_fini(fd, &wt_bo);
     {
@@ -398,23 +399,23 @@ static void direct_arm(int fd, const direct_arm_t *a, uint64_t seed, int is_cont
             .ic = IC, .ih = IH, .iw = IW, .oc = OCp, .oh = OH, .ow = OW,
             .kh = KH, .kw = KW, .stride_y = sy, .stride_x = sx, .dil_y = 1, .dil_x = 1,
             .pad_top = pt, .pad_left = pl,
-            .input_dma = (uint32_t)in_bo.dma_address, .weights_dma = (uint32_t)wt_bo.dma_address,
-            .output_dma = (uint32_t)out_bo.dma_address, .tasks = regs,
+            .input_iova = (uint32_t)in_bo.dma_address, .weights_iova = (uint32_t)wt_bo.dma_address,
+            .output_iova = (uint32_t)out_bo.dma_address, .tasks = regs,
         };
         int g = gen_conv2d_int8(&p);
         if (g != 0) { fprintf(stderr, "  gen_conv2d_int8 failed (%d)\n", g); goto out; }
         unsigned n = p.task_count;
-        int kb = reg_find(regs, n, OP_REG_DPU, DPU_BS_CFG);
-        int ko = reg_find(regs, n, OP_REG_DPU, DPU_BS_OW_CFG);
-        int km = reg_find(regs, n, OP_REG_CORE, CORE_MISC_CFG);
+        int kb = reg_find(regs, n, TARGET_DPU, REG_DPU_BS_CFG);
+        int ko = reg_find(regs, n, TARGET_DPU, REG_DPU_BS_OW_CFG);
+        int km = reg_find(regs, n, TARGET_CORE, REG_CORE_MISC_CFG);
         if (kb < 0 || ko < 0 || km < 0) { fprintf(stderr, "  register word missing\n"); goto out; }
-        if (a->bs_on) reg_set(regs, n, OP_REG_DPU, DPU_BS_CFG, (1u << 6) | (1u << 4) | (1u << 1));
-        if (a->od_on) reg_set(regs, n, OP_REG_DPU, DPU_BS_OW_CFG, reg_get(regs, ko) & ~(1u << 1));
-        if (a->op_set) reg_set(regs, n, OP_REG_DPU, DPU_BS_OW_OP, a->op & 0xffffu);
-        if (a->qd >= 0) reg_set(regs, n, OP_REG_CORE, CORE_MISC_CFG,
+        if (a->bs_on) reg_set(regs, n, TARGET_DPU, REG_DPU_BS_CFG, (1u << 6) | (1u << 4) | (1u << 1));
+        if (a->od_on) reg_set(regs, n, TARGET_DPU, REG_DPU_BS_OW_CFG, reg_get(regs, ko) & ~(1u << 1));
+        if (a->op_set) reg_set(regs, n, TARGET_DPU, REG_DPU_BS_OW_OP, a->op & 0xffffu);
+        if (a->qd >= 0) reg_set(regs, n, TARGET_CORE, REG_CORE_MISC_CFG,
                                 (reg_get(regs, km) & ~1u) | (uint32_t)(a->qd & 1));
         bscfg = reg_get(regs, kb); owcfg = reg_get(regs, ko); misc = reg_get(regs, km);
-        op_em = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_BS_OW_OP));
+        op_em = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_BS_OW_OP));
         rocket_bo_prep(fd, &rc_bo, 1, 0);
         memcpy(rc_bo.ptr, regs, (size_t)n * sizeof(uint64_t));
         rocket_bo_fini(fd, &rc_bo);
@@ -429,7 +430,7 @@ static void direct_arm(int fd, const direct_arm_t *a, uint64_t seed, int is_cont
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++)
                 got[((size_t)oc * OH + oh) * OW + ow] =
-                    ((const int32_t *)out_bo.ptr)[feature_data(OCp, OH, OW, 4, oc + 1, oh + 1, ow + 1)];
+                    ((const int32_t *)out_bo.ptr)[feature_index(OCp, OH, OW, 4, oc + 1, oh + 1, ow + 1)];
     /* the whole BO, for the placement question: are the right values anywhere in it? */
     nraw = out_bo.size / 4;
     raw = malloc(out_bo.size);
@@ -504,7 +505,7 @@ static int layer_mode(int fd, char **a)
     const int Hj = H < 4 ? 4 : H;
     int chunk = 0;
     for (int c = DW_G; c <= rup(C, DW_G); c += DW_G)
-        if ((long)c * Hj * W <= 8L * NPU_CBUF_BANK_SIZE) chunk = c;
+        if ((long)c * Hj * W <= 8L * RK3588_CBUF_BANK_BYTES) chunk = c;
     if (!chunk || C % 16) { printf("does not fit one pass (C %d, %dx%d)\n", C, H, W); return 3; }
     int8_t *x = malloc((size_t)C * H * W), *w = malloc((size_t)C * KH * KW);
     int8_t *o = malloc((size_t)C * OH * OW);

@@ -667,11 +667,11 @@ static void fa_gather_v(_Float16 *vh, const _Float16 *Vh, int n_kv, int Kn, int 
 }
 
 /* scale + soft-cap + additive mask, in place on sc[Tp,Kn]; pad key columns -> -inf. */
-/* THE SCORE SURFACE SATURATES. The QK contraction accumulates in fp32 and the DPU writes
- * the scores as fp16; a score past 65504 is written as +-65504, not as inf [HW sweep
- * 2026-10-09, RK3588: an overflowed surface reads 0 non-finite values]. So every key past the
- * limit ties, the softmax spreads its weight across them, and the result is a full, finite,
- * wrong surface that nothing downstream can tell from a right one. Each host pass over the
+/* THE SCORE SURFACE OVERFLOWS. The QK contraction holds its products and their sum wide and
+ * the DPU narrows the scores to fp16: a score from 65504 to 65519 is written as +-65504 and
+ * one of 65520 or more as +-inf, from a single product or a sum [HW sweep 2026-11-07, RK3588,
+ * tests/fp16_mm_product_overflow_probe]. The first ties the keys past the limit and the
+ * second turns the row's softmax into NaN, so neither can be trusted. Each host pass over the
  * raw scores therefore reports whether a real key reached the limit (a magnitude of 65504 or
  * more, or a non-finite value), and the head range returns ROCKET_E_RANGE for it: the caller
  * holds the operands at full precision and recomputes. A score of exactly 65504 that did not
@@ -773,7 +773,7 @@ static inline const _Float16 *fa_score_at(const _Float16 *sc, int Tp, int seg, i
     return sc + (size_t)(j / seg) * Tp * seg + (size_t)i * seg + j % seg;
 }
 
-/* Returns whether a real key's raw score reached the saturation limit (see FA_SAT). The
+/* Returns whether a real key's raw score reached the fp16 limit (see FA_SAT). The
  * scores are read as `seg`-key blocks (fa_score_at; seg == Kn for plain rows) and P is
  * written as plain [Tp][Kn] rows; with plain rows, P may be the scores themselves. */
 static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mask, int n_tokens,
@@ -805,7 +805,7 @@ static int fa_softmax_fused(const _Float16 *sc, _Float16 *P, const _Float16 *mas
         /* One block of keys at a time (one, for plain rows): the maxima are order-free, so
          * the values are the same however the row is split. */
 #ifdef FA_NEON
-        /* The same values as the generic loop below. The saturation test reads a running
+        /* The same values as the generic loop below. The overflow test reads a running
          * maximum of |raw|, which a NaN carries through; a NaN score may then leave a different
          * row maximum, but the call returns ROCKET_E_RANGE and P is not used. */
         {
@@ -908,7 +908,7 @@ static void fa_gather_v_tile(_Float16 *vh, const _Float16 *Vh, int j0, int w, in
 
 /* scale + soft-cap + additive mask for ONE key tile [j0,j0+w) into sc[Tp,wp]; pad columns
  * w..wp -> -inf. mask is the full [n_tokens,n_kv] additive mask (row i, key j0+jj). Returns
- * whether a real key's raw score reached the saturation limit (see FA_SAT). */
+ * whether a real key's raw score reached the fp16 limit (see FA_SAT). */
 static int fa_mask_scores_tile(_Float16 *sc, const _Float16 *mask, int n_tokens, int n_kv,
                                int j0, int w, int Tp, int wp, float scale, float softcap)
 {

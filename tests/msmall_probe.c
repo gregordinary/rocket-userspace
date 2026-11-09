@@ -10,7 +10,7 @@
  * H%4 == 0, and every other M came back wrong; that was the library's M%4 rule. An external
  * userspace (rknpu2_matmul_open, vendor driver) runs M 1..8 with M along the CNA width at
  * height 1 and a surface stride of -3M, the same formula at width M and height 1.
- * gen_matmul_fp16's RE knobs select the arm, one process each, since it reads them once:
+ * gen_gemm_fp16's RE knobs select the arm, one process each, since it reads them once:
  *
  *   (none)                    width 1, height M, the packed surface stride (shipped)
  *   ROCKET_MM_SURF_TRUNC=1    width 1, height M, the old truncating stride clamped at 0
@@ -18,9 +18,9 @@
  *   ROCKET_MM_GRAINS=n        feature grains n instead of M+1, with any of the above
  *   ROCKET_MM_LINE_STRIDE=n   the line stride raw, and ROCKET_MM_SURF_PER_M=s the surface
  *                             stride s*M: the external program is MWIDTH, 0x200, -3, grains 2
- *   MSP_ROWMAJOR=1            A read as plain rows at height M (matmul_params_t.a_row_atoms,
+ *   MSP_ROWMAJOR=1            A read as plain rows at height M (gemm_params_t.a_row_atoms,
  *                             GROUP_LINE_OFF), the external's standard program
- *   MSP_DT=int8               gen_matmul_int8 instead (C2=16 input, int32 output; N%32)
+ *   MSP_DT=int8               gen_gemm_int8 instead (C2=16 input, int32 output; N%32)
  *   MSP_KACC=1                fp16 K-accumulation, the library's ki > 0 task: a first job
  *                             contracts K/2 into an fp16 partial, a second contracts the
  *                             rest with accumulate=1 and EW-adds the partial (ERDMA read
@@ -62,10 +62,10 @@ static void load_ab(int fd, rocket_bo *in, rocket_bo *w, const _Float16 *A, cons
     memset(w->ptr, 0, w->size);
     for (int m = 1; m <= M; m++)
         for (int k = 1; k <= K; k++)
-            ((_Float16 *)in->ptr)[feature_data(K, M, 1, 8, k, m, 1)] = A[(size_t)(m - 1) * lda + k - 1];
+            ((_Float16 *)in->ptr)[feature_index(K, M, 1, 8, k, m, 1)] = A[(size_t)(m - 1) * lda + k - 1];
     for (int n = 1; n <= N; n++)
         for (int k = 1; k <= K; k++)
-            ((_Float16 *)w->ptr)[weight_fp16(K, n, k)] = B[(size_t)(n - 1) * lda + k - 1];
+            ((_Float16 *)w->ptr)[gemm_weight_index_fp16(K, n, k)] = B[(size_t)(n - 1) * lda + k - 1];
     rocket_bo_fini(fd, in);
     rocket_bo_fini(fd, w);
 }
@@ -96,14 +96,14 @@ static int run_kacc(int fd, int M, int K, int N, uint64_t seed)
     uint64_t slow0 = rocket_fence_wait_slow_count();
     for (int pass = 0; pass < 2; pass++) {
         uint64_t ops[256] = { 0 };
-        matmul_params_t p = {
+        gemm_params_t p = {
             .m = (uint16_t)M, .k = (uint16_t)(pass ? K2 : K1), .n = (uint16_t)N,
-            .input_dma = (uint32_t)(pass ? in2 : in1).dma_address,
-            .weights_dma = (uint32_t)(pass ? w2 : w1).dma_address,
-            .output_dma = (uint32_t)(pass ? out : part).dma_address, .tasks = ops, .fp32tofp16 = 1,
-            .accumulate = (uint8_t)pass, .add_dma = pass ? (uint32_t)part.dma_address : 0,
+            .input_iova = (uint32_t)(pass ? in2 : in1).dma_address,
+            .weights_iova = (uint32_t)(pass ? w2 : w1).dma_address,
+            .output_iova = (uint32_t)(pass ? out : part).dma_address, .tasks = ops, .fp16_out = 1,
+            .accumulate = (uint8_t)pass, .add_iova = pass ? (uint32_t)part.dma_address : 0,
         };
-        if (gen_matmul_fp16(&p) != 0) { printf("  M %2d: generator refused\n", M); goto done; }
+        if (gen_gemm_fp16(&p) != 0) { printf("  M %2d: generator refused\n", M); goto done; }
         rocket_bo_prep(fd, &rc, 1, 0);
         memcpy(rc.ptr, ops, (size_t)p.task_count * 8);
         rocket_bo_fini(fd, &rc);
@@ -127,7 +127,7 @@ static int run_kacc(int fd, int M, int K, int N, uint64_t seed)
                 want += t;
                 if (k < K1) pwant += t;
             }
-            int oi = feature_data(N, M, 1, 8, n + 1, m + 1, 1);
+            int oi = feature_index(N, M, 1, 8, n + 1, m + 1, 1);
             float got = (float)((_Float16 *)out.ptr)[oi], pg = (float)((_Float16 *)part.ptr)[oi];
             if (isnan(got)) unwritten++;
             if (got != want) rw++;
@@ -161,13 +161,13 @@ static int run(int fd, int M, int K, int N, uint64_t seed)
     tf_fill_f16_int(A, (size_t)M * K, seed, -3, 3);
     tf_fill_f16_int(B, (size_t)N * K, seed + 1, -3, 3);
 
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)N,
-        .input_dma = (uint32_t)in.dma_address, .weights_dma = (uint32_t)w.dma_address,
-        .output_dma = (uint32_t)out.dma_address, .tasks = ops, .fp32tofp16 = 0,
+        .input_iova = (uint32_t)in.dma_address, .weights_iova = (uint32_t)w.dma_address,
+        .output_iova = (uint32_t)out.dma_address, .tasks = ops, .fp16_out = 0,
         .a_row_atoms = g_rowmajor ? (uint32_t)(K * 2 / 16) : 0,
     };
-    if ((g_int8 ? gen_matmul_int8(&p) : gen_matmul_fp16(&p)) != 0) {
+    if ((g_int8 ? gen_gemm_int8(&p) : gen_gemm_fp16(&p)) != 0) {
         printf("  M %2d: generator refused\n", M);
         goto done;
     }
@@ -182,18 +182,18 @@ static int run(int fd, int M, int K, int N, uint64_t seed)
     for (int m = 1; m <= M; m++)
         for (int k = 1; k <= K; k++)
             if (g_int8)
-                ((int8_t *)in.ptr)[feature_data(K, M, 1, 16, k, m, 1)] =
+                ((int8_t *)in.ptr)[feature_index(K, M, 1, 16, k, m, 1)] =
                     (int8_t)A[(size_t)(m - 1) * K + k - 1];
             else
                 ((_Float16 *)in.ptr)[g_rowmajor ? (size_t)(m - 1) * K + k - 1
-                                                : (size_t)feature_data(K, M, 1, 8, k, m, 1)] =
+                                                : (size_t)feature_index(K, M, 1, 8, k, m, 1)] =
                     A[(size_t)(m - 1) * K + k - 1];
     for (int n = 1; n <= N; n++)
         for (int k = 1; k <= K; k++)
             if (g_int8)
-                ((int8_t *)w.ptr)[weight_int8(K, n, k)] = (int8_t)B[(size_t)(n - 1) * K + k - 1];
+                ((int8_t *)w.ptr)[gemm_weight_index_int8(K, n, k)] = (int8_t)B[(size_t)(n - 1) * K + k - 1];
             else
-                ((_Float16 *)w.ptr)[weight_fp16(K, n, k)] = B[(size_t)(n - 1) * K + k - 1];
+                ((_Float16 *)w.ptr)[gemm_weight_index_fp16(K, n, k)] = B[(size_t)(n - 1) * K + k - 1];
     rocket_bo_fini(fd, &in);
     rocket_bo_fini(fd, &w);
     rocket_bo_prep(fd, &out, 1, 0);
@@ -213,7 +213,7 @@ static int run(int fd, int M, int K, int N, uint64_t seed)
         for (int n = 0; n < N; n++) {
             double want = 0;
             for (int k = 0; k < K; k++) want += (double)A[(size_t)m * K + k] * (double)B[(size_t)n * K + k];
-            int oi = feature_data(N, M, 1, 4, n + 1, m + 1, 1);
+            int oi = feature_index(N, M, 1, 4, n + 1, m + 1, 1);
             float got = g_int8 ? (float)((int32_t *)out.ptr)[oi] : ((float *)out.ptr)[oi];
             if (isnan(got)) unwritten++;
             if (got != want) rw++;

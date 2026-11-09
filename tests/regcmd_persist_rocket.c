@@ -45,7 +45,8 @@
 
 #include "rocket_npu.h"
 #include "npu_matmul.h"
-#include "npu_hw.h"          /* NPUOP, OP_*, register addresses */
+#include "npu_hw.h"          /* REGCMD, OP_*, register addresses */
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 
 #define CK(c) do { int _r=(c); if(_r) fprintf(stderr,"%s -> %d (%s)\n",#c,_r,strerror(-_r)); } while(0)
 
@@ -56,17 +57,17 @@ static void ref_i8(int m,int k,int n,const int8_t*A,const int8_t*B,int32_t*C){
 }
 static void patch_val(uint64_t*ops,int n,uint16_t reg,uint32_t val){
     for(int i=0;i<n;i++) if((ops[i]&0xffff)==reg){
-        uint16_t op=(uint16_t)(ops[i]>>48); ops[i]=NPUOP(op,val,reg); return; }
+        uint16_t op=(uint16_t)(ops[i]>>48); ops[i]=REGCMD(op, reg, val); return; }
 }
 static int count_bad(const int32_t*od,const int32_t*C,int M,int N){
     int bad=0; for(int m=1;m<=M;m++)for(int n=1;n<=N;n++)
-        if(od[feature_data(N,M,1,4,n,m,1)]!=C[(m-1)*N+(n-1)]) bad++;
+        if(od[feature_index(N,M,1,4,n,m,1)]!=C[(m-1)*N+(n-1)]) bad++;
     return bad;
 }
 static void pack_i8(rocket_bo*in,rocket_bo*wt,int M,int K,int N,const int8_t*A,const int8_t*B){
     int8_t*id=in->ptr,*wd=wt->ptr; memset(id,0,in->size); memset(wd,0,wt->size);
-    for(int n=1;n<=N;n++)for(int k=1;k<=K;k++)wd[weight_int8(K,n,k)]=B[(n-1)*K+(k-1)];
-    for(int m=1;m<=M;m++)for(int k=1;k<=K;k++)id[feature_data(K,M,1,16,k,m,1)]=A[(m-1)*K+(k-1)];
+    for(int n=1;n<=N;n++)for(int k=1;k<=K;k++)wd[gemm_weight_index_int8(K,n,k)]=B[(n-1)*K+(k-1)];
+    for(int m=1;m<=M;m++)for(int k=1;k<=K;k++)id[feature_index(K,M,1,16,k,m,1)]=A[(m-1)*K+(k-1)];
 }
 
 int main(int argc,char**argv){
@@ -90,28 +91,28 @@ int main(int argc,char**argv){
 
     /* task0: full regcmd, A0xB0 -> outA */
     uint64_t r0[256]={0};
-    matmul_params_t p={.m=M,.k=K,.n=N,.input_dma=(uint32_t)in0.dma_address,
-        .weights_dma=(uint32_t)wt0.dma_address,.output_dma=(uint32_t)outA.dma_address,.tasks=r0};
-    if((ret=gen_matmul_int8(&p))){fprintf(stderr,"gen0=%d\n",ret);ret=1;goto out;}
-    uint32_t n0=p.task_count; patch_val(r0,n0,DPU_S_POINTER,sptr);
+    gemm_params_t p={.m=M,.k=K,.n=N,.input_iova=(uint32_t)in0.dma_address,
+        .weights_iova=(uint32_t)wt0.dma_address,.output_iova=(uint32_t)outA.dma_address,.tasks=r0};
+    if((ret=gen_gemm_int8(&p))){fprintf(stderr,"gen0=%d\n",ret);ret=1;goto out;}
+    uint32_t n0=p.task_count; patch_val(r0,n0,REG_DPU_S_POINTER,sptr);
 
     uint64_t r1[256]={0}; uint32_t n1;
     if(is_full){
-        matmul_params_t q=p; q.output_dma=(uint32_t)outB.dma_address; q.tasks=r1;
-        if((ret=gen_matmul_int8(&q))){fprintf(stderr,"gen1=%d\n",ret);ret=1;goto out;}
-        n1=q.task_count; patch_val(r1,n1,DPU_S_POINTER,sptr);
+        gemm_params_t q=p; q.output_iova=(uint32_t)outB.dma_address; q.tasks=r1;
+        if((ret=gen_gemm_int8(&q))){fprintf(stderr,"gen1=%d\n",ret);ret=1;goto out;}
+        n1=q.task_count; patch_val(r1,n1,REG_DPU_S_POINTER,sptr);
     } else {
         int i=0;
-        r1[i++]=NPUOP(OP_REG_DPU, sptr, DPU_S_POINTER);
+        r1[i++]=REGCMD(TARGET_DPU, REG_DPU_S_POINTER, sptr);
         if(is_tile){
-            r1[i++]=NPUOP(OP_REG_CNA,(uint32_t)in1.dma_address, CNA_FEATURE_DATA_ADDR);
-            r1[i++]=NPUOP(OP_REG_CNA,(uint32_t)wt1.dma_address, CNA_DCOMP_ADDR0);
+            r1[i++]=REGCMD(TARGET_CNA, REG_CNA_FEATURE_DATA_ADDR, (uint32_t)in1.dma_address);
+            r1[i++]=REGCMD(TARGET_CNA, REG_CNA_DCOMP_ADDR0, (uint32_t)wt1.dma_address);
         }
-        r1[i++]=NPUOP(OP_REG_DPU,(uint32_t)outB.dma_address, DPU_DST_BASE_ADD);
-        r1[i++]=NPUOP(OP_NONE,0x0,0x0);
-        r1[i++]=NPUOP(OP_REG_PC,0x0,PC_REGISTER_AMOUNTS);
-        r1[i++]=NPUOP(OP_40,0x0,0x0);
-        r1[i++]=NPUOP(OP_ENABLE,0x1D,PC_OPERATION_ENABLE);
+        r1[i++]=REGCMD(TARGET_DPU, REG_DPU_DST_BASE_ADDR, (uint32_t)outB.dma_address);
+        r1[i++]=REGCMD(TARGET_NONE, 0x0, 0x0);
+        r1[i++]=REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x0);
+        r1[i++]=REGCMD(TARGET_PRE_ENABLE, 0x0, 0x0);
+        r1[i++]=REGCMD(TARGET_ENABLE, REG_PC_OPERATION_ENABLE, 0x1D);
         n1=i;
     }
     printf("persist probe: mode=%s S_POINTER=0x%x  task0_ops=%u task1_ops=%u  C[%d,%d]\n",

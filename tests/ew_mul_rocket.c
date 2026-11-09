@@ -7,9 +7,9 @@
  * elementwise MULTIPLY on the DPU. The Teflon RE
  * settled that the rocket DPU EW unit reads its 2nd operand ONLY combined with a
  * conv/CACC main feed (ERDMA EW_BASE + MRDMA SRC_BASE + COMB_USE(5)); a pure
- * flying-MRDMA-main + ERDMA-operand pair (the old gen_ew_mul_fp16) reads the
+ * flying-MRDMA-main + ERDMA-operand pair reads the
  * operand as 0. So this gate drives the proven conv-main EW path — the SAME
- * machinery as the fp16 K-accum eltwise-ADD (gen_matmul_fp16, accumulate=1) — and
+ * machinery as the fp16 K-accum eltwise-ADD (gen_gemm_fp16, accumulate=1) — and
  * just swaps the EW op:
  *
  *   main feed   = an IDENTITY matmul  C[M,N] = A[M,K] · I[N,K]^T  (K==N, W=I)
@@ -20,7 +20,7 @@
  *                                        encoding 0x108003C4)
  *
  * Because the EW op is selected purely by DPU_EW_CFG (env ROCKET_EW_CFG, already
- * plumbed through gen_matmul_fp16), this reuses the entire validated conv+ERDMA
+ * plumbed through gen_gemm_fp16), this reuses the entire validated conv+ERDMA
  * path and only changes one register word. ADD must reproduce the K-accum result
  * (proving the operand layout is right); MUL is then the one new bit.
  *
@@ -58,7 +58,7 @@
  * internal M_TILE so the M-tiling path is exercised. Bit-exact vs the fp16 host op. */
 static int runtime_check(int fd)
 {
-    /* the gen-test above setenv()'s ROCKET_EW_CFG (gen_matmul_fp16 honors it as an
+    /* the gen-test above setenv()'s ROCKET_EW_CFG (gen_gemm_fp16 honors it as an
      * override) — clear it so the runtimes select the op from their own ew_mul flag. */
     unsetenv("ROCKET_EW_CFG");
     const int NS[] = { 256, 512, 2048, 40000 };  /* single-tile small..multi-tile */
@@ -116,7 +116,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Pick the EW op encoding. gen_matmul_fp16 reads ROCKET_EW_CFG; default it to
+    /* Pick the EW op encoding. gen_gemm_fp16 reads ROCKET_EW_CFG; default it to
      * the op under test but let an explicit env override win (for sweeps). */
     if (!getenv("ROCKET_EW_CFG"))
         setenv("ROCKET_EW_CFG", is_mul ? "0x108003C4" : "0x108202C0", 1);
@@ -160,7 +160,7 @@ int main(int argc, char **argv)
     { _Float16 *ip = inb.ptr;
       for (int h = 1; h <= M; h++)
           for (int c = 1; c <= K; c++)
-              ip[feature_data(K, M, 1, 8, c, h, 1)] = A[(size_t)(h-1)*N + (c-1)]; }
+              ip[feature_index(K, M, 1, 8, c, h, 1)] = A[(size_t)(h-1)*N + (c-1)]; }
     rocket_bo_fini(fd, &inb);
 
     /* identity weights I[N,K] (N==K): W[n,k] = (n==k) */
@@ -168,7 +168,7 @@ int main(int argc, char **argv)
     { _Float16 *wp = wtb.ptr;
       for (int kk = 1; kk <= N; kk++)
           for (int c = 1; c <= K; c++)
-              wp[weight_fp16(K, kk, c)] = (_Float16)(kk == c ? 1.0f : 0.0f); }
+              wp[gemm_weight_index_fp16(K, kk, c)] = (_Float16)(kk == c ? 1.0f : 0.0f); }
     rocket_bo_fini(fd, &wtb);
 
     /* operand B packed in the OUTPUT cube layout (same indexing as the readback) */
@@ -176,20 +176,20 @@ int main(int argc, char **argv)
     { _Float16 *bp = opb.ptr;
       for (int m = 0; m < M; m++)
           for (int n = 0; n < N; n++)
-              bp[feature_data(N, M, 1, 8, n+1, m+1, 1)] = B[(size_t)m*N + n]; }
+              bp[feature_index(N, M, 1, 8, n+1, m+1, 1)] = B[(size_t)m*N + n]; }
     rocket_bo_fini(fd, &opb);
 
     rocket_bo_prep(fd, &outb, 1, 0); memset(outb.ptr, 0, outb.size); rocket_bo_fini(fd, &outb);
 
     /* one accumulate job: main = identity matmul (=A), EW operand = B */
     uint64_t ops[256] = {0};
-    matmul_params_t p = { .m = M, .k = K, .n = N,
-        .input_dma   = (uint32_t)inb.dma_address,
-        .weights_dma = (uint32_t)wtb.dma_address,
-        .output_dma  = (uint32_t)outb.dma_address,
-        .tasks = ops, .fp32tofp16 = 1,
-        .accumulate = 1, .add_dma = (uint32_t)opb.dma_address };
-    if (gen_matmul_fp16(&p)) { fprintf(stderr, "gen failed\n"); return 1; }
+    gemm_params_t p = { .m = M, .k = K, .n = N,
+        .input_iova   = (uint32_t)inb.dma_address,
+        .weights_iova = (uint32_t)wtb.dma_address,
+        .output_iova  = (uint32_t)outb.dma_address,
+        .tasks = ops, .fp16_out = 1,
+        .accumulate = 1, .add_iova = (uint32_t)opb.dma_address };
+    if (gen_gemm_fp16(&p)) { fprintf(stderr, "gen failed\n"); return 1; }
 
     { uint32_t ew=0, erd=0, fmc=0;
       for (uint32_t z = 0; z < p.task_count; z++) {
@@ -214,7 +214,7 @@ int main(int argc, char **argv)
     float want_max = 0;
     for (int m = 0; m < M; m++)
         for (int n = 0; n < N; n++) {
-            float got = (float)ob[feature_data(N, M, 1, 8, n+1, m+1, 1)];
+            float got = (float)ob[feature_index(N, M, 1, 8, n+1, m+1, 1)];
             float a = (float)A[(size_t)m*N+n], b = (float)B[(size_t)m*N+n];
             float r_add = (float)(_Float16)(a + b);
             float r_mul = (float)(_Float16)(a * b);

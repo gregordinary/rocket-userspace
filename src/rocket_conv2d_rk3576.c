@@ -84,8 +84,8 @@
 #define r76_c2_unpack rocket_rk3576_c2_unpack
 
 
-int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
-int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+int feature_index(int C, int H, int W, int C2_, int c, int h, int w);
+int conv_weight_index_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
 
 /* ============================================================================
  * SECTION — shared plumbing
@@ -577,9 +577,11 @@ static int r76_chain_stream(struct r76_conv_bos *b, rocket_task_desc *td,
  * poisoning an int32-output job leaves behind — it crosses calls and processes, so a
  * conv inherits it from whatever ran before — and the idle in front of the redo is the
  * NPU power domain cycling rather than a settling time. */
-/* One word past the longest program, so the unchained multi-task layout puts each row
- * task at its own offset in the regcmd BO. Matches the chain's own even-word stride. */
-#define R76_TASK_SLOT_WORDS  (RK3576_CONV_TASK_OPS + 1u)
+/* The longest program rounded up to an even word count, so the unchained multi-task layout
+ * puts each row task at its own 16-byte-aligned offset in the regcmd BO. The PC drops bits
+ * 3:0 of the address, and rocket refuses an unaligned one from Linux 7.4 (725953d4). Matches
+ * the chain's own even-word stride. */
+#define R76_TASK_SLOT_WORDS  RK3576_CONV_TASK_SLOT
 
 static int r76_submit_ops(int fd, struct r76_conv_bos *b, const uint64_t *ops,
                           uint32_t task_ops, const uint32_t *in_h, unsigned n_in,
@@ -1653,14 +1655,14 @@ static rocket_bo *r76_surf(r76_w *h, unsigned ti, size_t *off)
 }
 
 /* The same, for a const handle that only needs the address the program is emitted with. */
-static uint64_t r76_surf_dma(const r76_w *h, unsigned ti)
+static uint64_t r76_surf_iova(const r76_w *h, unsigned ti)
 {
     if (h->out_ext.ptr && !ti) return h->out_ext.dma_address + h->out_off;
     return h->tile[ti].out.dma_address;
 }
 
 /* The feature cube's base, borrowed or the handle's own. */
-static uint64_t r76_feat_dma(const r76_w *h)
+static uint64_t r76_feat_iova(const r76_w *h)
 {
     return h->cube_in ? h->src.dma_address + h->src_off : h->in.dma_address;
 }
@@ -2378,7 +2380,7 @@ static int r76_wtile_pack(const char *entry, r76_w *h, unsigned t, const int8_t 
                     }
             }
         } else {
-            /* The same hoist. weight_conv_int8() at these groups is
+            /* The same hoist. conv_weight_index_int8() at these groups is
              * (c/32)*nIC1*KH*KW*1024 + (i/32)*KH*KW*1024 + (y*KW + x)*1024 +
              * (c%32)*32 + (i%32), so the taps of one (channel, input channel) pair walk a
              * fixed 1024-byte stride from a contiguous source run. */
@@ -2704,7 +2706,7 @@ static int r76_int8_exec(const char *entry, r76_w *h, const int8_t *W,
             return ROCKET_E_NOMEM;
         }
         lp.lo = h->lut_le; lp.hi = h->lut_lo;
-        lp.scratch_dma = h->lut_bo.dma_address + h->lut_scratch;
+        lp.scratch_iova = h->lut_bo.dma_address + h->lut_scratch;
         lp.tasks = lops;
         if (gen_lut_load_rk3576(&lp) != 0) {
             free(lops);
@@ -2776,10 +2778,10 @@ static int r76_int8_exec(const char *entry, r76_w *h, const int8_t *W,
         p.weight_zero_point = 0x80;
         p.lut         = h->has_lut ? &h->lut : NULL;
         p.tasks       = h->ops;
-        p.input_dma   = (uint32_t)r76_feat_dma(h);
-        p.weights_dma = s->w.dma_address;
-        p.bias_dma    = s->coeff.dma_address;
-        p.output_dma  = (uint32_t)(surf->dma_address + ooff);
+        p.input_iova   = (uint32_t)r76_feat_iova(h);
+        p.weights_iova = s->w.dma_address;
+        p.bias_iova    = s->coeff.dma_address;
+        p.output_iova  = (uint32_t)(surf->dma_address + ooff);
 
         {
             conv_params_t q = p;
@@ -2827,8 +2829,8 @@ static int r76_int8_exec(const char *entry, r76_w *h, const int8_t *W,
             conv_params_t q = p;
             q.ih = h->plan[t].ih; q.oh = h->plan[t].oh;
             q.pad_top = h->plan[t].pad_top;
-            q.input_dma  = p.input_dma  + h->plan[t].feature_off;
-            q.output_dma = p.output_dma + h->plan[t].output_off;
+            q.input_iova  = p.input_iova  + h->plan[t].feature_off;
+            q.output_iova = p.output_iova + h->plan[t].output_off;
             /* ALWAYS, not only when the plan split. A single-task plan's window is still
              * shorter than the plane whenever the last output row does not reach the
              * bottom input row — ordinary stride-2 VALID geometry — and leaving these at
@@ -4154,7 +4156,7 @@ void rocket_conv2d_int8_weights_free_rk3576(int fd,
  * WHAT MAKES IT SOUND is two measured facts and one structural one:
  *
  *   A chained stream HONOURS READ-AFTER-WRITE between its programs. The PC advances on a
- *   program's OP_ENABLE and the next program's feature read sees the previous one's output
+ *   program's TARGET_ENABLE and the next program's feature read sees the previous one's output
  *   surface — over five planes from 2 KB to 387 KB, with the second program's cube being the
  *   first's surface exactly as here (tests/rk3576_chain_raw.c). That was the question the
  *   row-task chain never had to ask, because row tasks write disjoint rows.
@@ -4287,10 +4289,10 @@ static void r76_chain_params(const r76_w *h, conv_params_t *p)
     p->input_zero_point  = h->in_zp  + 0x80;
     p->output_zero_point = h->out_zp + 0x80;
     p->weight_zero_point = 0x80;
-    p->input_dma   = (uint32_t)r76_feat_dma(h);
-    p->weights_dma = s->w.dma_address;
-    p->bias_dma    = s->coeff.dma_address;
-    p->output_dma  = (uint32_t)r76_surf_dma(h, 0);
+    p->input_iova   = (uint32_t)r76_feat_iova(h);
+    p->weights_iova = s->w.dma_address;
+    p->bias_iova    = s->coeff.dma_address;
+    p->output_iova  = (uint32_t)r76_surf_iova(h, 0);
 }
 
 /* ---- THE THREE NODE KINDS ----------------------------------------------------------
@@ -4359,20 +4361,20 @@ static int r76_node_cube_out(const rocket_chain_node_rk3576 *nd)
     return r76_node_pool_link(nd, &pl) && pl.cube_out;
 }
 
-static uint64_t r76_node_feat_dma(const rocket_chain_node_rk3576 *nd)
+static uint64_t r76_node_feat_iova(const rocket_chain_node_rk3576 *nd)
 {
     struct rocket_rk3576_pool_link pl;
     if (!r76_node_runs(nd)) return 0;
-    if (!r76_node_is_pool(nd)) return r76_feat_dma(nd->conv);
-    return r76_node_pool_link(nd, &pl) ? pl.feat_dma : 0;
+    if (!r76_node_is_pool(nd)) return r76_feat_iova(nd->conv);
+    return r76_node_pool_link(nd, &pl) ? pl.feat_iova : 0;
 }
 
-static uint64_t r76_node_surf_dma(const rocket_chain_node_rk3576 *nd)
+static uint64_t r76_node_surf_iova(const rocket_chain_node_rk3576 *nd)
 {
     struct rocket_rk3576_pool_link pl;
     if (!r76_node_runs(nd)) return 0;
-    if (!r76_node_is_pool(nd)) return r76_surf_dma(nd->conv, 0);
-    return r76_node_pool_link(nd, &pl) ? pl.surf_dma : 0;
+    if (!r76_node_is_pool(nd)) return r76_surf_iova(nd->conv, 0);
+    return r76_node_pool_link(nd, &pl) ? pl.surf_iova : 0;
 }
 
 /* Why a handle cannot be part of a chain, or NULL if it can. */
@@ -4426,8 +4428,8 @@ static int r76_run_fed(const rocket_chain_node_rk3576 *nd, unsigned first, unsig
     if (r76_node_is_placement(&nd[j])) return 1;
     if (!r76_node_cube_in(&nd[j])) return 0;
     for (i = first; i < j; i++)
-        if (r76_node_cube_out(&nd[i]) && r76_node_surf_dma(&nd[i]) ==
-                                         r76_node_feat_dma(&nd[j])) return 1;
+        if (r76_node_cube_out(&nd[i]) && r76_node_surf_iova(&nd[i]) ==
+                                         r76_node_feat_iova(&nd[j])) return 1;
     return 0;
 }
 
@@ -4745,7 +4747,7 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
                         "writes (cube_in=%d), so its input would need a host scatter. Link "
                         "it to its producer with rocket_conv2d_int8_cube_of_rk3576 / "
                         "_cube_in_ first\n",
-                        entry, i, (unsigned long long)r76_node_feat_dma(&nd[i]),
+                        entry, i, (unsigned long long)r76_node_feat_iova(&nd[i]),
                         r76_node_cube_in(&nd[i]));
             return NULL;
         }
@@ -4888,8 +4890,8 @@ rocket_chain_new_rk3576(int fd, const rocket_chain_node_rk3576 *nd, unsigned n)
             unsigned k = c->layer[i].task0 + t;
             q.ih = hi->plan[t].ih; q.oh = hi->plan[t].oh;
             q.pad_top = hi->plan[t].pad_top;
-            q.input_dma  = p.input_dma  + hi->plan[t].feature_off;
-            q.output_dma = p.output_dma + hi->plan[t].output_off;
+            q.input_iova  = p.input_iova  + hi->plan[t].feature_off;
+            q.output_iova = p.output_iova + hi->plan[t].output_off;
             q.ih_full = (uint16_t)hi->IH; q.oh_full = (uint16_t)hi->oh;
             q.tasks = all + (size_t)k * RK3576_CONV_TASK_OPS;
             if ((hi->dw ? gen_conv2d_dw_int8_rk3576(&q)
@@ -5779,7 +5781,7 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
     plan.stride_y = (uint8_t)d->stride_y; plan.stride_x = (uint8_t)d->stride_x;
     plan.pad_top = (uint8_t)d->pad_top; plan.pad_left = (uint8_t)d->pad_left;
     plan.ih_full = (uint16_t)IH; plan.oh_full = (uint16_t)oh;
-    if (rocket_rk3576_plan_rows_prec(&plan, 0, precision_float16, rows,
+    if (rocket_rk3576_plan_rows_prec(&plan, 0, PREC_FP16, rows,
                                      oh ? oh : 1u, &nrow) < 0 || !nrow) {
         ROCKET_LOGE("%s: no row plan for the first conv (ic=%u %ux%u k%ux%u)\n",
                     entry, IC, IW, IH, KW, KH);
@@ -5811,7 +5813,7 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
      * is a denormal that empties the surface. One tile's worth, reused by every tile. */
     rocket_bo_prep(fd, &b.coeff, 1, 0);
     rc = rocket_rk3576_pack_coeff_prec(b.coeff.ptr, coeff_bytes, NULL, tilepad,
-                                       precision_float16);
+                                       PREC_FP16);
     rocket_bo_fini(fd, &b.coeff);
     if (rc < 0) { rc = ROCKET_E_SHAPE; goto done; }
 
@@ -5853,13 +5855,13 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
             p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
             p.input_zero_point = 0; p.output_zero_point = 0; p.weight_zero_point = 0;
             p.tasks       = ops;
-            p.input_dma   = b.in.dma_address + rows[r].feature_off;
-            p.weights_dma = b.w.dma_address;
-            p.bias_dma    = b.coeff.dma_address;
+            p.input_iova   = b.in.dma_address + rows[r].feature_off;
+            p.weights_iova = b.w.dma_address;
+            p.bias_iova    = b.coeff.dma_address;
             /* The output cube's channel groups are contiguous planes, so a tile
              * starting on a group boundary is the same BO at a plane offset, and a row
              * window is that plus the planner's own row offset. */
-            p.output_dma  = b.out.dma_address +
+            p.output_iova  = b.out.dma_address +
                             (uint32_t)((size_t)oc0 * oh * ow * sizeof(_Float16)) +
                             rows[r].output_off;
             if (gen_conv2d_fp16_rk3576(&p) != 0) {
@@ -5953,7 +5955,7 @@ static unsigned r76_fp16_oc_tile(unsigned iw, unsigned ih, unsigned ocpad,
     unsigned slice = R76_FP16_OC_GROUP * ROCKET_RK3576_FP16_IC_SLICE * kh * kw * 2u;
 
     if (rocket_rk3576_cbuf_f_prec(iw, ROCKET_RK3576_FP16_IC_SLICE, ih, tile, kh, kw, 0,
-                                  precision_float16, &f) < 0)
+                                  PREC_FP16, &f) < 0)
         return tile;               /* rocket_rk3576_plan_ic() refuses the plane itself */
     g = rocket_rk3576_weight_phase_groups(slice, f);
     if (g && g != UINT_MAX && g * R76_FP16_OC_GROUP < tile) tile = g * R76_FP16_OC_GROUP;
@@ -6077,7 +6079,7 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
     }
 
     /* The feature cube is shared: at an 8-channel atom its channel groups are contiguous
-     * planes, so slice s is the same BO at input_dma + feature_off. */
+     * planes, so slice s is the same BO at input_iova + feature_off. */
     rocket_bo_prep(fd, &b.in, 1, 0);
     memset(b.in.ptr, 0, in_bytes);
     {
@@ -6097,7 +6099,7 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
      * the denormal 6e-8 and underflows the whole surface to empty. */
     rocket_bo_prep(fd, &b.coeff, 1, 0);
     if (rocket_rk3576_pack_coeff_prec(b.coeff.ptr, coeff_bytes, NULL, ocpad,
-                                      precision_float16) < 0) {
+                                      PREC_FP16) < 0) {
         rocket_bo_fini(fd, &b.coeff);
         rc = ROCKET_E_SHAPE; goto done;
     }
@@ -6147,13 +6149,13 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
             p.ic          = slices[s].ic;
             p.oc          = (uint16_t)n;
             p.tasks       = ops;
-            p.input_dma   = b.in.dma_address + slices[s].feature_off;
-            p.weights_dma = b.w.dma_address;
-            p.bias_dma    = b.coeff.dma_address;
+            p.input_iova   = b.in.dma_address + slices[s].feature_off;
+            p.weights_iova = b.w.dma_address;
+            p.bias_iova    = b.coeff.dma_address;
             /* Either surface puts channel group g at g * 16 * ow * oh bytes, eight fp16
              * channels or four fp32 ones to an atom, so a tile is the same surface at
              * oc0 * ow * oh elements. */
-            p.output_dma  = b.out.dma_address + (uint32_t)((size_t)oc0 * oh * ow * esz);
+            p.output_iova  = b.out.dma_address + (uint32_t)((size_t)oc0 * oh * ow * esz);
             if ((f32 ? gen_conv2d_fp16_rk3576_f32out(&p) : gen_conv2d_fp16_rk3576(&p)) != 0) {
                 ROCKET_LOGE("%s: the generator refused slice %u of %u, oc %u..%u\n", entry,
                             s, nslice, oc0, oc0 + n);

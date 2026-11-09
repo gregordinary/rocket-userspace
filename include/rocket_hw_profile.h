@@ -16,14 +16,14 @@
  * - The worker default
  *
  * The profile does not contain the datapath common to the IP family, which `npu_hw.h` and
- * `npu_regcmd.c` define. That datapath is the `precision_*` encoding values, the
+ * the RK3588 encoder (`npu_regcmd.c`) define. That datapath is the `precision_*` encoding values, the
  * CNA->CORE->DPU sequence, the BS, BN and EW field meanings, the LUT machinery and the
  * tile-layout index algebra. Those come from the IP rather than the SoC, so they are not
  * parameterized.
  *
  * The CNA, CORE and DPU geometry-register encoding is the one datapath element that is not
- * fully shared. The offsets and field packing in `npu_hw.h` are the RK3588's, and they are
- * specific to the IP revision. The RK3576 NPU re-packs the CNA block at the same block
+ * fully shared. The RK3588 encoder's offsets and field packing, from Mesa's `rocket` register
+ * database, are the RK3588's, and they are specific to the IP revision. The RK3576 NPU re-packs the CNA block at the same block
  * base, and the difference is more than an offset shift. Registers move, the bit-packing
  * differs at shared offsets, and the RK3576 uses offsets that are gaps on the RK3588. Only
  * 2 CNA geometry registers coincide.
@@ -58,7 +58,7 @@
 #define ROCKET_HW_PROFILE_H
 
 #include <stdint.h>
-#include "npu_hw.h"   /* NPU_CBUF_BANKS and NPU_CBUF_BANK_SIZE, which the RK3588
+#include "npu_hw.h"   /* RK3588_CBUF_BANKS and RK3588_CBUF_BANK_BYTES, which the RK3588
                        * profile mirrors so that each compile-time literal is defined
                        * once, and the precision_* enum that keys the datatype mask. */
 
@@ -79,8 +79,8 @@ struct rocket_hw_profile {
      * The bank count is the highest-risk machine parameter, because every tile-budget
      * loop depends on it. On the RK3588 both fields mirror `npu_hw.h`, so each literal is
      * defined once. */
-    int cbuf_banks;            /* number of CBUF banks      (RK3588: NPU_CBUF_BANKS)     */
-    int cbuf_bank_size;        /* bytes per CBUF bank       (RK3588: NPU_CBUF_BANK_SIZE) */
+    int cbuf_banks;            /* number of CBUF banks      (RK3588: RK3588_CBUF_BANKS)     */
+    int cbuf_bank_size;        /* bytes per CBUF bank       (RK3588: RK3588_CBUF_BANK_BYTES) */
 
     /* Matmul tile geometry. */
     int max_tile;              /* Mt and Nt cap, the M-independent resident-weight pivot */

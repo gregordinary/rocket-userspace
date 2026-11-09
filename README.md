@@ -372,10 +372,12 @@ instruction-bound.
 
 ### Quantization and prefill speed
 
-Quantization does not speed prefill at this operating point. Resident int8 and int4 run at 386
-and 413 GOP/s beside the whole-tile fp16 program's 461. The NPU then runs at ~15% of its fp16
-MAC peak. In-model resident int8 prefill measured 0.60x fp16 on Gemma-4-12B (~816 MHz, a June
-2026 build), because its int32 readback is not K-accumulated on the NPU.
+At equal residency, quantization does not speed prefill at this operating point. At
+`512×3840×4096`, int8 with streamed weights and int4 run 1.14-1.20x the streamed fp16 matmul,
+against MAC rates of 2x and 4x [HW sweep 2026-11-02]. In a model, `ggml-rocket`'s resident int8
+route prefills at 0.95-0.99x resident fp16, with half the resident weight bytes [HW sweep
+2026-11-06]. The models were Llama-3.2-3B-Instruct and Ministral-3-3B-Instruct F16. Both were
+measured at 928 MHz.
 
 The int8 and int4 paths therefore save RAM and fit larger models rather than raising
 throughput. The result holds while prefill is DMA-bound and dispatch-bound. The [datatype
@@ -408,6 +410,17 @@ limits:
   de-tile C on the host.
 - **The clock boots at 200 MHz.** A higher rate needs the `patches/rocket` clock patch
   ([Clock](#clock)).
+- **A pool runs on the NPU only on a driver with the PPU completion.** A pooling program
+  raises no DPU completion. A `rocket` driver without the `patches/rocket` PPU-completion
+  patch (DRM interface 1.3) therefore retires each pooling job at its 500 ms job timeout, with
+  a core reset. On such a driver the pool entries refuse and the global pools compute on the
+  host. `rocket_pool_npu_supported()` reports which case applies.
+- **One RK3588 pooling task has an output-width allowance.** Past it the PPU writes a
+  complete, incorrect output. The allowance is set by `ceil(kh / stride_y)`, the output rows
+  one input row feeds: 64 columns at 1-2 rows, 32 at 3-4 and 16 at 5-8. A 2×2 window at
+  stride 2 has 128. The fp16, int8 and uint8 pool entries run a wider output as column
+  bands in one job (`rocket_pool_fp16_max_ow()`). They refuse a window above 8×8 and a stride above
+  the window: the PPU computes either incorrectly at an output width of 8 or less.
 - **bf16, int16 and tf32 add datatype coverage rather than speed.** bf16 and int16 have
   fp16's nominal MAC rate and tf32 half of it. Only bf16 has an in-model use: fp32 range with
   no activation scaling.
@@ -508,8 +521,9 @@ optional kernel patches:
 - **[`rknpu-submit`](https://github.com/gregordinary/rknpu-submit)**: a submit provider that
   runs `librocketnpu` on the vendor `rknpu` BSP kernel driver instead of mainline `rocket`.
 - **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional
-  out-of-tree kernel-module patches for clock, voltage and IOMMU. They raise the NPU clock
-  from its 200 MHz boot default and trim dispatch latency.
+  out-of-tree kernel-module patches for clock, voltage, IOMMU and pool completion. They raise
+  the NPU clock from its 200 MHz boot default, trim dispatch latency and let a pool run on the
+  NPU.
 
 ## License and credits
 
@@ -518,15 +532,30 @@ optional kernel patches:
 It builds on prior work:
 
 - The RK3588 NPU register interface reverse-engineered by Jasbir Matharu
-  (`mtx512/rk3588-npu`), whose copyright is retained verbatim in the hardware headers
-  (`npu_cna.h`, `npu_dpu.h`, `npu_hw.h`, `npu_matmul.h`).
+  (`mtx512/rk3588-npu`), whose register headers and matmul generators this library started
+  from.
 - The `rocket` regcmd format established by the Mesa Teflon "rocket" gallium driver by Tomeu
-  Vizoso (MIT). The CNA→CORE→DPU register sequence this library emits derives from that
-  work, and no Mesa source is vendored here.
+  Vizoso (MIT). The RK3588 encoder in `src/npu_regcmd.c` is written on that driver's register
+  map. `third_party/mesa-rocket/` contains the map, `registers.xml`, unmodified, with the
+  generator of its C header.
 - johanvdb/librocket, a FOSS userspace fp16 matmul on mainline `rocket` that combined the
   two above, which served as the starting point for the kernel-access layer.
+- The RK3588 NPU driver by allbilly (`allbilly/npu`). The library's first DPU-only and PPU
+  programs were ported from its encodings of the DPU LUT activation, the elementwise
+  multiply and pooling. The pooling program and the sigmoid LUT geometry the library ships
+  agree with what RKNN-Toolkit2 compiles for the RK3588. The tanh LUT geometry is the
+  library's own measurement.
+- The RK3576 NPU work of Jiaxing Hu. The RK3576 encoder was first built from the register
+  maps in `gahingwoo/linux-rk3576-npu`. The register facts it programs are in Jiaxing Hu's
+  MIT-licensed RK3576 extension of Mesa's `rocket` driver (`gahingwoo/mesa-rk3576`), or in
+  this library's own captures and measurements.
+- `gahingwoo/charsiu` (GPL-2.0-or-later), Jiaxing Hu's LLM runtime for the RK3576 on
+  `rocket`. Its matmul-form fp16 program, read from a vendor
+  `.rkllm`, showed that one task contracts the whole of K. The RK3576 whole output stage
+  was found through it. `rocket_matmul_fp16_rk3576()` runs that program as
+  RKLLM-Toolkit compiles it.
 
-`librocketnpu` starts from that prior work. It adopts the RK3588 register headers and
-rewrites the kernel-access layer for the mainline `rocket` DRM-accel driver. It then adds
+`librocketnpu` starts from that prior work. Its RK3588 encoder is written on Mesa's register map,
+and its kernel-access layer for the mainline `rocket` DRM-accel driver. It adds
 the tiled/multicore/resident/multi-dtype matmul and the on-NPU op library. Those additions
 are validated bit-exact on real RK3588 hardware.

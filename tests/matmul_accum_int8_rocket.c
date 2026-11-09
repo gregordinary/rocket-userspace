@@ -9,7 +9,7 @@
  * an int32 operand read back by the ERDMA), bit-exact?
  *
  * Why a fresh test instead of more in-tiled-driver sweeping: the geometry in
- * gen_matmul_int8's accumulate path is BYTE-IDENTICAL to the working fp16 add
+ * gen_gemm_int8's accumulate path is BYTE-IDENTICAL to the working fp16 add
  * geometry (base_off = M*ATOMIC_K_SIZE(16), ew_stride = MAX(M,12), surf_notch =
  * ew_stride), and the int32 output really is C2=4 / 16 bytes-per-position (the
  * non-accum path reads it back bit-exact via out_idx_i8). So if the accumulate
@@ -32,7 +32,7 @@
  *                  round). Use once `single` passes to confirm multi-surface +
  *                  depth. sudo ... chain M K N nKt  (K%nKt==0, (K/nKt)%32==0).
  *
- * The int32 EW precision/geometry knobs are inherited from gen_matmul_int8:
+ * The int32 EW precision/geometry knobs are inherited from gen_gemm_int8:
  *   ROCKET_INT8_EW_CFG  ROCKET_INT8_ERDMA_CFG  ROCKET_INT8_RDMA_FMC
  *   ROCKET_INT8_EW_BASE_OFF  ROCKET_INT8_EW_SURF  ROCKET_INT8_EW_NOTCH
  * Run the integer-add candidate as:
@@ -50,10 +50,10 @@
 #include "rocket_npu.h"
 #include "npu_matmul.h"
 
-/* int8 layout via the exported feature_data(): input cube C2=16, output cube
- * C2=4 (== feat_idx_i8/out_idx_i8 in rocket_matmul.c); weights via weight_int8. */
-static inline int in_idx(int K, int M, int c, int h)  { return feature_data(K, M, 1, 16, c, h, 1); }
-static inline int out_idx(int N, int M, int n, int h) { return feature_data(N, M, 1, 4,  n, h, 1); }
+/* int8 layout via the exported feature_index(): input cube C2=16, output cube
+ * C2=4 (== feat_idx_i8/out_idx_i8 in rocket_matmul.c); weights via gemm_weight_index_int8. */
+static inline int in_idx(int K, int M, int c, int h)  { return feature_index(K, M, 1, 16, c, h, 1); }
+static inline int out_idx(int N, int M, int n, int h) { return feature_index(N, M, 1, 4,  n, h, 1); }
 
 static int8_t small_i8(size_t i) { return (int8_t)((int)(i % 9) - 4); }  /* [-4,4], keeps ref modest */
 
@@ -64,17 +64,17 @@ static int run_partial(int fd, int M, int Kt, int N,
                        rocket_bo *regcmd, int accumulate, rocket_bo *add_bo)
 {
     uint64_t ops[256] = {0};
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)M, .k = (uint16_t)Kt, .n = (uint16_t)N,
-        .input_dma   = (uint32_t)in->dma_address,
-        .weights_dma = (uint32_t)wt->dma_address,
-        .output_dma  = (uint32_t)out->dma_address,
+        .input_iova   = (uint32_t)in->dma_address,
+        .weights_iova = (uint32_t)wt->dma_address,
+        .output_iova  = (uint32_t)out->dma_address,
         .tasks = ops,
         .accumulate = (uint8_t)accumulate,
-        .add_dma = accumulate ? (uint32_t)add_bo->dma_address : 0,
+        .add_iova = accumulate ? (uint32_t)add_bo->dma_address : 0,
     };
-    int r = gen_matmul_int8(&p);
-    if (r) { fprintf(stderr, "gen_matmul_int8 failed (%d)\n", r); return -1; }
+    int r = gen_gemm_int8(&p);
+    if (r) { fprintf(stderr, "gen_gemm_int8 failed (%d)\n", r); return -1; }
 
     if (accumulate) {   /* echo the regs THIS binary generated, to defeat stale builds */
         uint32_t ew=0, erd=0, fmc=0, ews=0;
@@ -120,7 +120,7 @@ static void pack_wt(int fd, rocket_bo *bo, const int8_t *B, int N, int K, int k0
     int8_t *wp = bo->ptr;
     for (int kk = 1; kk <= N; kk++)
         for (int c = 1; c <= Kt; c++)
-            wp[weight_int8(Kt, kk, c)] = B[(size_t)(kk-1)*K + (k0 + c-1)];
+            wp[gemm_weight_index_int8(Kt, kk, c)] = B[(size_t)(kk-1)*K + (k0 + c-1)];
     rocket_bo_fini(fd, bo);
 }
 

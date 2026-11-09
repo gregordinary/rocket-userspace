@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rebuild the RK3576 vendor FLOAT captures beside this script.
 
-Every .rknn in the parent directory is int8, so the fp16 precision fields had no
+Every capture in ../int8 and ../dw is int8, so the fp16 precision fields had no
 oracle and were inferred from the RK3588's field packing. They can be transcribed
 instead: do_quantization=False on a FLOAT onnx leaves the weights float, and the
 vendor compiler then picks the float datapath and emits a genuine fp16 conv program.

@@ -124,7 +124,7 @@ static int coeff_init(int fd, struct prog *pr, unsigned ocreg, unsigned seed)
     if (!bias) return -1;
     for (i = 0; i < ocreg; i++) bias[i] = (int32_t)((seed + i) % 7u) - 3;
     rocket_bo_prep(fd, &pr->b, 1, 0);
-    rocket_rk3576_pack_coeff_prec(pr->b.ptr, coeff, bias, ocreg, precision_int8);
+    rocket_rk3576_pack_coeff_prec(pr->b.ptr, coeff, bias, ocreg, PREC_INT8);
     rocket_bo_fini(fd, &pr->b);
     free(bias);
     return 0;
@@ -134,7 +134,7 @@ static int coeff_init(int fd, struct prog *pr, unsigned ocreg, unsigned seed)
  * form. Its feature buffer is an interleaved image and its weight cube is the packed
  * path's own object, which is why it cannot share conv_init below. */
 static int argb_init(int fd, struct prog *pr, unsigned iw, unsigned k, unsigned s,
-                     unsigned oc, uint32_t in_dma, uint32_t out_dma, unsigned *nrow_out)
+                     unsigned oc, uint32_t in_iova, uint32_t out_iova, unsigned *nrow_out)
 {
     unsigned ow = iw / s, pad = (k - 1u) / 2u;
     size_t w_bytes = rocket_rk3576_weight_argb_int8_bytes(oc, k, k);
@@ -171,17 +171,17 @@ static int argb_init(int fd, struct prog *pr, unsigned iw, unsigned k, unsigned 
     pr->p.input_zero_point = 0x80; pr->p.output_zero_point = 0x80;
     pr->p.weight_zero_point = 0x80;
     pr->p.ih_full = (uint16_t)iw; pr->p.oh_full = (uint16_t)ow;
-    pr->p.input_dma   = in_dma;
-    pr->p.weights_dma = (uint32_t)pr->w.dma_address;
-    pr->p.bias_dma    = (uint32_t)pr->b.dma_address;
-    pr->p.output_dma  = out_dma;
+    pr->p.input_iova   = in_iova;
+    pr->p.weights_iova = (uint32_t)pr->w.dma_address;
+    pr->p.bias_iova    = (uint32_t)pr->b.dma_address;
+    pr->p.output_iova  = out_iova;
     pr->p.tasks = pr->ops;
     pr->p.task_count = 0;
 
     /* ONE row task or the cell is skipped: this probe is about the CROSS-LAYER boundary,
      * and a multi-task stem would put the packed path's own row split in the same
      * measurement. */
-    if (rocket_rk3576_plan_rows_prec(&pr->p, 0, precision_int8, rows,
+    if (rocket_rk3576_plan_rows_prec(&pr->p, 0, PREC_INT8, rows,
                                      (unsigned)(sizeof rows / sizeof rows[0]), &nrow) < 0)
         return -1;
     *nrow_out = nrow;
@@ -197,7 +197,7 @@ static int argb_init(int fd, struct prog *pr, unsigned iw, unsigned k, unsigned 
 
 /* The consumer: one 1x1 int8 direct convolution over the stem's output cube. */
 static int conv_init(int fd, struct prog *pr, unsigned plane, unsigned c,
-                     uint32_t in_dma, uint32_t out_dma)
+                     uint32_t in_iova, uint32_t out_iova)
 {
     unsigned icreg = rocket_rk3576_pad_ic(c), ocreg = rocket_rk3576_pad_oc(c);
     size_t w_bytes = (size_t)((ocreg + 31u) / 32u) * ((icreg + 31u) / 32u) * 32u * 32u;
@@ -221,10 +221,10 @@ static int conv_init(int fd, struct prog *pr, unsigned plane, unsigned c,
     pr->p.in_scale = 1.0f; pr->p.w_scale = 1.0f; pr->p.out_scale = 256.0f;
     pr->p.input_zero_point = 0; pr->p.output_zero_point = 0; pr->p.weight_zero_point = 0;
     pr->p.ih_full = (uint16_t)plane; pr->p.oh_full = (uint16_t)plane;
-    pr->p.input_dma   = in_dma;
-    pr->p.weights_dma = (uint32_t)pr->w.dma_address;
-    pr->p.bias_dma    = (uint32_t)pr->b.dma_address;
-    pr->p.output_dma  = out_dma;
+    pr->p.input_iova   = in_iova;
+    pr->p.weights_iova = (uint32_t)pr->w.dma_address;
+    pr->p.bias_iova    = (uint32_t)pr->b.dma_address;
+    pr->p.output_iova  = out_iova;
     pr->p.tasks = pr->ops;
     pr->p.task_count = 0;
     if (gen_conv2d_int8_rk3576(&pr->p) != 0) {

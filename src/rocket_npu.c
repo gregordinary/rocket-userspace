@@ -154,6 +154,27 @@ void rocket_submit_counters_reset(void)
     atomic_store_explicit(&rkt_submitted_tasks, 0, memory_order_relaxed);
 }
 
+/* The two rules the rocket driver applies to every task from Linux 7.4 (725953d4), checked
+ * here so a violation fails on every kernel. PC_BASE_ADDRESS takes the regcmd address from
+ * bits 31:4 and bit 0 selects slave mode, so an address 8 bytes past a 16-byte boundary is
+ * silently fetched from one word early on an older kernel, and refused with -EINVAL on a
+ * newer one. PC_DATA_AMOUNT is 16 bits of (regcmd_count + 1) / 2 - 1, which bounds the count.
+ * Returns 0 or -EINVAL. */
+#define RKT_REGCMD_ALIGN     16u
+#define RKT_MAX_REGCMDS      (0x10000u * 2u)
+static int rkt_tasks_valid(const struct drm_rocket_task *dt, uint32_t n_tasks)
+{
+    for (uint32_t i = 0; i < n_tasks; i++) {
+        if (dt[i].regcmd % RKT_REGCMD_ALIGN || dt[i].regcmd_count > RKT_MAX_REGCMDS) {
+            ROCKET_LOGE("ROCKET_SUBMIT: task %u regcmd 0x%x count %u: the address must be "
+                        "%u-byte aligned and the count at most %u\n", i, dt[i].regcmd,
+                        dt[i].regcmd_count, RKT_REGCMD_ALIGN, RKT_MAX_REGCMDS);
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
 /* Submit one job (n_tasks tasks) on `fd`, optionally with the per-job batched
  * flag set. Returns 0 / negative errno. */
 static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tasks,
@@ -161,6 +182,9 @@ static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tas
                               const uint32_t *out_handles, uint32_t n_out,
                               uint32_t job_flags)
 {
+    int v = rkt_tasks_valid(dt, n_tasks);
+    if (v) return v;
+
     rkt_job jx;
     rkt_job_init(&jx, dt, n_tasks, in_handles, n_in, out_handles, n_out, job_flags);
 
@@ -200,7 +224,10 @@ static int rkt_submit_one_job(int fd, struct drm_rocket_task *dt, uint32_t n_tas
  * other accel device must not report rocket's interface.
  *
  * Returns the minor number, or -1 if the device could not be identified as rocket.
- * Mainline reports 0.0.0; a major above 1 reads as "newer than everything we know". */
+ * Mainline reports 0.0.0; a major above 1 reads as "newer than everything we know".
+ * Either counts only on a kernel that carries this library's patch series, because the
+ * minors name that series' features and upstream numbers its own interface
+ * (rocket_sysfs_trusted_minor()); anywhere else it reads as 0. */
 static int rocket_iface_minor(void)
 {
     static _Atomic int cached = -2;                  /* -2 = unresolved, >= -1 = answer */
@@ -215,8 +242,16 @@ static int rocket_iface_minor(void)
     if (fd >= 0) {
         char name[32] = {0};
         struct drm_version dv = { .name = name, .name_len = sizeof(name) - 1 };
-        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0 && strcmp(name, "rocket") == 0)
+        if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0 && strcmp(name, "rocket") == 0) {
             c = (dv.version_major > 1) ? INT_MAX : (int)dv.version_minor;
+            int t = rocket_sysfs_trusted_minor(c, "/sys");
+            if (t != c)
+                ROCKET_LOGI("rocket reports interface %d.%d without the rocket_batch_submit "
+                            "parameter its patch series creates, so the series' job flags, "
+                            "ranged cache sync and PPU completion stay off\n",
+                            dv.version_major, dv.version_minor);
+            c = t;
+        }
         close(fd);
     }
     atomic_store(&cached, c);
@@ -1034,6 +1069,7 @@ int rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs)
             dts[j][i].regcmd       = jobs[j].tasks[i].regcmd;
             dts[j][i].regcmd_count = jobs[j].tasks[i].regcmd_count;
         }
+        if ((r = rkt_tasks_valid(dts[j], jobs[j].n_tasks)) != 0) goto cleanup;
         /* Multi-job submit keeps the stock gapped per-task path (batched=0). */
         rkt_job_init(&dj[j], dts[j], jobs[j].n_tasks,
                      jobs[j].in_handles,  jobs[j].n_in,

@@ -9,7 +9,7 @@
  *   fp16   rocket_conv2d_fp16_ctx() at EfficientDet-Lite0's depthwise shapes (its SAME pad
  *          materialized, so pad 0). The pack replicated is the entry's: the input scatter to
  *          the C2=8 feature cube, the depthwise weight scatter (group 32) and the output
- *          gather, each one feature_data() / weight_conv_dw_fp16() call per element.
+ *          gather, each one feature_index() / conv_dw_weight_index_fp16() call per element.
  *   int8   rocket_conv2d_int8_ctx() at MobileDet's direct-conv shapes. The pack replicated is
  *          the single-tile one: the input scatter to the C2=16 cube and the int32 output
  *          gather from the C2=4 cube. A shape the entry tiles packs per tile, one element at
@@ -62,7 +62,7 @@ static void f16_scat_s(_Float16 *d, size_t bytes, const _Float16 *in, int C, int
     for (int c = 0; c < C; c++)
         for (int h = 0; h < IH; h++)
             for (int w = 0; w < IW; w++)
-                d[feature_data(C, IHj, IW, 8, c + 1, h + 1, w + 1)] = in[((size_t)c * IH + h) * IW + w];
+                d[feature_index(C, IHj, IW, 8, c + 1, h + 1, w + 1)] = in[((size_t)c * IH + h) * IW + w];
 }
 static void f16_scat_b(_Float16 *d, size_t bytes, const _Float16 *in, int C, int IH, int IHj, int IW)
 {
@@ -80,7 +80,7 @@ static void f16_wdw_s(_Float16 *d, size_t bytes, const _Float16 *W, int C, int K
     for (int c = 0; c < C; c++)
         for (int kh = 0; kh < K; kh++)
             for (int kw = 0; kw < K; kw++)
-                d[weight_conv_dw_fp16(C, K, K, G, c + 1, kh + 1, kw + 1)] = W[((size_t)c * K + kh) * K + kw];
+                d[conv_dw_weight_index_fp16(C, K, K, G, c + 1, kh + 1, kw + 1)] = W[((size_t)c * K + kh) * K + kw];
 }
 static void f16_wdw_b(_Float16 *d, size_t bytes, const _Float16 *W, int C, int K, int G)
 {
@@ -97,7 +97,7 @@ static void f16_gath_s(_Float16 *out, const _Float16 *src, int C, int OH, int OW
     for (int c = 0; c < C; c++)
         for (int h = 0; h < OH; h++)
             for (int w = 0; w < OW; w++)
-                out[((size_t)c * OH + h) * OW + w] = src[feature_data(C, OH, OW, 8, c + 1, h + 1, w + 1)];
+                out[((size_t)c * OH + h) * OW + w] = src[feature_index(C, OH, OW, 8, c + 1, h + 1, w + 1)];
 }
 static void f16_gath_b(_Float16 *out, const _Float16 *src, int C, int OH, int OW)
 {
@@ -116,7 +116,7 @@ static void i8_scat_s(int8_t *d, size_t bytes, const int8_t *in, int C, int IH, 
     for (int c = 0; c < C; c++)
         for (int h = 0; h < IH; h++)
             for (int w = 0; w < IW; w++)
-                d[feature_data(C, IHj, IW, 16, c + 1, h + 1, w + 1)] = in[((size_t)c * IH + h) * IW + w];
+                d[feature_index(C, IHj, IW, 16, c + 1, h + 1, w + 1)] = in[((size_t)c * IH + h) * IW + w];
 }
 static void i8_scat_b(int8_t *d, size_t bytes, const int8_t *in, int C, int IH, int IHj, int IW)
 {
@@ -133,7 +133,7 @@ static void i32_gath_s(int32_t *out, const int32_t *src, int C, int OH, int OW)
     for (int c = 0; c < C; c++)
         for (int h = 0; h < OH; h++)
             for (int w = 0; w < OW; w++)
-                out[((size_t)c * OH + h) * OW + w] = src[feature_data(C, OH, OW, 4, c + 1, h + 1, w + 1)];
+                out[((size_t)c * OH + h) * OW + w] = src[feature_index(C, OH, OW, 4, c + 1, h + 1, w + 1)];
 }
 static void i32_gath_b(int32_t *out, const int32_t *src, int C, int OH, int OW)
 {
@@ -172,8 +172,8 @@ int main(int argc, char **argv)
         const int OH = rocket_conv2d_oh(&d), OW = rocket_conv2d_ow(&d), IHj = IH < 4 ? 4 : IH;
         const int Cpad = ((C + G - 1) / G) * G;
         const size_t in_n = (size_t)C * IH * IW, out_n = (size_t)C * OH * OW;
-        const size_t cin = ((size_t)C * IHj * IW + NPU_CBUF_BANK_SIZE) * 2;
-        const size_t cw = ((size_t)Cpad * K * K + NPU_CBUF_BANK_SIZE) * 2, cout = (size_t)Cpad * OH * OW * 2;
+        const size_t cin = ((size_t)C * IHj * IW + RK3588_CBUF_BANK_BYTES) * 2;
+        const size_t cw = ((size_t)Cpad * K * K + RK3588_CBUF_BANK_BYTES) * 2, cout = (size_t)Cpad * OH * OW * 2;
         _Float16 *in = malloc(in_n * 2), *w = malloc((size_t)C * K * K * 2), *out = malloc(out_n * 2);
         _Float16 *o2 = malloc(out_n * 2), *a = malloc(cin), *b = malloc(cin);
         _Float16 *wa = malloc(cw), *wb = malloc(cw), *co = malloc(cout);
@@ -220,7 +220,7 @@ int main(int argc, char **argv)
             .stride_y = s, .stride_x = s, .dil_y = 1, .dil_x = 1 };
         const int OH = rocket_conv2d_oh(&d), OW = rocket_conv2d_ow(&d), IHj = IH < 4 ? 4 : IH;
         const size_t in_n = (size_t)IC * IH * IW, out_n = (size_t)OC * OH * OW;
-        const size_t cin = (size_t)((IC + 15) / 16 * 16) * IHj * IW + NPU_CBUF_BANK_SIZE;
+        const size_t cin = (size_t)((IC + 15) / 16 * 16) * IHj * IW + RK3588_CBUF_BANK_BYTES;
         const size_t cout = (size_t)((OC + 3) / 4 * 4) * OH * OW;
         int8_t *in = malloc(in_n), *w = malloc((size_t)OC * IC * K * K), *a = malloc(cin), *b = malloc(cin);
         int32_t *out = malloc(out_n * 4), *o2 = malloc(out_n * 4), *co = malloc(cout * 4);

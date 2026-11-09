@@ -8,7 +8,7 @@
  * (overlapped across the T concurrent workers, as the pre-KACC envelope assumed)?
  *
  * The full-MODEL resident-weight path can't answer this: the NPU regcmd encodes BO
- * addresses as 32-bit fields (npu_regcmd.c: weights_dma & 0xFFFFFFFF), so all
+ * addresses as 32-bit fields (npu_regcmd.c: weights_iova & 0xFFFFFFFF), so all
  * resident weight BOs must live in the low-4GB IOVA window — far below a 22GB model
  * (ROCKET_CACHE_MB=12000 overflows it: "a BO dma_address exceeds 32 bits"). But ONE
  * representative shape needs just a single resident weight (tens of MB), so we can

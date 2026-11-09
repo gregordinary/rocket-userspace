@@ -2,7 +2,7 @@
 """First-conv ARGB captures whose weights NAME themselves, and the decoder that reads
 the ARGB weight cube's layout out of them.
 
-The twelve found ARGB programs pin the first-conv register program completely, and
+The twelve int8 ARGB programs in ../int8 pin the first-conv register program completely, and
 none of them carries the weight BO those registers point at -- so all that is settled
 about the cube is its SIZE and stride, `oc * kh * round16(4*kw)` bytes. A cube is the
 one thing a register program cannot tell you, and on this part the depthwise path
@@ -32,14 +32,14 @@ packed path computes bit-exactly at two channels on the part (rk3576_conv_lib_ga
 the packed path for every count at or below four.
 
 The low bits of that word are NOT the same on the two precisions, and this is the one
-place these captures correct the transcription: the found int8 ARGB programs carry
+place these captures correct the transcription: the int8 ARGB programs in ../int8 carry
 0x2000a006 and these float ones carry 0x2020a122, so the low field is 6 at int8 and 2
 at fp16 -- bit 2 clears on the float path while GROUP_LINE_OFF and ARGB_IN stay put.
 
 WHAT THIS DECODES, AND WHAT IT DOES NOT. The cube below is the FLOAT one. The
 depthwise path already showed that this part's int8 cube and its float cube are not
 the same object, and the int8 ARGB cube is NOT settled here: a quantized capture built
-the same way takes the ARGB path (0x100C reads 0x2000a006, exactly the found value)
+the same way takes the ARGB path (0x100C reads 0x2000a006, exactly the ../int8 value)
 but its weights do not survive as a findable value set, so `rocket_conv2d_int8_rk3576()`
 keeps its `ic <= 4` refusal.
 
@@ -47,12 +47,14 @@ Dependency pins are ../dw/mkdw.py's:
 
     ./venv/bin/python mkargb.py .
 """
-import sys, os, struct, glob
+import sys, os, glob
 import numpy as np
 import onnx
 from onnx import helper, TensorProto
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+from regcmd_scan import CONV_TARGETS, regcmd_programs  # noqa: E402
 OUT = sys.argv[1] if len(sys.argv) > 1 else HERE
 
 # tag                     ic  oc  k  ih  iw  stride
@@ -61,12 +63,12 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else HERE
 # A register formula needs more than that: every one of them holds iw == ih == 32 and
 # stride 1, so `iw`, `ih`, the plane and the entry count are one column. The rest vary
 # ONE axis at a time against them, which is what makes a fitted term separable from a
-# coincidence -- the found int8 ARGB set is all k3 stride 2 224/64-wide, and four
+# coincidence -- the ../int8 ARGB set is all k3 stride 2 224/64-wide, and four
 # formulas fitted through that set's confounds were wrong.
 CASES = [
     ("argbf_ic3_oc16_k3_32",  3, 16, 3, 32, 32, 1),  # the shape a vision stem uses
     ("argbf_ic3_oc32_k3_32",  3, 32, 3, 32, 32, 1),  # a second oc: separates the oc stride
-    ("argbf_ic3_oc16_k1_32",  3, 16, 1, 32, 32, 1),  # kw=1: the 4*kw fold, which no found
+    ("argbf_ic3_oc16_k1_32",  3, 16, 1, 32, 32, 1),  # kw=1: the 4*kw fold, which no int8
     ("argbf_ic3_oc16_k5_32",  3, 16, 5, 32, 32, 1),  # kw=5: capture could separate
     ("argbf_ic4_oc16_k3_32",  4, 16, 3, 32, 32, 1),  # 4 channels: is the 4th lane the image's
     # width alone: does the CBUF entry count carry the int8 path's +1 lookahead?
@@ -75,7 +77,7 @@ CASES = [
     # height alone: separates iw from ih in every stride and count
     ("argbf_ic3_oc16_k3_r48", 3, 16, 3, 48, 32, 1),
     ("argbf_ic3_oc16_k3_r16", 3, 16, 3, 16, 32, 1),
-    # stride 2, which every float capture lacked and every found int8 one had
+    # stride 2, which every float capture lacked and every int8 one had
     ("argbf_ic3_oc16_k3_s2",  3, 16, 3, 32, 32, 2),
     ("argbf_ic3_oc16_k1_s2",  3, 16, 1, 32, 32, 2),
     # oc past one 16-channel interleave group, and past 32
@@ -140,27 +142,8 @@ def emit(tag, ic, oc, k, ih, iw, stride):
 
 # ---- reading the capture back -------------------------------------------------
 
-TARGETS = {0x0201: "CNA", 0x0801: "CORE", 0x1001: "DPU", 0x2001: "RDMA",
-           0x0041: "SYNC", 0x0081: "BCAST"}
-
-
 def runs(path, min_run=20):
-    data = open(path, "rb").read()
-    n = len(data) // 8
-    words = struct.unpack("<%dQ" % n, data[:n * 8])
-    out, i = [], 0
-    while i < n:
-        if ((words[i] >> 48) & 0xffff) in TARGETS:
-            j = i
-            while j < n and ((words[j] >> 48) & 0xffff) in TARGETS:
-                j += 1
-            if j - i >= min_run:
-                out.append([(int((w >> 48) & 0xffff), int(w & 0xffff),
-                             int((w >> 16) & 0xffffffff)) for w in words[i:j]])
-            i = j
-        else:
-            i += 1
-    return out
+    return regcmd_programs(path, CONV_TARGETS, min_run)
 
 
 GROUP_LINE_OFF = 1 << 29

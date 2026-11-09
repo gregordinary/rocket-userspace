@@ -79,15 +79,15 @@ static void check_plan(const char *dt, const char *tag, int M, int K, int N, int
         return fail("non-positive tile", dt, tag, M, K, N, rc, Mt, Kt, Nt);
     if (Mt % 4 || Nt % nalign || Kt % kalign)
         return fail("misaligned tile", dt, tag, M, K, N, rc, Mt, Kt, Nt);
-    /* 2c. Unless ROCKET_MM_STREAM=0 the fp16 plan streams its weights instead, and under
-     * ROCKET_MM_STREAM_INT8=1 the int8 plan does too: Nt runs to the streamed cap, and what
+    /* 2c. Unless ROCKET_MM_STREAM=0 the fp16 plan streams its weights instead, and unless
+     * ROCKET_MM_STREAM_INT8=0 the int8 plan does too: Nt runs to the streamed cap, and what
      * bounds it is the CBUF holding the input tile beside the streamed-weight floor, which
      * the generator refuses below. int8 adds a slack bank to the input and a spare to the
-     * weights (gen_matmul_int8). */
+     * weights (gen_gemm_int8). */
     const char *se = getenv("ROCKET_MM_STREAM"), *s8 = getenv("ROCKET_MM_STREAM_INT8");
     const int i8 = !strcmp(dt, "int8");
     const int streamed = !(se && atoi(se) <= 0) &&
-                         (!strcmp(dt, "fp16") || (i8 && s8 && atoi(s8) > 0));
+                         (!strcmp(dt, "fp16") || (i8 && !(s8 && atoi(s8) <= 0)));
     if (strict_cap && (Mt > max_tile || Nt > (streamed ? 4096 : max_tile)))
         return fail("tile over the cap", dt, tag, M, K, N, rc, Mt, Kt, Nt);
     if (streamed) {

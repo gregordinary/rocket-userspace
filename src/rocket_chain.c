@@ -5,7 +5,7 @@
  *
  * Extracted from rocket_matmul.c so the matmul (fp16/int8/int4/...) and conv
  * submit paths share one chain implementation. The mode-3 layout (an embedded
- * PC_BASE_ADDRESS redirect repurposing the trailer's OP_NONE filler) was
+ * PC_BASE_ADDRESS redirect repurposing the trailer's TARGET_NONE filler) was
  * established by on-HW A/B on the RK1: contiguous + trailer=0 OR
  * encoded-amount-only BOTH stall (task 0 runs, counter stuck, 500 ms timeout) —
  * the PC must be told WHERE the next task is, not just how long.
@@ -15,13 +15,14 @@
 #include <stdatomic.h>
 
 #include "rocket_chain.h"
-#include "npu_hw.h"   /* OP_NONE, OP_REG_PC, PC_BASE_ADDRESS, PC_REGISTER_AMOUNTS */
+#include "npu_hw.h"   /* TARGET_NONE, TARGET_PC, PC_BASE_ADDRESS, PC_REGISTER_AMOUNTS */
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "rocket_npu.h"  /* rocket_batched_submit_supported */
 #include "rocket_log.h"
 #include "rocket_op.h"   /* rocket_op_iova_overflow — one 32-bit IOVA rule */
 
 /* A trailer rewrite below can only fail if a gen_* generator stops emitting the
- * [OP_NONE, PC_REGISTER_AMOUNTS, OP_40, OP_ENABLE] trailer this chain layout claims
+ * [TARGET_NONE, PC_REGISTER_AMOUNTS, TARGET_PRE_ENABLE, TARGET_ENABLE] trailer this chain layout claims
  * (the chain_layout_rocket host gate guards that). If it ever does, the chain link is
  * not written and the batch runs task 0 and stalls into a multi-second fence timeout —
  * a mystery hang. Convert that into one loud, actionable diagnostic instead. Logged
@@ -30,7 +31,7 @@ static void chain_trailer_fail(const char *where)
 {
     static atomic_flag warned = ATOMIC_FLAG_INIT;
     if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed))
-        ROCKET_LOGE("rocket_chain: %s found no [OP_NONE, PC_REGISTER_AMOUNTS] trailer to "
+        ROCKET_LOGE("rocket_chain: %s found no [TARGET_NONE, PC_REGISTER_AMOUNTS] trailer to "
                     "rewrite — the regcmd trailer shape drifted, so the chained batch link "
                     "was NOT written and this submit will stall. Disable ROCKET_BATCH_SUBMIT "
                     "(and file a bug); run the chain_layout_rocket gate.\n", where);
@@ -75,15 +76,15 @@ static inline uint32_t rkt_amount_encode(uint32_t count) {
 }
 
 /* Rewrite a copied regcmd's trailer PC_REGISTER_AMOUNTS op — the single
- * NPUOP(OP_REG_PC, *, PC_REGISTER_AMOUNTS) near the end — to carry `amount` in
+ * REGCMD(TARGET_PC, PC_REGISTER_AMOUNTS, *) near the end — to carry `amount` in
  * its value field. Scans from the end so it finds the trailer, not any earlier
  * PC write. -1 if the regcmd has no such op. */
 static int rkt_set_trailer_amount(uint64_t *rc, size_t words, uint32_t amount) {
     for (size_t j = words; j-- > 0; ) {
-        if ((uint16_t)(rc[j] >> 48) == OP_REG_PC &&
-            (uint16_t)(rc[j] & 0xffff) == PC_REGISTER_AMOUNTS) {
-            rc[j] = ((uint64_t)OP_REG_PC << 48) |
-                    ((uint64_t)amount << 16) | PC_REGISTER_AMOUNTS;
+        if ((uint16_t)(rc[j] >> 48) == TARGET_PC &&
+            (uint16_t)(rc[j] & 0xffff) == REG_PC_REGISTER_AMOUNTS) {
+            rc[j] = ((uint64_t)TARGET_PC << 48) |
+                    ((uint64_t)amount << 16) | REG_PC_REGISTER_AMOUNTS;
             return (int)j;
         }
     }
@@ -91,26 +92,26 @@ static int rkt_set_trailer_amount(uint64_t *rc, size_t words, uint32_t amount) {
 }
 
 /* Mode 3: give the regcmd an embedded PC_BASE_ADDRESS op pointing at the next
- * task so the PC advances to it after this task's OP_ENABLE. The trailer's inert
- * OP_NONE filler (the op immediately preceding the PC_REGISTER_AMOUNTS op) is
+ * task so the PC advances to it after this task's TARGET_ENABLE. The trailer's inert
+ * TARGET_NONE filler (the op immediately preceding the PC_REGISTER_AMOUNTS op) is
  * repurposed into that write, keeping the op count — and so the chained stride —
  * unchanged. The value is the raw 32-bit IOVA, exactly as the kernel programs
  * PC_BASE_ADDRESS for task 0. Returns 0 on success, -1 if the expected
- * OP_NONE/amount trailer shape is not found (caller then must not use mode 3). */
+ * TARGET_NONE/amount trailer shape is not found (caller then must not use mode 3). */
 static int rkt_set_trailer_base(uint64_t *rc, size_t words, uint32_t next_addr) {
     int amt = -1;
     for (size_t j = words; j-- > 0; )
-        if ((uint16_t)(rc[j] >> 48) == OP_REG_PC &&
-            (uint16_t)(rc[j] & 0xffff) == PC_REGISTER_AMOUNTS) { amt = (int)j; break; }
+        if ((uint16_t)(rc[j] >> 48) == TARGET_PC &&
+            (uint16_t)(rc[j] & 0xffff) == REG_PC_REGISTER_AMOUNTS) { amt = (int)j; break; }
     if (amt < 1)
         return -1;
-    /* The PC trailer is [OP_NONE, PC_REGISTER_AMOUNTS, OP_40, OP_ENABLE]; the
-     * OP_NONE just before the amount op is the slot we claim. Refuse if it is not
+    /* The PC trailer is [TARGET_NONE, PC_REGISTER_AMOUNTS, TARGET_PRE_ENABLE, TARGET_ENABLE]; the
+     * TARGET_NONE just before the amount op is the slot we claim. Refuse if it is not
      * the expected inert filler, rather than clobber a real op. */
-    if ((uint16_t)(rc[amt - 1] >> 48) != OP_NONE)
+    if ((uint16_t)(rc[amt - 1] >> 48) != TARGET_NONE)
         return -1;
-    rc[amt - 1] = ((uint64_t)OP_REG_PC << 48) |
-                  ((uint64_t)next_addr << 16) | PC_BASE_ADDRESS;
+    rc[amt - 1] = ((uint64_t)TARGET_PC << 48) |
+                  ((uint64_t)next_addr << 16) | REG_PC_BASE_ADDRESS;
     return 0;
 }
 
@@ -155,7 +156,7 @@ int rkt_chain_pack(int chained, rocket_bo *rcbo, rocket_task_desc *tasks,
     memcpy(slot, src, (size_t)count * sizeof(uint64_t));
     if (chained) {
         /* Link to the next contiguous slot: the PC_BASE_ADDRESS redirect points the
-         * PC there after this task's OP_ENABLE, and PC_REGISTER_AMOUNTS gives that
+         * PC there after this task's TARGET_ENABLE, and PC_REGISTER_AMOUNTS gives that
          * segment's length. rkt_chain_seal zeroes the final task's link (no next). */
         if (rkt_set_trailer_amount(slot, count, rkt_amount_encode(count)) < 0) {
             chain_trailer_fail("rkt_chain_pack (amount)");
@@ -174,14 +175,14 @@ int rkt_chain_pack(int chained, rocket_bo *rcbo, rocket_task_desc *tasks,
 }
 
 /* Drop the forward link from a task's trailer: restore the PC_BASE_ADDRESS redirect
- * that rkt_set_trailer_base installed (in the OP_NONE filler slot before
- * PC_REGISTER_AMOUNTS) back to the inert OP_NONE filler. Idempotent — a slot still
- * holding OP_NONE is left as-is. -1 if the regcmd has no PC_REGISTER_AMOUNTS trailer. */
+ * that rkt_set_trailer_base installed (in the TARGET_NONE filler slot before
+ * PC_REGISTER_AMOUNTS) back to the inert TARGET_NONE filler. Idempotent — a slot still
+ * holding TARGET_NONE is left as-is. -1 if the regcmd has no PC_REGISTER_AMOUNTS trailer. */
 static int rkt_clear_trailer_base(uint64_t *rc, size_t words) {
     for (size_t j = words; j-- > 1; ) {
-        if ((uint16_t)(rc[j] >> 48) == OP_REG_PC &&
-            (uint16_t)(rc[j] & 0xffff) == PC_REGISTER_AMOUNTS) {
-            rc[j - 1] = NPUOP(OP_NONE, 0x0, 0x0);   /* the inert filler gen emits */
+        if ((uint16_t)(rc[j] >> 48) == TARGET_PC &&
+            (uint16_t)(rc[j] & 0xffff) == REG_PC_REGISTER_AMOUNTS) {
+            rc[j - 1] = REGCMD(TARGET_NONE, 0x0, 0x0);   /* the inert filler gen emits */
             return 0;
         }
     }
@@ -225,8 +226,8 @@ int rkt_chain_pack_at(rocket_bo *rcbo, rocket_task_desc *tasks, int idx,
  * op's index, or -1. */
 static int rkt_find_trailer_amount(const uint64_t *rc, size_t words, uint32_t *amount) {
     for (size_t j = words; j-- > 0; ) {
-        if ((uint16_t)(rc[j] >> 48) == OP_REG_PC &&
-            (uint16_t)(rc[j] & 0xffff) == PC_REGISTER_AMOUNTS) {
+        if ((uint16_t)(rc[j] >> 48) == TARGET_PC &&
+            (uint16_t)(rc[j] & 0xffff) == REG_PC_REGISTER_AMOUNTS) {
             *amount = (uint32_t)((rc[j] >> 16) & 0xffffffffu);
             return (int)j;
         }
@@ -256,14 +257,14 @@ int rkt_chain_verify(const rocket_bo *rcbo, const rocket_task_desc *tasks, int n
         uint32_t amount = 0;
         int amt = rkt_find_trailer_amount(slot, count, &amount);
         if (amt < 1) {
-            ROCKET_LOGE("rocket_chain: verify task %d has no [OP_NONE, PC_REGISTER_AMOUNTS] "
+            ROCKET_LOGE("rocket_chain: verify task %d has no [TARGET_NONE, PC_REGISTER_AMOUNTS] "
                         "trailer\n", i);
             return -1;
         }
 
         const uint64_t link = slot[amt - 1];
-        int is_link = ((uint16_t)(link >> 48) == OP_REG_PC &&
-                       (uint16_t)(link & 0xffff) == PC_BASE_ADDRESS);
+        int is_link = ((uint16_t)(link >> 48) == TARGET_PC &&
+                       (uint16_t)(link & 0xffff) == REG_PC_BASE_ADDRESS);
 
         if (i == n - 1) {
             /* No successor: the forward link must have been cleared, or the PC
@@ -310,7 +311,7 @@ void rkt_chain_seal(int chained, rocket_bo *rcbo, int nb, uint32_t count) {
     uint64_t *last = (uint64_t *)rcbo->ptr + (size_t)(nb - 1) * stride;
     /* rkt_chain_pack links EVERY task to the next contiguous slot (it cannot know which
      * is last); the final task has no successor, so clear its forward link. Earlier this
-     * called rkt_set_trailer_base(...,0), which requires the slot to still be OP_NONE and
+     * called rkt_set_trailer_base(...,0), which requires the slot to still be TARGET_NONE and
      * thus always failed after pack had converted it to PC_BASE_ADDRESS — a dangling link
      * into the slot past the chain survived (benign only because the HW stops at
      * TASK_NUMBER). Clearing it removes that hazard and the spurious "will stall" warning. */

@@ -198,8 +198,8 @@ void rocket_rk3576_set_cbuf_bias(unsigned granules);
  * chain falls back to when a program has to be redone. */
 struct rocket_rk3576_pool_link {
     int        fd;
-    uint64_t   feat_dma;      /* the cube it reads     */
-    uint64_t   surf_dma;      /* the surface it writes */
+    uint64_t   feat_iova;      /* the cube it reads     */
+    uint64_t   surf_iova;      /* the surface it writes */
     int        cube_in, cube_out;
     rocket_bo *surf;          /* the BO the surface lives in   */
     size_t     surf_off;      /* this handle's slice inside it */

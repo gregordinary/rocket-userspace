@@ -13,7 +13,7 @@
  *
  * int4 deltas vs rocket_prepacked_int8.c: in/wt NIBBLE-packed (2 int4/byte, BO
  * bytes = nibbles/2); feature cube C2=32; weight layout (N/64,K/32,64,32)
- * [weight_int4]; output int16 (cube C2=8), host-summed in int64 -> int32 C; Nt%64
+ * [gemm_weight_index_int4]; output int16 (cube C2=8), host-summed in int64 -> int32 C; Nt%64
  * (int4 N-group is 64). Host int64 K-accum (DPU-EW int16 K-accum is a later lever).
  * Self-contained (fp16/int8 paths untouched). Index helpers duplicated from
  * rocket_matmul.c, pinned by the bit-exact test (matmul_int4_tiled_rocket).
@@ -39,7 +39,7 @@
 #define RK4_MAX_WORKERS ROCKET_FANOUT_MAX_WORKERS
 #define I4_BATCH        ROCKET_FANOUT_BATCH
 #define I4_RC_STRIDE    ROCKET_FANOUT_RC_STRIDE
-#define I4_CBUF_BANK    NPU_CBUF_BANK_SIZE
+#define I4_CBUF_BANK    RK3588_CBUF_BANK_BYTES
 
 /* ============================================================================
  * SECTION — int4 tile-layout index math and small helpers
@@ -420,14 +420,14 @@ static void *rk4_thread(void *a) {
                 int Ktile = (K - ki * Kt < Kt) ? (K - ki * Kt) : Kt;
                 if (nb == 0 && (t->ret = rocket_bo_prep(fd, &w->regcmd, 1, 0)) != 0) return NULL;
                 size_t out_off = (size_t)nb * w->out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(w->in_all.dma_address + (size_t)(mi*nKt+ki) * (w->in_slot / 2)),
-                    .weights_dma = (uint32_t)(t->wt->dma_address     + (size_t)(ni*nKt+ki) * (w->wt_slot / 2)),
-                    .output_dma  = (uint32_t)(w->out_all.dma_address + out_off * sizeof(int16_t)),
+                    .input_iova   = (uint32_t)(w->in_all.dma_address + (size_t)(mi*nKt+ki) * (w->in_slot / 2)),
+                    .weights_iova = (uint32_t)(t->wt->dma_address     + (size_t)(ni*nKt+ki) * (w->wt_slot / 2)),
+                    .output_iova  = (uint32_t)(w->out_all.dma_address + out_off * sizeof(int16_t)),
                     .tasks = npu_regs,
                 };
-                if ((t->ret = gen_matmul_int4(&p)) != 0) {
+                if ((t->ret = gen_gemm_int4(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_int4_prepacked: gen failed (%d)\n", t->ret); return NULL;
                 }
                 if (p.task_count > I4_RC_STRIDE) {  /* unconditional: -DNDEBUG strips asserts */
@@ -569,14 +569,14 @@ static void *rk4_thread_gw(void *a) {
                 int Ktile = (K - ki * Kt < Kt) ? (K - ki * Kt) : Kt;
                 if (nb == 0 && (t->ret = rocket_bo_prep(fd, &w->regcmd, 1, 0)) != 0) return NULL;
                 size_t out_off = (size_t)nb * w->out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(w->in_all.dma_address + (size_t)(mi*nKt+ki) * (w->in_slot / 2)),
-                    .weights_dma = (uint32_t)(t->wt->dma_address     + (size_t)(ni*nKt+ki) * (w->wt_slot / 2)),
-                    .output_dma  = (uint32_t)(w->out_all.dma_address + out_off * sizeof(int16_t)),
+                    .input_iova   = (uint32_t)(w->in_all.dma_address + (size_t)(mi*nKt+ki) * (w->in_slot / 2)),
+                    .weights_iova = (uint32_t)(t->wt->dma_address     + (size_t)(ni*nKt+ki) * (w->wt_slot / 2)),
+                    .output_iova  = (uint32_t)(w->out_all.dma_address + out_off * sizeof(int16_t)),
                     .tasks = npu_regs,
                 };
-                if ((t->ret = gen_matmul_int4(&p)) != 0) {
+                if ((t->ret = gen_gemm_int4(&p)) != 0) {
                     ROCKET_LOGE("rocket_matmul_int4_prepacked_gw: gen failed (%d)\n", t->ret); return NULL;
                 }
                 if (p.task_count > I4_RC_STRIDE) {  /* unconditional: -DNDEBUG strips asserts */

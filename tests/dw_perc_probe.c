@@ -43,12 +43,13 @@
 #include "rocket_npu.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "test_fill.h"
 #include "requant_model.h"
 
-#define PADB NPU_CBUF_BANK_SIZE
+#define PADB RK3588_CBUF_BANK_BYTES
 #define DW_G 64
-#define OP_REG_DPU_RDMA_P (BLOCK_DPU_RDMA | PC_OP_01)
+#define TARGET_DPU_RDMA_P (NPU_TARGET_DPU_RDMA | NPU_REG_WRITE)
 #define RDMA_BRDMA_CFG_P   0x501C
 #define RDMA_BS_BASE_P     0x5020
 
@@ -74,7 +75,7 @@ static int reg_set(uint64_t *ops, unsigned n, unsigned blockop, unsigned reg, ui
     int k = 0;
     for (unsigned i = 0; i < n; i++)
         if ((unsigned)(ops[i] >> 48) == (blockop & 0xffffu) && (unsigned)(ops[i] & 0xffffu) == reg) {
-            ops[i] = NPUOP(blockop, v, reg);
+            ops[i] = REGCMD(blockop, reg, v);
             k++;
         }
     return k;
@@ -256,7 +257,7 @@ static void run_arm(int fd, const shape_t *s, const arm_t *a, uint64_t seed)
     for (int c = 0; c < C; c++)
         for (int ih = 0; ih < IH; ih++)
             for (int iw = 0; iw < IW; iw++)
-                ((int8_t *)in_bo.ptr)[feature_data(C, IHj, IW, 16, c + 1, ih + 1, iw + 1)] =
+                ((int8_t *)in_bo.ptr)[feature_index(C, IHj, IW, 16, c + 1, ih + 1, iw + 1)] =
                     x[((size_t)c * IH + ih) * IW + iw];
     rocket_bo_fini(fd, &in_bo);
     rocket_bo_prep(fd, &wt_bo, 1, 0);
@@ -264,7 +265,7 @@ static void run_arm(int fd, const shape_t *s, const arm_t *a, uint64_t seed)
     for (int c = 0; c < C; c++)
         for (int kh = 0; kh < KH; kh++)
             for (int kw = 0; kw < KW; kw++)
-                ((int8_t *)wt_bo.ptr)[weight_conv_dw_int8(C, KH, KW, DW_G, c + 1, kh + 1, kw + 1)] =
+                ((int8_t *)wt_bo.ptr)[conv_dw_weight_index_int8(C, KH, KW, DW_G, c + 1, kh + 1, kw + 1)] =
                     w[((size_t)c * KH + kh) * KW + kw];
     rocket_bo_fini(fd, &wt_bo);
     rocket_bo_prep(fd, &bs_bo, 1, 0);
@@ -290,45 +291,45 @@ static void run_arm(int fd, const shape_t *s, const arm_t *a, uint64_t seed)
             .ic = C, .ih = IHj, .iw = IW, .oc = C, .oh = OH, .ow = OW,
             .kh = KH, .kw = KW, .stride_y = s->sy, .stride_x = s->sx,
             .dil_y = 1, .dil_x = 1, .pad_top = s->pt, .pad_left = s->pl,
-            .input_dma = (uint32_t)in_bo.dma_address, .weights_dma = (uint32_t)wt_bo.dma_address,
-            .output_dma = (uint32_t)out_bo.dma_address, .tasks = regs,
+            .input_iova = (uint32_t)in_bo.dma_address, .weights_iova = (uint32_t)wt_bo.dma_address,
+            .output_iova = (uint32_t)out_bo.dma_address, .tasks = regs,
             .dw_group = DW_G, .int8_out = 1,
             .in_scale = a->conv_scale, .w_scale = 1.0f, .out_scale = 1.0f,
             .input_zero_point = a->zx + 0x80, .output_zero_point = a->zo + 0x80,
             .weight_zero_point = 0x80,
-            .bias_dma = (uint32_t)bs_bo.dma_address,
+            .bias_iova = (uint32_t)bs_bo.dma_address,
         };
         int g = gen_conv2d_dw_int8(&p);
         if (g != 0) { fprintf(stderr, "  gen_conv2d_dw_int8 failed (%d)\n", g); goto out; }
         n = p.task_count;
         if (a->patch) {
-            int kf = reg_find(regs, n, OP_REG_DPU, DPU_DATA_FORMAT);
+            int kf = reg_find(regs, n, TARGET_DPU, REG_DPU_DATA_FORMAT);
             if (kf < 0) { fprintf(stderr, "  no DATA_FORMAT word\n"); goto out; }
             uint32_t fmt = (reg_get(regs, kf) & ~(0x3fu << 4)) | ((a->s_neg & 0x3fu) << 4);
-            reg_set(regs, n, OP_REG_DPU, DPU_DATA_FORMAT, fmt);
-            reg_set(regs, n, OP_REG_DPU, DPU_BS_CFG, (2u << 16) | (1u << 8) | (1u << 6));
-            reg_set(regs, n, OP_REG_DPU, DPU_BS_MUL_CFG, ((a->s_mul & 0x3fu) << 8) | 1u);
-            reg_set(regs, n, OP_REG_DPU_RDMA_P, RDMA_BRDMA_CFG_P, (a->data_use & 0xfu) << 1);
+            reg_set(regs, n, TARGET_DPU, REG_DPU_DATA_FORMAT, fmt);
+            reg_set(regs, n, TARGET_DPU, REG_DPU_BS_CFG, (2u << 16) | (1u << 8) | (1u << 6));
+            reg_set(regs, n, TARGET_DPU, REG_DPU_BS_MUL_CFG, ((a->s_mul & 0x3fu) << 8) | 1u);
+            reg_set(regs, n, TARGET_DPU_RDMA_P, RDMA_BRDMA_CFG_P, (a->data_use & 0xfu) << 1);
             if (a->bn) {
-                int kf2 = reg_find(regs, n, OP_REG_DPU, DPU_DATA_FORMAT);
+                int kf2 = reg_find(regs, n, TARGET_DPU, REG_DPU_DATA_FORMAT);
                 uint32_t fmt2 = (reg_get(regs, kf2) & ~(0x3fu << 10)) | ((a->bn_sn & 0x3fu) << 10);
-                reg_set(regs, n, OP_REG_DPU, DPU_DATA_FORMAT, fmt2);
-                reg_set(regs, n, OP_REG_DPU, DPU_BN_CFG, (2u << 16) | (1u << 8) | (1u << 6));
-                reg_set(regs, n, OP_REG_DPU, DPU_BN_MUL_CFG, ((a->bn_s & 0x3fu) << 8) | 1u);
-                reg_set(regs, n, OP_REG_DPU_RDMA_P, 0x5028, 7u << 1);
-                reg_set(regs, n, OP_REG_DPU_RDMA_P, 0x502C, (uint32_t)bn_bo.dma_address);
+                reg_set(regs, n, TARGET_DPU, REG_DPU_DATA_FORMAT, fmt2);
+                reg_set(regs, n, TARGET_DPU, REG_DPU_BN_CFG, (2u << 16) | (1u << 8) | (1u << 6));
+                reg_set(regs, n, TARGET_DPU, REG_DPU_BN_MUL_CFG, ((a->bn_s & 0x3fu) << 8) | 1u);
+                reg_set(regs, n, TARGET_DPU_RDMA_P, 0x5028, 7u << 1);
+                reg_set(regs, n, TARGET_DPU_RDMA_P, 0x502C, (uint32_t)bn_bo.dma_address);
             }
             if (a->ow_src >= 0) {
-                int ko = reg_find(regs, n, OP_REG_DPU, DPU_BS_OW_CFG);
+                int ko = reg_find(regs, n, TARGET_DPU, REG_DPU_BS_OW_CFG);
                 if (ko >= 0)
-                    reg_set(regs, n, OP_REG_DPU, DPU_BS_OW_CFG,
+                    reg_set(regs, n, TARGET_DPU, REG_DPU_BS_OW_CFG,
                             (reg_get(regs, ko) & ~1u) | (uint32_t)(a->ow_src & 1));
             }
         }
-        w_bscfg  = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_BS_CFG));
-        w_mulcfg = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_BS_MUL_CFG));
-        w_fmt    = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_DATA_FORMAT));
-        w_brdma  = reg_get(regs, reg_find(regs, n, OP_REG_DPU_RDMA_P, RDMA_BRDMA_CFG_P));
+        w_bscfg  = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_BS_CFG));
+        w_mulcfg = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_BS_MUL_CFG));
+        w_fmt    = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_DATA_FORMAT));
+        w_brdma  = reg_get(regs, reg_find(regs, n, TARGET_DPU_RDMA_P, RDMA_BRDMA_CFG_P));
 
         rocket_bo_prep(fd, &rc_bo, 1, 0);
         memcpy(rc_bo.ptr, regs, (size_t)n * sizeof(uint64_t));
@@ -346,7 +347,7 @@ static void run_arm(int fd, const shape_t *s, const arm_t *a, uint64_t seed)
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++)
                 got[((size_t)c * OH + oh) * OW + ow] =
-                    ((const int8_t *)out_bo.ptr)[feature_data(C, OH, OW, 16, c + 1, oh + 1, ow + 1)];
+                    ((const int8_t *)out_bo.ptr)[feature_index(C, OH, OW, 16, c + 1, oh + 1, ow + 1)];
     rocket_bo_fini(fd, &out_bo);
     rc = 0;
 out:

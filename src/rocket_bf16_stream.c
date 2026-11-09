@@ -22,7 +22,7 @@
  * bf16 reuses int16's NPU geometry exactly (2-byte input cube C2=8, weight
  * (N/16,K/32,16,32), 4-byte fp32 output cube C2=4) — identical index math to the fp16
  * input path, differing only in the bf16 truncation on the scatter, the fp32 output
- * cube, and gen_matmul_bf16 (precision 3). K-partials accumulate on the HOST in double
+ * cube, and gen_gemm_bf16 (precision 3). K-partials accumulate on the HOST in double
  * (no NPU K-accum: the bf16 output is fp32, and an fp32 EW add is validated only for
  * the fp16 KACC variant).
  *
@@ -40,7 +40,7 @@
 #include "rocket_hw_profile.h"
 #include "rocket_matmul.h"
 #include "rocket_matmul_internal.h"  /* mm_plan + mm_plan_derive (bf16 shares the geometry) */
-#include "npu_matmul.h"        // matmul_params_t + gen_matmul_bf16
+#include "npu_matmul.h"        // gemm_params_t + gen_gemm_bf16
 #include "rocket_affinity.h"
 #include "rocket_cube.h"       /* the NPU cube index math + blocked moves */
 #include "rocket_fanout.h"
@@ -50,7 +50,7 @@
 #define BFS_MAX_WORKERS ROCKET_FANOUT_MAX_WORKERS
 #define BFS_BATCH       ROCKET_FANOUT_BATCH
 #define BFS_RC_STRIDE   ROCKET_FANOUT_RC_STRIDE
-#define BFS_CBUF_BANK   NPU_CBUF_BANK_SIZE
+#define BFS_CBUF_BANK   RK3588_CBUF_BANK_BYTES
 
 /* ============================================================================
  * SECTION — bf16 tile-layout index math and small helpers
@@ -223,14 +223,14 @@ static int bfs_compute(int fd, const bfs_plan *pl, bfs_bos *b, float *Csub)
                 if (nb == 0) rocket_bo_prep(fd, &b->regcmd, 1, 0);
 
                 size_t out_off = (size_t)nb * pl->out_slot;
-                matmul_params_t p = {
+                gemm_params_t p = {
                     .m = (uint16_t)Mtile, .k = (uint16_t)Ktile, .n = (uint16_t)Ntile,
-                    .input_dma   = (uint32_t)(b->in_all.dma_address  + (size_t)(mi*pl->nKt+ki) * pl->in_slot * sizeof(uint16_t)),
-                    .weights_dma = (uint32_t)(b->wt_all.dma_address  + (size_t)(ni*pl->nKt+ki) * pl->wt_slot * sizeof(uint16_t)),
-                    .output_dma  = (uint32_t)(b->out_all.dma_address + out_off * sizeof(float)),
+                    .input_iova   = (uint32_t)(b->in_all.dma_address  + (size_t)(mi*pl->nKt+ki) * pl->in_slot * sizeof(uint16_t)),
+                    .weights_iova = (uint32_t)(b->wt_all.dma_address  + (size_t)(ni*pl->nKt+ki) * pl->wt_slot * sizeof(uint16_t)),
+                    .output_iova  = (uint32_t)(b->out_all.dma_address + out_off * sizeof(float)),
                     .tasks = npu_regs,
                 };
-                if ((ret = gen_matmul_bf16(&p)) != 0) {
+                if ((ret = gen_gemm_bf16(&p)) != 0) {
                     ROCKET_LOGE("bf16_stream: gen failed (%d)\n", ret); return ret;
                 }
                 if ((size_t)p.task_count > (size_t)BFS_RC_STRIDE) {

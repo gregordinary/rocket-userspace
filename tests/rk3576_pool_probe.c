@@ -97,7 +97,7 @@
 #define C2       16u
 #define SENTINEL 0xAA
 
-int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
+int feature_index(int C, int H, int W, int C2_, int c, int h, int w);
 
 static unsigned round4(unsigned v) { return (v + 3u) & ~3u; }
 
@@ -244,8 +244,8 @@ static int run_pool(int fd, const pool_case *pc, unsigned dst_reg, int check,
     p.pad_left = p.pad_right = p.pad_top = p.pad_bottom = (uint8_t)pc->pad;
     p.mode = (uint8_t)pc->mode;
     p.input_zero_point = 0;
-    p.input_dma  = bo_in.dma_address;
-    p.output_dma = bo_o.dma_address;
+    p.input_iova  = bo_in.dma_address;
+    p.output_iova = bo_o.dma_address;
     p.ppu_dst_reg = (uint16_t)dst_reg;
     p.tasks = ops;
 
@@ -1936,12 +1936,12 @@ static int dst_arm(int fd, int diw, int dih, int dc, const char *name,
     p.ow = (uint16_t)diw; p.oh = (uint16_t)dih;
     p.kw = p.kh = 1; p.stride_x = p.stride_y = 1;
     p.mode = ROCKET_RK3576_POOL_MAX;
-    p.input_dma = bo_in.dma_address;
-    p.output_dma = bo_o.dma_address;
+    p.input_iova = bo_in.dma_address;
+    p.output_iova = bo_o.dma_address;
     p.ppu_dst_reg = 0x6070;
     p.tasks = ops;
     if (gen_pool_rk3576(&p) != 0) { printf("   generator refused\n"); return -1; }
-    /* Patch the two words in place: an NPUOP is op<<48 | value<<16 | reg. */
+    /* Patch the two words in place: a regcmd word is op<<48 | value<<16 | reg. */
     for (i = 0; i < p.task_count; i++) {
         unsigned reg = (unsigned)(ops[i] & 0xffffu);
         if (reg == 0x607Cu || reg == 0x6084u)

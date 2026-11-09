@@ -95,13 +95,13 @@ static int submit_rk3588(int fd, int *built)
         goto out;
 
     {
-        matmul_params_t p = {
-            .m = M, .k = K, .n = N, .tasks = ops, .fp32tofp16 = 1,
-            .input_dma   = (uint32_t)in.dma_address,
-            .weights_dma = (uint32_t)wt.dma_address,
-            .output_dma  = (uint32_t)out.dma_address,
+        gemm_params_t p = {
+            .m = M, .k = K, .n = N, .tasks = ops, .fp16_out = 1,
+            .input_iova   = (uint32_t)in.dma_address,
+            .weights_iova = (uint32_t)wt.dma_address,
+            .output_iova  = (uint32_t)out.dma_address,
         };
-        if (gen_matmul_fp16(&p) != 0 || p.task_count == 0) goto out;
+        if (gen_gemm_fp16(&p) != 0 || p.task_count == 0) goto out;
         *built = 1;
 
         rocket_bo_prep(fd, &rc_bo, 1, 0);
@@ -155,10 +155,10 @@ static int submit_and_close(int *built)
             .kh = 1, .kw = 1, .stride_y = 1, .stride_x = 1, .dil_y = 1, .dil_x = 1,
             .ih_full = IH, .oh_full = IH, .int8_out = 1, .tasks = ops,
             .in_scale = 1.0f, .w_scale = 1.0f, .out_scale = 1.0f,
-            .input_dma   = (uint32_t)in.dma_address,
-            .weights_dma = (uint32_t)wt.dma_address,
-            .bias_dma    = (uint32_t)coeff.dma_address,
-            .output_dma  = (uint32_t)out.dma_address,
+            .input_iova   = (uint32_t)in.dma_address,
+            .weights_iova = (uint32_t)wt.dma_address,
+            .bias_iova    = (uint32_t)coeff.dma_address,
+            .output_iova  = (uint32_t)out.dma_address,
         };
         if (gen_conv2d_int8_rk3576(&p) != 0 || p.task_count == 0) goto out;
         *built = 1;

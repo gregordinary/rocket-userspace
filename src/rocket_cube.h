@@ -12,8 +12,9 @@
  * test, which is why they never diverged in VALUE — but it meant that blocking the
  * scatters, the single largest host cost of a matmul, was a five-times job.
  *
- * All of them are 1-BASED in the channel/row index, matching weight_fp16() and the
- * hardware's own numbering.
+ * Two 0-based positions, cube_pos() and tile_pos(), compute it. The per-datatype wrappers
+ * the loops call are 1-BASED in the channel/row index, the convention of the out-of-line
+ * helpers in npu_regcmd.c (feature_index(), gemm_weight_index_*()) that they must equal.
  */
 #ifndef ROCKET_CUBE_H
 #define ROCKET_CUBE_H
@@ -34,18 +35,19 @@
  * int8 route measured 195 ms -> 65 ms on the RK1 from exactly this change.
  *
  * The index functions belong in the loop BOUNDS. Written once here rather than per
- * dtype, because the algebra is one family:
+ * dtype, because every datatype's cube is one of two shapes at its own granule (0-based,
+ * the positions below):
  *
- *   FEATURE / OUTPUT   idx(H, ch, h) = (ch-1)/G * H*G + G*(h-1) + (ch-1)%G
- *                      -> for fixed h, G consecutive ch are G consecutive elements;
- *                         groups stride by H*G.
- *   WEIGHT             idx(C, k, c)  = (c-1)/KG * KG*NG + (k-1)/NG * NG*C
- *                                    + (c-1)%KG + (k-1)%NG * KG
- *                      -> for fixed k, KG consecutive c are KG consecutive elements;
- *                         groups stride by KG*NG.
+ *   FEATURE / OUTPUT   cube_pos(H, g, c, h) = ((c/g)*H + h)*g + c%g
+ *                      -> along the channel axis, g neighbours are g neighbouring
+ *                         elements; the next group starts H*g further on.
+ *   WEIGHT             tile_pos(K, ng, kg, n, k) = ((n/ng)*K + (k/kg)*kg)*ng
+ *                                                  + (n%ng)*kg + k%kg
+ *                      -> along the contraction, kg neighbours are kg neighbouring
+ *                         elements; the next block starts kg*ng further on.
  *
- * G / KG / NG per dtype: fp16 (8, 32, 16), int8 (16, 32, 32), int4 (32 nibbles, 32, 64),
- * int16+bf16 (8, 32, 16), tf32 (4, 16, 16); the 4-byte output cube is G=4 everywhere.
+ * g / kg / ng per dtype: fp16 (8, 32, 16), int8 (16, 32, 32), int4 (32 nibbles, 32, 64),
+ * int16+bf16 (8, 32, 16), tf32 (4, 16, 16); the 4-byte output cube is g=4 everywhere.
  * The contiguous run is 16 BYTES on the feature side for every one of them.
  *
  * The scalar tail is the same expression the whole loop used to be, so a tile whose
@@ -87,13 +89,14 @@
     } while (0)
 
 /* Scatter ONE source row into a WEIGHT cube of granule (KG, NG): `srow` is the row's first
- * element of this K-tile, `k` its 1-based row within the tile's N extent, KT the tile's K. */
+ * element of this K-tile, `k` its 1-based row within the tile's N extent, KT the tile's K.
+ * IDX is the weight index of that granule. One kernel's consecutive K blocks sit one
+ * KG x NG block apart, so the row's position is taken once, at contraction index 1. */
 #define MM_WT_SCATTER_ROW(DT, ST, KG, NG, IDX, slot, srow, k, KT, CVT)                   \
     do {                                                                                 \
         const int mmrC_ = (KT), mmrng_ = (KT) / (KG), mmrk_ = (k);                       \
         const ST *mmrs_ = (srow);                                                        \
-        DT *mmrd_ = (DT *)(slot) + (size_t)((mmrk_ - 1) / (NG)) * (NG) * (size_t)mmrC_   \
-                                 + (size_t)((mmrk_ - 1) % (NG)) * (KG);                  \
+        DT *mmrd_ = (DT *)(slot) + IDX(mmrC_, mmrk_, 1);                                 \
         for (int mmrg_ = 0; mmrg_ < mmrng_; mmrg_++) {                                   \
             DT *restrict mmrdg_ = mmrd_ + (size_t)mmrg_ * (KG) * (NG);                   \
             const ST *restrict mmrsg_ = mmrs_ + (size_t)mmrg_ * (KG);                    \
@@ -179,32 +182,57 @@
     } while (0)
 
 
-/* int8 NPU layout index math (cf. feat_idx/wt_idx). Input feature cube C2=16,
- * weight k-group 32 (== weight_int8()), int32-output cube C2=4. */
-static inline size_t feat_idx_i8(int H, int ch, int h) {   /* input, C2=16 */
-    return ((size_t)(ch - 1) / 16) * (size_t)H * 16 + 16 * (size_t)(h - 1) + (ch - 1) % 16;
-}
-static inline size_t wt_idx_i8(int C, int k, int c) {      /* weight, k-group 32 */
-    return (size_t)((c - 1) / 32) * 32 * 32 + (size_t)((k - 1) / 32) * 32 * C
-         + (size_t)((c - 1) % 32) + (size_t)((k - 1) % 32) * 32;
-}
-static inline size_t out_idx_i8(int H, int ch, int h) {    /* output, C2=4 */
-    return ((size_t)(ch - 1) / 4) * (size_t)H * 4 + 4 * (size_t)(h - 1) + (ch - 1) % 4;
+/* ── Where one element lands ──────────────────────────────────────────────────────
+ *
+ * A matmul moves two cube shapes, and every datatype's index is one of them at its own
+ * granule.
+ *
+ * The FEATURE cube holds an operand or the result as an NC1HWC2 cube one pixel wide.
+ * The channels are cut into groups of `g`, groups outermost; a group stores its H rows
+ * in order, and a row is that group's g channels side by side.
+ *
+ * The WEIGHT cube cuts the N kernels into groups of `ng` and the contraction into groups
+ * of `kg`. Each (kernel group, contraction group) pair is one ng x kg block, stored whole
+ * with the contraction index fastest, and a kernel group's blocks run the length of the
+ * contraction before the next kernel group starts. `klen` is the contraction length the
+ * cube was laid out for.
+ *
+ * Both take 0-based coordinates. They return what npu_regcmd.c's feature_index() and
+ * weight_*() return out of line, and tests/cube_index_gate.c holds each wrapper below to
+ * its out-of-line counterpart. */
+static inline size_t cube_pos(size_t H, size_t g, size_t c, size_t h)
+{
+    return ((c / g) * H + h) * g + c % g;
 }
 
-/* int4 NPU layout index math (NIBBLE indices for in/wt; int16 elems for out). */
-static inline size_t feat_idx_i4(int H, int ch, int h) {   /* input nibble, C2=32 */
-    return ((size_t)(ch - 1) / 32) * (size_t)H * 32 + 32 * (size_t)(h - 1) + (ch - 1) % 32;
+static inline size_t tile_pos(size_t klen, size_t ng, size_t kg, size_t n, size_t k)
+{
+    return ((n / ng) * klen + (k / kg) * kg) * ng + (n % ng) * kg + k % kg;
 }
-static inline size_t wt_idx_i4(int C, int k, int c) {      /* weight nibble, (N/64,K/32,64,32) */
-    size_t nKgrp   = (size_t)((C + 31) / 32);
-    size_t Ngrp    = (size_t)(k - 1) / 64, Nwithin = (size_t)(k - 1) % 64;
-    size_t Kgrp    = (size_t)(c - 1) / 32, Kwithin = (size_t)(c - 1) % 32;
-    return Ngrp * nKgrp * 64 * 32 + Kgrp * 64 * 32 + Nwithin * 32 + Kwithin;
+
+/* The per-datatype wrappers are 1-based: row h, channel or kernel n, contraction index
+ * k, with K the contraction length. A feat_ cube is an input, an out_ cube is what the
+ * DPU writes. */
+
+/* fp16: 8-element feature atom, 16 x 32 weight blocks (gemm_weight_index_fp16). */
+static inline size_t feat_idx(int H, int n, int h)  { return cube_pos(H, 8, n - 1, h - 1); }
+static inline size_t wt_idx(int K, int n, int k)    { return tile_pos(K, 16, 32, n - 1, k - 1); }
+
+/* int8: 16-element feature atom, 32 x 32 weight blocks (gemm_weight_index_int8), int32 output
+ * in 4-element atoms. */
+static inline size_t feat_idx_i8(int H, int n, int h) { return cube_pos(H, 16, n - 1, h - 1); }
+static inline size_t wt_idx_i8(int K, int n, int k)   { return tile_pos(K, 32, 32, n - 1, k - 1); }
+static inline size_t out_idx_i8(int H, int n, int h)  { return cube_pos(H, 4, n - 1, h - 1); }
+
+/* int4: positions are NIBBLES on the input and weight side. 32-nibble feature atom,
+ * 64 x 32 weight blocks over K rounded up to 32 (gemm_weight_index_int4), int16 output in
+ * 8-element atoms. */
+static inline size_t feat_idx_i4(int H, int n, int h) { return cube_pos(H, 32, n - 1, h - 1); }
+static inline size_t wt_idx_i4(int K, int n, int k)
+{
+    return tile_pos((size_t)(K + 31) / 32 * 32, 64, 32, n - 1, k - 1);
 }
-static inline size_t out_idx_i4(int H, int ch, int h) {    /* output int16 elem, C2=8 */
-    return ((size_t)(ch - 1) / 8) * (size_t)H * 8 + 8 * (size_t)(h - 1) + (ch - 1) % 8;
-}
+static inline size_t out_idx_i4(int H, int n, int h)  { return cube_pos(H, 8, n - 1, h - 1); }
 /* set nibble `idx` (byte idx/2; even=low, odd=high) in a packed buffer. */
 static inline void put_nib(uint8_t *buf, size_t idx, int8_t v) {
     uint8_t nib = (uint8_t)(v & 0xF);
@@ -242,12 +270,10 @@ static inline void i4_feat_scatter(uint8_t *restrict slot, const int8_t *restric
 static inline void i4_wt_scatter(uint8_t *restrict slot, const int8_t *restrict B,
                                  size_t Bstride, int n0, int k0, int Ntile, int Ktile)
 {
-    const size_t nKgrp = (size_t)((Ktile + 31) / 32);
     const int ng = Ktile / 32;
     for (int k = 1; k <= Ntile; k++) {
         const int8_t *restrict brow = B + (size_t)(n0 + k - 1) * Bstride + k0;
-        const size_t nbase = (size_t)((k - 1) / 64) * nKgrp * 64 * 32
-                           + (size_t)((k - 1) % 64) * 32;
+        const size_t nbase = wt_idx_i4(Ktile, k, 1);
         for (int g = 0; g < ng; g++)   /* the Kgrp stride is 64*32 nibbles */
             i4_pack16(slot + ((nbase + (size_t)g * 64 * 32) >> 1), brow + (size_t)g * 32);
         for (int c = ng * 32 + 1; c <= Ktile; c++)          /* Ktile%32 tail */
@@ -263,29 +289,16 @@ static inline uint16_t f32_to_bf16(float f) {
     uint32_t b; memcpy(&b, &f, sizeof b); return (uint16_t)(b >> 16);
 }
 
-/* int16 NPU layout index math. Feature cube C2=8 (== fp16); weight (N/16,K/32,
- * 16,32) (== weight_fp16); int32-output cube C2=4 (== int8). */
-static inline size_t feat_idx_i16(int H, int ch, int h) {   /* input, C2=8 */
-    return ((size_t)(ch - 1) / 8) * (size_t)H * 8 + 8 * (size_t)(h - 1) + (ch - 1) % 8;
-}
-static inline size_t wt_idx_i16(int C, int k, int c) {      /* weight, (N/16,K/32,16,32) */
-    return (size_t)((c - 1) / 32) * 32 * 16 + (size_t)((k - 1) / 16) * 16 * C
-         + (size_t)((c - 1) % 32) + (size_t)((k - 1) % 16) * 32;
-}
-static inline size_t out_idx_i16(int H, int ch, int h) {    /* output int32 elem, C2=4 */
-    return ((size_t)(ch - 1) / 4) * (size_t)H * 4 + 4 * (size_t)(h - 1) + (ch - 1) % 4;
-}
+/* int16: the fp16 cube shapes (8-element feature atom, 16 x 32 weight blocks,
+ * gemm_weight_index_int16), int32 output in 4-element atoms as int8's. */
+static inline size_t feat_idx_i16(int H, int n, int h) { return cube_pos(H, 8, n - 1, h - 1); }
+static inline size_t wt_idx_i16(int K, int n, int k)   { return tile_pos(K, 16, 32, n - 1, k - 1); }
+static inline size_t out_idx_i16(int H, int n, int h)  { return cube_pos(H, 4, n - 1, h - 1); }
 
-/* tf32 NPU layout index math. Feature cube C2=4 (4-byte atom); weight
- * (N/16,K/16,16,16) (== weight_tf32). The fp32 output reuses out_idx_i16 (cube
- * C2=4) — identical to the int16/bf16 fp32-out writer. */
-static inline size_t feat_idx_tf32(int H, int ch, int h) {   /* input, C2=4 */
-    return ((size_t)(ch - 1) / 4) * (size_t)H * 4 + 4 * (size_t)(h - 1) + (ch - 1) % 4;
-}
-static inline size_t wt_idx_tf32(int C, int k, int c) {      /* weight, (N/16,K/16,16,16) */
-    return (size_t)((c - 1) / 16) * 16 * 16 + (size_t)((k - 1) / 16) * 16 * C
-         + (size_t)((c - 1) % 16) + (size_t)((k - 1) % 16) * 16;
-}
+/* tf32: 4-element feature atom, 16 x 16 weight blocks (gemm_weight_index_tf32). The fp32 output
+ * is out_idx_i16's cube, the one the int16 and bf16 fp32-out writer uses. */
+static inline size_t feat_idx_tf32(int H, int n, int h) { return cube_pos(H, 4, n - 1, h - 1); }
+static inline size_t wt_idx_tf32(int K, int n, int k)   { return tile_pos(K, 16, 16, n - 1, k - 1); }
 
 /* ── Planes <-> one channel group of a cube ───────────────────────────────────────
  *

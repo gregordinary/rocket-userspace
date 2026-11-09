@@ -11,43 +11,13 @@ histogram, and lists the distinct registers each block received. Usage:
 
     dumpblocks.py <file.rknn> [more ...]
 """
-import struct, sys, collections
+import sys, collections
 
-# Block ids as they appear in the top 16 bits of an NPUOP word: BLOCK | 0x1.
-BLOCKS = {
-    0x0101: "PC",
-    0x0201: "CNA",
-    0x0801: "CORE",
-    0x1001: "DPU",
-    0x2001: "DPU_RDMA",
-    0x4001: "PPU",
-    0x8001: "PPU_RDMA",
-    0x0041: "SYNC",
-    0x0081: "BCAST",
-}
-
-
-def words(path):
-    data = open(path, "rb").read()
-    n = len(data) // 8
-    return struct.unpack("<%dQ" % n, data[:n * 8])
+from regcmd_scan import ALL_TARGETS, BLOCK_NAMES as BLOCKS, regcmd_programs
 
 
 def runs(path, min_run=12):
-    w = words(path)
-    out, i, n = [], 0, len(w)
-    while i < n:
-        if ((w[i] >> 48) & 0xffff) in BLOCKS:
-            j = i
-            while j < n and ((w[j] >> 48) & 0xffff) in BLOCKS:
-                j += 1
-            if j - i >= min_run:
-                out.append([(int((x >> 48) & 0xffff), int(x & 0xffff),
-                             int((x >> 16) & 0xffffffff)) for x in w[i:j]])
-            i = j
-        else:
-            i += 1
-    return out
+    return regcmd_programs(path, ALL_TARGETS, min_run)
 
 
 def main(paths):

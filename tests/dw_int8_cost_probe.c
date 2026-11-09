@@ -8,8 +8,8 @@
  *
  *   call     rocket_conv2d_dw_int8_ctx(), the whole entry on a resident context
  *   scat     the entry's input scatter as written: a memset of the input BO's size, then
- *            one feature_data() call per element from the [C][IH][IW] source
- *   gath     the entry's output gather as written: one feature_data() call per element
+ *            one feature_index() call per element from the [C][IH][IW] source
+ *   gath     the entry's output gather as written: one feature_index() call per element
  *   bscat    a blocked scatter to the same cube, the index hoisted out of the inner loop
  *   bgath    a blocked gather from the same cube
  *
@@ -60,7 +60,7 @@ static void scat_scalar(int8_t *dst, size_t dst_bytes, const int8_t *in, int C, 
     for (int c = 0; c < C; c++)
         for (int ih = 0; ih < IH; ih++)
             for (int iw = 0; iw < IW; iw++)
-                dst[feature_data(Cj, IHj, IW, C2, c + 1, ih + 1, iw + 1)] =
+                dst[feature_index(Cj, IHj, IW, C2, c + 1, ih + 1, iw + 1)] =
                     in[((size_t)c * IH + ih) * IW + iw];
 }
 
@@ -82,7 +82,7 @@ static void gath_scalar(int8_t *out, const int8_t *src, int C, int Cj, int OH, i
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++)
                 out[((size_t)c * OH + oh) * OW + ow] =
-                    src[feature_data(Cj, OH, OW, C2, c + 1, oh + 1, ow + 1)];
+                    src[feature_index(Cj, OH, OW, C2, c + 1, oh + 1, ow + 1)];
 }
 
 static void gath_blocked(int8_t *out, const int8_t *src, int C, int OH, int OW)
@@ -120,7 +120,7 @@ int main(int argc, char **argv)
         const int Cj = ((C + 63) / 64) * 64;
         const int IHj = IH < 4 ? 4 : IH;
         const size_t in_n = (size_t)C * IH * IW, out_n = (size_t)C * OH * OW;
-        const size_t cube_in = (size_t)Cj * IHj * IW + NPU_CBUF_BANK_SIZE;
+        const size_t cube_in = (size_t)Cj * IHj * IW + RK3588_CBUF_BANK_BYTES;
         const size_t cube_out = (size_t)Cj * OH * OW;
         int8_t *in = malloc(in_n), *w = malloc((size_t)C * K * K), *out = malloc(out_n);
         int8_t *o2 = malloc(out_n), *ci = malloc(cube_in), *ci2 = malloc(cube_in);

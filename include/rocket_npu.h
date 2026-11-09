@@ -205,6 +205,12 @@ int  rocket_bo_prep_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
 int  rocket_bo_fini_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r,
                            unsigned n);
 
+/* The interface versions the capability probes below name are those of this library's
+ * kernel patch series, which also creates the `rocket_batch_submit` module parameter.
+ * Upstream numbers its interface independently. Where sysfs lists the `rocket` module
+ * without that parameter, each probe answers 0, whatever version the kernel reports.
+ * Where sysfs is not mounted, the reported version stands. */
+
 /* Returns 1 if the running kernel has `DRM_ROCKET_PREP_BO_RANGES` and
  * `DRM_ROCKET_FINI_BO_RANGES` (interface >= 1.5). The result is probed once and cached. */
 int  rocket_bo_ranges_supported(void);
@@ -313,10 +319,10 @@ void rocket_busy_poll_set_us(long us);
 
 /* Submits one job containing one task, which is one register program:
  *
- * - `regcmd_bo`: the BO holding the packed NPUOP uint64 words (the `ops[]` array).
- * - `regcmd_count`: the total NPUOP words the PC executes, including the control trailer
- *   whose final `OP_ENABLE` triggers the compute. A generator returns it in
- *   `task_count`: 122 + 4 trailer = 126 for `gen_matmul_fp16` and `gen_matmul_int8`. The
+ * - `regcmd_bo`: the BO holding the packed uint64 regcmd words (the `ops[]` array).
+ * - `regcmd_count`: the total regcmd words the PC executes, including the control trailer
+ *   whose final `TARGET_ENABLE` triggers the compute. A generator returns it in
+ *   `task_count`: 122 + 4 trailer = 126 for `gen_gemm_fp16` and `gen_gemm_int8`. The
  *   driver encodes it to hardware as (count+1)/2 - 1.
  * - `in_handles`: the BOs the NPU reads (input, weights, `regcmd_bo`).
  * - `out_handles`: the BOs the NPU writes (output).
@@ -356,9 +362,9 @@ int  rocket_submit_matmul_flags(int fd,
  * `ROCKET_JOB_BATCHED`: the job's tasks are laid out contiguously and self-chained. Each
  * task's trailer must point the PC at the next task with two writes. A `PC_BASE_ADDRESS`
  * write gives the next task's regcmd address. `PC_REGISTER_AMOUNTS` gives its word count,
- * encoded as the driver encodes `regcmd_count`. The `gen_*` trailer is [`OP_NONE`,
- * `PC_REGISTER_AMOUNTS`, `OP_40`, `OP_ENABLE`], and the address write takes its `OP_NONE`
- * slot. The last task's forward link must be cleared back to `OP_NONE`.
+ * encoded as the driver encodes `regcmd_count`. The `gen_*` trailer is [`TARGET_NONE`,
+ * `PC_REGISTER_AMOUNTS`, `TARGET_PRE_ENABLE`, `TARGET_ENABLE`], and the address write takes its `TARGET_NONE`
+ * slot. The last task's forward link must be cleared back to `TARGET_NONE`.
  *
  * The driver runs the tasks in one kick with a single completion, instead of one kick and
  * one completion per task. The caller must check `rocket_batched_submit_supported()`

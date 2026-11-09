@@ -20,7 +20,7 @@
  *     feature / C2=? output cube). Once stage 1 writes, fix the packing:
  *       ROCKET_INT4_NIBBLE_HILO  swap which logical elem is the low vs high nibble
  *       ROCKET_INT4_OUT_C2       int16 output cube (try 8, then 4, 16)
- *     The weight_int4 ordinal layout (npu_regcmd.c, currently == weight_int8)
+ *     The gemm_weight_index_int4 ordinal layout (npu_regcmd.c, currently == gemm_weight_index_int8)
  *     is the prime suspect — int4 N-align is 64 (vs the guessed 32).
  *
  * Small shapes keep the int16 output UNSATURATED so the compare to the int32
@@ -113,15 +113,15 @@ int main(int argc, char **argv) {
     }
 
     uint64_t npu_regs[256] = {0};
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)N,
-        .input_dma = (uint32_t)input.dma_address,
-        .weights_dma = (uint32_t)weights.dma_address,
-        .output_dma = (uint32_t)output.dma_address,
+        .input_iova = (uint32_t)input.dma_address,
+        .weights_iova = (uint32_t)weights.dma_address,
+        .output_iova = (uint32_t)output.dma_address,
         .tasks = npu_regs,
     };
-    if ((ret = gen_matmul_int4(&p)) != 0) {
-        fprintf(stderr, "gen_matmul_int4 = %d (CBUF banks? -1 fd, -2 weight/kernel)\n", ret);
+    if ((ret = gen_gemm_int4(&p)) != 0) {
+        fprintf(stderr, "gen_gemm_int4 = %d (CBUF banks? -1 fd, -2 weight/kernel)\n", ret);
         goto out;
     }
     printf("regcmd ops = %u\n", p.task_count);
@@ -140,13 +140,13 @@ int main(int argc, char **argv) {
     memcpy(regcmd.ptr, npu_regs, (size_t)p.task_count * sizeof(uint64_t));
     memset(input.ptr, 0, input.size);
     memset(weights.ptr, 0, weights.size);
-    /* pack into NPU native int4 nibble layouts: weight_int4, feature cube C2=32 */
+    /* pack into NPU native int4 nibble layouts: gemm_weight_index_int4, feature cube C2=32 */
     for (int n = 1; n <= N; n++)
         for (int k = 1; k <= K; k++)
-            put_nibble(weights.ptr, (size_t)weight_int4(K, n, k), B[(n-1)*K + (k-1)], hilo);
+            put_nibble(weights.ptr, (size_t)gemm_weight_index_int4(K, n, k), B[(n-1)*K + (k-1)], hilo);
     for (int m = 1; m <= M; m++)
         for (int k = 1; k <= K; k++)
-            put_nibble(input.ptr, (size_t)feature_data(K, M, 1, 32, k, m, 1), A[(m-1)*K + (k-1)], hilo);
+            put_nibble(input.ptr, (size_t)feature_index(K, M, 1, 32, k, m, 1), A[(m-1)*K + (k-1)], hilo);
     CK(rocket_bo_fini(fd, &regcmd));
     CK(rocket_bo_fini(fd, &input));
     CK(rocket_bo_fini(fd, &weights));
@@ -191,7 +191,7 @@ int main(int argc, char **argv) {
     int sentinel = 0;                        /* outputs left as 0xAAAA (untouched)  */
     for (int m = 1; m <= M; m++)
         for (int n = 1; n <= N; n++) {
-            int16_t act = od[feature_data(N, M, 1, out_c2, n, m, 1)];
+            int16_t act = od[feature_index(N, M, 1, out_c2, n, m, 1)];
             int32_t exp = C[(m-1)*N + (n-1)];
             if ((uint16_t)act == 0xAAAA) sentinel++;
             if ((int32_t)act == exp) {
@@ -214,7 +214,7 @@ int main(int argc, char **argv) {
     if (bad == 0) { printf("==> PASS (bit-exact int4xint4->int16)\n"); ret = 0; }
     else {
         printf("==> values wrong (stage1 cleared). Crack packing: ROCKET_INT4_NIBBLE_HILO=1, "
-               "ROCKET_INT4_OUT_C2=4/16, and the weight_int4 layout (N-group 64?).\n");
+               "ROCKET_INT4_OUT_C2=4/16, and the gemm_weight_index_int4 layout (N-group 64?).\n");
         ret = -1;
     }
 

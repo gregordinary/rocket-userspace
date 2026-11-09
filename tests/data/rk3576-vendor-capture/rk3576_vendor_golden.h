@@ -4,9 +4,9 @@
  * rk3576_vendor_golden.h - GENERATED, do not edit by hand.
  *
  * RK3576 vendor register programs, decoded from RKNN-Toolkit2 .rknn captures
- * (the gahingwoo vendor-capture set, plus the manufactured ones here: dw/ for
- * depthwise, float/ for the fp16 direct path, argb/ for the fp16 first conv,
- * rebuilt by their own mk*.py). Each table is one
+ * manufactured here and rebuilt by their own mk*.py: int8/ for the quantized
+ * first, direct and depthwise convs, dw/ for depthwise, float/ for the fp16
+ * direct path, argb/ for the fp16 first conv. Each table is one
  * task's complete CNA+CORE+DPU+DPU_RDMA register program, in stream order, as
  * (target, reg, value) triples. These are the acceptance oracle for the RK3576
  * regcmd emitter: what the vendor toolkit programs for a known conv geometry.
@@ -43,7 +43,7 @@ struct rk3576_golden_case {
 };
 
 /* argb_c12_32_k3_s2_224x224_o112x112: ARGB  ic=12 oc=32 k=3x3 s=2 in 224x224 of 14 rows -> out 112x112 of 112
- * source: chain_rk3576.rknn run 0, 139 entries */
+ * source: chain_stem_224.rknn run 0, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -118,9 +118,9 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x00001190u },  /* DPU */
+    { 0x1001, 0x4070, 0x0000100au },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x00001190u },  /* DPU */
+    { 0x1001, 0x4078, 0x0000100au },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -132,7 +132,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00004107u },  /* DPU */
+    { 0x1001, 0x40b0, 0x000040d5u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000012u },  /* DPU */
     { 0x1001, 0x40b8, 0x00003100u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -187,7 +187,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
 };
 
 /* dw_c32_32_k3_s1_112x91_o112x90: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x91 of 112 rows -> out 112x90 of 112
- * source: chain_rk3576.rknn run 1, 139 entries */
+ * source: chain_stem_224.rknn run 1, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -262,9 +262,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4070, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4078, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -276,7 +276,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005249u },  /* DPU */
+    { 0x1001, 0x40b0, 0x0000539fu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x00009ca0u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -331,7 +331,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
 };
 
 /* dw_c32_32_k3_s1_112x23_o112x22: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x23 of 112 rows -> out 112x22 of 112
- * source: chain_rk3576.rknn run 2, 139 entries */
+ * source: chain_stem_224.rknn run 2, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -406,9 +406,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4070, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4078, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -420,7 +420,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005249u },  /* DPU */
+    { 0x1001, 0x40b0, 0x0000539fu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x0000ba60u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -475,7 +475,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
 };
 
 /* conv_c32_64_k1_s1_112x91_o112x91:  ic=32 oc=64 k=1x1 s=1 in 112x91 of 112 rows -> out 112x91 of 112
- * source: chain_rk3576.rknn run 3, 139 entries */
+ * source: chain_stem_224.rknn run 3, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x91_o112x91[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -550,9 +550,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x91_o112
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002d594u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002d594u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -564,7 +564,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x91_o112
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492bu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004d2au },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x00003a30u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -619,7 +619,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x91_o112
 };
 
 /* conv_c32_64_k1_s1_112x21_o112x21:  ic=32 oc=64 k=1x1 s=1 in 112x21 of 112 rows -> out 112x21 of 112
- * source: chain_rk3576.rknn run 4, 139 entries */
+ * source: chain_stem_224.rknn run 4, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x21_o112x21[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -694,9 +694,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x21_o112
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002d594u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002d594u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -708,7 +708,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x21_o112
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492bu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004d2au },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x000058d0u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -763,7 +763,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x21_o112
 };
 
 /* dw_c64_64_k3_s2_112x44_o56x22: depthwise  ic=64 oc=64 k=3x3 s=2 in 112x44 of 112 rows -> out 56x22 of 56
- * source: chain_rk3576.rknn run 5, 139 entries */
+ * source: chain_stem_224.rknn run 5, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -838,9 +838,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -852,7 +852,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007245u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000016u },  /* DPU */
     { 0x1001, 0x40b8, 0x00002c30u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -907,7 +907,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22
 };
 
 /* dw_c64_64_k3_s2_112x45_o56x22: depthwise  ic=64 oc=64 k=3x3 s=2 in 112x45 of 112 rows -> out 56x22 of 56
- * source: chain_rk3576.rknn run 6, 139 entries */
+ * source: chain_stem_224.rknn run 6, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -982,9 +982,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -996,7 +996,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007245u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000016u },  /* DPU */
     { 0x1001, 0x40b8, 0x00002c30u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -1051,7 +1051,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22
 };
 
 /* argb_c12_32_k3_s2_224x224_o112x112_v2: ARGB  ic=12 oc=32 k=3x3 s=2 in 224x224 of 14 rows -> out 112x112 of 112
- * source: chain_rk3576.rknn run 8, 139 entries */
+ * source: chain_stem_224.rknn run 8, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -1126,9 +1126,9 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x00001190u },  /* DPU */
+    { 0x1001, 0x4070, 0x0000100au },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x00001190u },  /* DPU */
+    { 0x1001, 0x4078, 0x0000100au },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -1140,7 +1140,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00004107u },  /* DPU */
+    { 0x1001, 0x40b0, 0x000040d5u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000012u },  /* DPU */
     { 0x1001, 0x40b8, 0x00003100u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -1195,7 +1195,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
 };
 
 /* dw_c32_32_k3_s1_112x91_o112x90_v2: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x91 of 112 rows -> out 112x90 of 112
- * source: chain_rk3576.rknn run 9, 139 entries */
+ * source: chain_stem_224.rknn run 9, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -1270,9 +1270,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4070, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4078, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -1284,7 +1284,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005249u },  /* DPU */
+    { 0x1001, 0x40b0, 0x0000539fu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x00009ca0u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -1339,7 +1339,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
 };
 
 /* dw_c32_32_k3_s1_112x23_o112x22_v2: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x23 of 112 rows -> out 112x22 of 112
- * source: chain_rk3576.rknn run 10, 139 entries */
+ * source: chain_stem_224.rknn run 10, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -1414,9 +1414,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4070, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4078, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -1428,7 +1428,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005249u },  /* DPU */
+    { 0x1001, 0x40b0, 0x0000539fu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x0000ba60u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -1483,7 +1483,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
 };
 
 /* conv_c32_64_k1_s1_112x91_o112x91_v2:  ic=32 oc=64 k=1x1 s=1 in 112x91 of 112 rows -> out 112x91 of 112
- * source: chain_rk3576.rknn run 11, 139 entries */
+ * source: chain_stem_224.rknn run 11, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x91_o112x91_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -1558,9 +1558,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x91_o112
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002d594u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002d594u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -1572,7 +1572,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x91_o112
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492bu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004d2au },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x00003a30u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -1627,7 +1627,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x91_o112
 };
 
 /* conv_c32_64_k1_s1_112x21_o112x21_v2:  ic=32 oc=64 k=1x1 s=1 in 112x21 of 112 rows -> out 112x21 of 112
- * source: chain_rk3576.rknn run 12, 139 entries */
+ * source: chain_stem_224.rknn run 12, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x21_o112x21_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -1702,9 +1702,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x21_o112
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002d594u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002d594u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -1716,7 +1716,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x21_o112
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492bu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004d2au },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x000058d0u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -1771,7 +1771,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x21_o112
 };
 
 /* dw_c64_64_k3_s2_112x44_o56x22_v2: depthwise  ic=64 oc=64 k=3x3 s=2 in 112x44 of 112 rows -> out 56x22 of 56
- * source: chain_rk3576.rknn run 13, 139 entries */
+ * source: chain_stem_224.rknn run 13, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -1846,9 +1846,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -1860,7 +1860,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007245u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000016u },  /* DPU */
     { 0x1001, 0x40b8, 0x00002c30u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -1915,7 +1915,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22
 };
 
 /* dw_c64_64_k3_s2_112x45_o56x22_v2: depthwise  ic=64 oc=64 k=3x3 s=2 in 112x45 of 112 rows -> out 56x22 of 56
- * source: chain_rk3576.rknn run 14, 139 entries */
+ * source: chain_stem_224.rknn run 14, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -1990,9 +1990,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -2004,7 +2004,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007245u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000016u },  /* DPU */
     { 0x1001, 0x40b8, 0x00002c30u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -2059,7 +2059,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22
 };
 
 /* argb_c12_32_k3_s2_224x112_o112x56: ARGB  ic=12 oc=32 k=3x3 s=2 in 224x112 of 14 rows -> out 112x56 of 112
- * source: chain_rk3576.rknn run 16, 138 entries */
+ * source: chain_stem_224.rknn run 16, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x112_o112x56[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -2133,9 +2133,9 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x112_o11
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x00001190u },  /* DPU */
+    { 0x1001, 0x4070, 0x0000100au },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x00001190u },  /* DPU */
+    { 0x1001, 0x4078, 0x0000100au },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -2147,7 +2147,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x112_o11
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00004107u },  /* DPU */
+    { 0x1001, 0x40b0, 0x000040d5u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000012u },  /* DPU */
     { 0x1001, 0x40b8, 0x00004980u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -2202,7 +2202,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x112_o11
 };
 
 /* dw_c32_32_k3_s1_112x57_o112x56: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x57 of 112 rows -> out 112x56 of 112
- * source: chain_rk3576.rknn run 17, 138 entries */
+ * source: chain_stem_224.rknn run 17, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -2276,9 +2276,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4070, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4078, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -2290,7 +2290,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005249u },  /* DPU */
+    { 0x1001, 0x40b0, 0x0000539fu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x0000ab80u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -2345,7 +2345,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
 };
 
 /* conv_c32_64_k1_s1_112x56_o112x56:  ic=32 oc=64 k=1x1 s=1 in 112x56 of 112 rows -> out 112x56 of 112
- * source: chain_rk3576.rknn run 18, 138 entries */
+ * source: chain_stem_224.rknn run 18, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x56_o112x56[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -2419,9 +2419,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x56_o112
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002d594u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002d594u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -2433,7 +2433,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x56_o112
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492bu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004d2au },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x00004980u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -2488,7 +2488,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x56_o112
 };
 
 /* dw_c64_64_k3_s2_112x37_o56x18: depthwise  ic=64 oc=64 k=3x3 s=2 in 112x37 of 112 rows -> out 56x18 of 56
- * source: chain_rk3576.rknn run 19, 138 entries */
+ * source: chain_stem_224.rknn run 19, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -2562,9 +2562,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -2576,7 +2576,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007245u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000016u },  /* DPU */
     { 0x1001, 0x40b8, 0x00002d10u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -2631,7 +2631,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18
 };
 
 /* dw_c64_64_k3_s2_112x20_o56x10: depthwise  ic=64 oc=64 k=3x3 s=2 in 112x20 of 112 rows -> out 56x10 of 56
- * source: chain_rk3576.rknn run 20, 138 entries */
+ * source: chain_stem_224.rknn run 20, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x20_o56x10[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -2705,9 +2705,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x20_o56x10
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -2719,7 +2719,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x20_o56x10
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007245u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000016u },  /* DPU */
     { 0x1001, 0x40b8, 0x00002ed0u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -2774,7 +2774,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x20_o56x10
 };
 
 /* argb_c12_32_k3_s2_224x113_o112x56: ARGB  ic=12 oc=32 k=3x3 s=2 in 224x113 of 14 rows -> out 112x56 of 112
- * source: chain_rk3576.rknn run 21, 138 entries */
+ * source: chain_stem_224.rknn run 21, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x113_o112x56[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -2848,9 +2848,9 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x113_o11
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x00001190u },  /* DPU */
+    { 0x1001, 0x4070, 0x0000100au },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x00001190u },  /* DPU */
+    { 0x1001, 0x4078, 0x0000100au },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -2862,7 +2862,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x113_o11
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00004107u },  /* DPU */
+    { 0x1001, 0x40b0, 0x000040d5u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000012u },  /* DPU */
     { 0x1001, 0x40b8, 0x00004980u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -2917,7 +2917,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x113_o11
 };
 
 /* dw_c32_32_k3_s1_112x57_o112x56_v2: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x57 of 112 rows -> out 112x56 of 112
- * source: chain_rk3576.rknn run 22, 138 entries */
+ * source: chain_stem_224.rknn run 22, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -2991,9 +2991,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4070, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0001948cu },  /* DPU */
+    { 0x1001, 0x4078, 0x0001a3f9u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -3005,7 +3005,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005249u },  /* DPU */
+    { 0x1001, 0x40b0, 0x0000539fu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x0000ab80u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -3060,7 +3060,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
 };
 
 /* conv_c32_64_k1_s1_112x56_o112x56_v2:  ic=32 oc=64 k=1x1 s=1 in 112x56 of 112 rows -> out 112x56 of 112
- * source: chain_rk3576.rknn run 23, 138 entries */
+ * source: chain_stem_224.rknn run 23, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x56_o112x56_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -3134,9 +3134,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x56_o112
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002d594u },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x000337a1u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002d594u },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -3148,7 +3148,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x56_o112
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492bu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004d2au },  /* DPU */
     { 0x1001, 0x40b4, 0x00000017u },  /* DPU */
     { 0x1001, 0x40b8, 0x00004980u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -3203,7 +3203,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c32_64_k1_s1_112x56_o112
 };
 
 /* dw_c64_64_k3_s2_112x37_o56x18_v2: depthwise  ic=64 oc=64 k=3x3 s=2 in 112x37 of 112 rows -> out 56x18 of 56
- * source: chain_rk3576.rknn run 24, 138 entries */
+ * source: chain_stem_224.rknn run 24, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -3277,9 +3277,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -3291,7 +3291,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007245u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000016u },  /* DPU */
     { 0x1001, 0x40b8, 0x00002d10u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -3346,7 +3346,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18
 };
 
 /* dw_c64_64_k3_s2_112x21_o56x10: depthwise  ic=64 oc=64 k=3x3 s=2 in 112x21 of 112 rows -> out 56x10 of 56
- * source: chain_rk3576.rknn run 25, 138 entries */
+ * source: chain_stem_224.rknn run 25, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x21_o56x10[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -3420,9 +3420,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x21_o56x10
     { 0x1001, 0x405c, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x4060, 0x00000902u },  /* DPU */
     { 0x1001, 0x406c, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4070, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4070, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x4074, 0x00000000u },  /* DPU */
-    { 0x1001, 0x4078, 0x0002e682u },  /* DPU */
+    { 0x1001, 0x4078, 0x0002e0cbu },  /* DPU */
     { 0x1001, 0x407c, 0x010041c1u },  /* DPU */
     { 0x1001, 0x4080, 0x00000000u },  /* DPU */
     { 0x1001, 0x4084, 0x00000001u },  /* DPU */
@@ -3434,7 +3434,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x21_o56x10
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000492du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007245u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000016u },  /* DPU */
     { 0x1001, 0x40b8, 0x00002ed0u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -3489,7 +3489,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c64_64_k3_s2_112x21_o56x10
 };
 
 /* argb_c12_32_k3_s2_224x224_o112x112_v3: ARGB  ic=12 oc=32 k=3x3 s=2 in 224x224 of 14 rows -> out 112x112 of 112
- * source: conv0_rk3576.rknn run 0, 139 entries */
+ * source: conv0_argb_224.rknn run 0, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v3[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -3577,8 +3577,8 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xfffffffeu },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005391u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000005u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004b35u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00003100u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -3633,7 +3633,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
 };
 
 /* argb_c12_32_k3_s2_224x224_o112x112_v4: ARGB  ic=12 oc=32 k=3x3 s=2 in 224x224 of 14 rows -> out 112x112 of 112
- * source: conv0_rk3576.rknn run 1, 139 entries */
+ * source: conv0_argb_224.rknn run 1, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v4[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -3721,8 +3721,8 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xfffffffeu },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005391u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000005u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004b35u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00003100u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -3777,7 +3777,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x224_o11
 };
 
 /* argb_c12_32_k3_s2_224x112_o112x56_v2: ARGB  ic=12 oc=32 k=3x3 s=2 in 224x112 of 14 rows -> out 112x56 of 112
- * source: conv0_rk3576.rknn run 2, 138 entries */
+ * source: conv0_argb_224.rknn run 2, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x112_o112x56_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -3864,8 +3864,8 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x112_o11
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xfffffffeu },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005391u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000005u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004b35u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00004980u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -3920,7 +3920,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x112_o11
 };
 
 /* argb_c12_32_k3_s2_224x113_o112x56_v2: ARGB  ic=12 oc=32 k=3x3 s=2 in 224x113 of 14 rows -> out 112x56 of 112
- * source: conv0_rk3576.rknn run 3, 138 entries */
+ * source: conv0_argb_224.rknn run 3, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x113_o112x56_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -4007,8 +4007,8 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x113_o11
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xfffffffeu },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005391u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000005u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004b35u },  /* DPU */
     { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00004980u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -4063,7 +4063,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_224x113_o11
 };
 
 /* conv_c16_128_k5_s2_80x80_o40x40:  ic=16 oc=128 k=5x5 s=2 in 80x80 of 80 rows -> out 40x40 of 40
- * source: conv2d_rk3576.rknn run 0, 139 entries */
+ * source: conv2d_c16_128_k5_s2.rknn run 0, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x80_o40x40[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -4151,9 +4151,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x80_o40x
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000009u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005d58u },  /* DPU */
-    { 0x1001, 0x40b4, 0x0000001au },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000001u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004702u },  /* DPU */
+    { 0x1001, 0x40b4, 0x0000001bu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000640u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -4207,7 +4207,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x80_o40x
 };
 
 /* conv_c16_128_k5_s2_80x80_o40x40_v2:  ic=16 oc=128 k=5x5 s=2 in 80x80 of 80 rows -> out 40x40 of 40
- * source: conv2d_rk3576.rknn run 1, 139 entries */
+ * source: conv2d_c16_128_k5_s2.rknn run 1, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x80_o40x40_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -4295,9 +4295,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x80_o40x
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000009u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005d58u },  /* DPU */
-    { 0x1001, 0x40b4, 0x0000001au },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000001u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004702u },  /* DPU */
+    { 0x1001, 0x40b4, 0x0000001bu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000640u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -4351,7 +4351,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x80_o40x
 };
 
 /* conv_c16_128_k5_s2_80x42_o40x20:  ic=16 oc=128 k=5x5 s=2 in 80x42 of 80 rows -> out 40x20 of 40
- * source: conv2d_rk3576.rknn run 2, 138 entries */
+ * source: conv2d_c16_128_k5_s2.rknn run 2, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x42_o40x20[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -4438,9 +4438,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x42_o40x
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000009u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005d58u },  /* DPU */
-    { 0x1001, 0x40b4, 0x0000001au },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000001u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004702u },  /* DPU */
+    { 0x1001, 0x40b4, 0x0000001bu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000960u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -4494,7 +4494,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x42_o40x
 };
 
 /* conv_c16_128_k5_s2_80x41_o40x20:  ic=16 oc=128 k=5x5 s=2 in 80x41 of 80 rows -> out 40x20 of 40
- * source: conv2d_rk3576.rknn run 3, 138 entries */
+ * source: conv2d_c16_128_k5_s2.rknn run 3, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x41_o40x20[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -4581,9 +4581,9 @@ static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x41_o40x
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000009u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005d58u },  /* DPU */
-    { 0x1001, 0x40b4, 0x0000001au },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000001u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004702u },  /* DPU */
+    { 0x1001, 0x40b4, 0x0000001bu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000960u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -4637,7 +4637,7 @@ static const struct rk3576_golden_op rk3576_golden_conv_c16_128_k5_s2_80x41_o40x
 };
 
 /* argb_c12_32_k3_s2_64x64_o32x32: ARGB  ic=12 oc=32 k=3x3 s=2 in 64x64 of 4 rows -> out 32x32 of 32
- * source: conv64_rk3576.rknn run 0, 139 entries */
+ * source: conv64_argb_64.rknn run 0, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x64_o32x32[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -4725,8 +4725,8 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x64_o32x3
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000011u },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060aau },  /* DPU */
+    { 0x1001, 0x40ac, 0x0000000au },  /* DPU */
+    { 0x1001, 0x40b0, 0x000055bfu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00000400u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -4781,7 +4781,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x64_o32x3
 };
 
 /* argb_c12_32_k3_s2_64x64_o32x32_v2: ARGB  ic=12 oc=32 k=3x3 s=2 in 64x64 of 4 rows -> out 32x32 of 32
- * source: conv64_rk3576.rknn run 1, 139 entries */
+ * source: conv64_argb_64.rknn run 1, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x64_o32x32_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -4869,8 +4869,8 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x64_o32x3
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000011u },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060aau },  /* DPU */
+    { 0x1001, 0x40ac, 0x0000000au },  /* DPU */
+    { 0x1001, 0x40b0, 0x000055bfu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00000400u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -4925,7 +4925,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x64_o32x3
 };
 
 /* argb_c12_32_k3_s2_64x32_o32x16: ARGB  ic=12 oc=32 k=3x3 s=2 in 64x32 of 4 rows -> out 32x16 of 32
- * source: conv64_rk3576.rknn run 2, 138 entries */
+ * source: conv64_argb_64.rknn run 2, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x32_o32x16[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -5012,8 +5012,8 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x32_o32x1
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000011u },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060aau },  /* DPU */
+    { 0x1001, 0x40ac, 0x0000000au },  /* DPU */
+    { 0x1001, 0x40b0, 0x000055bfu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00000600u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -5068,7 +5068,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x32_o32x1
 };
 
 /* argb_c12_32_k3_s2_64x33_o32x16: ARGB  ic=12 oc=32 k=3x3 s=2 in 64x33 of 4 rows -> out 32x16 of 32
- * source: conv64_rk3576.rknn run 3, 138 entries */
+ * source: conv64_argb_64.rknn run 3, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x33_o32x16[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -5155,8 +5155,8 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x33_o32x1
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000011u },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060aau },  /* DPU */
+    { 0x1001, 0x40ac, 0x0000000au },  /* DPU */
+    { 0x1001, 0x40b0, 0x000055bfu },  /* DPU */
     { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00000600u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -5211,7 +5211,7 @@ static const struct rk3576_golden_op rk3576_golden_argb_c12_32_k3_s2_64x33_o32x1
 };
 
 /* dw_c32_32_k3_s1_112x91_o112x90_v3: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x91 of 112 rows -> out 112x90 of 112
- * source: dw_rk3576.rknn run 0, 139 entries */
+ * source: dw_c32_k3_s1_112.rknn run 0, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v3[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -5299,9 +5299,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xffffffebu },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060e9u },  /* DPU */
-    { 0x1001, 0x40b4, 0x00000018u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000007u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007fbeu },  /* DPU */
+    { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00009ca0u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -5355,7 +5355,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
 };
 
 /* dw_c32_32_k3_s1_112x23_o112x22_v3: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x23 of 112 rows -> out 112x22 of 112
- * source: dw_rk3576.rknn run 1, 139 entries */
+ * source: dw_c32_k3_s1_112.rknn run 1, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v3[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -5443,9 +5443,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xffffffebu },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060e9u },  /* DPU */
-    { 0x1001, 0x40b4, 0x00000018u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000007u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007fbeu },  /* DPU */
+    { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x0000ba60u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -5499,7 +5499,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
 };
 
 /* dw_c32_32_k3_s1_112x91_o112x90_v4: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x91 of 112 rows -> out 112x90 of 112
- * source: dw_rk3576.rknn run 2, 139 entries */
+ * source: dw_c32_k3_s1_112.rknn run 2, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v4[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -5587,9 +5587,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xffffffebu },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060e9u },  /* DPU */
-    { 0x1001, 0x40b4, 0x00000018u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000007u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007fbeu },  /* DPU */
+    { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x00009ca0u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -5643,7 +5643,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x91_o112x9
 };
 
 /* dw_c32_32_k3_s1_112x23_o112x22_v4: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x23 of 112 rows -> out 112x22 of 112
- * source: dw_rk3576.rknn run 3, 139 entries */
+ * source: dw_c32_k3_s1_112.rknn run 3, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v4[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -5731,9 +5731,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xffffffebu },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060e9u },  /* DPU */
-    { 0x1001, 0x40b4, 0x00000018u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000007u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007fbeu },  /* DPU */
+    { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x0000ba60u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -5787,7 +5787,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x23_o112x2
 };
 
 /* dw_c32_32_k3_s1_112x57_o112x56_v3: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x57 of 112 rows -> out 112x56 of 112
- * source: dw_rk3576.rknn run 4, 138 entries */
+ * source: dw_c32_k3_s1_112.rknn run 4, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v3[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -5874,9 +5874,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xffffffebu },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060e9u },  /* DPU */
-    { 0x1001, 0x40b4, 0x00000018u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000007u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007fbeu },  /* DPU */
+    { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x0000ab80u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -5930,7 +5930,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
 };
 
 /* dw_c32_32_k3_s1_112x57_o112x56_v4: depthwise  ic=32 oc=32 k=3x3 s=1 in 112x57 of 112 rows -> out 112x56 of 112
- * source: dw_rk3576.rknn run 5, 138 entries */
+ * source: dw_c32_k3_s1_112.rknn run 5, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v4[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -6017,9 +6017,9 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0xffffffebu },  /* DPU */
-    { 0x1001, 0x40b0, 0x000060e9u },  /* DPU */
-    { 0x1001, 0x40b4, 0x00000018u },  /* DPU */
+    { 0x1001, 0x40ac, 0x00000007u },  /* DPU */
+    { 0x1001, 0x40b0, 0x00007fbeu },  /* DPU */
+    { 0x1001, 0x40b4, 0x00000019u },  /* DPU */
     { 0x1001, 0x40b8, 0x0000ab80u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
     { 0x1001, 0x40c0, 0x04440100u },  /* DPU */
@@ -6073,7 +6073,7 @@ static const struct rk3576_golden_op rk3576_golden_dw_c32_32_k3_s1_112x57_o112x5
 };
 
 /* epi_c16_128_k5_s2_80x80_o40x40:  ic=16 oc=128 k=5x5 s=2 in 80x80 of 80 rows -> out 40x40 of 40
- * source: iso_bias_rk3576.rknn run 0, 139 entries */
+ * source: iso_bias_k5_s2.rknn run 0, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -6161,8 +6161,8 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000008u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005520u },  /* DPU */
+    { 0x1001, 0x40ac, 0xffffffceu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00005933u },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001au },  /* DPU */
     { 0x1001, 0x40b8, 0x00000640u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -6217,7 +6217,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
 };
 
 /* epi_c16_128_k5_s2_80x80_o40x40_v2:  ic=16 oc=128 k=5x5 s=2 in 80x80 of 80 rows -> out 40x40 of 40
- * source: iso_bias_rk3576.rknn run 1, 139 entries */
+ * source: iso_bias_k5_s2.rknn run 1, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -6305,8 +6305,8 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000008u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005520u },  /* DPU */
+    { 0x1001, 0x40ac, 0xffffffceu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00005933u },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001au },  /* DPU */
     { 0x1001, 0x40b8, 0x00000640u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -6361,7 +6361,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
 };
 
 /* epi_c16_128_k5_s2_80x42_o40x20:  ic=16 oc=128 k=5x5 s=2 in 80x42 of 80 rows -> out 40x20 of 40
- * source: iso_bias_rk3576.rknn run 2, 138 entries */
+ * source: iso_bias_k5_s2.rknn run 2, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -6448,8 +6448,8 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x2
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000008u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005520u },  /* DPU */
+    { 0x1001, 0x40ac, 0xffffffceu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00005933u },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001au },  /* DPU */
     { 0x1001, 0x40b8, 0x00000960u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -6504,7 +6504,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x2
 };
 
 /* epi_c16_128_k5_s2_80x41_o40x20:  ic=16 oc=128 k=5x5 s=2 in 80x41 of 80 rows -> out 40x20 of 40
- * source: iso_bias_rk3576.rknn run 3, 138 entries */
+ * source: iso_bias_k5_s2.rknn run 3, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -6591,8 +6591,8 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x41_o40x2
     { 0x1001, 0x409c, 0x00000000u },  /* DPU */
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
-    { 0x1001, 0x40ac, 0x00000008u },  /* DPU */
-    { 0x1001, 0x40b0, 0x00005520u },  /* DPU */
+    { 0x1001, 0x40ac, 0xffffffceu },  /* DPU */
+    { 0x1001, 0x40b0, 0x00005933u },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001au },  /* DPU */
     { 0x1001, 0x40b8, 0x00000960u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -6647,7 +6647,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x41_o40x2
 };
 
 /* epi_c16_128_k5_s2_80x80_o40x40_v3:  ic=16 oc=128 k=5x5 s=2 in 80x80 of 80 rows -> out 40x40 of 40
- * source: iso_scale_rk3576.rknn run 0, 139 entries */
+ * source: iso_scale_k5_s2.rknn run 0, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v3[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -6736,7 +6736,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000489du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004c0du },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001eu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000640u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -6791,7 +6791,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
 };
 
 /* epi_c16_128_k5_s2_80x80_o40x40_v4:  ic=16 oc=128 k=5x5 s=2 in 80x80 of 80 rows -> out 40x40 of 40
- * source: iso_scale_rk3576.rknn run 1, 139 entries */
+ * source: iso_scale_k5_s2.rknn run 1, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v4[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -6880,7 +6880,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000489du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004c0du },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001eu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000640u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -6935,7 +6935,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
 };
 
 /* epi_c16_128_k5_s2_80x42_o40x20_v2:  ic=16 oc=128 k=5x5 s=2 in 80x42 of 80 rows -> out 40x20 of 40
- * source: iso_scale_rk3576.rknn run 2, 138 entries */
+ * source: iso_scale_k5_s2.rknn run 2, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -7023,7 +7023,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x2
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000489du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004c0du },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001eu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000960u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -7078,7 +7078,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x2
 };
 
 /* epi_c16_128_k5_s2_80x41_o40x20_v2:  ic=16 oc=128 k=5x5 s=2 in 80x41 of 80 rows -> out 40x20 of 40
- * source: iso_scale_rk3576.rknn run 3, 138 entries */
+ * source: iso_scale_k5_s2.rknn run 3, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20_v2[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -7166,7 +7166,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x41_o40x2
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0xffffff80u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000489du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004c0du },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001eu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000960u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -7221,7 +7221,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x41_o40x2
 };
 
 /* epi_c16_128_k5_s2_80x80_o40x40_v5:  ic=16 oc=128 k=5x5 s=2 in 80x80 of 80 rows -> out 40x40 of 40
- * source: iso_sum_rk3576.rknn run 0, 139 entries */
+ * source: iso_sum_k5_s2.rknn run 0, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v5[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -7310,7 +7310,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0x00000000u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000489du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004b58u },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001eu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000640u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -7365,7 +7365,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
 };
 
 /* epi_c16_128_k5_s2_80x80_o40x40_v6:  ic=16 oc=128 k=5x5 s=2 in 80x80 of 80 rows -> out 40x40 of 40
- * source: iso_sum_rk3576.rknn run 1, 139 entries */
+ * source: iso_sum_k5_s2.rknn run 1, 139 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v6[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -7454,7 +7454,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0x00000000u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000489du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004b58u },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001eu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000640u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -7509,7 +7509,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x80_o40x4
 };
 
 /* epi_c16_128_k5_s2_80x42_o40x20_v3:  ic=16 oc=128 k=5x5 s=2 in 80x42 of 80 rows -> out 40x20 of 40
- * source: iso_sum_rk3576.rknn run 2, 138 entries */
+ * source: iso_sum_k5_s2.rknn run 2, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20_v3[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -7597,7 +7597,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x2
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0x00000000u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000489du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004b58u },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001eu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000960u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -7652,7 +7652,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x42_o40x2
 };
 
 /* epi_c16_128_k5_s2_80x41_o40x20_v3:  ic=16 oc=128 k=5x5 s=2 in 80x41 of 80 rows -> out 40x20 of 40
- * source: iso_sum_rk3576.rknn run 3, 138 entries */
+ * source: iso_sum_k5_s2.rknn run 3, 138 entries */
 static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20_v3[] = {
     { 0x0201, 0x1004, 0x0000000eu },  /* CNA */
     { 0x0801, 0x3004, 0x0000000eu },  /* CORE */
@@ -7740,7 +7740,7 @@ static const struct rk3576_golden_op rk3576_golden_epi_c16_128_k5_s2_80x41_o40x2
     { 0x1001, 0x40a4, 0x80000000u },  /* DPU */
     { 0x1001, 0x40a8, 0x7fffffffu },  /* DPU */
     { 0x1001, 0x40ac, 0x00000000u },  /* DPU */
-    { 0x1001, 0x40b0, 0x0000489du },  /* DPU */
+    { 0x1001, 0x40b0, 0x00004b58u },  /* DPU */
     { 0x1001, 0x40b4, 0x0000001eu },  /* DPU */
     { 0x1001, 0x40b8, 0x00000960u },  /* DPU */
     { 0x1001, 0x40bc, 0x00000000u },  /* DPU */
@@ -29607,113 +29607,113 @@ static const struct rk3576_golden_op rk3576_golden_f16argb_c4_16_k3_s1_32x17_o32
 };
 
 static const struct rk3576_golden_case rk3576_golden_cases[] = {
-    { "argb_c12_32_k3_s2_224x224_o112x112", "chain_rk3576.rknn run 0", rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112, 139,
+    { "argb_c12_32_k3_s2_224x224_o112x112", "chain_stem_224.rknn run 0", rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112, 139,
       0, 1, 0, 0, 12, 32, 224, 224, 14, 112, 112, 112, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 1536, 48, 96, 12544 },
-    { "dw_c32_32_k3_s1_112x91_o112x90", "chain_rk3576.rknn run 1", rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90, 139,
+    { "dw_c32_32_k3_s1_112x91_o112x90", "chain_stem_224.rknn run 1", rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90, 139,
       1, 0, 0, 0, 32, 32, 112, 91, 112, 112, 90, 112, 3, 3, 1, 1, 1, 1, 0, 1, 1024, 0, 576, 288, 36, 40096 },
-    { "dw_c32_32_k3_s1_112x23_o112x22", "chain_rk3576.rknn run 2", rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22, 139,
+    { "dw_c32_32_k3_s1_112x23_o112x22", "chain_stem_224.rknn run 2", rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22, 139,
       1, 0, 0, 0, 32, 32, 112, 23, 112, 112, 22, 112, 3, 3, 1, 1, 0, 1, 1, 1, 1024, 5096, 576, 288, 36, 47712 },
-    { "conv_c32_64_k1_s1_112x91_o112x91", "chain_rk3576.rknn run 3", rk3576_golden_conv_c32_64_k1_s1_112x91_o112x91, 139,
+    { "conv_c32_64_k1_s1_112x91_o112x91", "chain_stem_224.rknn run 3", rk3576_golden_conv_c32_64_k1_s1_112x91_o112x91, 139,
       0, 0, 0, 0, 32, 64, 112, 91, 112, 112, 91, 112, 1, 1, 1, 1, 0, 0, 0, 0, 1024, 0, 2048, 32, 64, 14896 },
-    { "conv_c32_64_k1_s1_112x21_o112x21", "chain_rk3576.rknn run 4", rk3576_golden_conv_c32_64_k1_s1_112x21_o112x21, 139,
+    { "conv_c32_64_k1_s1_112x21_o112x21", "chain_stem_224.rknn run 4", rk3576_golden_conv_c32_64_k1_s1_112x21_o112x21, 139,
       0, 0, 0, 0, 32, 64, 112, 21, 112, 112, 21, 112, 1, 1, 1, 1, 0, 0, 0, 0, 1024, 0, 2048, 32, 64, 22736 },
-    { "dw_c64_64_k3_s2_112x44_o56x22", "chain_rk3576.rknn run 5", rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22, 139,
+    { "dw_c64_64_k3_s2_112x44_o56x22", "chain_stem_224.rknn run 5", rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22, 139,
       1, 0, 0, 0, 64, 64, 112, 44, 112, 56, 22, 56, 3, 3, 2, 2, 1, 1, 0, 0, 1024, 0, 1152, 576, 72, 11312 },
-    { "dw_c64_64_k3_s2_112x45_o56x22", "chain_rk3576.rknn run 6", rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22, 139,
+    { "dw_c64_64_k3_s2_112x45_o56x22", "chain_stem_224.rknn run 6", rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22, 139,
       1, 0, 0, 0, 64, 64, 112, 45, 112, 56, 22, 56, 3, 3, 2, 2, 0, 1, 0, 0, 1024, 4928, 1152, 576, 72, 11312 },
-    { "argb_c12_32_k3_s2_224x224_o112x112_v2", "chain_rk3576.rknn run 8", rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v2, 139,
+    { "argb_c12_32_k3_s2_224x224_o112x112_v2", "chain_stem_224.rknn run 8", rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v2, 139,
       0, 1, 0, 0, 12, 32, 224, 224, 14, 112, 112, 112, 3, 3, 2, 2, 1, 1, 0, 0, 3072, 7168, 1536, 48, 96, 12544 },
-    { "dw_c32_32_k3_s1_112x91_o112x90_v2", "chain_rk3576.rknn run 9", rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v2, 139,
+    { "dw_c32_32_k3_s1_112x91_o112x90_v2", "chain_stem_224.rknn run 9", rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v2, 139,
       1, 0, 0, 0, 32, 32, 112, 91, 112, 112, 90, 112, 3, 3, 1, 1, 1, 1, 0, 1, 0, 7168, 576, 288, 36, 40096 },
-    { "dw_c32_32_k3_s1_112x23_o112x22_v2", "chain_rk3576.rknn run 10", rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v2, 139,
+    { "dw_c32_32_k3_s1_112x23_o112x22_v2", "chain_stem_224.rknn run 10", rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v2, 139,
       1, 0, 0, 0, 32, 32, 112, 23, 112, 112, 22, 112, 3, 3, 1, 1, 0, 1, 1, 1, 0, 12264, 576, 288, 36, 47712 },
-    { "conv_c32_64_k1_s1_112x91_o112x91_v2", "chain_rk3576.rknn run 11", rk3576_golden_conv_c32_64_k1_s1_112x91_o112x91_v2, 139,
+    { "conv_c32_64_k1_s1_112x91_o112x91_v2", "chain_stem_224.rknn run 11", rk3576_golden_conv_c32_64_k1_s1_112x91_o112x91_v2, 139,
       0, 0, 0, 0, 32, 64, 112, 91, 112, 112, 91, 112, 1, 1, 1, 1, 0, 0, 0, 0, 0, 7168, 2048, 32, 64, 14896 },
-    { "conv_c32_64_k1_s1_112x21_o112x21_v2", "chain_rk3576.rknn run 12", rk3576_golden_conv_c32_64_k1_s1_112x21_o112x21_v2, 139,
+    { "conv_c32_64_k1_s1_112x21_o112x21_v2", "chain_stem_224.rknn run 12", rk3576_golden_conv_c32_64_k1_s1_112x21_o112x21_v2, 139,
       0, 0, 0, 0, 32, 64, 112, 21, 112, 112, 21, 112, 1, 1, 1, 1, 0, 0, 0, 0, 0, 7168, 2048, 32, 64, 22736 },
-    { "dw_c64_64_k3_s2_112x44_o56x22_v2", "chain_rk3576.rknn run 13", rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22_v2, 139,
+    { "dw_c64_64_k3_s2_112x44_o56x22_v2", "chain_stem_224.rknn run 13", rk3576_golden_dw_c64_64_k3_s2_112x44_o56x22_v2, 139,
       1, 0, 0, 0, 64, 64, 112, 44, 112, 56, 22, 56, 3, 3, 2, 2, 1, 1, 0, 0, 0, 7168, 1152, 576, 72, 11312 },
-    { "dw_c64_64_k3_s2_112x45_o56x22_v2", "chain_rk3576.rknn run 14", rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22_v2, 139,
+    { "dw_c64_64_k3_s2_112x45_o56x22_v2", "chain_stem_224.rknn run 14", rk3576_golden_dw_c64_64_k3_s2_112x45_o56x22_v2, 139,
       1, 0, 0, 0, 64, 64, 112, 45, 112, 56, 22, 56, 3, 3, 2, 2, 0, 1, 0, 0, 0, 12096, 1152, 576, 72, 11312 },
-    { "argb_c12_32_k3_s2_224x112_o112x56", "chain_rk3576.rknn run 16", rk3576_golden_argb_c12_32_k3_s2_224x112_o112x56, 138,
+    { "argb_c12_32_k3_s2_224x112_o112x56", "chain_stem_224.rknn run 16", rk3576_golden_argb_c12_32_k3_s2_224x112_o112x56, 138,
       0, 1, 0, 0, 12, 32, 224, 112, 14, 112, 56, 112, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 1536, 48, 96, 18816 },
-    { "dw_c32_32_k3_s1_112x57_o112x56", "chain_rk3576.rknn run 17", rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56, 138,
+    { "dw_c32_32_k3_s1_112x57_o112x56", "chain_stem_224.rknn run 17", rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56, 138,
       1, 0, 0, 0, 32, 32, 112, 57, 112, 112, 56, 112, 3, 3, 1, 1, 1, 1, 0, 1, 0, 0, 576, 288, 36, 43904 },
-    { "conv_c32_64_k1_s1_112x56_o112x56", "chain_rk3576.rknn run 18", rk3576_golden_conv_c32_64_k1_s1_112x56_o112x56, 138,
+    { "conv_c32_64_k1_s1_112x56_o112x56", "chain_stem_224.rknn run 18", rk3576_golden_conv_c32_64_k1_s1_112x56_o112x56, 138,
       0, 0, 0, 0, 32, 64, 112, 56, 112, 112, 56, 112, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 2048, 32, 64, 18816 },
-    { "dw_c64_64_k3_s2_112x37_o56x18", "chain_rk3576.rknn run 19", rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18, 138,
+    { "dw_c64_64_k3_s2_112x37_o56x18", "chain_stem_224.rknn run 19", rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18, 138,
       1, 0, 0, 0, 64, 64, 112, 37, 112, 56, 18, 56, 3, 3, 2, 2, 0, 1, 0, 0, 0, 0, 1152, 576, 72, 11536 },
-    { "dw_c64_64_k3_s2_112x20_o56x10", "chain_rk3576.rknn run 20", rk3576_golden_dw_c64_64_k3_s2_112x20_o56x10, 138,
+    { "dw_c64_64_k3_s2_112x20_o56x10", "chain_stem_224.rknn run 20", rk3576_golden_dw_c64_64_k3_s2_112x20_o56x10, 138,
       1, 0, 0, 0, 64, 64, 112, 20, 112, 56, 10, 56, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 1152, 576, 72, 11984 },
-    { "argb_c12_32_k3_s2_224x113_o112x56", "chain_rk3576.rknn run 21", rk3576_golden_argb_c12_32_k3_s2_224x113_o112x56, 138,
+    { "argb_c12_32_k3_s2_224x113_o112x56", "chain_stem_224.rknn run 21", rk3576_golden_argb_c12_32_k3_s2_224x113_o112x56, 138,
       0, 1, 0, 0, 12, 32, 224, 113, 14, 112, 56, 112, 3, 3, 2, 2, 0, 1, 0, 0, 0, 6144, 1536, 48, 96, 18816 },
-    { "dw_c32_32_k3_s1_112x57_o112x56_v2", "chain_rk3576.rknn run 22", rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v2, 138,
+    { "dw_c32_32_k3_s1_112x57_o112x56_v2", "chain_stem_224.rknn run 22", rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v2, 138,
       1, 0, 0, 0, 32, 32, 112, 57, 112, 112, 56, 112, 3, 3, 1, 1, 0, 1, 1, 1, 0, 6144, 576, 288, 36, 43904 },
-    { "conv_c32_64_k1_s1_112x56_o112x56_v2", "chain_rk3576.rknn run 23", rk3576_golden_conv_c32_64_k1_s1_112x56_o112x56_v2, 138,
+    { "conv_c32_64_k1_s1_112x56_o112x56_v2", "chain_stem_224.rknn run 23", rk3576_golden_conv_c32_64_k1_s1_112x56_o112x56_v2, 138,
       0, 0, 0, 0, 32, 64, 112, 56, 112, 112, 56, 112, 1, 1, 1, 1, 0, 0, 0, 0, 0, 6144, 2048, 32, 64, 18816 },
-    { "dw_c64_64_k3_s2_112x37_o56x18_v2", "chain_rk3576.rknn run 24", rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18_v2, 138,
+    { "dw_c64_64_k3_s2_112x37_o56x18_v2", "chain_stem_224.rknn run 24", rk3576_golden_dw_c64_64_k3_s2_112x37_o56x18_v2, 138,
       1, 0, 0, 0, 64, 64, 112, 37, 112, 56, 18, 56, 3, 3, 2, 2, 0, 1, 0, 0, 0, 6144, 1152, 576, 72, 11536 },
-    { "dw_c64_64_k3_s2_112x21_o56x10", "chain_rk3576.rknn run 25", rk3576_golden_dw_c64_64_k3_s2_112x21_o56x10, 138,
+    { "dw_c64_64_k3_s2_112x21_o56x10", "chain_stem_224.rknn run 25", rk3576_golden_dw_c64_64_k3_s2_112x21_o56x10, 138,
       1, 0, 0, 0, 64, 64, 112, 21, 112, 56, 10, 56, 3, 3, 2, 2, 0, 1, 0, 0, 0, 6144, 1152, 576, 72, 11984 },
-    { "argb_c12_32_k3_s2_224x224_o112x112_v3", "conv0_rk3576.rknn run 0", rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v3, 139,
+    { "argb_c12_32_k3_s2_224x224_o112x112_v3", "conv0_argb_224.rknn run 0", rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v3, 139,
       0, 1, 0, 0, 12, 32, 224, 224, 14, 112, 112, 112, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 1536, 48, 96, 12544 },
-    { "argb_c12_32_k3_s2_224x224_o112x112_v4", "conv0_rk3576.rknn run 1", rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v4, 139,
+    { "argb_c12_32_k3_s2_224x224_o112x112_v4", "conv0_argb_224.rknn run 1", rk3576_golden_argb_c12_32_k3_s2_224x224_o112x112_v4, 139,
       0, 1, 0, 0, 12, 32, 224, 224, 14, 112, 112, 112, 3, 3, 2, 2, 1, 1, 0, 0, 3072, 7168, 1536, 48, 96, 12544 },
-    { "argb_c12_32_k3_s2_224x112_o112x56_v2", "conv0_rk3576.rknn run 2", rk3576_golden_argb_c12_32_k3_s2_224x112_o112x56_v2, 138,
+    { "argb_c12_32_k3_s2_224x112_o112x56_v2", "conv0_argb_224.rknn run 2", rk3576_golden_argb_c12_32_k3_s2_224x112_o112x56_v2, 138,
       0, 1, 0, 0, 12, 32, 224, 112, 14, 112, 56, 112, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 1536, 48, 96, 18816 },
-    { "argb_c12_32_k3_s2_224x113_o112x56_v2", "conv0_rk3576.rknn run 3", rk3576_golden_argb_c12_32_k3_s2_224x113_o112x56_v2, 138,
+    { "argb_c12_32_k3_s2_224x113_o112x56_v2", "conv0_argb_224.rknn run 3", rk3576_golden_argb_c12_32_k3_s2_224x113_o112x56_v2, 138,
       0, 1, 0, 0, 12, 32, 224, 113, 14, 112, 56, 112, 3, 3, 2, 2, 0, 1, 0, 0, 0, 6144, 1536, 48, 96, 18816 },
-    { "conv_c16_128_k5_s2_80x80_o40x40", "conv2d_rk3576.rknn run 0", rk3576_golden_conv_c16_128_k5_s2_80x80_o40x40, 139,
+    { "conv_c16_128_k5_s2_80x80_o40x40", "conv2d_c16_128_k5_s2.rknn run 0", rk3576_golden_conv_c16_128_k5_s2_80x80_o40x40, 139,
       0, 0, 0, 0, 16, 128, 80, 80, 80, 40, 40, 40, 5, 5, 2, 2, 1, 1, 2, 2, 0, 0, 51200, 400, 800, 1600 },
-    { "conv_c16_128_k5_s2_80x80_o40x40_v2", "conv2d_rk3576.rknn run 1", rk3576_golden_conv_c16_128_k5_s2_80x80_o40x40_v2, 139,
+    { "conv_c16_128_k5_s2_80x80_o40x40_v2", "conv2d_c16_128_k5_s2.rknn run 1", rk3576_golden_conv_c16_128_k5_s2_80x80_o40x40_v2, 139,
       0, 0, 0, 0, 16, 128, 80, 80, 80, 40, 40, 40, 5, 5, 2, 2, 1, 1, 2, 2, 3072, 7168, 51200, 400, 800, 1600 },
-    { "conv_c16_128_k5_s2_80x42_o40x20", "conv2d_rk3576.rknn run 2", rk3576_golden_conv_c16_128_k5_s2_80x42_o40x20, 138,
+    { "conv_c16_128_k5_s2_80x42_o40x20", "conv2d_c16_128_k5_s2.rknn run 2", rk3576_golden_conv_c16_128_k5_s2_80x42_o40x20, 138,
       0, 0, 0, 0, 16, 128, 80, 42, 80, 40, 20, 40, 5, 5, 2, 2, 1, 1, 0, 2, 0, 0, 51200, 400, 800, 2400 },
-    { "conv_c16_128_k5_s2_80x41_o40x20", "conv2d_rk3576.rknn run 3", rk3576_golden_conv_c16_128_k5_s2_80x41_o40x20, 138,
+    { "conv_c16_128_k5_s2_80x41_o40x20", "conv2d_c16_128_k5_s2.rknn run 3", rk3576_golden_conv_c16_128_k5_s2_80x41_o40x20, 138,
       0, 0, 0, 0, 16, 128, 80, 41, 80, 40, 20, 40, 5, 5, 2, 2, 0, 1, 2, 2, 0, 6144, 51200, 400, 800, 2400 },
-    { "argb_c12_32_k3_s2_64x64_o32x32", "conv64_rk3576.rknn run 0", rk3576_golden_argb_c12_32_k3_s2_64x64_o32x32, 139,
+    { "argb_c12_32_k3_s2_64x64_o32x32", "conv64_argb_64.rknn run 0", rk3576_golden_argb_c12_32_k3_s2_64x64_o32x32, 139,
       0, 1, 0, 0, 12, 32, 64, 64, 4, 32, 32, 32, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 1536, 48, 96, 1024 },
-    { "argb_c12_32_k3_s2_64x64_o32x32_v2", "conv64_rk3576.rknn run 1", rk3576_golden_argb_c12_32_k3_s2_64x64_o32x32_v2, 139,
+    { "argb_c12_32_k3_s2_64x64_o32x32_v2", "conv64_argb_64.rknn run 1", rk3576_golden_argb_c12_32_k3_s2_64x64_o32x32_v2, 139,
       0, 1, 0, 0, 12, 32, 64, 64, 4, 32, 32, 32, 3, 3, 2, 2, 1, 1, 0, 0, 3072, 7168, 1536, 48, 96, 1024 },
-    { "argb_c12_32_k3_s2_64x32_o32x16", "conv64_rk3576.rknn run 2", rk3576_golden_argb_c12_32_k3_s2_64x32_o32x16, 138,
+    { "argb_c12_32_k3_s2_64x32_o32x16", "conv64_argb_64.rknn run 2", rk3576_golden_argb_c12_32_k3_s2_64x32_o32x16, 138,
       0, 1, 0, 0, 12, 32, 64, 32, 4, 32, 16, 32, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 1536, 48, 96, 1536 },
-    { "argb_c12_32_k3_s2_64x33_o32x16", "conv64_rk3576.rknn run 3", rk3576_golden_argb_c12_32_k3_s2_64x33_o32x16, 138,
+    { "argb_c12_32_k3_s2_64x33_o32x16", "conv64_argb_64.rknn run 3", rk3576_golden_argb_c12_32_k3_s2_64x33_o32x16, 138,
       0, 1, 0, 0, 12, 32, 64, 33, 4, 32, 16, 32, 3, 3, 2, 2, 0, 1, 0, 0, 0, 6144, 1536, 48, 96, 1536 },
-    { "dw_c32_32_k3_s1_112x91_o112x90_v3", "dw_rk3576.rknn run 0", rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v3, 139,
+    { "dw_c32_32_k3_s1_112x91_o112x90_v3", "dw_c32_k3_s1_112.rknn run 0", rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v3, 139,
       1, 0, 0, 0, 32, 32, 112, 91, 112, 112, 90, 112, 3, 3, 1, 1, 1, 1, 0, 1, 1024, 0, 576, 288, 36, 40096 },
-    { "dw_c32_32_k3_s1_112x23_o112x22_v3", "dw_rk3576.rknn run 1", rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v3, 139,
+    { "dw_c32_32_k3_s1_112x23_o112x22_v3", "dw_c32_k3_s1_112.rknn run 1", rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v3, 139,
       1, 0, 0, 0, 32, 32, 112, 23, 112, 112, 22, 112, 3, 3, 1, 1, 0, 1, 1, 1, 1024, 5096, 576, 288, 36, 47712 },
-    { "dw_c32_32_k3_s1_112x91_o112x90_v4", "dw_rk3576.rknn run 2", rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v4, 139,
+    { "dw_c32_32_k3_s1_112x91_o112x90_v4", "dw_c32_k3_s1_112.rknn run 2", rk3576_golden_dw_c32_32_k3_s1_112x91_o112x90_v4, 139,
       1, 0, 0, 0, 32, 32, 112, 91, 112, 112, 90, 112, 3, 3, 1, 1, 1, 1, 0, 1, 0, 7168, 576, 288, 36, 40096 },
-    { "dw_c32_32_k3_s1_112x23_o112x22_v4", "dw_rk3576.rknn run 3", rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v4, 139,
+    { "dw_c32_32_k3_s1_112x23_o112x22_v4", "dw_c32_k3_s1_112.rknn run 3", rk3576_golden_dw_c32_32_k3_s1_112x23_o112x22_v4, 139,
       1, 0, 0, 0, 32, 32, 112, 23, 112, 112, 22, 112, 3, 3, 1, 1, 0, 1, 1, 1, 0, 12264, 576, 288, 36, 47712 },
-    { "dw_c32_32_k3_s1_112x57_o112x56_v3", "dw_rk3576.rknn run 4", rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v3, 138,
+    { "dw_c32_32_k3_s1_112x57_o112x56_v3", "dw_c32_k3_s1_112.rknn run 4", rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v3, 138,
       1, 0, 0, 0, 32, 32, 112, 57, 112, 112, 56, 112, 3, 3, 1, 1, 1, 1, 0, 1, 0, 0, 576, 288, 36, 43904 },
-    { "dw_c32_32_k3_s1_112x57_o112x56_v4", "dw_rk3576.rknn run 5", rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v4, 138,
+    { "dw_c32_32_k3_s1_112x57_o112x56_v4", "dw_c32_k3_s1_112.rknn run 5", rk3576_golden_dw_c32_32_k3_s1_112x57_o112x56_v4, 138,
       1, 0, 0, 0, 32, 32, 112, 57, 112, 112, 56, 112, 3, 3, 1, 1, 0, 1, 1, 1, 0, 6144, 576, 288, 36, 43904 },
-    { "epi_c16_128_k5_s2_80x80_o40x40", "iso_bias_rk3576.rknn run 0", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40, 139,
+    { "epi_c16_128_k5_s2_80x80_o40x40", "iso_bias_k5_s2.rknn run 0", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40, 139,
       0, 0, 1, 0, 16, 128, 80, 80, 80, 40, 40, 40, 5, 5, 2, 2, 1, 1, 2, 2, 0, 0, 51200, 400, 800, 1600 },
-    { "epi_c16_128_k5_s2_80x80_o40x40_v2", "iso_bias_rk3576.rknn run 1", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v2, 139,
+    { "epi_c16_128_k5_s2_80x80_o40x40_v2", "iso_bias_k5_s2.rknn run 1", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v2, 139,
       0, 0, 1, 0, 16, 128, 80, 80, 80, 40, 40, 40, 5, 5, 2, 2, 1, 1, 2, 2, 3072, 7168, 51200, 400, 800, 1600 },
-    { "epi_c16_128_k5_s2_80x42_o40x20", "iso_bias_rk3576.rknn run 2", rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20, 138,
+    { "epi_c16_128_k5_s2_80x42_o40x20", "iso_bias_k5_s2.rknn run 2", rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20, 138,
       0, 0, 1, 0, 16, 128, 80, 42, 80, 40, 20, 40, 5, 5, 2, 2, 1, 1, 0, 2, 0, 0, 51200, 400, 800, 2400 },
-    { "epi_c16_128_k5_s2_80x41_o40x20", "iso_bias_rk3576.rknn run 3", rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20, 138,
+    { "epi_c16_128_k5_s2_80x41_o40x20", "iso_bias_k5_s2.rknn run 3", rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20, 138,
       0, 0, 1, 0, 16, 128, 80, 41, 80, 40, 20, 40, 5, 5, 2, 2, 0, 1, 2, 2, 0, 6144, 51200, 400, 800, 2400 },
-    { "epi_c16_128_k5_s2_80x80_o40x40_v3", "iso_scale_rk3576.rknn run 0", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v3, 139,
+    { "epi_c16_128_k5_s2_80x80_o40x40_v3", "iso_scale_k5_s2.rknn run 0", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v3, 139,
       0, 0, 1, 0, 16, 128, 80, 80, 80, 40, 40, 40, 5, 5, 2, 2, 1, 1, 2, 2, 0, 0, 51200, 400, 800, 1600 },
-    { "epi_c16_128_k5_s2_80x80_o40x40_v4", "iso_scale_rk3576.rknn run 1", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v4, 139,
+    { "epi_c16_128_k5_s2_80x80_o40x40_v4", "iso_scale_k5_s2.rknn run 1", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v4, 139,
       0, 0, 1, 0, 16, 128, 80, 80, 80, 40, 40, 40, 5, 5, 2, 2, 1, 1, 2, 2, 3072, 7168, 51200, 400, 800, 1600 },
-    { "epi_c16_128_k5_s2_80x42_o40x20_v2", "iso_scale_rk3576.rknn run 2", rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20_v2, 138,
+    { "epi_c16_128_k5_s2_80x42_o40x20_v2", "iso_scale_k5_s2.rknn run 2", rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20_v2, 138,
       0, 0, 1, 0, 16, 128, 80, 42, 80, 40, 20, 40, 5, 5, 2, 2, 1, 1, 0, 2, 0, 0, 51200, 400, 800, 2400 },
-    { "epi_c16_128_k5_s2_80x41_o40x20_v2", "iso_scale_rk3576.rknn run 3", rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20_v2, 138,
+    { "epi_c16_128_k5_s2_80x41_o40x20_v2", "iso_scale_k5_s2.rknn run 3", rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20_v2, 138,
       0, 0, 1, 0, 16, 128, 80, 41, 80, 40, 20, 40, 5, 5, 2, 2, 0, 1, 2, 2, 0, 6144, 51200, 400, 800, 2400 },
-    { "epi_c16_128_k5_s2_80x80_o40x40_v5", "iso_sum_rk3576.rknn run 0", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v5, 139,
+    { "epi_c16_128_k5_s2_80x80_o40x40_v5", "iso_sum_k5_s2.rknn run 0", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v5, 139,
       0, 0, 1, 0, 16, 128, 80, 80, 80, 40, 40, 40, 5, 5, 2, 2, 1, 1, 2, 2, 0, 0, 51200, 400, 800, 1600 },
-    { "epi_c16_128_k5_s2_80x80_o40x40_v6", "iso_sum_rk3576.rknn run 1", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v6, 139,
+    { "epi_c16_128_k5_s2_80x80_o40x40_v6", "iso_sum_k5_s2.rknn run 1", rk3576_golden_epi_c16_128_k5_s2_80x80_o40x40_v6, 139,
       0, 0, 1, 0, 16, 128, 80, 80, 80, 40, 40, 40, 5, 5, 2, 2, 1, 1, 2, 2, 3072, 7168, 51200, 400, 800, 1600 },
-    { "epi_c16_128_k5_s2_80x42_o40x20_v3", "iso_sum_rk3576.rknn run 2", rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20_v3, 138,
+    { "epi_c16_128_k5_s2_80x42_o40x20_v3", "iso_sum_k5_s2.rknn run 2", rk3576_golden_epi_c16_128_k5_s2_80x42_o40x20_v3, 138,
       0, 0, 1, 0, 16, 128, 80, 42, 80, 40, 20, 40, 5, 5, 2, 2, 1, 1, 0, 2, 0, 0, 51200, 400, 800, 2400 },
-    { "epi_c16_128_k5_s2_80x41_o40x20_v3", "iso_sum_rk3576.rknn run 3", rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20_v3, 138,
+    { "epi_c16_128_k5_s2_80x41_o40x20_v3", "iso_sum_k5_s2.rknn run 3", rk3576_golden_epi_c16_128_k5_s2_80x41_o40x20_v3, 138,
       0, 0, 1, 0, 16, 128, 80, 41, 80, 40, 20, 40, 5, 5, 2, 2, 0, 1, 2, 2, 0, 6144, 51200, 400, 800, 2400 },
     { "dw_c112_112_k3_s1_16x16_o16x16", "dw_c112_k3_s1_16.rknn run 0", rk3576_golden_dw_c112_112_k3_s1_16x16_o16x16, 139,
       1, 0, 0, 0, 112, 112, 16, 16, 16, 16, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 0, 2016, 1008, 126, 768 },

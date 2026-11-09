@@ -15,8 +15,8 @@
  * (matmul fp16, int8 and int4, convolution and others). Each path keeps its own gapped
  * slot stride, and the matmul, int8 and int4 paths use 128 u64 words. The chained stride
  * is always the regcmd word count rounded up to a 128-bit (2-u64) boundary. The chain
- * rewrites only the inert `OP_NONE` filler in the trailer that every `gen_*` emits,
- * [OP_NONE, PC_REGISTER_AMOUNTS, OP_40, OP_ENABLE]. The op count, and therefore the
+ * rewrites only the inert `TARGET_NONE` filler in the trailer that every `gen_*` emits,
+ * [TARGET_NONE, PC_REGISTER_AMOUNTS, TARGET_PRE_ENABLE, TARGET_ENABLE]. The op count, and therefore the
  * stride, is unchanged.
  *
  * This header is internal and is not installed.
@@ -96,8 +96,8 @@ int rkt_chain_pack_at(rocket_bo *rcbo, rocket_task_desc *tasks, int idx,
                       const uint64_t *src, uint32_t count, uint32_t next_count);
 
 /* Closes a chained batch of `nb` tasks. The last task has no successor, so the function
- * clears its forward link, restoring the trailer's inert `OP_NONE` filler. `TASK_NUMBER`
- * halts the PC after the last `OP_ENABLE`, so this link is never followed. A live address
+ * clears its forward link, restoring the trailer's inert `TARGET_NONE` filler. `TASK_NUMBER`
+ * halts the PC after the last `TARGET_ENABLE`, so this link is never followed. A live address
  * there would still make the PC prefetch past the batch. It does nothing when `chained`
  * is 0 or `nb` < 1. `count` is the uniform per-task op count (`tasks[0].regcmd_count`). */
 void rkt_chain_seal(int chained, rocket_bo *rcbo, int nb, uint32_t count);

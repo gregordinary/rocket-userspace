@@ -111,7 +111,7 @@
 
 /* The DPU_RDMA block opcode. `npu_hw.h` names the other four blocks but not this one,
  * and `unwritten` appends a write to it. */
-#define OP_REG_DPU_RDMA_ (BLOCK_DPU_RDMA | PC_OP_01)
+#define TARGET_DPU_RDMA_ (NPU_TARGET_DPU_RDMA | NPU_REG_WRITE)
 
 /* What the output BO is filled with before the submit. -1 is SENTINEL, which is what
  * makes "this task never wrote" a property of the surface. A mode that asks whether the
@@ -210,9 +210,9 @@ static int run_ew(int fd, ew_params_rk3576_t *p, const int8_t *a, const int8_t *
     rocket_bo_fini(fd, &bo_a);
     rocket_bo_fini(fd, &bo_b);
 
-    p->src_dma = bo_a.dma_address;
-    p->ew_dma = bo_b.dma_address;
-    p->dst_dma = bo_o.dma_address;
+    p->src_iova = bo_a.dma_address;
+    p->ew_iova = bo_b.dma_address;
+    p->dst_iova = bo_o.dma_address;
     p->tasks = ops;
     if (gen_ew_int8_rk3576(p) != 0) { printf("    generator refused\n"); goto done; }
 
@@ -593,7 +593,7 @@ static int mode_where(int fd)
 
         base_params(&p, c, h, w);
         /* Emit with every candidate base zeroed, then place the two by hand. */
-        p.src_dma = 0; p.ew_dma = 0; p.dst_dma = bo_o.dma_address;
+        p.src_iova = 0; p.ew_iova = 0; p.dst_iova = bo_o.dma_address;
         p.out_scale = 1; p.out_shift = 14;
         p.tasks = ops;
         memset(ops, 0, sizeof ops);
@@ -987,7 +987,7 @@ static int mode_joint(int fd)
 
             base_params(&p, c, h, w);
             p.out_scale = 1; p.out_shift = (uint8_t)sh;
-            p.src_dma = 0; p.ew_dma = 0; p.dst_dma = bo_o.dma_address;
+            p.src_iova = 0; p.ew_iova = 0; p.dst_iova = bo_o.dma_address;
             p.tasks = ops;
             memset(ops, 0, sizeof ops);
             if (gen_ew_int8_rk3576(&p) != 0) continue;
@@ -1099,9 +1099,9 @@ static int mode_span(int fd)
         rocket_bo_fini(fd, &bo_b);
 
         base_params(&p, c, h, w);
-        p.src_dma = guard.dma_address;
-        p.ew_dma = bo_b.dma_address + (uint32_t)((size_t)base_atom * C2);
-        p.dst_dma = bo_o.dma_address;
+        p.src_iova = guard.dma_address;
+        p.ew_iova = bo_b.dma_address + (uint32_t)((size_t)base_atom * C2);
+        p.dst_iova = bo_o.dma_address;
         p.tasks = ops;
         memset(ops, 0, sizeof ops);
         if (gen_ew_int8_rk3576(&p) != 0) continue;
@@ -1214,18 +1214,18 @@ static int mode_unwritten(int fd)
 
             base_params(&p, c, h, w);
             p.out_scale = 1; p.out_shift = SHIFTS[j];
-            p.src_dma = 0;
-            p.ew_dma = bo_b.dma_address;
-            p.dst_dma = bo_o.dma_address;
+            p.src_iova = 0;
+            p.ew_iova = bo_b.dma_address;
+            p.dst_iova = bo_o.dma_address;
             p.tasks = ops;
             memset(ops, 0, sizeof ops);
             if (gen_ew_int8_rk3576(&p) != 0) continue;
             n = p.task_count;
             /* Insert before the four-word trailer, which must stay last. */
             memmove(&ops[n - 3], &ops[n - 4], 4 * sizeof ops[0]);
-            ops[n - 4] = NPUOP(OP_REG_DPU, bo_a.dma_address, CAND[i]);
+            ops[n - 4] = REGCMD(TARGET_DPU, CAND[i], bo_a.dma_address);
             if (CAND[i] >= 0x5000)
-                ops[n - 4] = NPUOP(OP_REG_DPU_RDMA_, bo_a.dma_address, CAND[i]);
+                ops[n - 4] = REGCMD(TARGET_DPU_RDMA_, CAND[i], bo_a.dma_address);
             n++;
 
             rocket_bo_prep(fd, &bo_r, 1, 0);
@@ -1381,17 +1381,17 @@ static unsigned ga54_apply(uint64_t *ops, unsigned n, const ga54_set *set, unsig
     unsigned s, k;
     for (s = 0; s < nset; s++) {
         uint32_t v = set[s].val == GA54_IOVA_B ? iova_b : set[s].val;
-        uint16_t op = set[s].reg >= 0x5000 ? OP_REG_DPU_RDMA_ : OP_REG_DPU;
+        uint16_t op = set[s].reg >= 0x5000 ? TARGET_DPU_RDMA_ : TARGET_DPU;
         int found = 0;
         for (k = 0; k + 4 < n; k++)
             if ((uint16_t)(ops[k] & 0xFFFF) == set[s].reg &&
                 (uint16_t)(ops[k] >> 48) == op) {
-                ops[k] = NPUOP(op, v, set[s].reg);
+                ops[k] = REGCMD(op, set[s].reg, v);
                 found = 1;
             }
         if (!found && n < GA54_MAX_WORDS) {
             memmove(&ops[n - 3], &ops[n - 4], 4 * sizeof ops[0]);
-            ops[n - 4] = NPUOP(op, v, set[s].reg);
+            ops[n - 4] = REGCMD(op, set[s].reg, v);
             n++;
         }
     }
@@ -1647,9 +1647,9 @@ static int mode_ga54(int fd)
             base_params(&p, GA54_C, GA54_H, GA54_W);
             p.ew_scale = GAINS[g].es; p.ew_shift = GAINS[g].esh;
             p.out_scale = 1; p.out_shift = GAINS[g].osh;
-            p.src_dma = (uint32_t)bf.b.dma_address;
-            p.ew_dma = (uint32_t)bf.a.dma_address;
-            p.dst_dma = (uint32_t)bf.o.dma_address;
+            p.src_iova = (uint32_t)bf.b.dma_address;
+            p.ew_iova = (uint32_t)bf.a.dma_address;
+            p.dst_iova = (uint32_t)bf.o.dma_address;
             p.tasks = ops;
             memset(ops, 0, sizeof ops);
             if (gen_ew_int8_rk3576(&p) != 0) { printf("  generator refused\n"); goto done; }
@@ -1688,7 +1688,7 @@ static int mode_ga54(int fd)
 
         /* Self-check: the emitter at those converters against the capture, word by word
          * with the bases zeroed as stored. */
-        p.src_dma = 0; p.ew_dma = 0; p.dst_dma = 0;
+        p.src_iova = 0; p.ew_iova = 0; p.dst_iova = 0;
         p.tasks = ops;
         memset(ops, 0, sizeof ops);
         if (gen_ew_int8_rk3576(&p) == 0 && p.task_count == 93)
@@ -1792,9 +1792,9 @@ static int mode_ga54b(int fd)
         if (STEPS[i].idle) rocket_rk3576_power_idle();
         base_params(&p, GA54_C, GA54_H, GA54_W);
         p.out_shift = 15;                                       /* G14 */
-        p.src_dma = (uint32_t)bf.b.dma_address;
-        p.ew_dma = (uint32_t)bf.a.dma_address;
-        p.dst_dma = (uint32_t)bf.o.dma_address;
+        p.src_iova = (uint32_t)bf.b.dma_address;
+        p.ew_iova = (uint32_t)bf.a.dma_address;
+        p.dst_iova = (uint32_t)bf.o.dma_address;
         p.tasks = ops;
         memset(ops, 0, sizeof ops);
         if (gen_ew_int8_rk3576(&p) != 0) goto done;

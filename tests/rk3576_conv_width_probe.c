@@ -259,7 +259,7 @@ static uint32_t reg_of(const uint64_t *ops, int n, uint16_t reg, int *found)
     *found = 0;
     for (i = 0; i < n; i++)
         if ((uint16_t)(ops[i] & 0xFFFFu) == reg &&
-            (uint16_t)(ops[i] >> 48) != 0 /* skip OP_NONE padding */) {
+            (uint16_t)(ops[i] >> 48) != 0 /* skip TARGET_NONE padding */) {
             v = (uint32_t)(ops[i] >> 16);
             *found = 1;
         }
@@ -361,7 +361,7 @@ static int plan_fp16(const struct arm *a, int emit)
         if (!plan) return -1;
         q.ic = (uint16_t)a->ic;
         q.oc = (uint16_t)rocket_rk3576_fp16_pad_oc(a->oc > 64 ? 64 : a->oc);
-        if (rocket_rk3576_plan_rows_prec(&q, 0, precision_float16, plan, oh + 2u, &n) < 0) {
+        if (rocket_rk3576_plan_rows_prec(&q, 0, PREC_FP16, plan, oh + 2u, &n) < 0) {
             printf("      plan: the row planner REFUSES\n");
             free(plan);
             return 0;

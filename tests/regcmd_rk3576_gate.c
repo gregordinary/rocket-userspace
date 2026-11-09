@@ -26,6 +26,7 @@
 #include <stdlib.h>
 
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
 #include "rk3576_vendor_golden.h"
@@ -55,12 +56,13 @@ static const uint16_t EXCLUDE_QUANT[] = { 0x40AC, 0x40B0 };
 /* DPU epilogue registers the captures show tracking the MODEL rather than the
  * geometry: they take one value per capture file and are constant across every
  * geometry and both modes inside it. The eltwise clamp pair carries the layer's
- * activation range (0/103564 in the chained model, full int32 in the single-op
- * ones); BN_CFG and the BS ALU config likewise follow which epilogue stages that
- * model uses. Our emitter clamps nothing and runs no BN, which is a valid program,
- * so a difference here is a different model, not a different encoder. */
+ * activation range (a ReLU6 bound per layer in the chained model, full int32 in the
+ * single-op ones); BN_CFG follows which epilogue stages that model uses, and the BS
+ * ALU config follows how its weights are quantized. Our emitter clamps nothing and
+ * runs no BN, which is a valid program, so a difference here is a different model,
+ * not a different encoder. */
 static const uint16_t EXCLUDE_MODEL[] = {
-    0x4044,  /* BS ALU config  — 1 with a bias stage, 0 in the isolated-op models */
+    0x4044,  /* BS ALU config  — 1 per-channel weights, 0 per-tensor (the iso_* models) */
     0x4060,  /* BN config      — 0x903 single-op, 0x902 chained                   */
     0x406C, 0x4070, 0x4074, 0x4078,  /* EW clamp min/max pairs = activation range */
 };
@@ -173,7 +175,7 @@ static int run_case(const struct rk3576_golden_case *c, struct gate_result *tot,
         .stride_y = c->sy, .stride_x = c->sx,
         .pad_top = c->pad_top, .pad_left = c->pad_left,
         .ih_full = ih_full, .oh_full = c->oh_full,
-        .input_dma = 0, .weights_dma = 0, .output_dma = 0, .bias_dma = 0,
+        .input_iova = 0, .weights_iova = 0, .output_iova = 0, .bias_iova = 0,
         .int8_out = 1, .input_zero_point = zp,
         .tasks = ops,
     };
@@ -189,7 +191,7 @@ static int run_case(const struct rk3576_golden_case *c, struct gate_result *tot,
      * The float captures are manufactured (do_quantization=False on a float ONNX), and
      * they are what turns the transcribed float fields into a gated program. */
     rc = gen_conv2d_rk3576_prec(&p, (int)c->dw,
-                                c->is_float ? precision_float16 : precision_int8);
+                                c->is_float ? PREC_FP16 : PREC_INT8);
     unsetenv("ROCKET_RK3576_CBUF_F");
     if (rc != 0) {
         printf("  FAIL %s: generator returned %d\n", c->name, rc);
@@ -291,7 +293,7 @@ static int run_case(const struct rk3576_golden_case *c, struct gate_result *tot,
     if (p.task_count >= 4) {
         uint64_t last = ops[p.task_count - 1];
         uint16_t op = (uint16_t)(last >> 48), reg = (uint16_t)(last & 0xFFFF);
-        if (op != OP_ENABLE || reg != PC_OPERATION_ENABLE) {
+        if (op != TARGET_ENABLE || reg != REG_PC_OPERATION_ENABLE) {
             printf("  FAIL %s: missing PC_OPERATION_ENABLE trailer "
                    "(last op 0x%04x reg 0x%04x)\n", c->name, op, reg);
             fail++;
@@ -334,13 +336,13 @@ int main(int argc, char **argv)
     rocket_log_set_level(ROCKET_LOG_ERROR);
 
     printf("RK3576 regcmd emitter vs vendor capture\n");
-    printf("%zu captured task programs (dedup'd across 8 .rknn captures)\n\n",
+    printf("%zu captured task programs (dedup'd across the .rknn captures)\n\n",
            sizeof(rk3576_golden_cases)/sizeof(rk3576_golden_cases[0]));
 
     for (size_t i = 0; i < sizeof(rk3576_golden_cases)/sizeof(rk3576_golden_cases[0]); i++) {
         const struct rk3576_golden_case *c = &rk3576_golden_cases[i];
-        /* conv + a DPU epilogue stage: same geometry as the plain conv2d capture,
-         * carried for the epilogue registers rather than as a conv oracle. */
+        /* the conv2d geometry with per-tensor weights: carried for its BS-stage registers
+         * (0x4044, 0x4050, 0x501C) rather than as a conv oracle. */
         if (c->epilogue) { n_epi++; continue; }
         if (c->dw) n_dw++; else if (c->argb) n_argb++; else n_direct++;
         fail += run_case(c, &tot, verbose);
@@ -364,14 +366,14 @@ int main(int argc, char **argv)
     {
         int argb_fail = 0;
         struct { const char *what; unsigned ic, iw; int dw; unsigned prec; int want_ok; } g[] = {
-            { "RGB 64x64 accepted",            3, 64, 0, precision_int8,    1 },
-            { "RGBA accepted",                 4, 64, 0, precision_int8,    1 },
-            { "grayscale accepted",            1, 64, 0, precision_int8,    1 },
-            { "fp16 RGB accepted",             3, 64, 0, precision_float16, 1 },
-            { "fp16 RGBA accepted",            4, 64, 0, precision_float16, 1 },
-            { "iw not a multiple of 16",       3, 60, 0, precision_int8,    0 },
-            { "no depthwise form",             3, 64, 1, precision_int8,    0 },
-            { "int8 and fp16 only",            3, 64, 0, precision_bfloat16, 0 },
+            { "RGB 64x64 accepted",            3, 64, 0, PREC_INT8,    1 },
+            { "RGBA accepted",                 4, 64, 0, PREC_INT8,    1 },
+            { "grayscale accepted",            1, 64, 0, PREC_INT8,    1 },
+            { "fp16 RGB accepted",             3, 64, 0, PREC_FP16, 1 },
+            { "fp16 RGBA accepted",            4, 64, 0, PREC_FP16, 1 },
+            { "iw not a multiple of 16",       3, 60, 0, PREC_INT8,    0 },
+            { "no depthwise form",             3, 64, 1, PREC_INT8,    0 },
+            { "int8 and fp16 only",            3, 64, 0, PREC_BF16, 0 },
         };
         printf("== ARGB first-conv guards ==\n");
         for (size_t i = 0; i < sizeof(g)/sizeof(g[0]); i++) {

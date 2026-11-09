@@ -4,7 +4,7 @@
  * iova_ceiling_rocket.c — measure the NPU's 32-bit IOVA window.
  *
  * The NPU regcmd addresses every BO with a 32-bit field (npu_regcmd.c:
- * weights_dma & 0xFFFFFFFF), so all BOs the NPU touches must live in the low 4 GB.
+ * weights_iova & 0xFFFFFFFF), so all BOs the NPU touches must live in the low 4 GB.
  * That caps RESIDENT pre-tiled weights and resident int8 weights
  * far below a ~22 GB model: ROCKET_CACHE_MB=12000 trips "a BO dma_address exceeds 32
  * bits". This probe pins the ceiling AND whether the window is PER-fd or SHARED:

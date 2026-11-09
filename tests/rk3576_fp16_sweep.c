@@ -93,9 +93,9 @@
 
 #define SENTINEL 0xAA
 
-int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
-int weight_conv_fp16(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
-int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+int feature_index(int C, int H, int W, int C2_, int c, int h, int w);
+int conv_weight_index_fp16(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+int conv_weight_index_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
 
 static int env_int(const char *k, int dflt)
 {
@@ -167,13 +167,13 @@ static int fs_all_sentinel(const void *buf, size_t bytes)
 static int fs_feature_idx(unsigned c, unsigned y, unsigned x, unsigned c2)
 {
     (void)c2;
-    return feature_data((int)IC, (int)IH, (int)IW, (int)FEAT_C2,
+    return feature_index((int)IC, (int)IH, (int)IW, (int)FEAT_C2,
                         (int)c + 1, (int)y + 1, (int)x + 1);
 }
 
 /* Which map the OUTPUT surface is read back through.
  *
- * `native` is the cube the emitter is aiming at — the same feature_data() scatter the
+ * `native` is the cube the emitter is aiming at — the same feature_index() scatter the
  * input side uses, at the output's own lane count.
  *
  * `dup4` is what the part actually writes at fp16 today: it spends FOUR bytes on a
@@ -191,12 +191,12 @@ static int fs_output_idx(unsigned c, unsigned y, unsigned x, unsigned c2)
 {
     if (OUT_LAYOUT == OUTL_DUP4)
         return rocket_rk3576_fp16_out_index(OH, OW, c, y, x);
-    return feature_data((int)OC, (int)OH, (int)OW, (int)c2,
+    return feature_index((int)OC, (int)OH, (int)OW, (int)c2,
                         (int)c + 1, (int)y + 1, (int)x + 1);
 }
 
 /* Mesa's oc1/ic1/kh/kw/oc2/ic2 reorder with both group sizes left open. At the
- * published groups this reproduces weight_conv_fp16 and weight_conv_int8 exactly. */
+ * published groups this reproduces conv_weight_index_fp16 and conv_weight_index_int8 exactly. */
 static int fs_weight_idx(unsigned oc, unsigned ic, unsigned kh, unsigned kw, int fp16)
 {
     unsigned goc = W_OC_GROUP, gic = W_IC_GROUP;
@@ -204,7 +204,7 @@ static int fs_weight_idx(unsigned oc, unsigned ic, unsigned kh, unsigned kw, int
     unsigned ic1 = ic / gic, ic2 = ic % gic;
     unsigned nic1 = (IC + gic - 1u) / gic;
     if (!fp16)
-        return weight_conv_int8((int)OC, (int)IC, (int)K, (int)K,
+        return conv_weight_index_int8((int)OC, (int)IC, (int)K, (int)K,
                                 (int)oc + 1, (int)ic + 1, (int)kh + 1, (int)kw + 1);
     return (int)((((((oc1 * nic1 + ic1) * K) + kh) * K + kw) * goc + oc2) * gic + ic2);
 }
@@ -722,8 +722,8 @@ int main(int argc, char **argv)
     if (rocket_bo_alloc(fd, o_alloc,  &B.o)  < 0) goto done;
     if (rocket_bo_alloc(fd, sizeof ops, &B.r) < 0) goto done;
 
-    /* Scatter into the cubes. fp16 takes C2=8 and weight_conv_fp16; the int8 control
-     * takes C2=16 and weight_conv_int8, which is the layout the part is known to
+    /* Scatter into the cubes. fp16 takes C2=8 and conv_weight_index_fp16; the int8 control
+     * takes C2=16 and conv_weight_index_int8, which is the layout the part is known to
      * want, so a failure in that mode is the harness and not the encoding. */
     rocket_bo_prep(fd, &B.in, 1, 0);
     memset(B.in.ptr, 0, in_bytes);
@@ -745,7 +745,7 @@ int main(int argc, char **argv)
                 for (kw = 0; kw < K; kw++) {
                     float v = (float)w_p[((c * IC + i) * K + kh) * K + kw];
                     /* weight_conv_* take 1-based oc/ic/kh/kw, the same convention as
-                     * feature_data above; at 0 the group remainder goes negative and
+                     * feature_index above; at 0 the group remainder goes negative and
                      * the whole cube is misplaced. */
                     int idx = fs_weight_idx(c, i, kh, kw, fp16);
                     if (fp16) ((_Float16 *)B.w.ptr)[idx] = (_Float16)v;
@@ -859,10 +859,10 @@ int main(int argc, char **argv)
 
             p.ic          = slices[s].ic;
             p.tasks       = ops;
-            p.input_dma   = B.in.dma_address + slices[s].feature_off;
-            p.weights_dma = B.w.dma_address;
-            p.bias_dma    = B.b.dma_address;
-            p.output_dma  = B.o.dma_address;
+            p.input_iova   = B.in.dma_address + slices[s].feature_off;
+            p.weights_iova = B.w.dma_address;
+            p.bias_iova    = B.b.dma_address;
+            p.output_iova  = B.o.dma_address;
 
             if (gen_conv2d_fp16_rk3576(&p) != 0) {
                 printf("  slice %u: generator refused\n", s); free(acc); goto done;
@@ -1005,8 +1005,8 @@ int main(int argc, char **argv)
             else
                 snprintf(set, sizeof set, "0x4010=0x%x,0x%04x=0x%x%s%s",
                          (R76_OUTW_WORD32 << 29) |
-                         ((unsigned)precision_float16 << 26) |
-                         (unsigned)precision_float16, sweep_reg, val,
+                         ((unsigned)PREC_FP16 << 26) |
+                         (unsigned)PREC_FP16, sweep_reg, val,
                          sweep_with ? "," : "", sweep_with ? sweep_with : "");
             printf("     overrides: %s\n", set);
             setenv("ROCKET_RK3576_SET", set, 1);
@@ -1019,8 +1019,8 @@ int main(int argc, char **argv)
             if (out32)
                 snprintf(set, sizeof set, "0x4010=0x%x%s%s",
                          (R76_OUTW_WORD32 << 29) |
-                         ((unsigned)precision_float16 << 26) |
-                         (unsigned)precision_float16,
+                         ((unsigned)PREC_FP16 << 26) |
+                         (unsigned)PREC_FP16,
                          *body ? "," : "", body);
             else
                 snprintf(set, sizeof set, "%s", body);
@@ -1054,15 +1054,15 @@ int main(int argc, char **argv)
         p.weight_zero_point = 0x80;
         p.ih_full = (uint16_t)IH; p.oh_full = (uint16_t)OH;
         p.tasks       = ops;
-        p.input_dma   = B.in.dma_address;
-        p.weights_dma = B.w.dma_address;
-        p.bias_dma    = B.b.dma_address;
-        p.output_dma  = B.o.dma_address;
+        p.input_iova   = B.in.dma_address;
+        p.weights_iova = B.w.dma_address;
+        p.bias_iova    = B.b.dma_address;
+        p.output_iova  = B.o.dma_address;
 
         /* The UNCHECKED entry, deliberately: gen_conv2d_fp16_rk3576() refuses past
          * ic=8, and the defect that bound it there is exactly what these modes drive.
          * The caller-facing path is exercised by `icsplit` above. */
-        r = fp16 ? gen_conv2d_rk3576_prec(&p, 0, precision_float16)
+        r = fp16 ? gen_conv2d_rk3576_prec(&p, 0, PREC_FP16)
                  : gen_conv2d_int8_rk3576(&p);
         if (r != 0) { printf("     generator refused: %d\n", r); continue; }
 

@@ -7,7 +7,7 @@
  * A probe, not a gate. rocket_matmul_fp16_rk3576() refuses outside the envelope its gate
  * ran (M 16, K 2048, N 256), and those are bounds of the evidence, not of the part. This
  * runs the same register program as ONE task at any shape the closed forms can express,
- * through gen_matmul_fp16_rk3576_unchecked(), and says what came back.
+ * through gen_gemm_fp16_rk3576_unchecked(), and says what came back.
  *
  * A wrong value here computes a full, correctly sized, plausible surface, so the verdict
  * is per element and the report says WHERE the damage is, because where it is names the
@@ -72,16 +72,15 @@ static int run_shape(int fd, unsigned m, unsigned k, unsigned n)
 {
     size_t ib = rocket_rk3576_mm_fp16_in_bytes(m, k);
     size_t wb = rocket_rk3576_mm_fp16_weight_bytes(k, n);
-    size_t cb = rocket_rk3576_mm_fp16_coef_bytes(n);
     size_t ob = rocket_rk3576_mm_fp16_out_bytes(m, n);
     size_t ne = (size_t)m * n, e;
-    rocket_bo in = {0}, w = {0}, coef = {0}, out = {0}, rc = {0};
+    rocket_bo in = {0}, w = {0}, out = {0}, rc = {0};
     uint64_t ops[RK3576_MM_FP16_OPS];
     int8_t *ai = malloc((size_t)m * k), *bi = malloc((size_t)n * k);
     _Float16 *B = malloc((size_t)n * k * 2);
     int32_t *ref = malloc(ne * 4);
     unsigned char *rseen = malloc(2 * (size_t)m), *cseen = malloc(2 * (size_t)n);
-    uint32_t in_h[4], out_h[1];
+    uint32_t in_h[3], out_h[1];
     unsigned attempt;
     int exact_first = 0, ret = 1;
 
@@ -104,10 +103,9 @@ static int run_shape(int fd, unsigned m, unsigned k, unsigned n)
         }
 
     if (rocket_bo_alloc32(fd, ib, &in) || rocket_bo_alloc32(fd, wb, &w) ||
-        rocket_bo_alloc32(fd, cb, &coef) || rocket_bo_alloc32(fd, ob, &out) ||
-        rocket_bo_alloc32(fd, sizeof ops, &rc)) {
-        printf("%4u %5u %5u  BO allocation failed (in %zu w %zu coef %zu out %zu)\n",
-               m, k, n, ib, wb, cb, ob);
+        rocket_bo_alloc32(fd, ob, &out) || rocket_bo_alloc32(fd, sizeof ops, &rc)) {
+        printf("%4u %5u %5u  BO allocation failed (in %zu w %zu out %zu)\n",
+               m, k, n, ib, wb, ob);
         goto out;
     }
     rocket_bo_prep(fd, &in, 1, 0);
@@ -124,19 +122,16 @@ static int run_shape(int fd, unsigned m, unsigned k, unsigned n)
         goto out;
     }
     rocket_bo_fini(fd, &w);
-    rocket_bo_prep(fd, &coef, 1, 0);
-    rocket_rk3576_mm_fp16_pack_coef(coef.ptr, coef.size, n);
-    rocket_bo_fini(fd, &coef);
-    if (gen_matmul_fp16_rk3576_unchecked(ops, m, k, n, (uint32_t)in.dma_address,
-                                         (uint32_t)w.dma_address, (uint32_t)out.dma_address,
-                                         (uint32_t)coef.dma_address) != RK3576_MM_FP16_OPS) {
+    if (gen_gemm_fp16_rk3576_unchecked(ops, m, k, n, (uint32_t)in.dma_address,
+                                         (uint32_t)w.dma_address, (uint32_t)out.dma_address)
+            != RK3576_MM_FP16_OPS) {
         printf("%4u %5u %5u  the generator refused\n", m, k, n);
         goto out;
     }
     rocket_bo_prep(fd, &rc, 1, 0);
     memcpy(rc.ptr, ops, sizeof ops);
     rocket_bo_fini(fd, &rc);
-    in_h[0] = in.handle; in_h[1] = w.handle; in_h[2] = coef.handle; in_h[3] = rc.handle;
+    in_h[0] = in.handle; in_h[1] = w.handle; in_h[2] = rc.handle;
     out_h[0] = out.handle;
 
     for (attempt = 1; attempt <= 2; attempt++) {
@@ -151,7 +146,7 @@ static int run_shape(int fd, unsigned m, unsigned k, unsigned n)
         memset(out.ptr, STAMP, ob);
         rocket_bo_fini(fd, &out);
         t0 = now_ms();
-        src = rocket_submit_matmul(fd, &rc, RK3576_MM_FP16_OPS, in_h, 4, out_h, 1, 4000);
+        src = rocket_submit_matmul(fd, &rc, RK3576_MM_FP16_OPS, in_h, 3, out_h, 1, 4000);
         if (src == 0 && rocket_bo_prep(fd, &out, 0, 4000000000ull) < 0) src = -1;
         dev = now_ms() - t0;
         if (src != 0) {
@@ -202,7 +197,6 @@ static int run_shape(int fd, unsigned m, unsigned k, unsigned n)
 out:
     if (rc.ptr) rocket_bo_free(fd, &rc);
     if (out.ptr) rocket_bo_free(fd, &out);
-    if (coef.ptr) rocket_bo_free(fd, &coef);
     if (w.ptr) rocket_bo_free(fd, &w);
     if (in.ptr) rocket_bo_free(fd, &in);
     free(ai); free(bi); free(B); free(ref); free(rseen); free(cseen);

@@ -5,8 +5,8 @@
  *
  * The NPU CNA is a native convolution engine, so a KxK / stride / pad / dilation
  * conv runs directly (no im2col): the host scatters the input feature into the
- * NC1HWC2 cube (feature_data, C2=8) and the weights into the conv weight cube
- * (weight_conv_fp16, the Mesa-confirmed oc1/ic1/kh/kw/oc2/ic2 reorder), and the
+ * NC1HWC2 cube (feature_index, C2=8) and the weights into the conv weight cube
+ * (conv_weight_index_fp16, the Mesa-confirmed oc1/ic1/kh/kw/oc2/ic2 reorder), and the
  * generator (gen_conv2d_fp16) programs the sliding-window MAC. The matmul path is
  * the degenerate 1x1 case of exactly this.
  *
@@ -51,9 +51,9 @@
 /* CBUF bank SIZE: a compile-time constant pointed at the single npu_hw.h source (the
  * feature/weight budget macros below want a constant). The bank COUNT is read from the
  * active hardware profile per tiler (rocket_hw_current()->cbuf_banks) so the chip value
- * lives in ONE place rather than as a bare 12 duplicating NPU_CBUF_BANKS (the "edit one,
+ * lives in ONE place rather than as a bare 12 duplicating RK3588_CBUF_BANKS (the "edit one,
  * miss the others" mis-tile trap). */
-#define CBUF_BANK NPU_CBUF_BANK_SIZE
+#define CBUF_BANK RK3588_CBUF_BANK_BYTES
 /* Feature-tile budget: rows*IC*IW*2 must leave room for the weight tile in the
  * 12x32KB CBUF. Keep the feature within ~8 banks so the weight always has >=4. The
  * tilers SHRINK this further when a single OC-group's weight cube needs >4 banks (a
@@ -61,7 +61,7 @@
 #define CONV_FEAT_BUDGET (8 * CBUF_BANK)
 /* int8 feature budget = 8 banks - 1 SLACK bank. The int8 C2=16 feature-cube DMA
  * over-reads one CBUF bank past its ceil allocation at near-bank-full geometries
- * (gen_conv2d_int8_fill sets data_bank = fd_banks+1, HW-proven for the conv). The
+ * (gen_conv2d_int8 sets data_bank = fd_banks+1, HW-proven for the conv). The
  * tiler must keep feature_banks + 1 + weight_banks <= 12,
  * so the int8 feature ceiling drops to 7 banks (fp16 is immune -> CONV_FEAT_BUDGET). */
 #define CONV_FEAT_BUDGET_I8 (7 * CBUF_BANK)
@@ -667,7 +667,7 @@ static int conv2d_one_job(int fd, rocket_conv_ctx *ctx,
 
     /* scatter input feature -> NC1HWC2 cube (C2=8) */
     rocket_bo_prep(fd, in_bo, 1, 0);
-    /* feature_data()'s layout, (ic/8, h, w, ic%8) over IHj rows, eight channels a pass:
+    /* feature_index()'s layout, (ic/8, h, w, ic%8) over IHj rows, eight channels a pass:
      * one call per element was ~80% of a depthwise call [HW, RK1,
      * tests/conv_pack_cost_probe.c]. Rows >= IH are 0. */
     conv_pack_planes(in_bo->ptr, in_bo->size, in, IC, IH, IW, IHj, 8, 2);
@@ -681,7 +681,7 @@ static int conv2d_one_job(int fd, rocket_conv_ctx *ctx,
     {
         _Float16 *dst = wt_bo->ptr;
         if (DW) {
-            /* OC==IC, one filter per channel: weight_conv_dw_fp16()'s layout,
+            /* OC==IC, one filter per channel: conv_dw_weight_index_fp16()'s layout,
              * (c/G, kh, kw, c%G), from W[c][0][kh][kw]. */
             const size_t taps = (size_t)KH * KW;
             for (int c = 0; c < IC; c++) {
@@ -703,10 +703,10 @@ static int conv2d_one_job(int fd, rocket_conv_ctx *ctx,
         .stride_y = sy, .stride_x = sx,
         .dil_y = dy, .dil_x = dx,
         .pad_top = pt, .pad_left = pl,
-        .input_dma = (uint32_t)in_bo->dma_address,
-        .weights_dma = (uint32_t)wt_bo->dma_address,
-        .output_dma = (uint32_t)out_bo->dma_address,
-        .tasks = regs, .fp32tofp16 = 1, .dw_group = (uint8_t)(DW ? G : 0),
+        .input_iova = (uint32_t)in_bo->dma_address,
+        .weights_iova = (uint32_t)wt_bo->dma_address,
+        .output_iova = (uint32_t)out_bo->dma_address,
+        .tasks = regs, .fp16_out = 1, .dw_group = (uint8_t)(DW ? G : 0),
         .act = jact,   /* fp16-out conv + LUT epilogue (direct only; NULL == plain conv) */
         .deconv_sy = (uint8_t)dsy, .deconv_sx = (uint8_t)dsx,   /* 1 == off */
     };
@@ -1320,7 +1320,7 @@ int rocket_conv2d_act_fp16_ctx(rocket_conv_ctx *ctx, const rocket_conv2d_desc *d
  * Native int8 DIRECT CONV_2D (int32-raw): the exact-W8A8 sibling of the fp16
  * path above. int8 in/weight -> int32 accumulate on the NPU, host requant. The
  * structure mirrors conv2d_one_job / conv2d_run verbatim with the int8 deltas:
- * feature cube C2=16 (vs fp16 C2=8), weight cube weight_conv_int8 (oc-group 32 vs
+ * feature cube C2=16 (vs fp16 C2=8), weight cube conv_weight_index_int8 (oc-group 32 vs
  * fp16's 16), int32 output cube C2=4, gen_conv2d_int8, and the int8/int32 BO byte
  * sizes. The fp16 path is byte-for-byte untouched.
  * ========================================================================= */
@@ -1498,7 +1498,7 @@ static int conv2d_int8_one_job(int fd, rocket_conv_ctx *ctx,
     const int cpp = q ? CPP_I8Q : CPP_I8;
     double cpa[CP_N] = {0}, cpt = cp ? cprof_now() : 0.0;
 
-    /* scatter input feature -> NC1HWC2 cube (int8, C2=16): feature_data()'s layout,
+    /* scatter input feature -> NC1HWC2 cube (int8, C2=16): feature_index()'s layout,
      * (ic/16, h, w, ic%16) over IHj rows, sixteen channels a pass. Rows >= IH are 0. */
     rocket_bo_prep(fd, in_bo, 1, 0);
     conv_pack_planes(in_bo->ptr, in_bo->size, in, IC, IH, IW, IHj, 16, 1);
@@ -1526,9 +1526,9 @@ static int conv2d_int8_one_job(int fd, rocket_conv_ctx *ctx,
             .ic = IC, .ih = IHj, .iw = IW, .oc = OC, .oh = OH, .ow = OW,
             .kh = KH, .kw = KW, .stride_y = sy, .stride_x = sx,
             .dil_y = dy, .dil_x = dx, .pad_top = pt, .pad_left = pl,
-            .input_dma = (uint32_t)in_bo->dma_address,
-            .weights_dma = (uint32_t)wt_bo->dma_address,
-            .output_dma = (uint32_t)out_bo->dma_address,
+            .input_iova = (uint32_t)in_bo->dma_address,
+            .weights_iova = (uint32_t)wt_bo->dma_address,
+            .output_iova = (uint32_t)out_bo->dma_address,
             .tasks = regs,
         };
         if (q) {
@@ -1539,7 +1539,7 @@ static int conv2d_int8_one_job(int fd, rocket_conv_ctx *ctx,
             p.input_zero_point = q->in_zp + 0x80;
             p.output_zero_point = q->out_zp + 0x80;
             p.weight_zero_point = q->w_zp + 0x80;
-            p.bias_dma = (uint32_t)bs_bo->dma_address;
+            p.bias_iova = (uint32_t)bs_bo->dma_address;
             p.bs_mul_perc = q->C ? 1 : 0;
             p.bs_mul_shift = q->C ? (uint8_t)q->bs_shift : 0;
         }
@@ -1821,9 +1821,9 @@ static int conv2d_int8_batch_tiles(int fd, rocket_conv_ctx *ctx,
             .ic = IC, .ih = IHj, .iw = iw_sub, .oc = tl->OCn, .oh = tl->rh, .ow = tl->cw,
             .kh = KH, .kw = KW, .stride_y = sy, .stride_x = sx, .dil_y = dy, .dil_x = dx,
             .pad_top = 0, .pad_left = 0,             /* halo materialized -> no HW pad */
-            .input_dma   = (uint32_t)(in_bo->dma_address  + off_in[k]),
-            .weights_dma = (uint32_t)(wt_bo->dma_address  + off_wt[k]),
-            .output_dma  = (uint32_t)(out_bo->dma_address + off_out[k]),
+            .input_iova   = (uint32_t)(in_bo->dma_address  + off_in[k]),
+            .weights_iova = (uint32_t)(wt_bo->dma_address  + off_wt[k]),
+            .output_iova  = (uint32_t)(out_bo->dma_address + off_out[k]),
             .tasks = regs,
         };
         if (q) {
@@ -1833,7 +1833,7 @@ static int conv2d_int8_batch_tiles(int fd, rocket_conv_ctx *ctx,
             p.input_zero_point = tq->in_zp + 0x80;
             p.output_zero_point = tq->out_zp + 0x80;
             p.weight_zero_point = tq->w_zp + 0x80;
-            p.bias_dma = (uint32_t)(bs_bo->dma_address + off_bs[k]);
+            p.bias_iova = (uint32_t)(bs_bo->dma_address + off_bs[k]);
             p.bs_mul_perc = tq->C ? 1 : 0;
             p.bs_mul_shift = tq->C ? (uint8_t)tq->bs_shift : 0;
         }
@@ -2021,7 +2021,7 @@ static int conv2d_int8_plan(const rocket_conv2d_desc *d, i8plan *pl)
     while (OCt > 32 && WBANKS_I8(OCt) > 4) OCt -= 32;
     size_t wbanks = WBANKS_I8(OCt);
     if (wbanks > (size_t)(CBUF_BANKS - 2)) return -4;   /* leave >=1 feature bank + the slack */
-    /* Reserve ONE feature slack bank (gen_conv2d_int8_fill sets data_bank = fd_banks+1):
+    /* Reserve ONE feature slack bank (gen_conv2d_int8 sets data_bank = fd_banks+1):
      * feature_banks + 1 + weight_banks <= 12.  */
     size_t feat_budget = (size_t)(CBUF_BANKS - 1 - wbanks) * CBUF_BANK;
     if (feat_budget > CONV_FEAT_BUDGET_I8) feat_budget = CONV_FEAT_BUDGET_I8;
@@ -2523,7 +2523,7 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
     double cpa[CP_N] = {0}, cpt = cp ? cprof_now() : 0.0;
 
     /* input feature cube (C2=16): the raw int8 values, which the CNA reads signed. The
-     * layout is feature_data()'s, (c/16, h, w, c%16) over IHj rows, with the index hoisted:
+     * layout is feature_index()'s, (c/16, h, w, c%16) over IHj rows, with the index hoisted:
      * a per-element call was 83% of this entry's time at MobileDet's shapes [HW, RK1,
      * tests/dw_int8_cost_probe.c]. Rows >= IH stay 0. */
     rocket_bo_prep(fd, in_bo, 1, 0);
@@ -2532,7 +2532,7 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
     rocket_bo_fini(fd, in_bo);
     CP_MARK(cp, cpa, CP_IN, cpt);
 
-    /* DW weight cube (group G): the raw int8 values, in weight_conv_dw_int8()'s layout,
+    /* DW weight cube (group G): the raw int8 values, in conv_dw_weight_index_int8()'s layout,
      * (c/G, kh, kw, c%G). */
     rocket_bo_prep(fd, wt_bo, 1, 0);
     memset(wt_bo->ptr, 0, wt_bo->size);
@@ -2579,9 +2579,9 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
             .ic = Cj, .ih = IHj, .iw = IW, .oc = Cj, .oh = OH, .ow = OW,
             .kh = KH, .kw = KW, .stride_y = sy, .stride_x = sx,
             .dil_y = dy, .dil_x = dx, .pad_top = pt, .pad_left = pl,
-            .input_dma = (uint32_t)in_bo->dma_address,
-            .weights_dma = (uint32_t)wt_bo->dma_address,
-            .output_dma = (uint32_t)out_bo->dma_address,
+            .input_iova = (uint32_t)in_bo->dma_address,
+            .weights_iova = (uint32_t)wt_bo->dma_address,
+            .output_iova = (uint32_t)out_bo->dma_address,
             .tasks = regs, .dw_group = (uint8_t)G, .int8_out = 1,
             /* per-channel: the OUT_CVT carries the job's base gain alone */
             .in_scale = pc ? pc->cvt : in_scale, .w_scale = pc ? 1.0f : w_scale,
@@ -2594,7 +2594,7 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
              * is wrong [HW sweep, RK1]. */
             .input_zero_point = in_zp + 0x80, .output_zero_point = out_zp + 0x80,
             .weight_zero_point = w_zp + 0x80,
-            .bias_dma = (uint32_t)bs_bo->dma_address,
+            .bias_iova = (uint32_t)bs_bo->dma_address,
         };
         if ((ret = gen_conv2d_dw_int8(&p)) != 0) {
             ROCKET_LOGE("rocket_conv2d_dw_int8: gen failed (%d)\n", ret);
@@ -2628,7 +2628,7 @@ static int conv2d_dw_int8_one_job(int fd, rocket_conv_ctx *ctx,
     if (ret) { ROCKET_LOGE("rocket_conv2d_dw_int8: wait timeout (%d)\n", ret); goto out; }
     CP_MARK(cp, cpa, CP_WAIT, cpt);
     {
-        /* int8 output cube (C2=16), already in the model domain: feature_data()'s layout
+        /* int8 output cube (C2=16), already in the model domain: feature_index()'s layout
          * over OH rows, gathered with the index hoisted. */
         const int8_t *src = out_bo->ptr;
         const size_t plane = (size_t)OH * OW * 16, hw = (size_t)OH * OW;
@@ -2700,7 +2700,7 @@ static int dw_int8_shape_bands(const rocket_conv2d_desc *d, int *cc, int *rht, i
     if (d->ic <= 0 || d->ih <= 0 || d->iw <= 0 || d->kh <= 0 || d->kw <= 0) return -2;
     if (d->stride_x <= 0 || d->stride_y <= 0 || d->dil_x <= 0 || d->dil_y <= 0) return -2;
     const int C = d->ic, IH = d->ih, IW = d->iw, KH = d->kh, KW = d->kw;
-    /* The int8-DW feature cube is C2=16 (feature_data(C,...,16,...)); a channel
+    /* The int8-DW feature cube is C2=16 (feature_index(C,...,16,...)); a channel
      * count not a multiple of 16 desyncs the cube padding from the regcmd
      * channel-grain count -> wrong output. (Cc stays a G-multiple and G=64%16==0, so
      * C%16==0 also keeps every channel chunk aligned.) */

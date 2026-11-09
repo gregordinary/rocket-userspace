@@ -46,6 +46,7 @@
 #include "rocket_chain.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "test_fill.h"
 
 #define RC_STRIDE 256            /* gapped slot stride in u64 words, unused when chained */
@@ -73,7 +74,7 @@ static int patch(uint64_t *ops, int n, uint16_t target, uint16_t reg, uint32_t v
     for (int i = 0; i < n; i++) {
         if ((uint16_t)(ops[i] >> 48) != target || (uint16_t)(ops[i] & 0xFFFF) != reg) continue;
         uint32_t v = orbits ? (uint32_t)(ops[i] >> 16) | value : value;
-        ops[i] = NPUOP(target, v, reg);
+        ops[i] = REGCMD(target, reg, v);
         return 0;
     }
     return -1;
@@ -116,14 +117,14 @@ static void stage(int fd, struct bufs *b, const _Float16 *A, const _Float16 *B)
         _Float16 *s = (_Float16 *)b->a_cube.ptr + (size_t)ki * M * Kt;
         for (int m = 1; m <= M; m++)
             for (int k = 1; k <= Kt; k++)
-                s[feature_data(Kt, M, 1, 8, k, m, 1)] = A[(size_t)(m - 1) * K + ki * Kt + k - 1];
+                s[feature_index(Kt, M, 1, 8, k, m, 1)] = A[(size_t)(m - 1) * K + ki * Kt + k - 1];
     }
     for (int ni = 0; ni < nNt; ni++)
         for (int ki = 0; ki < nKt; ki++) {
             _Float16 *s = (_Float16 *)b->w.ptr + (size_t)(ni * nKt + ki) * Nt * Kt;
             for (int n = 1; n <= Nt; n++)
                 for (int k = 1; k <= Kt; k++)
-                    s[weight_fp16(Kt, n, k)] = B[(size_t)(ni * Nt + n - 1) * K + ki * Kt + k - 1];
+                    s[gemm_weight_index_fp16(Kt, n, k)] = B[(size_t)(ni * Nt + n - 1) * K + ki * Kt + k - 1];
         }
     rocket_bo_fini(fd, &b->a_cube);
     rocket_bo_fini(fd, &b->a_rm);
@@ -142,32 +143,32 @@ static int build(const struct arm *a, struct bufs *b, rocket_task_desc *td)
         const int last = (ki == nKt - 1);
         for (int ni = 0; ni < nNt; ni++) {
             memset(ops, 0, sizeof ops);
-            uint32_t in_dma = a->form == CUBE
+            uint32_t in_iova = a->form == CUBE
                 ? (uint32_t)b->a_cube.dma_address + (uint32_t)((size_t)ki * M * Kt * 2)
                 : (uint32_t)b->a_rm.dma_address + (uint32_t)((size_t)ki * Kt * 2);
-            uint32_t out_dma = (uint32_t)dst->dma_address + (uint32_t)(ni * slot);
-            if (last && a->form == RM_OWN) out_dma = (uint32_t)b->fin.dma_address + (uint32_t)(ni * slot);
-            if (last && a->form == RM_WIDE) out_dma = (uint32_t)b->c.dma_address + (uint32_t)((size_t)ni * Nt * 2);
-            matmul_params_t p = {
+            uint32_t out_iova = (uint32_t)dst->dma_address + (uint32_t)(ni * slot);
+            if (last && a->form == RM_OWN) out_iova = (uint32_t)b->fin.dma_address + (uint32_t)(ni * slot);
+            if (last && a->form == RM_WIDE) out_iova = (uint32_t)b->c.dma_address + (uint32_t)((size_t)ni * Nt * 2);
+            gemm_params_t p = {
                 .m = (uint16_t)M, .k = (uint16_t)Kt, .n = (uint16_t)Nt,
-                .input_dma = in_dma,
-                .weights_dma = (uint32_t)b->w.dma_address + (uint32_t)((size_t)(ni * nKt + ki) * Nt * Kt * 2),
-                .output_dma = out_dma, .tasks = ops, .fp32tofp16 = 1,
+                .input_iova = in_iova,
+                .weights_iova = (uint32_t)b->w.dma_address + (uint32_t)((size_t)(ni * nKt + ki) * Nt * Kt * 2),
+                .output_iova = out_iova, .tasks = ops, .fp16_out = 1,
                 .accumulate = (uint8_t)(ki > 0),
-                .add_dma = ki > 0 ? (uint32_t)src->dma_address + (uint32_t)(ni * slot) : 0,
+                .add_iova = ki > 0 ? (uint32_t)src->dma_address + (uint32_t)(ni * slot) : 0,
                 .data_reuse = (uint8_t)(a->reuse && ni > 0),
             };
-            if (gen_matmul_fp16(&p) != 0) { printf("  %s: generator refused\n", a->name); return -1; }
+            if (gen_gemm_fp16(&p) != 0) { printf("  %s: generator refused\n", a->name); return -1; }
             const int n = (int)p.task_count;
             if (a->form != CUBE &&
-                (patch(ops, n, OP_REG_CNA, CNA_CONV_CON1, 1u << 29, 1) ||
-                 patch(ops, n, OP_REG_CNA, CNA_DMA_CON1, (uint32_t)(K * 2 / 16), 0) ||
-                 patch(ops, n, OP_REG_CNA, CNA_DMA_CON2, 0, 0))) return -1;
+                (patch(ops, n, TARGET_CNA, REG_CNA_CONV_CON1, 1u << 29, 1) ||
+                 patch(ops, n, TARGET_CNA, REG_CNA_DMA_CON1, (uint32_t)(K * 2 / 16), 0) ||
+                 patch(ops, n, TARGET_CNA, REG_CNA_DMA_CON2, 0, 0))) return -1;
             if (last && a->form != CUBE) {
                 const uint32_t notch = (uint32_t)((a->form == RM_OWN ? Nt : N) * 2 / 16 - 1);
-                if (patch(ops, n, OP_REG_DPU, DPU_DST_SURF_STRIDE, 1u << 4, 0) ||
-                    patch(ops, n, OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, (notch << 16) | notch, 0) ||
-                    patch(ops, n, OP_REG_DPU, DPU_SURFACE_ADD, 2u << 4, 0)) return -1;
+                if (patch(ops, n, TARGET_DPU, REG_DPU_DST_SURF_STRIDE, 1u << 4, 0) ||
+                    patch(ops, n, TARGET_DPU, REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch << 16) | notch, 0) ||
+                    patch(ops, n, TARGET_DPU, REG_DPU_SURFACE_ADD, 2u << 4, 0)) return -1;
             }
             if (count && (uint32_t)n != count) { printf("  %s: program lengths differ\n", a->name); return -1; }
             count = (uint32_t)n;
@@ -212,7 +213,7 @@ static double arm_run(int fd, const struct arm *a, struct bufs *b, const double 
         for (int m = 0; m < M; m++)
             for (int n = 0; n < Nt; n++) {
                 size_t at;
-                if (a->form == CUBE) at = (size_t)ni * M * Nt + (size_t)feature_data(Nt, M, 1, 8, n + 1, m + 1, 1);
+                if (a->form == CUBE) at = (size_t)ni * M * Nt + (size_t)feature_index(Nt, M, 1, 8, n + 1, m + 1, 1);
                 else if (a->form == RM_OWN) at = (size_t)ni * M * Nt + (size_t)m * Nt + n;
                 else at = (size_t)m * N + (size_t)ni * Nt + n;
                 if (tf_is_sentinel_f16(o[at])) unwritten++;

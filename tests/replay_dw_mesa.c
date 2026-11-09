@@ -26,6 +26,7 @@
 #include "rocket_hw_profile.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"       /* CNA_PAD_CON1 */
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 
 #define CBUF_BANK 32768
 
@@ -96,14 +97,14 @@ int main(int argc, char **argv) {
         .ic = IC, .ih = IH, .iw = IW, .oc = OC, .oh = OH, .ow = OW,
         .kh = KH, .kw = KW, .stride_y = 1, .stride_x = 1,
         .dil_y = 1, .dil_x = 1, .pad_top = 1, .pad_left = 1,
-        .input_dma = (uint32_t)input.dma_address,
-        .weights_dma = (uint32_t)weights.dma_address,
-        .output_dma = (uint32_t)output.dma_address,
+        .input_iova = (uint32_t)input.dma_address,
+        .weights_iova = (uint32_t)weights.dma_address,
+        .output_iova = (uint32_t)output.dma_address,
         .tasks = regs, .dw_group = 64,
         .int8_out = 1,
         .in_scale = 0.03657235f, .w_scale = 0.00079638f, .out_scale = 0.00691164f,
         .input_zero_point = -2, .output_zero_point = 5, .weight_zero_point = 0,
-        .bias_dma = (uint32_t)biases.dma_address,
+        .bias_iova = (uint32_t)biases.dma_address,
     };
     int g = gen_conv2d_dw_int8(&p);
     if (g != 0) { fprintf(stderr, "gen failed %d\n", g); goto out; }
@@ -114,7 +115,7 @@ int main(int argc, char **argv) {
     {
         int patched = 0;
         for (uint32_t i = 0; i < p.task_count; i++)
-            if ((regs[i] & 0xffff) == CNA_PAD_CON1) {
+            if ((regs[i] & 0xffff) == REG_CNA_PAD_CON1) {
                 regs[i] = (regs[i] & ~(0xffffffffull << 16)) | ((uint64_t)0x7eu << 16);
                 patched++;
             }
@@ -151,7 +152,7 @@ int main(int argc, char **argv) {
         for (int c = 0; c < OC; c++)
           for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++) {
-                long idx = feature_data(OC, OH, OW, 16, c + 1, oh + 1, ow + 1);
+                long idx = feature_index(OC, OH, OW, 16, c + 1, oh + 1, ow + 1);
                 int mv = (int8_t)mine[idx], ev = (int8_t)mesa[idx];
                 if (mv != ev) {
                     mism++;

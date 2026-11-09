@@ -6,7 +6,7 @@
  *
  * A probe, not a gate. The library's planner (`mm_fits`, rocket_matmul.c) requires the whole
  * Nt x Kt weight tile to fit in the CBUF beside the input tile, and caps Nt at 256. The
- * generator does not: `gen_matmul_fp16` gives every bank the input does not take to the
+ * generator does not: `gen_gemm_fp16` gives every bank the input does not take to the
  * weights and refuses only a kernel wider than one bank. With the input tile resident, the
  * CNA can then stream the kernel groups through the weight banks, so one task covers all
  * of N. An external userspace (rknpu2_matmul_open, vendor driver) runs fp16 tasks this way
@@ -52,6 +52,7 @@
 #include "rocket_chain.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "test_fill.h"
 
 #define SLOT_WORDS 128   /* gapped slot per task; a matmul program is ~110 words */
@@ -92,7 +93,7 @@ static int cmp_d(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-static int banks(long bytes) { return (int)((bytes + NPU_CBUF_BANK_SIZE - 1) / NPU_CBUF_BANK_SIZE); }
+static int banks(long bytes) { return (int)((bytes + RK3588_CBUF_BANK_BYTES - 1) / RK3588_CBUF_BANK_BYTES); }
 
 static int min_i(int a, int b) { return a < b ? a : b; }
 
@@ -102,7 +103,7 @@ static int patch(uint64_t *ops, int n, uint16_t target, uint16_t reg, uint32_t v
 {
     for (int i = 0; i < n; i++) {
         if ((uint16_t)(ops[i] >> 48) != target || (uint16_t)(ops[i] & 0xFFFF) != reg) continue;
-        ops[i] = NPUOP(target, value, reg);
+        ops[i] = REGCMD(target, reg, value);
         return 0;
     }
     return -1;
@@ -117,11 +118,11 @@ static int stream_patch(uint64_t *ops, int n, int m, int K)
     const char *wb = getenv("WSP_WBANKS"), *gr = getenv("WSP_GRAINS");
     if (wb) {
         int w = !strcmp(wb, "atom") ? banks((long)K * 2 * 32) : atoi(wb);
-        int d = NPU_CBUF_BANKS - w;
+        int d = RK3588_CBUF_BANKS - w;
         if (w < 1 || d < banks((long)m * K * 2)) return -1;
-        if (patch(ops, n, OP_REG_CNA, CNA_CBUF_CON0, ((uint32_t)w << 4) | (uint32_t)d)) return -1;
+        if (patch(ops, n, TARGET_CNA, REG_CNA_CBUF_CON0, ((uint32_t)w << 4) | (uint32_t)d)) return -1;
     }
-    if (gr && patch(ops, n, OP_REG_CNA, CNA_CONV_CON2, ((uint32_t)atoi(gr) & 0x3FF) << 4)) return -1;
+    if (gr && patch(ops, n, TARGET_CNA, REG_CNA_CONV_CON2, ((uint32_t)atoi(gr) & 0x3FF) << 4)) return -1;
     return 0;
 }
 
@@ -165,14 +166,14 @@ static int arm_build(int fd, struct arm *a, int which, const struct shape *s,
         int mt = min_i(a->mt, M - mi * a->mt);
         for (int m = 1; m <= mt; m++)
             for (int k = 1; k <= K; k++)
-                id[feature_data(K, mt, 1, 8, k, m, 1)] = A[(size_t)(mi * a->mt + m - 1) * K + (k - 1)];
+                id[feature_index(K, mt, 1, 8, k, m, 1)] = A[(size_t)(mi * a->mt + m - 1) * K + (k - 1)];
     }
     for (int ni = 0; ni < a->nnt; ni++) {
         _Float16 *wd = (_Float16 *)((uint8_t *)a->w.ptr + ni * w_slot);
         int nt = min_i(a->nt, N - ni * a->nt);
         for (int n = 1; n <= nt; n++)
             for (int k = 1; k <= K; k++)
-                wd[weight_fp16(K, n, k)] = B[(size_t)(ni * a->nt + n - 1) * K + (k - 1)];
+                wd[gemm_weight_index_fp16(K, n, k)] = B[(size_t)(ni * a->nt + n - 1) * K + (k - 1)];
     }
     rocket_bo_fini(fd, &a->in);
     rocket_bo_fini(fd, &a->w);
@@ -183,16 +184,16 @@ static int arm_build(int fd, struct arm *a, int which, const struct shape *s,
         for (int ni = 0; ni < a->nnt; ni++) {
             int t = mi * a->nnt + ni;
             uint64_t ops[SLOT_WORDS] = { 0 };
-            matmul_params_t p = {
+            gemm_params_t p = {
                 .m = (uint16_t)min_i(a->mt, M - mi * a->mt), .k = (uint16_t)K,
                 .n = (uint16_t)min_i(a->nt, N - ni * a->nt),
-                .input_dma = (uint32_t)(a->in.dma_address + mi * in_slot),
-                .weights_dma = (uint32_t)(a->w.dma_address + ni * w_slot),
-                .output_dma = (uint32_t)(a->out.dma_address + a->out_off[t]),
-                .tasks = ops, .fp32tofp16 = 0,
+                .input_iova = (uint32_t)(a->in.dma_address + mi * in_slot),
+                .weights_iova = (uint32_t)(a->w.dma_address + ni * w_slot),
+                .output_iova = (uint32_t)(a->out.dma_address + a->out_off[t]),
+                .tasks = ops, .fp16_out = 0,
                 .data_reuse = (which == ARM_REUSE && ni > 0) ? 1 : 0,
             };
-            int rc = gen_matmul_fp16(&p);
+            int rc = gen_gemm_fp16(&p);
             if (rc != 0) {
                 printf("  %s: the generator refused task %d (%dx%dx%d, rc %d)\n", arm_name[which],
                        t, p.m, K, p.n, rc);
@@ -256,7 +257,7 @@ static int arm_run(int fd, struct arm *a, const struct shape *s, int chained, co
             int mt = min_i(a->mt, M - mi * a->mt), nt = min_i(a->nt, N - ni * a->nt);
             for (int m = 0; m < mt; m++)
                 for (int n = 0; n < nt; n++) {
-                    double got = o[feature_data(nt, mt, 1, 4, n + 1, m + 1, 1)];
+                    double got = o[feature_index(nt, mt, 1, 4, n + 1, m + 1, 1)];
                     size_t at = (size_t)(mi * a->mt + m) * N + (ni * a->nt + n);
                     if (isnan(got)) unwritten++;
                     if (got != want[at]) { if (first < 0) first = (long)at; wrong++; }
@@ -301,11 +302,11 @@ static int run_shape(int fd, const struct shape *s, int chained, int reps)
     int bad = 0;
     printf("-- %dx%dx%d: stream Mt %d (input %d + atom %d of %d banks, weight cube %ld KiB); "
            "tile %dx%d (input %d + weights %d banks)\n", M, K, N, s->mt_s,
-           banks((long)s->mt_s * K * 2), banks((long)K * 2 * 32), NPU_CBUF_BANKS,
+           banks((long)s->mt_s * K * 2), banks((long)K * 2 * 32), RK3588_CBUF_BANKS,
            (long)N * K * 2 / 1024, s->mt_t, s->nt_t, banks((long)s->mt_t * K * 2),
            banks((long)s->nt_t * K * 2));
-    if (banks((long)s->mt_s * K * 2) + banks((long)K * 2 * 32) > NPU_CBUF_BANKS ||
-        banks((long)s->mt_t * K * 2) + banks((long)s->nt_t * K * 2) > NPU_CBUF_BANKS) {
+    if (banks((long)s->mt_s * K * 2) + banks((long)K * 2 * 32) > RK3588_CBUF_BANKS ||
+        banks((long)s->mt_t * K * 2) + banks((long)s->nt_t * K * 2) > RK3588_CBUF_BANKS) {
         printf("  shape outside the bank budget, skipped\n");
         return 1;
     }

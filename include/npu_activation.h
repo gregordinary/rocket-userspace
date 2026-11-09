@@ -44,7 +44,7 @@
  * cube dimensions.
  *
  * `gen_lut_activation_fp16` emits that DPU and DPU_RDMA flying program into `params->tasks`
- * and sets `params->task_count`. Like `gen_matmul_fp16`, it takes shapes and addresses and
+ * and sets `params->task_count`. Like `gen_gemm_fp16`, it takes shapes and addresses and
  * returns regcmd. The runtime (`rocket_activation.c`) allocates the BOs and supplies the LUT
  * table contents and the per-activation constants.
  */
@@ -53,8 +53,8 @@
 extern "C" {
 #endif
 typedef struct {
-  uint64_t input_dma;     /* device VA of the fp16 input cube  */
-  uint64_t output_dma;    /* device VA of the fp16 output cube */
+  uint64_t input_iova;     /* device VA of the fp16 input cube  */
+  uint64_t output_iova;    /* device VA of the fp16 output cube */
   int      n;             /* element count, which must be a multiple of 8 (C2 atom) */
 
   /* The two LUT tables, Q-format per the activation. 1026 uint16 entries:
@@ -95,46 +95,6 @@ typedef struct {
  * `ROCKET_LUT_ENABLE` sets the PC_OPERATION_ENABLE block bitmap (default 0x18, DPU and
  * DPU_RDMA). */
 int gen_lut_activation_fp16(lut_act_params_t *params);
-
-/*
- * Describes the elementwise fp16 multiply with a pure flying main feed. MRDMA reads input `A`,
- * ERDMA reads input `B` and EW MUL combines them, with no convolution.
- *
- * Caution: as emitted, this program produces no correct output, because two of its fields
- * are wrong. Under its `COMB_USE(5)` the task never completes. With `COMB_USE` 0 or 4, it
- * writes the product on lane 0 of each 8-channel atom and zero on the other seven. The cause
- * is that its `DATA_CUBE_CHANNEL` leaves `ORIG_CHANNEL` at 0.
- *
- * A DPU-only program is exact for fp16 MUL with `ORIG_CHANNEL` equal to `CHANNEL`, `COMB_USE`
- * bit 0 clear and the EW converter bypassed. With the converter live, it is exact for ADD,
- * MAX, MIN and MINUS as well. A two-buffer EW op therefore needs no conv main feed.
- *
- * Evidence: [HW sweep, RK3588] (`tests/ew_int_probe.c`, its `oldgen` mode for this program,
- * and the same probe for the DPU-only program).
- *
- * The library's fully-on-NPU multiply is `rocket_ew_mul_fp16` (`rocket_activation.c`). An
- * identity conv or matmul supplies the main feed (equal to `A`), and EW MUL combines the
- * ERDMA operand (`B`) with it. The multiply uses `gen_matmul_fp16` with accumulate=1 and
- * ew_mul=1, which selects EW_OP_TYPE=1. It is bit-exact [HW sweep] (`tests/ew_mul_rocket.c`).
- *
- * No library entry calls this generator, and no environment variable enables it. Only the
- * tests call it: an off-device regcmd smoke test in `tests/activation_lut_rocket.c` and the
- * `oldgen` mode of `tests/ew_int_probe.c`.
- */
-typedef struct {
-  uint64_t input_a_dma;   /* MRDMA main feed  */
-  uint64_t input_b_dma;   /* ERDMA EW operand */
-  uint64_t output_dma;
-  int       n;            /* element count, which must be a multiple of 8 */
-  uint64_t *tasks;
-  int       task_count;   /* OUT */
-} ew_mul_params_t;
-
-/* Emits the flying-mode DPU elementwise-multiply program. The return codes are those of
- * `gen_lut_activation_fp16`, including -1 on a hardware profile other than the RK3588's. It
- * reads `ROCKET_LUT_SPTR` and `ROCKET_LUT_ENABLE` as that generator does.
- * `ROCKET_EW_MUL_COMB` sets the DPU_RDMA `COMB_USE` field (default 5). */
-int gen_ew_mul_fp16(ew_mul_params_t *params);
 
 
 #ifdef __cplusplus

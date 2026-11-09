@@ -105,8 +105,8 @@ static void one(const struct shape *s, int dump)
                 q.input_zero_point = 0x80; q.output_zero_point = 0x80;
                 q.weight_zero_point = 0x80;
                 q.tasks = ops;
-                q.input_dma = 0x10000000u; q.weights_dma = 0x20000000u;
-                q.bias_dma = 0x30000000u; q.output_dma = 0x40000000u;
+                q.input_iova = 0x10000000u; q.weights_iova = 0x20000000u;
+                q.bias_iova = 0x30000000u; q.output_iova = 0x40000000u;
                 if ((mult == 4u ? gen_conv2d_int8_rk3576_i32out(&q)
                                 : gen_conv2d_int8_rk3576_i32out_wide(&q)) != 0)
                     printf("      EMITTER REFUSED\n");

@@ -13,8 +13,8 @@
  * Two layers, same structure as conv2d_fp16_rocket.c:
  *
  *  1. CUBE-LAYOUT SELF-CHECK (runs anywhere, incl. x86, no NPU). Scatters int8
- *     feature + weights into the native cubes (feature_data C2=16, weight_conv_int8
- *     oc-group 32 / ic-group 32, or weight_conv_dw_int8), computes the conv reading
+ *     feature + weights into the native cubes (feature_index C2=16, conv_weight_index_int8
+ *     oc-group 32 / ic-group 32, or conv_dw_weight_index_int8), computes the conv reading
  *     THROUGH those index functions exactly as the CNA would, writes the int32
  *     output cube (C2=4), de-scatters it, and compares bit-for-bit to a naive NCHW
  *     int64-accumulate oracle. A PASS proves the scatter/index/de-scatter math is
@@ -39,7 +39,7 @@
 
 #include "rocket_npu.h"
 #include "rocket_conv.h"
-#include "npu_matmul.h"   /* feature_data, weight_conv_int8, gen_conv2d_int8 */
+#include "npu_matmul.h"   /* feature_index, conv_weight_index_int8, gen_conv2d_int8 */
 
 #define CBUF_BANK 32768
 
@@ -107,20 +107,20 @@ static int cube_self_check(const rocket_conv2d_desc *d, const int8_t *in, const 
     for (int ic = 0; ic < IC; ic++)
         for (int ih = 0; ih < IH; ih++)
             for (int iw = 0; iw < IW; iw++)
-                in_cube[feature_data(IC, IH, IW, 16, ic + 1, ih + 1, iw + 1)] =
+                in_cube[feature_index(IC, IH, IW, 16, ic + 1, ih + 1, iw + 1)] =
                     in[((size_t)ic * IH + ih) * IW + iw];
     if (DW) {
         for (int c = 0; c < IC; c++)
             for (int kh = 0; kh < KH; kh++)
                 for (int kw = 0; kw < KW; kw++)
-                    wt_cube[weight_conv_dw_int8(IC, KH, KW, G, c + 1, kh + 1, kw + 1)] =
+                    wt_cube[conv_dw_weight_index_int8(IC, KH, KW, G, c + 1, kh + 1, kw + 1)] =
                         W[((size_t)c * KH + kh) * KW + kw];
     } else {
         for (int oc = 0; oc < OC; oc++)
             for (int ic = 0; ic < IC; ic++)
                 for (int kh = 0; kh < KH; kh++)
                     for (int kw = 0; kw < KW; kw++)
-                        wt_cube[weight_conv_int8(OC, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
+                        wt_cube[conv_weight_index_int8(OC, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
                             W[(((size_t)oc * IC + ic) * KH + kh) * KW + kw];
     }
 
@@ -137,21 +137,21 @@ static int cube_self_check(const rocket_conv2d_desc *d, const int8_t *in, const 
                         for (int kw = 0; kw < KW; kw++) {
                             int iw = ow * d->stride_x + kw * d->dil_x - d->pad_left;
                             if (iw < 0 || iw >= IW) continue;
-                            int32_t a = in_cube[feature_data(IC, IH, IW, 16, ic + 1, ih + 1, iw + 1)];
+                            int32_t a = in_cube[feature_index(IC, IH, IW, 16, ic + 1, ih + 1, iw + 1)];
                             int32_t w = DW
-                                ? wt_cube[weight_conv_dw_int8(IC, KH, KW, G, oc + 1, kh + 1, kw + 1)]
-                                : wt_cube[weight_conv_int8(OC, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)];
+                                ? wt_cube[conv_dw_weight_index_int8(IC, KH, KW, G, oc + 1, kh + 1, kw + 1)]
+                                : wt_cube[conv_weight_index_int8(OC, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)];
                             s += (int64_t)a * w;
                         }
                     }
-                out_cube[feature_data(OC, OH, OW, 4, oc + 1, oh + 1, ow + 1)] = (int32_t)s;
+                out_cube[feature_index(OC, OH, OW, 4, oc + 1, oh + 1, ow + 1)] = (int32_t)s;
             }
 
     for (int oc = 0; oc < OC; oc++)
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++)
                 got[((size_t)oc * OH + oh) * OW + ow] =
-                    out_cube[feature_data(OC, OH, OW, 4, oc + 1, oh + 1, ow + 1)];
+                    out_cube[feature_index(OC, OH, OW, 4, oc + 1, oh + 1, ow + 1)];
     ref_conv_int8(d, in, W, ref);
 
     int64_t max_abs = 0; int bad = 0;
@@ -224,7 +224,7 @@ static int run_hw_single_job(int fd, const rocket_conv2d_desc *d,
         for (int ic = 0; ic < IC; ic++)
             for (int ih = 0; ih < IH; ih++)
                 for (int iw = 0; iw < IW; iw++)
-                    dst[feature_data(IC, IH, IW, 16, ic + 1, ih + 1, iw + 1)] =
+                    dst[feature_index(IC, IH, IW, 16, ic + 1, ih + 1, iw + 1)] =
                         in[((size_t)ic * IH + ih) * IW + iw];
     }
     rocket_bo_fini(fd, &input);
@@ -238,14 +238,14 @@ static int run_hw_single_job(int fd, const rocket_conv2d_desc *d,
             for (int c = 0; c < IC; c++)
                 for (int kh = 0; kh < KH; kh++)
                     for (int kw = 0; kw < KW; kw++)
-                        dst[weight_conv_dw_int8(IC, KH, KW, G, c + 1, kh + 1, kw + 1)] =
+                        dst[conv_dw_weight_index_int8(IC, KH, KW, G, c + 1, kh + 1, kw + 1)] =
                             W[((size_t)c * KH + kh) * KW + kw];
         } else {
             for (int oc = 0; oc < OCp; oc++)
                 for (int ic = 0; ic < IC; ic++)
                     for (int kh = 0; kh < KH; kh++)
                         for (int kw = 0; kw < KW; kw++)
-                            dst[weight_conv_int8(OCp, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
+                            dst[conv_weight_index_int8(OCp, IC, KH, KW, oc + 1, ic + 1, kh + 1, kw + 1)] =
                                 Wuse[(((size_t)oc * IC + ic) * KH + kh) * KW + kw];
         }
     }
@@ -257,8 +257,8 @@ static int run_hw_single_job(int fd, const rocket_conv2d_desc *d,
             .ic = IC, .ih = IH, .iw = IW, .oc = OCp, .oh = OH, .ow = OW,
             .kh = KH, .kw = KW, .stride_y = d->stride_y, .stride_x = d->stride_x,
             .dil_y = d->dil_y, .dil_x = d->dil_x, .pad_top = d->pad_top, .pad_left = d->pad_left,
-            .input_dma = (uint32_t)input.dma_address, .weights_dma = (uint32_t)weights.dma_address,
-            .output_dma = (uint32_t)output.dma_address, .tasks = regs,
+            .input_iova = (uint32_t)input.dma_address, .weights_iova = (uint32_t)weights.dma_address,
+            .output_iova = (uint32_t)output.dma_address, .tasks = regs,
             .dw_group = (uint8_t)(DW ? G : 0),
         };
         int g = DW ? gen_conv2d_dw_int8(&p) : gen_conv2d_int8(&p);
@@ -298,7 +298,7 @@ static int run_hw_single_job(int fd, const rocket_conv2d_desc *d,
             for (int oh = 0; oh < OH; oh++)
                 for (int ow = 0; ow < OW; ow++)
                     got[((size_t)oc * OH + oh) * OW + ow] =
-                        src[feature_data(OCcube, OH, OW, out_c2, oc + 1, oh + 1, ow + 1)];
+                        src[feature_index(OCcube, OH, OW, out_c2, oc + 1, oh + 1, ow + 1)];
     }
     rocket_bo_fini(fd, &output);
     rc = 0;
@@ -380,7 +380,7 @@ static int run_shape(int fd, const rocket_conv2d_desc *d)
         conv_params_t p = { .ic=d->ic,.ih=d->ih,.iw=d->iw,.oc=rup(d->oc, d->depthwise?1:32),.oh=OH,.ow=OW,
             .kh=d->kh,.kw=d->kw,.stride_y=d->stride_y,.stride_x=d->stride_x,
             .dil_y=d->dil_y,.dil_x=d->dil_x,.pad_top=d->pad_top,.pad_left=d->pad_left,
-            .input_dma=0x1000,.weights_dma=0x2000,.output_dma=0x3000,.tasks=regs,
+            .input_iova=0x1000,.weights_iova=0x2000,.output_iova=0x3000,.tasks=regs,
             .dw_group=(uint8_t)(d->depthwise ? dwg() : 0) };
         int g = d->depthwise ? gen_conv2d_dw_int8(&p) : gen_conv2d_int8(&p);
         const char *gs = (g==0 && p.task_count>0) ? "OK" : (g==-1||g==-2) ? "needs tiling (OK)" : "FAIL";

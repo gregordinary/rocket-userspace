@@ -49,6 +49,23 @@ int rocket_sysfs_bound_devices(char names[][ROCKET_SYSFS_NAME_MAX], int max)
     return n;
 }
 
+int rocket_sysfs_trusted_minor(int reported, const char *sys_root)
+{
+    char path[512];
+    struct stat st;
+
+    if (reported <= 0) return reported;
+    if (!sys_root) sys_root = "/sys";
+    if (snprintf(path, sizeof path, "%s/module", sys_root) >= (int)sizeof path)
+        return reported;
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+        return reported;                     /* sysfs not visible: nothing to ask */
+    if (snprintf(path, sizeof path, "%s/module/rocket/parameters/rocket_batch_submit",
+                 sys_root) >= (int)sizeof path)
+        return reported;
+    return stat(path, &st) == 0 ? reported : 0;
+}
+
 int rocket_sysfs_bound_core_count(void)
 {
     /* Cached: the bind set does not change under a running process that is using the

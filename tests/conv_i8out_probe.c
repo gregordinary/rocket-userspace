@@ -58,11 +58,12 @@
 #include "rocket_npu.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "test_fill.h"
 #include "requant_model.h"
 
-#define PADB NPU_CBUF_BANK_SIZE
-#define OP_REG_DPU_RDMA_P (BLOCK_DPU_RDMA | PC_OP_01)
+#define PADB RK3588_CBUF_BANK_BYTES
+#define TARGET_DPU_RDMA_P (NPU_TARGET_DPU_RDMA | NPU_REG_WRITE)
 #define RDMA_BRDMA_CFG_P   0x501C
 
 static int rup(int a, int b) { return ((a + b - 1) / b) * b; }
@@ -105,14 +106,14 @@ static int reg_set(uint64_t *ops, unsigned n, unsigned blockop, unsigned reg, ui
     int k = 0;
     for (unsigned i = 0; i < n; i++)
         if ((unsigned)(ops[i] >> 48) == (blockop & 0xffffu) && (unsigned)(ops[i] & 0xffffu) == reg) {
-            ops[i] = NPUOP(blockop, v, reg);
+            ops[i] = REGCMD(blockop, reg, v);
             k++;
         }
     return k;
 }
 
 /* Mesa's direct weight packing (rkt_coefs.c): oc1, ic1, kh, kw, oc2, ic2 with the LAST
- * oc group holding only its real kernels. For a whole-group OC this is weight_conv_int8. */
+ * oc group holding only its real kernels. For a whole-group OC this is conv_weight_index_int8. */
 static size_t wt_index(int OCp, int ICp, int KH, int KW, int oc, int ic, int kh, int kw)
 {
     int g = oc / 32, ng = OCp - 32 * g < 32 ? OCp - 32 * g : 32;
@@ -165,7 +166,7 @@ static int run_once(int fd, const shape_t *s, const arm_t *a, const int8_t *x, c
     for (int ic = 0; ic < s->IC; ic++)
         for (int ih = 0; ih < s->IH; ih++)
             for (int iw = 0; iw < s->IW; iw++)
-                ((int8_t *)in_bo.ptr)[feature_data(ICp, IHj, s->IW, 16, ic + 1, ih + 1, iw + 1)] =
+                ((int8_t *)in_bo.ptr)[feature_index(ICp, IHj, s->IW, 16, ic + 1, ih + 1, iw + 1)] =
                     x[((size_t)ic * s->IH + ih) * s->IW + iw];
     rocket_bo_fini(fd, &in_bo);
     rocket_bo_prep(fd, &wt_bo, 1, 0);
@@ -187,47 +188,47 @@ static int run_once(int fd, const shape_t *s, const arm_t *a, const int8_t *x, c
             .ic = ICp, .ih = IHj, .iw = s->IW, .oc = OCp, .oh = OH, .ow = OW,
             .kh = s->KH, .kw = s->KW, .stride_y = s->sy, .stride_x = s->sx,
             .dil_y = 1, .dil_x = 1, .pad_top = s->pt, .pad_left = s->pl,
-            .input_dma = (uint32_t)in_bo.dma_address, .weights_dma = (uint32_t)wt_bo.dma_address,
-            .output_dma = (uint32_t)out_bo.dma_address, .tasks = regs,
+            .input_iova = (uint32_t)in_bo.dma_address, .weights_iova = (uint32_t)wt_bo.dma_address,
+            .output_iova = (uint32_t)out_bo.dma_address, .tasks = regs,
             .int8_out = 1,
             .in_scale = a->conv_scale, .w_scale = 1.0f, .out_scale = 1.0f,
             .input_zero_point = a->zx + 0x80, .output_zero_point = a->zo + 0x80,
             .weight_zero_point = a->zw + 0x80,
-            .bias_dma = (uint32_t)bs_bo.dma_address,
+            .bias_iova = (uint32_t)bs_bo.dma_address,
         };
         int g = gen_conv2d_int8(&p);
         if (g != 0) { fprintf(stderr, "  gen_conv2d_int8 failed (%d)\n", g); goto out; }
         unsigned n = p.task_count;
-        if (a->op_set) reg_set(regs, n, OP_REG_DPU, DPU_BS_OW_OP, a->op & 0xffffu);
+        if (a->op_set) reg_set(regs, n, TARGET_DPU, REG_DPU_BS_OW_OP, a->op & 0xffffu);
         if (a->perc) {
-            int kf = reg_find(regs, n, OP_REG_DPU, DPU_DATA_FORMAT);
+            int kf = reg_find(regs, n, TARGET_DPU, REG_DPU_DATA_FORMAT);
             uint32_t fmt = (reg_get(regs, kf) & ~(0x3fu << 4)) | ((a->s_neg & 0x3fu) << 4);
-            reg_set(regs, n, OP_REG_DPU, DPU_DATA_FORMAT, fmt);
-            reg_set(regs, n, OP_REG_DPU, DPU_BS_CFG, (2u << 16) | (1u << 8) | (1u << 6));
-            reg_set(regs, n, OP_REG_DPU, DPU_BS_MUL_CFG, ((a->s_mul & 0x3fu) << 8) | 1u);
-            reg_set(regs, n, OP_REG_DPU_RDMA_P, RDMA_BRDMA_CFG_P, 7u << 1);
+            reg_set(regs, n, TARGET_DPU, REG_DPU_DATA_FORMAT, fmt);
+            reg_set(regs, n, TARGET_DPU, REG_DPU_BS_CFG, (2u << 16) | (1u << 8) | (1u << 6));
+            reg_set(regs, n, TARGET_DPU, REG_DPU_BS_MUL_CFG, ((a->s_mul & 0x3fu) << 8) | 1u);
+            reg_set(regs, n, TARGET_DPU_RDMA_P, RDMA_BRDMA_CFG_P, 7u << 1);
         }
         {
-            int ko = reg_find(regs, n, OP_REG_DPU, DPU_BS_OW_CFG);
+            int ko = reg_find(regs, n, TARGET_DPU, REG_DPU_BS_OW_CFG);
             uint32_t v = reg_get(regs, ko);
             if (a->ow_src >= 0) v = (v & ~1u) | (uint32_t)(a->ow_src & 1);
             if (a->se >= 0) {
                 unsigned se = (unsigned)a->se & 7u;
                 v = (v & ~((7u << 8) | (7u << 5) | (7u << 2))) | (se << 8) | (se << 5) | (se << 2);
             }
-            reg_set(regs, n, OP_REG_DPU, DPU_BS_OW_CFG, v);
+            reg_set(regs, n, TARGET_DPU, REG_DPU_BS_OW_CFG, v);
             if (a->sm >= 0)
-                reg_set(regs, n, OP_REG_DPU, DPU_SURFACE_ADD,
+                reg_set(regs, n, TARGET_DPU, REG_DPU_SURFACE_ADD,
                         (((uint32_t)OH * OW * (uint32_t)a->sm) & 0xFFFFFFFu) << 4);
         }
         if (words) {
-            words[0] = reg_get(regs, reg_find(regs, n, OP_REG_CORE, CORE_MISC_CFG));
-            words[1] = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_DATA_FORMAT));
-            words[2] = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_BS_CFG));
-            words[3] = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_BS_OW_CFG));
-            words[4] = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_BS_OW_OP));
-            words[5] = reg_get(regs, reg_find(regs, n, OP_REG_DPU, DPU_SURFACE_ADD));
-            words[6] = reg_get(regs, reg_find(regs, n, OP_REG_CNA, CNA_PAD_CON1));
+            words[0] = reg_get(regs, reg_find(regs, n, TARGET_CORE, REG_CORE_MISC_CFG));
+            words[1] = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_DATA_FORMAT));
+            words[2] = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_BS_CFG));
+            words[3] = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_BS_OW_CFG));
+            words[4] = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_BS_OW_OP));
+            words[5] = reg_get(regs, reg_find(regs, n, TARGET_DPU, REG_DPU_SURFACE_ADD));
+            words[6] = reg_get(regs, reg_find(regs, n, TARGET_CNA, REG_CNA_PAD_CON1));
         }
         rocket_bo_prep(fd, &rc_bo, 1, 0);
         memcpy(rc_bo.ptr, regs, (size_t)n * sizeof(uint64_t));
@@ -247,7 +248,7 @@ static int run_once(int fd, const shape_t *s, const arm_t *a, const int8_t *x, c
         for (int oh = 0; oh < OH; oh++)
             for (int ow = 0; ow < OW; ow++)
                 got[((size_t)oc * OH + oh) * OW + ow] =
-                    ((const int8_t *)out_bo.ptr)[feature_data(OCc, OH, OW, 16, oc + 1, oh + 1, ow + 1)];
+                    ((const int8_t *)out_bo.ptr)[feature_index(OCc, OH, OW, 16, oc + 1, oh + 1, ow + 1)];
     rocket_bo_fini(fd, &out_bo);
     ret = 0;
 out:

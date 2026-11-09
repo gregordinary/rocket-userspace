@@ -209,7 +209,7 @@ static int run_fp16(int fd, unsigned ic, unsigned oc, unsigned ih, unsigned iw, 
     d.stride_y = 1; d.stride_x = 1; d.pad_top = pad; d.pad_left = pad;
     d.dil_y = 1; d.dil_x = 1;
     if (rocket_rk3576_cbuf_f_prec(iw, 16u, ih, (oc + 15u) & ~15u, k, k, 0,
-                                  precision_float16, &f) != 0)
+                                  PREC_FP16, &f) != 0)
         f = ~0u;
     printf("fp16 ic %u oc %u plane %ux%u k %u: 16-ch group slice %u B (%.1f KiB), planner F %d,"
            " %u tasks (one per 16 ic);", ic, oc, ih, iw, k, s16, s16 / 1024.0,

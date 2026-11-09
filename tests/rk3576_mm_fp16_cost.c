@@ -8,15 +8,15 @@
  * compares like with like. Five arms per shape:
  *
  *   fp16   rocket_matmul_fp16_rk3576(), the whole call: its buffers, the weight
- *          permutation, the coefficient buffer, the stamp, the submit, the fence, the copy.
+ *          permutation, the stamp, the submit, the fence, the copy.
  *   int8   rocket_matmul_int8_rk3576() at the same M, K and N, the whole call, per-tensor
  *          scale and no bias. Skipped where N%32 != 0, which that entry refuses.
  *   floor  the fp16 program's own device floor: the same register program with its
  *          buffers packed once, timed from the submit to the end of the fence wait. It is
  *          what a resident-weight fp16 entry could approach, and what the call pays above
  *          it is host work.
- *   f16r   rocket_matmul_fp16_rk3576_wbo(), the whole call, with the weight and the
- *          coefficient buffer in a handle created once per shape outside the timing.
+ *   f16r   rocket_matmul_fp16_rk3576_wbo(), the whole call, with the weight in a handle
+ *          created once per shape outside the timing.
  *   i8r    rocket_matmul_int8_rk3576_perc_wbo(), the entry the RK3576 LLM route calls,
  *          with its weight in a handle, one scale for every column and the column sums
  *          computed once, all outside the timing. Skipped where N%32 != 0.
@@ -110,8 +110,8 @@ static double pct(double *v, int n, double p)
  * share. */
 #define FLOOR_MAX_TASKS 128
 struct floor_job {
-    rocket_bo in, w, coef, out, rc;
-    uint32_t in_h[4], out_h[1];
+    rocket_bo in, w, out, rc;
+    uint32_t in_h[3], out_h[1];
     rocket_task_desc td[FLOOR_MAX_TASKS];
     unsigned ntask;
 };
@@ -128,7 +128,6 @@ static int floor_init(int fd, struct floor_job *j, unsigned m, unsigned k, unsig
     if (j->ntask > FLOOR_MAX_TASKS) return -1;
     if (rocket_bo_alloc32(fd, rocket_rk3576_mm_fp16_in_bytes(m, k), &j->in) ||
         rocket_bo_alloc32(fd, rocket_rk3576_mm_fp16_weight_bytes(k, n), &j->w) ||
-        rocket_bo_alloc32(fd, rocket_rk3576_mm_fp16_coef_bytes(n), &j->coef) ||
         rocket_bo_alloc32(fd, rocket_rk3576_mm_fp16_out_bytes(m, n), &j->out) ||
         rocket_bo_alloc32(fd, (size_t)j->ntask * RK3576_MM_FP16_OPS * 8, &j->rc))
         return -1;
@@ -139,18 +138,15 @@ static int floor_init(int fd, struct floor_job *j, unsigned m, unsigned k, unsig
     rocket_bo_prep(fd, &j->w, 1, 0);
     rocket_rk3576_mm_fp16_pack_weights(j->w.ptr, j->w.size, (const uint16_t *)B, k, n);
     rocket_bo_fini(fd, &j->w);
-    rocket_bo_prep(fd, &j->coef, 1, 0);
-    rocket_rk3576_mm_fp16_pack_coef(j->coef.ptr, j->coef.size, n);
-    rocket_bo_fini(fd, &j->coef);
     rocket_bo_prep(fd, &j->rc, 1, 0);
     for (t = 0; t < j->ntask; t++) {
         unsigned r0 = t * mt, rows = m - r0 < mt ? m - r0 : mt;
-        if (gen_matmul_fp16_rk3576((uint64_t *)j->rc.ptr + (size_t)t * RK3576_MM_FP16_OPS,
+        if (gen_gemm_fp16_rk3576((uint64_t *)j->rc.ptr + (size_t)t * RK3576_MM_FP16_OPS,
                                    rows, k, n,
                                    (uint32_t)(j->in.dma_address + (uint64_t)r0 * k * 2),
                                    (uint32_t)j->w.dma_address,
-                                   (uint32_t)(j->out.dma_address + (uint64_t)r0 * n * 4),
-                                   (uint32_t)j->coef.dma_address) != RK3576_MM_FP16_OPS) {
+                                   (uint32_t)(j->out.dma_address + (uint64_t)r0 * n * 4))
+                != RK3576_MM_FP16_OPS) {
             rocket_bo_fini(fd, &j->rc);
             return -1;
         }
@@ -159,8 +155,7 @@ static int floor_init(int fd, struct floor_job *j, unsigned m, unsigned k, unsig
         j->td[t].regcmd_count = RK3576_MM_FP16_OPS;
     }
     rocket_bo_fini(fd, &j->rc);
-    j->in_h[0] = j->in.handle; j->in_h[1] = j->w.handle;
-    j->in_h[2] = j->coef.handle; j->in_h[3] = j->rc.handle;
+    j->in_h[0] = j->in.handle; j->in_h[1] = j->w.handle; j->in_h[2] = j->rc.handle;
     j->out_h[0] = j->out.handle;
     return 0;
 }
@@ -169,8 +164,8 @@ static double floor_run(int fd, struct floor_job *j)
 {
     double t0 = now_ms();
     if (j->ntask == 1
-        ? rocket_submit_matmul(fd, &j->rc, RK3576_MM_FP16_OPS, j->in_h, 4, j->out_h, 1, 4000)
-        : rocket_submit_tasks(fd, j->td, j->ntask, j->in_h, 4, j->out_h, 1))
+        ? rocket_submit_matmul(fd, &j->rc, RK3576_MM_FP16_OPS, j->in_h, 3, j->out_h, 1, 4000)
+        : rocket_submit_tasks(fd, j->td, j->ntask, j->in_h, 3, j->out_h, 1))
         return -1;
     if (rocket_bo_prep(fd, &j->out, 0, 2000000000ull) < 0) return -1;
     t0 = now_ms() - t0;
@@ -180,8 +175,8 @@ static double floor_run(int fd, struct floor_job *j)
 
 static void floor_free(int fd, struct floor_job *j)
 {
-    rocket_bo *b[5] = { &j->rc, &j->out, &j->coef, &j->w, &j->in };
-    for (int i = 0; i < 5; i++) if (b[i]->ptr) rocket_bo_free(fd, b[i]);
+    rocket_bo *b[4] = { &j->rc, &j->out, &j->w, &j->in };
+    for (int i = 0; i < 4; i++) if (b[i]->ptr) rocket_bo_free(fd, b[i]);
 }
 
 static int run_shape(int fd, unsigned m, unsigned k, unsigned n, int rounds, int warm,

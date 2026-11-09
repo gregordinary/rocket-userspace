@@ -4,7 +4,7 @@
  * int16_native_probe.c — does an int16 x int16 matmul write a full int32 surface on the
  * RK3588?
  *
- * A probe, not a gate. The record says no: with `gen_matmul_int16`
+ * A probe, not a gate. The record says no: with `gen_gemm_int16`
  * the int32 writer emitted one 1x16 tile, row 0 and the first sixteen channels, and nothing
  * else, invariant to every field swept. Two things about that sweep decide what it could see:
  *
@@ -16,7 +16,7 @@
  *   - allbilly's evidence is weak in its own way: operands in [-16, 16), whose high byte is
  *     only a sign extension, and every shape square, which cannot tell M from N in a stride.
  *
- * So each arm here is one single-task job of `gen_matmul_int16`, scored against a CPU model,
+ * So each arm here is one single-task job of `gen_gemm_int16`, scored against a CPU model,
  * under one of two output geometries:
  *
  *   int8g  size_e 7, surf_add x8: the generator as it ships, the record's arm
@@ -139,14 +139,14 @@ static int run_arm(int fd, int g, int f, struct shape s, int rep, int *timed_out
 
     setenv("ROCKET_INT16_SIZE_E", geom_size_e[g], 1);
     setenv("ROCKET_INT16_SURF_MULT", geom_surf[g], 1);
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)N,
-        .input_dma = (uint32_t)in.dma_address,
-        .weights_dma = (uint32_t)w.dma_address,
-        .output_dma = (uint32_t)out.dma_address,
+        .input_iova = (uint32_t)in.dma_address,
+        .weights_iova = (uint32_t)w.dma_address,
+        .output_iova = (uint32_t)out.dma_address,
         .tasks = ops,
     };
-    int grc = gen_matmul_int16(&p);
+    int grc = gen_gemm_int16(&p);
     unsetenv("ROCKET_INT16_SIZE_E");
     unsetenv("ROCKET_INT16_SURF_MULT");
     if (grc != 0) {
@@ -169,10 +169,10 @@ static int run_arm(int fd, int g, int f, struct shape s, int rep, int *timed_out
         int16_t *id = in.ptr, *wd = w.ptr;
         for (int m = 1; m <= M; m++)
             for (int k = 1; k <= K; k++)
-                id[feature_data(K, M, 1, 8, k, m, 1)] = A[(size_t)(m - 1) * K + (k - 1)];
+                id[feature_index(K, M, 1, 8, k, m, 1)] = A[(size_t)(m - 1) * K + (k - 1)];
         for (int n = 1; n <= N; n++)
             for (int k = 1; k <= K; k++)
-                wd[weight_int16(K, n, k)] = B[(size_t)(n - 1) * K + (k - 1)];
+                wd[gemm_weight_index_int16(K, n, k)] = B[(size_t)(n - 1) * K + (k - 1)];
     }
     rocket_bo_fini(fd, &in);
     rocket_bo_fini(fd, &w);
@@ -199,7 +199,7 @@ static int run_arm(int fd, int g, int f, struct shape s, int rep, int *timed_out
             for (int n = 1; n <= N; n++) {
                 const int64_t want64 = C[(size_t)(m - 1) * N + (n - 1)];
                 const int32_t want = sat_i32(want64);
-                const int32_t got = o[feature_data(N, M, 1, 4, n, m, 1)];
+                const int32_t got = o[feature_index(N, M, 1, 4, n, m, 1)];
                 if ((uint32_t)got == 0xAAAAAAAAu && want != (int32_t)0xAAAAAAAAu) sc.unwritten++;
                 if (got == want) {
                     if ((int64_t)got == want64) sc.exact64++; else sc.saturated++;

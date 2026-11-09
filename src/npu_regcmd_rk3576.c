@@ -3,11 +3,11 @@
 /*
  * npu_regcmd_rk3576.c — RK3576 int8 CONV_2D register-command generator.
  *
- * A sibling of npu_regcmd.c's gen_conv2d_task/gen_conv2d_int8_fill pair, for the
- * RK3576's own CNA/CORE/DPU geometry-register encoding. Same descriptor structs,
- * same NPUOP word, same block targets, same PC trailer — different registers and
- * different packing, because the RK3576 re-packs the geometry registers at the
- * shared block bases.
+ * A sibling of npu_regcmd.c's convolution emitter, for the RK3576's own CNA/CORE/DPU
+ * geometry-register encoding. Same regcmd word, same block targets and PC registers (from
+ * the register map, npu_regmap.h), same PC trailer — different registers and different
+ * packing, because the RK3576 re-packs the geometry registers at the shared block bases.
+ * Its R76_* offsets are its own, and the map's RK3588 offsets do not apply to them.
  *
  * PROVENANCE. The encoding is transcribed from RKNN-Toolkit2 register programs
  * captured for known conv geometries on the RK3576 (the .rknn captures decoded in
@@ -35,7 +35,7 @@
  * program without it and the pipeline is configured and never fires.
  *
  * CHANNEL GRANULARITY. BOTH channel counts must be programmed as a multiple of 32 —
- * the group weight_conv_int8 pads its two channel axes to — and the caller's buffers
+ * the group conv_weight_index_int8 pads its two channel axes to — and the caller's buffers
  * must follow. rocket_rk3576_pad_ic() / rocket_rk3576_pad_oc() give the counts to
  * program. No capture shows this, because every captured geometry already satisfies
  * it. [HW sweep, H96 MAX M9]
@@ -57,7 +57,7 @@
  *
  * The vendor programs a partial ic group verbatim — its conv2d capture is ic=16 with
  * weight bytes ic*oc*kh*kw = the TIGHT size — so it packs a 16-channel weight group
- * where weight_conv_int8 pads to 32. Padding is how this cube expresses the same
+ * where conv_weight_index_int8 pads to 32. Padding is how this cube expresses the same
  * conv; a tighter partial-group weight packing would be the other way, at half the
  * weight bytes for such a layer.
  *
@@ -78,8 +78,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "npu_hw.h"
-#include "npu_cna.h"
+#include "npu_regmap.h"   /* the PC registers, the block targets, the enable words */
 #include "npu_dpu.h"
 #include "npu_matmul.h"
 #include "npu_regcmd_rk3576.h"
@@ -89,7 +88,7 @@
 
 #include <math.h>
 
-#define OP_REG_DPU_RDMA (BLOCK_DPU_RDMA | PC_OP_01)   /* 0x2001 */
+#define TARGET_DPU_RDMA (DPU_RDMA + 0x1)   /* the register map's target and the write bit, 0x2001 */
 
 /* ============================================================================
  * SECTION — RK3576 register offsets
@@ -377,9 +376,9 @@ static inline unsigned r76_proc_precision(unsigned prec)
 static inline unsigned r76_elem_bytes(unsigned prec)
 {
     switch (prec) {
-        case precision_float16:
-        case precision_bfloat16:
-        case precision_int16:   return 2;
+        case PREC_FP16:
+        case PREC_BF16:
+        case PREC_INT16:   return 2;
         default:                return 1;   /* int8, int4 (packed by the caller) */
     }
 }
@@ -388,7 +387,7 @@ static inline unsigned r76_elem_bytes(unsigned prec)
  * coefficient C unit and the DPU narrowing, none of which the integer path shares. */
 static inline int r76_is_float(unsigned prec)
 {
-    return prec == precision_float16 || prec == precision_bfloat16;
+    return prec == PREC_FP16 || prec == PREC_BF16;
 }
 
 /* The FLOAT weight cube's channel groups, and the float feature cube's lane count.
@@ -1207,7 +1206,7 @@ int rocket_rk3576_cbuf_f(unsigned iw, unsigned ic, unsigned ih, unsigned oc,
                          unsigned kh, unsigned kw, int dw, unsigned *f_out)
 {
     return rocket_rk3576_cbuf_f_prec(iw, ic, ih, oc, kh, kw, dw,
-                                     precision_int8, f_out);
+                                     PREC_INT8, f_out);
 }
 
 unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
@@ -1293,7 +1292,7 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
         if (R76_CBUF_BASE_GRANULES + cand + wgran > R76_CBUF_POOL_GRANULES) break;
         if (!r76_rung_live(cand, wres, dw)) continue;
         if (!dw && wbytes > r76_weight_slice_cap_at(oc, cand)) continue;
-        if (cand && !dw && ic > R76_ARGB_LANES && prec == precision_int8 &&
+        if (cand && !dw && ic > R76_ARGB_LANES && prec == PREC_INT8 &&
             rocket_rk3576_weight_phase_groups(wbytes, cand) < (oc + 31u) / 32u)
             continue;
         f = cand;
@@ -1305,7 +1304,7 @@ unsigned rocket_rk3576_max_task_rows_prec(unsigned iw, unsigned ic, unsigned oc,
 unsigned rocket_rk3576_max_task_rows(unsigned iw, unsigned ic, unsigned oc,
                                      unsigned kh, unsigned kw, int dw)
 {
-    return rocket_rk3576_max_task_rows_prec(iw, ic, oc, kh, kw, dw, precision_int8);
+    return rocket_rk3576_max_task_rows_prec(iw, ic, oc, kh, kw, dw, PREC_INT8);
 }
 
 /* A GROUP'S WEIGHT SLICE IS STAGED AT ITS 64 KiB PHASE, AND ONE THAT OVERRUNS THE WEIGHT
@@ -1594,14 +1593,14 @@ int rocket_rk3576_plan_rows(const conv_params_t *p, int dw,
                             rocket_rk3576_row_task *out, unsigned max_tasks,
                             unsigned *count)
 {
-    return r76_plan_rows(p, dw, precision_int8, 0u, out, max_tasks, count);
+    return r76_plan_rows(p, dw, PREC_INT8, 0u, out, max_tasks, count);
 }
 
 int rocket_rk3576_plan_rows_cap(const conv_params_t *p, int dw, unsigned row_cap,
                                 rocket_rk3576_row_task *out, unsigned max_tasks,
                                 unsigned *count)
 {
-    return r76_plan_rows(p, dw, precision_int8, row_cap, out, max_tasks, count);
+    return r76_plan_rows(p, dw, PREC_INT8, row_cap, out, max_tasks, count);
 }
 
 /* ============================================================================
@@ -1616,6 +1615,43 @@ int rocket_rk3576_plan_rows_cap(const conv_params_t *p, int dw, unsigned row_cap
  * except for the S_POINTER writes, which select the register group and must come
  * before their block's registers.
  */
+/* What the fill below passes the emitter, by block. Each member is a quantity of the task,
+ * not a register image: the emitter packs the RK3576's own register layout from them. The
+ * widths are the ones the emission was validated with, so a value past one wraps the same
+ * way. */
+struct r76_cna {
+    uint8_t  conv_mode, in_precision, proc_precision;
+    uint8_t  conv_x_stride, conv_y_stride;
+    uint16_t datain_width, datain_height, datain_channel;
+    uint16_t dataout_width, dataout_height;
+    uint8_t  weight_width, weight_height;
+    uint16_t weight_kernels;
+    uint8_t  data_sign, cvt_type, cvt_bypass;
+    uint16_t cvt_scale0, cvt_scale1, cvt_scale2, cvt_scale3;
+    uint16_t data_offset;
+    uint8_t  pad_left, pad_top;
+    uint32_t pad_con1;                 /* the value a border reads */
+    uint32_t feature_base_addr, decompress_addr0;
+    uint8_t  weight_burst_len, data_burst_len;
+    uint32_t line_stride;
+};
+
+struct r76_core {
+    uint8_t  proc_precision, dw_en;
+    uint16_t dataout_width, dataout_height, dataout_channel;   /* each minus one */
+};
+
+struct r76_dpu {
+    uint8_t  conv_mode, in_precision, proc_precision, out_precision;
+    uint32_t dst_base_addr, dst_surf_stride;
+    uint8_t  fp32tofp16_en;
+    uint32_t out_cvt_offset;
+    uint16_t out_cvt_scale;
+    uint8_t  out_cvt_shift, out_cvt_round;
+    uint8_t  bias_en;
+    uint32_t bias_base_addr;
+};
+
 /* CBUF row reuse, as the vendor's continuation tasks program it. All zero — which is
  * what the plain entry points pass — is "refetch the whole window at base 0", the
  * form validated on hardware. See gen_conv2d_int8_rk3576_reuse() in the header. */
@@ -1625,8 +1661,8 @@ struct r76_reuse {
     unsigned resident;       /* CBUF granules the sequence has filled so far   */
 };
 
-static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
-                                  const npu_core_desc *core, const npu_dpu_desc *dpu,
+static int gen_conv2d_task_rk3576(uint64_t *ops, const struct r76_cna *cna,
+                                  const struct r76_core *core, const struct r76_dpu *dpu,
                                   int dw, int argb, unsigned ih_full, unsigned oh_full,
                                   unsigned pad_right, unsigned pad_bottom,
                                   unsigned cbuf_f, const struct r76_reuse *reuse,
@@ -1748,115 +1784,95 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     }
 #define R76_ZERO(reg) r76_zero_value(reg, zval)
 
-    /* The vendor's RK3576-only state init, replayed from the regcmd. Its kernel
-     * carries a per-SoC `state_init` hook that the RK3588 does not have and that
-     * mainline `rocket` therefore has no analog of: it seeds CNA 0x1024 with bit 31
-     * in BOTH ping-pong register groups and then clears the pointer
-     * (S_POINTER = POINTER_PP_CLEAR | POINTER_PP_MODE | EXECUTER_PP_EN |
-     * POINTER_PP_EN). The kernel does it with the PC in slave mode after each
-     * power-on; the PC-slave-mode write cannot be replayed from inside a regcmd the
-     * PC is fetching, but the CNA writes can. Gated on the knob because it is a
-     * cold-start-wall experiment, not part of the transcribed program. */
-    if (getenv("ROCKET_RK3576_STATE_INIT")) {
-        ops[i++] = NPUOP(OP_REG_CNA, 0x0,        R76_CNA_S_POINTER);
-        ops[i++] = NPUOP(OP_REG_CNA, 0x80000000, R76_CNA_KERNEL_OC);
-        ops[i++] = NPUOP(OP_REG_CNA, 0x1,        R76_CNA_S_POINTER);
-        ops[i++] = NPUOP(OP_REG_CNA, 0x80000000, R76_CNA_KERNEL_OC);
-        ops[i++] = NPUOP(OP_REG_CNA, 0x1E,       R76_CNA_S_POINTER);
-    }
-
     /* Interleaved S_POINTER preamble, verbatim from the vendor stream. The early
      * 0x1038 write is the vendor's; it is rewritten in place inside the CNA block.
      *
      * A LUT-consuming task carries 0x30 in all four instead of 0xE — the one thing
      * outside the DPU's own LUT bank that separates a vendor activation from its
      * bare-conv control, and it is in every one of them. */
-    ops[i++] = NPUOP(OP_REG_CNA,      lut ? 0x30u : 0xEu,  R76_CNA_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_CORE,     lut ? 0x30u : 0xEu,  R76_CORE_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_CNA,      0x07, R76_CNA_WEIGHT_SIZE2);
-    ops[i++] = NPUOP(OP_REG_DPU,      lut ? 0x30u : 0xEu,  R76_DPU_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, lut ? 0x30u : 0xEu,  R76_RDMA_S_POINTER);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_S_POINTER, lut ? 0x30u : 0xEu);
+    ops[i++] = REGCMD(TARGET_CORE, R76_CORE_S_POINTER, lut ? 0x30u : 0xEu);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_WEIGHT_SIZE2, 0x07);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_S_POINTER, lut ? 0x30u : 0xEu);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_S_POINTER, lut ? 0x30u : 0xEu);
 
     /* ---- CNA ----
      * Precision joins conv_mode in this word at the RK3588's CNA_CONV_CON1 offsets;
      * both fields are zero at int8, so the int8 program is byte-unchanged. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     (is_float ? R76_CNA_CON1_FLOAT_EN : 0u) |
-                     ((uint32_t)(cna->proc_precision & 0x7) << 7) |
-                     ((uint32_t)(cna->in_precision   & 0x7) << 4) |
-                     (argb ? (R76_CNA_CON1_GROUP_LINE_OFF |
-                              ((8u | ((ic - 1u) & 0x7u)) << R76_CNA_CON1_ARGB_IN_SHIFT) |
-                              (is_float ? R76_ARGB_CONV_MODE_FLOAT
-                                        : R76_ARGB_CONV_MODE))
-                           : (dw ? 1u : 0u)), R76_CNA_CONV_MODE);
-    ops[i++] = NPUOP(OP_REG_CNA, 0xFFFu, R76_CNA_CONV_CON2);
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     ((uint32_t)(cna->conv_y_stride & 0x7) << 3) |
-                      (uint32_t)(cna->conv_x_stride & 0x7), R76_CNA_STRIDE);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CONV_MODE,
+                      (is_float ? R76_CNA_CON1_FLOAT_EN : 0u) |
+                      ((uint32_t)(cna->proc_precision & 0x7) << 7) |
+                      ((uint32_t)(cna->in_precision   & 0x7) << 4) |
+                      (argb ? (R76_CNA_CON1_GROUP_LINE_OFF |
+                               ((8u | ((ic - 1u) & 0x7u)) << R76_CNA_CON1_ARGB_IN_SHIFT) |
+                               (is_float ? R76_ARGB_CONV_MODE_FLOAT
+                                         : R76_ARGB_CONV_MODE))
+                            : (dw ? 1u : 0u)));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CONV_CON2, 0xFFFu);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_STRIDE,
+                      ((uint32_t)(cna->conv_y_stride & 0x7) << 3) |
+                       (uint32_t)(cna->conv_x_stride & 0x7));
     /* Bit 31 marks a task that RETAINS rows from the previous one; the low bits are
      * the vendor allocator's, and a hardware sweep found only bit 30 live on the
      * direct int8 path. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     r76_cna_format(windowed) |
-                     (reuse->retained_rows ? 0x80000000u : 0u), R76_CNA_FORMAT);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_FORMAT,
+                      r76_cna_format(windowed) |
+                      (reuse->retained_rows ? 0x80000000u : 0u));
     /* Total weight bytes. The element size scales it — the depthwise form already
      * carries a 2 that is NOT the element size: a depthwise weight occupies a 16-bit
      * slot whatever its precision, which is why the float and int8 cubes for one
      * geometry are the same size. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     argb ? (oc * welems)
-                          : (dw ? (r76_dw_cw(oc) * kh * kw * 2u)
-                                : (ic * oc * kh * kw) * elem),
-                     R76_CNA_WEIGHT_BYTES);
-    ops[i++] = NPUOP(OP_REG_CNA, welems, R76_CNA_WEIGHT_ELEMS);
-    ops[i++] = NPUOP(OP_REG_CNA, (kword << 16) | (dw ? 1u : (oc - 1u)), R76_CNA_KERNEL_OC);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_WEIGHT_BYTES,
+                      argb ? (oc * welems)
+                           : (dw ? (r76_dw_cw(oc) * kh * kw * 2u)
+                                 : (ic * oc * kh * kw) * elem));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_WEIGHT_ELEMS, welems);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_KERNEL_OC, (kword << 16) | (dw ? 1u : (oc - 1u)));
     /* The CBUF granules this task FILLS — its fetched rows, not its window. The two
      * differ only when the previous task left the leading rows resident. */
-    ops[i++] = NPUOP(OP_REG_CNA, ((entries * fetch_rows) << 16) | (ic_prog - 1u),
-                     R76_CNA_SURF_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_CNA, ((iw - 1u) << 16) | (ih - 1u), R76_CNA_DATAIN_SIZE);
-    ops[i++] = NPUOP(OP_REG_CNA, (wbpk << 16) | (ow - 1u), R76_CNA_WBPK_OW);
-    ops[i++] = NPUOP(OP_REG_CNA, ow * oh - 1u, R76_CNA_DATAOUT_ATOMS);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_SURF_CHANNEL,
+                      ((entries * fetch_rows) << 16) | (ic_prog - 1u));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DATAIN_SIZE, ((iw - 1u) << 16) | (ih - 1u));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_WBPK_OW, (wbpk << 16) | (ow - 1u));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DATAOUT_ATOMS, ow * oh - 1u);
     /* 0x07 in every single-task capture; the sliced ARGB program varies its low bits.
      * Only bit 31 is live on the direct int8 path — 0x07, 0x010e and 0x10 are all
      * bit-exact, and setting bit 31 (0x80000010) corrupts the surface.
      * [HW sweep, H96 MAX M9] */
-    ops[i++] = NPUOP(OP_REG_CNA, 0x07u | (reuse->continuation ? 0x80000000u : 0u),
-                     R76_CNA_WEIGHT_SIZE2);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_WEIGHT_SIZE2,
+                      0x07u | (reuse->continuation ? 0x80000000u : 0u));
     /* Granules per feature row, and — in the low half — the CBUF granule where this
      * task's WINDOW begins, which is where its retained rows already sit. */
-    ops[i++] = NPUOP(OP_REG_CNA, (entries << 16) | (cbuf_window_base & 0xFFFFu),
-                     R76_CNA_CBUF_ENTRIES);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CBUF_ENTRIES,
+                      (entries << 16) | (cbuf_window_base & 0xFFFFu));
     /* The granule allowance, not a constant — see the CBUF planning section. The
      * captures' two values are F=0 and F=1024, so a planned F reproduces them. The
      * low half is where FETCHING resumes: the window base plus the retained rows. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     R76_CBUF_CON0_BASE |
-                     ((cbuf_f & R76_CBUF_F_MASK) << R76_CBUF_F_SHIFT) |
-                     (cbuf_fetch_base & 0xFFFFu),
-                     R76_CNA_CBUF_CON0);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CBUF_CON0,
+                      R76_CBUF_CON0_BASE |
+                      ((cbuf_f & R76_CBUF_F_MASK) << R76_CBUF_F_SHIFT) |
+                      (cbuf_fetch_base & 0xFFFFu));
     /* The low half is the entry count on the direct path and on the int8 first conv.
      * On the FLOAT first conv it is iw instead, measured at three widths — which is
      * also `entries * 8` and `iw*LANES*elem/8`, three readings that coincide at every
      * value the path can take, so the number is settled and the mechanism is not. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     (iw << 16) | ((argb && is_float) ? iw : entries_ddr),
-                     R76_CNA_IW_ENTRIES);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_IW_ENTRIES,
+                      (iw << 16) | ((argb && is_float) ? iw : entries_ddr));
     /* Same field packing as RK3588 CNA_CVT_CON0, at a different offset: four 6-bit
      * truncate fields above the four mode bits. Every non-ARGB capture bypasses the
      * converter and leaves all four truncates at zero; the ARGB one runs it, which is
      * where the field layout is confirmed rather than assumed. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     (argb ? r76_argb_cvt_con0(ic) : 0u) |
-                     ((uint32_t)(cna->data_sign & 0x1) << 3) |
-                     ((uint32_t)(cna->cvt_type  & 0x1) << 1) |
-                      (uint32_t)(cna->cvt_bypass & 0x1), R76_CNA_CVT_CON0);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CVT_CON0,
+                      (argb ? r76_argb_cvt_con0(ic) : 0u) |
+                      ((uint32_t)(cna->data_sign & 0x1) << 3) |
+                      ((uint32_t)(cna->cvt_type  & 0x1) << 1) |
+                       (uint32_t)(cna->cvt_bypass & 0x1));
     /* The RK3576 packs two CVT scales per register where the RK3588 pairs each scale
      * with its offset; the offsets get three registers of their own below. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     ((uint32_t)cna->cvt_scale1 << 16) | cna->cvt_scale0, R76_CNA_CVT_SCALE01);
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     ((uint32_t)cna->cvt_scale3 << 16) | cna->cvt_scale2, R76_CNA_CVT_SCALE23);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CVT_SCALE01,
+                      ((uint32_t)cna->cvt_scale1 << 16) | cna->cvt_scale0);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CVT_SCALE23,
+                      ((uint32_t)cna->cvt_scale3 << 16) | cna->cvt_scale2);
     /* CVT_OFFSET0..2, one register per image channel, sign-extended. Zero on every
      * bypassed path; on the ARGB one they carry the negated zero point the captures
      * do, and are INERT there: the CNA reads each packed byte as a signed int8 with
@@ -1866,40 +1882,37 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * address-shotgun list below rather than being claimed. */
     {
         int32_t off = (int32_t)(int16_t)cna->data_offset;
-        ops[i++] = NPUOP(OP_REG_CNA, (uint32_t)(ic > 0u ? off : 0), R76_CNA_CVT_OFFSET0);
-        ops[i++] = NPUOP(OP_REG_CNA, (uint32_t)(ic > 1u ? off : 0), R76_CNA_CVT_OFFSET1);
-        ops[i++] = NPUOP(OP_REG_CNA, (uint32_t)(ic > 2u ? off : 0), R76_CNA_CVT_OFFSET2);
+        ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CVT_OFFSET0, (uint32_t)(ic > 0u ? off : 0));
+        ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CVT_OFFSET1, (uint32_t)(ic > 1u ? off : 0));
+        ops[i++] = REGCMD(TARGET_CNA, R76_CNA_CVT_OFFSET2, (uint32_t)(ic > 2u ? off : 0));
     }
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_ZERO_1060), R76_CNA_ZERO_1060);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_ZERO_1064), R76_CNA_ZERO_1064);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_ZERO_1068), R76_CNA_ZERO_1068);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_ZERO_106C), R76_CNA_ZERO_106C);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_ZERO_1070), R76_CNA_ZERO_1070);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_ZERO_1074), R76_CNA_ZERO_1074);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_ZERO_1060, R76_ZERO(R76_CNA_ZERO_1060));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_ZERO_1064, R76_ZERO(R76_CNA_ZERO_1064));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_ZERO_1068, R76_ZERO(R76_CNA_ZERO_1068));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_ZERO_106C, R76_ZERO(R76_CNA_ZERO_106C));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_ZERO_1070, R76_ZERO(R76_CNA_ZERO_1070));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_ZERO_1074, R76_ZERO(R76_CNA_ZERO_1074));
     /* The feature DMA's own view of the fetch. On the normal path it repeats the
      * cube's width and height; on the ARGB path the width becomes the PACKED row's
      * granule count, because the DMA is walking interleaved image bytes and not a
      * channel-group plane. The row count is the BUDGET (see dma_rows above), which is
      * the fetched rows themselves everywhere but a pitched feature buffer. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     ((argb ? line_stride - 1u : iw - 1u) << 16) | (dma_rows - 1u),
-                     R76_CNA_DMA_SIZE);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DMA_SIZE,
+                      ((argb ? line_stride - 1u : iw - 1u) << 16) | (dma_rows - 1u));
     /* The DMA's channel count is the IMAGE's on the ARGB path — 3 for RGB — while
      * 0x1028 above carries the folded count the MAC sees. The two disagreeing is the
      * clearest signature of this sub-encoding in a capture. */
-    ops[i++] = NPUOP(OP_REG_CNA, ic - 1u, R76_CNA_DMA_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     ((pad_right  & 0xFFu) << 24) | ((pad_bottom & 0xFFu) << 16) |
-                     (((uint32_t)cna->pad_left & 0xFFu) << 8) | ((uint32_t)cna->pad_top & 0xFFu),
-                     R76_CNA_PAD_CON0);
-    ops[i++] = NPUOP(OP_REG_CNA, cna->pad_con1, R76_CNA_PAD_CON1);
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     faddr_reg == R76_CNA_FEATURE_ADDR ? cna->feature_base_addr : 0u,
-                     R76_CNA_FEATURE_ADDR);
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     ((uint32_t)(cna->weight_burst_len & 0xF) << 16) |
-                      (uint32_t)(cna->data_burst_len & 0xF), R76_CNA_DMA_CON0);
-    ops[i++] = NPUOP(OP_REG_CNA, line_stride, R76_CNA_LINE_STRIDE);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DMA_CHANNEL, ic - 1u);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_PAD_CON0,
+                      ((pad_right  & 0xFFu) << 24) | ((pad_bottom & 0xFFu) << 16) |
+                      (((uint32_t)cna->pad_left & 0xFFu) << 8) | ((uint32_t)cna->pad_top & 0xFFu));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_PAD_CON1, cna->pad_con1);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_FEATURE_ADDR,
+                      faddr_reg == R76_CNA_FEATURE_ADDR ? cna->feature_base_addr : 0u);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DMA_CON0,
+                      ((uint32_t)(cna->weight_burst_len & 0xF) << 16) |
+                       (uint32_t)(cna->data_burst_len & 0xF));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_LINE_STRIDE, line_stride);
     /* The two surface strides. On the normal path they are the DDR channel-group jump
      * over the FULL plane and over this task's window, in 16-byte atoms. The ARGB
      * image has ONE surface — there is no second channel group to jump to — so both
@@ -1909,22 +1922,19 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * The DDR one is a caller-supplied quantity when the feature cube is somebody
      * else's surface with a padded stride; `in_surf_elems` is zero everywhere else and
      * the derived plane stands. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     argb ? line_stride * ih
-                          : (in_surf_elems ? in_surf_elems : iw * ih_full),
-                     R76_CNA_SURF_FULL);
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     argb ? line_stride * fetch_rows
-                          : ((iw * fetch_rows + 3u) & ~3u),
-                     R76_CNA_SURF_TASK);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_ZERO_109C), R76_CNA_ZERO_109C);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_DCOMP_CTRL), R76_CNA_DCOMP_CTRL);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_DCOMP_REGNUM), R76_CNA_DCOMP_REGNUM);
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     (waddr_reg == R76_CNA_DCOMP_ADDR0 || shotgun) ? cna->decompress_addr0 : 0u,
-                     R76_CNA_DCOMP_ADDR0);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_DCOMP_AMOUNT), R76_CNA_DCOMP_AMOUNT);
-    ops[i++] = NPUOP(OP_REG_CNA, R76_ZERO(R76_CNA_DCOMP_AMOUNT1), R76_CNA_DCOMP_AMOUNT1);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_SURF_FULL,
+                      argb ? line_stride * ih
+                           : (in_surf_elems ? in_surf_elems : iw * ih_full));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_SURF_TASK,
+                      argb ? line_stride * fetch_rows
+                           : ((iw * fetch_rows + 3u) & ~3u));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_ZERO_109C, R76_ZERO(R76_CNA_ZERO_109C));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DCOMP_CTRL, R76_ZERO(R76_CNA_DCOMP_CTRL));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DCOMP_REGNUM, R76_ZERO(R76_CNA_DCOMP_REGNUM));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DCOMP_ADDR0,
+                      (waddr_reg == R76_CNA_DCOMP_ADDR0 || shotgun) ? cna->decompress_addr0 : 0u);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DCOMP_AMOUNT, R76_ZERO(R76_CNA_DCOMP_AMOUNT));
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DCOMP_AMOUNT1, R76_ZERO(R76_CNA_DCOMP_AMOUNT1));
     /* The full plane's extent — and on the ARGB path, NOT that at all. There it is
      * the CBUF row's granule count and that count minus one, which is why a
      * normal-path decode of an ARGB capture reads a nonsense full-plane height. The
@@ -1935,11 +1945,10 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * told apart; rectangular ones separate them, and 142 non-ARGB programs carry
      * iw-1 twice with no exception. The ARGB path's own two halves are granule
      * counts. */
-    ops[i++] = NPUOP(OP_REG_CNA,
-                     argb ? (is_float ? (((entries - 1u) << 16) | (entries - 1u))
-                                      : (((entries - 1u) << 16) | (entries - 2u)))
-                          : (((iw - 1u) << 16) | (iw - 1u)),
-                     R76_CNA_DATAIN_FULL);
+    ops[i++] = REGCMD(TARGET_CNA, R76_CNA_DATAIN_FULL,
+                      argb ? (is_float ? (((entries - 1u) << 16) | (entries - 1u))
+                                       : (((entries - 1u) << 16) | (entries - 2u)))
+                           : (((iw - 1u) << 16) | (iw - 1u)));
 
     /* ---- CORE ----
      * The mode word carries the processing precision at the RK3588's CORE_MISC_CFG
@@ -1949,19 +1958,18 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
     /* Bit 0 is an INT8 marker, not part of the mode: every float capture clears it on
      * both the direct and the first-conv path, where every integer one sets it.
      * [source-confirmed, RKNN-Toolkit2 rk3576 float build] */
-    ops[i++] = NPUOP(OP_REG_CORE,
-                     ((argb ? R76_CORE_MISC_ARGB
-                            : (dw ? R76_CORE_MISC_DW : R76_CORE_MISC_DIRECT))
-                      & (is_float ? ~1u : ~0u)) |
-                     ((uint32_t)(core->proc_precision & 0x7) << 8),
-                     R76_CORE_MISC_CFG);
-    ops[i++] = NPUOP(OP_REG_CORE, ((oh - 1u) << 16) | (ow - 1u), R76_CORE_DATAOUT_SIZE0);
-    ops[i++] = NPUOP(OP_REG_CORE, oc - 1u, R76_CORE_DATAOUT_SIZE1);
-    ops[i++] = NPUOP(OP_REG_CORE, 0x0, R76_CORE_CLIP_TRUNCATE);
+    ops[i++] = REGCMD(TARGET_CORE, R76_CORE_MISC_CFG,
+                      ((argb ? R76_CORE_MISC_ARGB
+                             : (dw ? R76_CORE_MISC_DW : R76_CORE_MISC_DIRECT))
+                       & (is_float ? ~1u : ~0u)) |
+                      ((uint32_t)(core->proc_precision & 0x7) << 8));
+    ops[i++] = REGCMD(TARGET_CORE, R76_CORE_DATAOUT_SIZE0, ((oh - 1u) << 16) | (ow - 1u));
+    ops[i++] = REGCMD(TARGET_CORE, R76_CORE_DATAOUT_SIZE1, oc - 1u);
+    ops[i++] = REGCMD(TARGET_CORE, R76_CORE_CLIP_TRUNCATE, 0x0);
 
     /* ---- DPU ---- */
-    ops[i++] = NPUOP(OP_REG_DPU, dw ? R76_DPU_FMODE_DW : R76_DPU_FMODE_DIRECT,
-                     R76_DPU_FEATURE_MODE);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_FEATURE_MODE,
+                      dw ? R76_DPU_FMODE_DW : R76_DPU_FMODE_DIRECT);
     /* Zero in every capture, which is all-int8 under the RK3588's DPU_DATA_FORMAT
      * packing — so the int8 program is byte-unchanged and the three fields are
      * placed where that packing puts them. */
@@ -1969,12 +1977,12 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * the float path — only the output width and the processing precision move there.
      * Ours used to carry fp16 in all three; that computes, so the field is inert at
      * these shapes, but the capture is what this emitter reproduces. */
-    ops[i++] = NPUOP(OP_REG_DPU,
-                     ((uint32_t)(dpu->out_precision  & 0x7) << 29) |
-                     (is_float ? 0u : ((uint32_t)(dpu->in_precision & 0x7) << 26)) |
-                      (uint32_t)(dpu->proc_precision & 0x7), R76_DPU_DATA_FORMAT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OFFSET_PEND);
-    ops[i++] = NPUOP(OP_REG_DPU, dpu->dst_base_addr, R76_DPU_DST_BASE_ADDR);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DATA_FORMAT,
+                      ((uint32_t)(dpu->out_precision  & 0x7) << 29) |
+                      (is_float ? 0u : ((uint32_t)(dpu->in_precision & 0x7) << 26)) |
+                       (uint32_t)(dpu->proc_precision & 0x7));
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OFFSET_PEND, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DST_BASE_ADDR, dpu->dst_base_addr);
     /* The destination surface, in output elements. On the DEPTHWISE path it is
      * ROUNDED UP TO FOUR: the rounding is invisible at every power-of-two plane, and
      * the vendor programs 272, 324 and 364 for ow*oh_full of 270, 323 and 361.
@@ -1985,62 +1993,58 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * ow*oh_full = 105 is bit-exact with 105 here and wrong with 108. Both paths feed
      * the same value into the surface add below, so a wrong one there mis-places
      * every output channel group past the first. */
-    ops[i++] = NPUOP(OP_REG_DPU, dw ? ((ow * oh_full + 3u) & ~3u) : (ow * oh_full),
-                     R76_DPU_DST_SURF);
-    ops[i++] = NPUOP(OP_REG_DPU, ow - 1u, R76_DPU_CUBE_WIDTH);
-    ops[i++] = NPUOP(OP_REG_DPU, oh - 1u, R76_DPU_CUBE_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_NOTCH);
-    ops[i++] = NPUOP(OP_REG_DPU, oc - 1u, R76_DPU_CUBE_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_DPU, ((oc - 1u) << 16) |
-                     (dw ? R76_DPU_WDMA0_DW : R76_DPU_WDMA0_DIRECT), R76_DPU_WDMA_SIZE0);
-    ops[i++] = NPUOP(OP_REG_DPU, ((oh - 1u) << 16) | (ow - 1u), R76_DPU_WDMA_SIZE1);
-    ops[i++] = NPUOP(OP_REG_DPU,
-                     is_float ? R76_DPU_NOTCH_FLOAT
-                              : (dw ? R76_DPU_NOTCH_DW : R76_DPU_NOTCH_DIRECT),
-                     R76_DPU_NOTCH_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_403C);
-    ops[i++] = NPUOP(OP_REG_DPU, dw ? 0x0u : 0x1u, R76_DPU_BS_ALU_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BS_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BS_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU,
-                     is_float ? R76_DPU_BS_CFG_FLOAT
-                              : (dw ? r76_dw_bs_cfg(oc) : R76_DPU_BS_CFG_DIRECT),
-                     R76_DPU_BS_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BN_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BN_MAX);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DST_SURF,
+                      dw ? ((ow * oh_full + 3u) & ~3u) : (ow * oh_full));
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_WIDTH, ow - 1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_HEIGHT, oh - 1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_NOTCH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_CHANNEL, oc - 1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_WDMA_SIZE0,
+                      ((oc - 1u) << 16) |
+          (dw ? R76_DPU_WDMA0_DW : R76_DPU_WDMA0_DIRECT));
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_WDMA_SIZE1, ((oh - 1u) << 16) | (ow - 1u));
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_NOTCH_CFG,
+                      is_float ? R76_DPU_NOTCH_FLOAT
+                               : (dw ? R76_DPU_NOTCH_DW : R76_DPU_NOTCH_DIRECT));
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_403C, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_ALU_CFG, dw ? 0x0u : 0x1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_CFG,
+                      is_float ? R76_DPU_BS_CFG_FLOAT
+                               : (dw ? r76_dw_bs_cfg(oc) : R76_DPU_BS_CFG_DIRECT));
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_MAX, 0x7FFFFFFFu);
     /* BN STAYS BYPASSED even with the LUT on. Every vendor activation carries 0x20
      * here — the stage active — and copying that pins the LUT at the table join for
      * every input, because BN then multiplies by an operand register no vendor program
      * writes and this register file is not cleared between jobs. The readout still
      * tracks the table, so it reads as a working LUT with no input map anywhere. */
-    ops[i++] = NPUOP(OP_REG_DPU, 0x903u, R76_DPU_BN_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN2);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX2);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_CFG, 0x903u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MIN2, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MAX2, 0x7FFFFFFFu);
     /* The LUT is the EW stage: EW_LUT_BYPASS is bit 7 here — the RK3588's field layout
      * at a moved offset — and clearing it, with bit 0 (the stage's own bypass), is what
      * turns the table on. */
-    ops[i++] = NPUOP(OP_REG_DPU, lut ? R76_DPU_EW_CFG_LUT : 0x010041C1u,
-                     R76_DPU_EW_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_CVT_OFFSET);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x1u, R76_DPU_EW_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_CLAMP_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_CLAMP_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE0);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE1);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_409C);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_OUT_CLAMP_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_OUT_CLAMP_MAX);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CFG, lut ? R76_DPU_EW_CFG_LUT : 0x010041C1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CVT_OFFSET, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CVT_SCALE, 0x1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CLAMP_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CLAMP_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_OP_VALUE0, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_OP_VALUE1, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_409C, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CLAMP_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CLAMP_MAX, 0x7FFFFFFFu);
     /* OUT_CVT triple: offset / scale / shift in three consecutive registers, the
      * same requant the RK3588 puts at 0x4080-0x4088. */
-    ops[i++] = NPUOP(OP_REG_DPU, dpu->out_cvt_offset, R76_DPU_OUT_CVT_OFFSET);
-    ops[i++] = NPUOP(OP_REG_DPU,
-                     ((uint32_t)(dpu->fp32tofp16_en & 0x1) << 16) | dpu->out_cvt_scale,
-                     R76_DPU_OUT_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU,
-                     npu_out_cvt_round_bit(dpu->out_cvt_round) | dpu->out_cvt_shift,
-                     R76_DPU_OUT_CVT_SHIFT);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_OFFSET, dpu->out_cvt_offset);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_SCALE,
+                      ((uint32_t)(dpu->fp32tofp16_en & 0x1) << 16) | dpu->out_cvt_scale);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_SHIFT,
+                      npu_out_cvt_round_bit(dpu->out_cvt_round) | dpu->out_cvt_shift);
     /* The channel-group jump: a full destination surface PLUS the rows of it this
      * task does not write. The writer walks the task's rows and then adds this to
      * reach the same rows of the next group, so a windowed task has to be told about
@@ -2068,15 +2072,14 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * channels — per depthwise pass, which is the width the depthwise datapath has no
      * input-channel reduction to spend. The unit is inferred; the values are
      * transcribed. */
-    ops[i++] = NPUOP(OP_REG_DPU,
-                     dw ? 4u * ((ow * oh_full + 3u) & ~3u) - ow * oh
-                        : 2u * (ow * oh_full) - ow * oh,
-                     R76_DPU_SURFACE_ADD);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40BC);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x04440100u, R76_DPU_CONST_40C0);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40C8);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40CC);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0040FFFFu, R76_DPU_CONST_40D0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_SURFACE_ADD,
+                      dw ? 4u * ((ow * oh_full + 3u) & ~3u) - ow * oh
+                         : 2u * (ow * oh_full) - ow * oh);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40BC, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CONST_40C0, 0x04440100u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40C8, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40CC, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CONST_40D0, 0x0040FFFFu);
     /* The LUT bank. Zero throughout in every convolution capture, which is the LUT
      * bypassed; a task that carries a window writes it here, and the WHOLE bank is
      * written either way so a stale value from the previous job cannot survive into
@@ -2090,16 +2093,15 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
             else if (r >= R76_LUT_LE_START && r <= R76_LUT_LE_START + 0xC)
                                                      v = (uint32_t)lut->le_start;
         }
-        ops[i++] = NPUOP(OP_REG_DPU, v, r);
+        ops[i++] = REGCMD(TARGET_DPU, r, v);
     }
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4130);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4130, 0x0);
     for (unsigned r = 0x4140; r <= 0x4154; r += 4)
-        ops[i++] = NPUOP(OP_REG_DPU,
-                         (lut && r <= R76_LUT_LO_END + 0xC) ? (uint32_t)lut->lo_end : 0u,
-                         r);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4160);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4170);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4174);
+        ops[i++] = REGCMD(TARGET_DPU, r,
+                          (lut && r <= R76_LUT_LO_END + 0xC) ? (uint32_t)lut->lo_end : 0u);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4160, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4170, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4174, 0x0);
     /* The two overflow clamps, in the vendor's own packing: the value alone in the
      * high half of the first register and doubled across the second. */
     for (unsigned r = 0x4184; r <= 0x4194; r += 4) {
@@ -2111,18 +2113,18 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
             else if (r == R76_LUT_UNDERFLOW + 4 || r == R76_LUT_OVERFLOW + 4)
                                                                      v = (c << 16) | c;
         }
-        ops[i++] = NPUOP(OP_REG_DPU, v, r);
+        ops[i++] = REGCMD(TARGET_DPU, r, v);
     }
 
     /* ---- DPU_RDMA ---- */
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, ow - 1u, R76_RDMA_CUBE_WIDTH);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, oh - 1u, R76_RDMA_CUBE_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, oc - 1u, R76_RDMA_CUBE_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SRC_BASE_ADDR);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_WIDTH, ow - 1u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_HEIGHT, oh - 1u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_CHANNEL, oc - 1u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_SRC_BASE_ADDR, 0x0);
     /* The integer value on every path, deliberately — see R76_RDMA_ERDMA_FLOAT. */
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, dw ? R76_RDMA_BRDMA_DW : R76_RDMA_BRDMA_DIRECT,
-                     R76_RDMA_BRDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, dpu->bias_base_addr, R76_RDMA_BS_BASE_ADDR);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BRDMA_CFG,
+                      dw ? R76_RDMA_BRDMA_DW : R76_RDMA_BRDMA_DIRECT);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BS_BASE_ADDR, dpu->bias_base_addr);
     /* BS_BASE_ADDR1 is a live operand base, not a spare word. The DPU reads one
      * 32-bit shift word through it per task and applies it to the accumulator:
      * bits[5:0] right-shift the non-negative results, bits[13:8] the negative ones.
@@ -2133,26 +2135,23 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
      * allocated first, which is normally the feature cube: its byte 0 and byte 1
      * silently attenuate the result by up to 2^-63 per sign. Point it at the zeroed
      * group past the A/B/C coefficients, which is what "no shift" means. */
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA,
-                     dpu->bias_base_addr + (uint32_t)r76_shift_offset_p(oc, dw),
-                     R76_RDMA_BS_BASE_ADDR1);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, lut ? 0x1Au : 0x0u, R76_RDMA_NRDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BN_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5030);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, is_float ? R76_RDMA_ERDMA_FLOAT : 0x41u,
-                     R76_RDMA_ERDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_SURF);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA,
-                     is_float ? R76_RDMA_FMODE_FLOAT
-                              : (dw ? R76_RDMA_FMODE_DW : R76_RDMA_FMODE_DIRECT),
-                     R76_RDMA_FEATURE_MODE);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SRC_DMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SURF_NOTCH);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_PAD_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_SURF_NOTCH);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5078);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_507C);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BS_BASE_ADDR1,
+                      dpu->bias_base_addr + (uint32_t)r76_shift_offset_p(oc, dw));
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_NRDMA_CFG, lut ? 0x1Au : 0x0u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BN_BASE_ADDR, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ZERO_5030, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ERDMA_CFG, is_float ? R76_RDMA_ERDMA_FLOAT : 0x41u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_EW_BASE_ADDR, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_EW_SURF, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_FEATURE_MODE,
+                      is_float ? R76_RDMA_FMODE_FLOAT
+                               : (dw ? R76_RDMA_FMODE_DW : R76_RDMA_FMODE_DIRECT));
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_SRC_DMA_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_SURF_NOTCH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_PAD_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_EW_SURF_NOTCH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ZERO_5078, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ZERO_507C, 0x0);
 
     /* Registers the vendor stream never writes, added on request. The vendor program
      * leaves several per-stage DPU operand slots untouched (0x4040, 0x4054, 0x4064,
@@ -2180,25 +2179,25 @@ static int gen_conv2d_task_rk3576(uint64_t *ops, const npu_cna_desc *cna,
             p = end;
             while (*p == ',' || *p == ' ') p++;
             switch (reg >> 12) {
-            case 0x0: target = OP_REG_PC;       break;
-            case 0x1: target = OP_REG_CNA;      break;
-            case 0x3: target = OP_REG_CORE;     break;
-            case 0x4: target = OP_REG_DPU;      break;
-            case 0x5: target = OP_REG_DPU_RDMA; break;
+            case 0x0: target = TARGET_PC;       break;
+            case 0x1: target = TARGET_CNA;      break;
+            case 0x3: target = TARGET_CORE;     break;
+            case 0x4: target = TARGET_DPU;      break;
+            case 0x5: target = TARGET_DPU_RDMA; break;
             default:  ROCKET_LOGE("rk3576 add: no block owns register 0x%04lx\n", reg);
                       continue;
             }
-            ops[i++] = NPUOP(target, (uint32_t)val, (uint16_t)reg);
+            ops[i++] = REGCMD(target, (uint16_t)reg, (uint32_t)val);
             ROCKET_LOGI("rk3576 add: reg 0x%04lx = 0x%08lx\n", reg, val);
         }
     }
 
     /* The PC trailer the vendor stream does not carry. Without it `rocket` submits a
      * fully-configured pipeline that never starts. */
-    ops[i++] = NPUOP(OP_NONE, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
-    ops[i++] = NPUOP(OP_40, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_ENABLE, 0x1D, PC_OPERATION_ENABLE);
+    ops[i++] = REGCMD(TARGET_NONE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x0);
+    ops[i++] = REGCMD(TARGET_PRE_ENABLE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_ENABLE, REG_PC_OPERATION_ENABLE, NPU_ENABLE_CONV);
 
 #undef R76_ZERO
     return i;
@@ -2296,9 +2295,9 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
                                   unsigned out_prec, unsigned dpu_proc,
                                   const struct r76_reuse *reuse)
 {
-    npu_cna_desc  cna  = {0};
-    npu_core_desc core = {0};
-    npu_dpu_desc  dpu  = {0};
+    struct r76_cna  cna  = {0};
+    struct r76_core core = {0};
+    struct r76_dpu  dpu  = {0};
 
     unsigned IC = p->ic, IH = p->ih, IW = p->iw;
     unsigned OC = p->oc, OH = p->oh, OW = p->ow;
@@ -2318,7 +2317,7 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
                     "over)\n");
         return -1;
     }
-    if (argb && prec != precision_int8 && prec != precision_float16) {
+    if (argb && prec != PREC_INT8 && prec != PREC_FP16) {
         ROCKET_LOGE("rk3576 conv: the first-conv ARGB datapath has an int8 and an fp16 "
                     "form and nothing else — precision %u has no transcribed mode "
                     "word\n", prec);
@@ -2476,7 +2475,7 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
     pad_right  = r76_trail_pad(OW, p->stride_x, KW, p->pad_left, IW);
     pad_bottom = r76_trail_pad(OH, p->stride_y, KH, p->pad_top,  IH);
 
-    cna.conv_mode      = dw ? 3 : direct_convolution;
+    cna.conv_mode      = dw ? 3 : CONV_MODE_DIRECT;
     cna.in_precision   = (uint8_t)prec;
     /* PROC_PRECISION is the OPERAND width, so a float conv programs float16 here
      * even though it accumulates in fp32. An earlier reading had this field naming
@@ -2548,8 +2547,8 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
     }
     cna.pad_left    = p->pad_left;
     cna.pad_top     = p->pad_top;
-    cna.feature_base_addr = p->input_dma;
-    cna.decompress_addr0  = p->weights_dma;
+    cna.feature_base_addr = p->input_iova;
+    cna.decompress_addr0  = p->weights_iova;
     cna.weight_burst_len  = 0xF;
     cna.data_burst_len    = 0xF;
     /* NOT the DDR row jump, whatever its RK3588 name says: a readout of the fetch map
@@ -2568,7 +2567,7 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
     core.dataout_width   = (uint16_t)(OW - 1u);
     core.dataout_height  = (uint16_t)(OH - 1u);
 
-    dpu.conv_mode     = dw ? 3 : direct_convolution;
+    dpu.conv_mode     = dw ? 3 : CONV_MODE_DIRECT;
     dpu.out_precision = (uint8_t)out_prec;
     dpu.in_precision  = (uint8_t)prec;
     dpu.proc_precision = (uint8_t)dpu_proc;
@@ -2579,11 +2578,11 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
      * for every small value — and reads as a dead MAC. With the narrowing on, width 2
      * writes true fp16 and width 3 writes the top half, which is bfloat16.
      * [HW sweep, H96 MAX M9] */
-    dpu.fp32tofp16_en = (prec == precision_float16 || prec == precision_bfloat16);
-    dpu.dst_base_addr = p->output_dma;
+    dpu.fp32tofp16_en = (prec == PREC_FP16 || prec == PREC_BF16);
+    dpu.dst_base_addr = p->output_iova;
     dpu.dst_surf_stride = OW * oh_full;
     dpu.bias_en         = 1;
-    dpu.bias_base_addr  = p->bias_dma;
+    dpu.bias_base_addr  = p->bias_iova;
 
     /* OUT_CVT requant, identical arithmetic to the RK3588 int8-out path:
      *   out_i8 = sat8( round(acc_i32 * scale >> shift) + (out_zp - 0x80) )
@@ -2595,8 +2594,8 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
      * here is scale 1 << 14 with the matching shift, which is what this arithmetic
      * produces for conv_scale == 1.0, and the fp16 conv (gen_conv2d_fp16_rk3576) is
      * bit-faithful against a CPU model under it. */
-    if (prec == precision_float16 || prec == precision_bfloat16 ||
-        out_prec == precision_int32) {
+    if (prec == PREC_FP16 || prec == PREC_BF16 ||
+        out_prec == PREC_INT32) {
         /* Unity, and it has to be EXACTLY unity on the int32-out path: the QNNPACK
          * derivation below lands on scale 16385 for a conv_scale of 1.0, which drifts
          * the accumulator by acc/16384 — invisible on the int8 writer, where the
@@ -2653,7 +2652,7 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
 /* ============================================================================
  * SECTION — the float weight cube
  *
- * The int8 weight cube groups both channel axes by 32 (weight_conv_int8). The float
+ * The int8 weight cube groups both channel axes by 32 (conv_weight_index_int8). The float
  * one does NOT inherit that: measured on the RK3576, both of its channel groups are 16
  * (R76_FP16_W_OC_GROUP, R76_FP16_W_IC_GROUP). A kernel spans 16 fp16 (32 bytes), and
  * the group block holds 16 of them. A kernel that ramps over ic, with its sum read back,
@@ -2849,7 +2848,7 @@ int rocket_rk3576_argb_int8_pack_weights(void *dst, size_t dst_bytes,
  * SECTION — the depthwise weight cube
  *
  * DECODED, not inherited. The RK3588's depthwise cube is 64-channel groups of
- * single-byte weights (weight_conv_dw_int8); this part's is neither, and driving it
+ * single-byte weights (conv_dw_weight_index_int8); this part's is neither, and driving it
  * with the RK3588 layout is why depthwise never computed here. Read out of vendor
  * captures whose weights carry a unique value per (channel, tap), at C = 24, 32, 48,
  * 64 and 128 and at k = 3 and 5:
@@ -2980,7 +2979,7 @@ int rocket_rk3576_plan_ic(const conv_params_t *p, rocket_rk3576_ic_task *out,
      * at one slice is refused here with a pointer at the row planner. */
     slice = ROCKET_RK3576_FP16_IC_SLICE;
     if (rocket_rk3576_cbuf_f_prec(p->iw, slice, p->ih, p->oc,
-                                  p->kh, p->kw, 0, precision_float16, NULL) < 0) {
+                                  p->kh, p->kw, 0, PREC_FP16, NULL) < 0) {
         ROCKET_LOGE("rk3576 ic split: a single %u-channel slice of this %ux%u plane "
                     "still exceeds the CBUF allowance — window the rows too "
                     "(rocket_rk3576_plan_rows) and compose the two splits\n",
@@ -3140,19 +3139,19 @@ static const struct r76_reuse R76_NO_REUSE = { 0, 0, 0 };
 
 int gen_conv2d_int8_rk3576(conv_params_t *p)
 {
-    return gen_conv2d_rk3576_fill(p, 0, precision_int8, precision_int8,
-                                 precision_int8, &R76_NO_REUSE);
+    return gen_conv2d_rk3576_fill(p, 0, PREC_INT8, PREC_INT8,
+                                 PREC_INT8, &R76_NO_REUSE);
 }
 
 int gen_conv2d_dw_int8_rk3576(conv_params_t *p)
 {
-    return gen_conv2d_rk3576_fill(p, 1, precision_int8, precision_int8,
-                                 precision_int8, &R76_NO_REUSE);
+    return gen_conv2d_rk3576_fill(p, 1, PREC_INT8, PREC_INT8,
+                                 PREC_INT8, &R76_NO_REUSE);
 }
 
 /* The same int8 direct convolution, writing the DPU's RAW 32-bit accumulator instead
  * of the requantized int8 byte. Only two things change and neither is geometry:
- * DPU 0x4010's output WIDTH field takes precision_int32, and the OUT_CVT is pinned to
+ * DPU 0x4010's output WIDTH field takes PREC_INT32, and the OUT_CVT is pinned to
  * exact unity. The surface's BYTE layout is unchanged — the int8 writer puts 16 lanes
  * in a 16-byte atom and this one puts 4, so a channel group occupies the same bytes
  * and every stride register already holds the right value. What changes for the
@@ -3162,8 +3161,8 @@ int gen_conv2d_dw_int8_rk3576(conv_params_t *p)
  * and each one names exactly one word.] */
 int gen_conv2d_int8_rk3576_i32out(conv_params_t *p)
 {
-    return gen_conv2d_rk3576_fill(p, 0, precision_int8, precision_int32,
-                                 precision_int8, &R76_NO_REUSE);
+    return gen_conv2d_rk3576_fill(p, 0, PREC_INT8, PREC_INT32,
+                                 PREC_INT8, &R76_NO_REUSE);
 }
 
 /* The same raw-int32 convolution with the writer's byte budget DOUBLED.
@@ -3187,8 +3186,8 @@ int gen_conv2d_int8_rk3576_i32out(conv_params_t *p)
  * surface, and size the BO for twice the narrow writer's extent. */
 int gen_conv2d_int8_rk3576_i32out_wide(conv_params_t *p)
 {
-    return gen_conv2d_rk3576_fill(p, 0, precision_int8, precision_int32,
-                                 precision_int32, &R76_NO_REUSE);
+    return gen_conv2d_rk3576_fill(p, 0, PREC_INT8, PREC_INT32,
+                                 PREC_INT32, &R76_NO_REUSE);
 }
 
 /* Where gen_conv2d_int8_rk3576_i32out_wide() puts output channel `c` at pixel `p`, as a
@@ -3262,8 +3261,8 @@ int gen_conv2d_int8_rk3576_reuse(conv_params_t *p, int dw,
     r.continuation  = index ? 1u : 0u;
     r.retained_rows = index ? t->retained : 0u;
     r.resident      = index ? t->cbuf_resident : 0u;
-    return gen_conv2d_rk3576_fill(p, dw, precision_int8, precision_int8,
-                                 precision_int8, &r);
+    return gen_conv2d_rk3576_fill(p, dw, PREC_INT8, PREC_INT8,
+                                 PREC_INT8, &r);
 }
 
 /* ONE fp16 task, which is exactly 16 input channels.
@@ -3287,8 +3286,8 @@ int gen_conv2d_fp16_rk3576(conv_params_t *p)
      * contraction bound below does not apply to it. gen_conv2d_rk3576_fill() selects
      * it from the same ic <= 4 test the int8 entry uses. */
     if (p->ic <= 4u)
-        return gen_conv2d_rk3576_fill(p, 0, precision_float16, precision_float16,
-                                      precision_float16, &R76_NO_REUSE);
+        return gen_conv2d_rk3576_fill(p, 0, PREC_FP16, PREC_FP16,
+                                      PREC_FP16, &R76_NO_REUSE);
     if (p->ic != ROCKET_RK3576_FP16_IC_SLICE) {
         ROCKET_LOGE("rk3576 fp16 conv: one task contracts exactly %u input channels "
                     "and ic=%u was asked for. The DPU's output element stride is 16/ic "
@@ -3298,15 +3297,17 @@ int gen_conv2d_fp16_rk3576(conv_params_t *p)
                     ROCKET_RK3576_FP16_IC_SLICE, p->ic);
         return -1;
     }
-    return gen_conv2d_rk3576_fill(p, 0, precision_float16, precision_float16,
-                                 precision_float16, &R76_NO_REUSE);
+    return gen_conv2d_rk3576_fill(p, 0, PREC_FP16, PREC_FP16,
+                                 PREC_FP16, &R76_NO_REUSE);
 }
 
 /* THE WHOLE WIDE OUTPUT STAGE, over an already-emitted direct program.
  *
  * Nine DPU words: 0x4010 out 5 proc 2, 0x4030's low half 0x0310, 0x4038 0x53, 0x4044 2,
  * 0x4050 0x00023333, OUT_CVT 0/1/0 (no requant and no bias), and 0x40B8 at three task
- * surfaces. The first eight are the charsiu project's stage, read from vendor streams. Over
+ * surfaces. The first eight are the output stage of Rockchip's compiled fp16 matmul, which
+ * carries all eight together (gen_gemm_fp16_rk3576(), whose table is RKLLM-Toolkit output,
+ * and tests/rk3576_mm_fp16_vendor_gate.c). Over
  * the int8 program they make a dense int32 writer and over the fp16 slice program an fp32
  * one, and neither poisons the next submit, where our own partial stages (0x4010 alone on
  * the int32 writers, the float word on the fp16 one) do [HW sweep, H96 MAX M9, rocket
@@ -3565,7 +3566,7 @@ int rocket_rk3576_pack_bs_shift(void *dst, size_t dst_bytes, unsigned oc, int dw
 int rocket_rk3576_pack_coeff_dw_prec(void *dst, size_t dst_bytes, const int32_t *bias,
                                      unsigned oc, unsigned prec)
 {
-    int16_t unit = (prec == precision_float16 || prec == precision_bfloat16)
+    int16_t unit = (prec == PREC_FP16 || prec == PREC_BF16)
                    ? R76_COEFF_C_UNIT_FP16 : (int16_t)1;
 
     return rocket_rk3576_pack_coeff_dw_perc(dst, dst_bytes, bias, oc, NULL, unit);
@@ -3574,13 +3575,13 @@ int rocket_rk3576_pack_coeff_dw_prec(void *dst, size_t dst_bytes, const int32_t 
 int rocket_rk3576_pack_coeff_dw(void *dst, size_t dst_bytes, const int32_t *bias,
                                 unsigned oc)
 {
-    return rocket_rk3576_pack_coeff_dw_prec(dst, dst_bytes, bias, oc, precision_int8);
+    return rocket_rk3576_pack_coeff_dw_prec(dst, dst_bytes, bias, oc, PREC_INT8);
 }
 
 int rocket_rk3576_pack_coeff_prec(void *dst, size_t dst_bytes, const int32_t *bias,
                                   unsigned oc, unsigned prec)
 {
-    int16_t unit = (prec == precision_float16 || prec == precision_bfloat16)
+    int16_t unit = (prec == PREC_FP16 || prec == PREC_BF16)
                    ? R76_COEFF_C_UNIT_FP16 : (int16_t)1;
     return rocket_rk3576_pack_coeff_asym(dst, dst_bytes, bias, oc, NULL, unit);
 }
@@ -3691,8 +3692,8 @@ int rocket_rk3576_pack_coeff_perc(void *dst, size_t dst_bytes, const int32_t *bi
  * part can drive the candidates without a second emitter.
  * ==========================================================================*/
 
-#define OP_REG_PPU      (BLOCK_PPU | PC_OP_01)        /* 0x4001 */
-#define OP_REG_PPU_RDMA (BLOCK_PPU_RDMA | PC_OP_01)   /* 0x8001 */
+#define TARGET_PPU      (PPU + 0x1)        /* 0x4001 */
+#define TARGET_PPU_RDMA (PPU_RDMA + 0x1)   /* 0x8001 */
 
 #define R76_PPU_S_POINTER   0x6004
 #define R76_PPU_IN_WIDTH    0x600C
@@ -3729,7 +3730,7 @@ int rocket_rk3576_pack_coeff_perc(void *dst, size_t dst_bytes, const int32_t *bi
 
 /* PC_OPERATION_ENABLE is a per-block bitmap. The conv path's 0x1D and this 0x60 are
  * disjoint, so a pool carrying the conv's word starts nothing. */
-#define R76_PPU_ENABLE_WORD     0x60
+#define R76_PPU_ENABLE_WORD     NPU_ENABLE_PPU   /* 0x60 */
 
 #define R76_PPU_MODE_MAX        0x11
 #define R76_PPU_MODE_AVG        0x10
@@ -3825,26 +3826,26 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
 
     dst_reg = p->ppu_dst_reg ? p->ppu_dst_reg : R76_PPU_ZERO_6070;
 
-    ops[i++] = NPUOP(OP_REG_PPU, 0xE, R76_PPU_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_PPU, in_w - 1u, R76_PPU_IN_WIDTH);
-    ops[i++] = NPUOP(OP_REG_PPU, in_h - 1u, R76_PPU_IN_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_PPU, creg - 1u,  R76_PPU_IN_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_PPU, ow - 1u,    R76_PPU_OUT_WIDTH);
-    ops[i++] = NPUOP(OP_REG_PPU, oh - 1u,    R76_PPU_OUT_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_PPU, creg - 1u,  R76_PPU_OUT_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_PPU, mode,       R76_PPU_MODE);
-    ops[i++] = NPUOP(OP_REG_PPU,
-                     ((uint32_t)(p->stride_y - 1u) << 20) |
-                     ((uint32_t)(p->stride_x - 1u) << 16) |
-                     ((uint32_t)(p->kh - 1u) << 8) |
-                      (uint32_t)(p->kw - 1u), R76_PPU_KERNEL);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_S_POINTER, 0xE);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_IN_WIDTH, in_w - 1u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_IN_HEIGHT, in_h - 1u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_IN_CHANNEL, creg - 1u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_OUT_WIDTH, ow - 1u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_OUT_HEIGHT, oh - 1u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_OUT_CHANNEL, creg - 1u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_MODE, mode);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_KERNEL,
+                      ((uint32_t)(p->stride_y - 1u) << 20) |
+                      ((uint32_t)(p->stride_x - 1u) << 16) |
+                      ((uint32_t)(p->kh - 1u) << 8) |
+                       (uint32_t)(p->kw - 1u));
     /* 1/kw and 1/kh in Q16, and zero on the max path where nothing is divided. */
     if (p->mode == ROCKET_RK3576_POOL_MAX) {
-        ops[i++] = NPUOP(OP_REG_PPU, 0x0, R76_PPU_RECIP_W);
-        ops[i++] = NPUOP(OP_REG_PPU, 0x0, R76_PPU_RECIP_H);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_RECIP_W, 0x0);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_RECIP_H, 0x0);
     } else {
-        ops[i++] = NPUOP(OP_REG_PPU, 0x10000u / p->kw, R76_PPU_RECIP_W);
-        ops[i++] = NPUOP(OP_REG_PPU, 0x10000u / p->kh, R76_PPU_RECIP_H);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_RECIP_W, 0x10000u / p->kw);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_RECIP_H, 0x10000u / p->kh);
     }
     /* Four pad nibbles, and the LEADING pads sit in the two LOW ones: bits [3:0] are the
      * LEFT pad and bits [7:4] the TOP. Measured, not read off a capture — every capture's
@@ -3860,53 +3861,52 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
      * The trailing pads are the high pair. Nothing this emitter produces depends on them
      * — the window count is programmed explicitly in OUT_WIDTH/OUT_HEIGHT and the span in
      * IN_WIDTH/IN_HEIGHT — so they are written for the part's benefit, not read back. */
-    ops[i++] = NPUOP(OP_REG_PPU,
-                     ((uint32_t)(p->pad_bottom & 0xf) << 12) |
-                     ((uint32_t)(p->pad_right  & 0xf) << 8) |
-                     ((uint32_t)(p->pad_top    & 0xf) << 4) |
-                      (uint32_t)(p->pad_left   & 0xf), R76_PPU_PAD_CFG);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_CFG,
+                      ((uint32_t)(p->pad_bottom & 0xf) << 12) |
+                      ((uint32_t)(p->pad_right  & 0xf) << 8) |
+                      ((uint32_t)(p->pad_top    & 0xf) << 4) |
+                       (uint32_t)(p->pad_left   & 0xf));
     /* The four pad values. Max pads with the minimum so a padded window never wins;
      * average pads with the input zero point, scaled 1..4 — the capture's own ramp. */
     if (p->mode == ROCKET_RK3576_POOL_MAX) {
-        ops[i++] = NPUOP(OP_REG_PPU, R76_PPU_PAD_MIN, R76_PPU_PAD_VAL0);
-        ops[i++] = NPUOP(OP_REG_PPU, R76_PPU_PAD_MIN, R76_PPU_PAD_VAL1);
-        ops[i++] = NPUOP(OP_REG_PPU, R76_PPU_PAD_MIN, R76_PPU_PAD_VAL2);
-        ops[i++] = NPUOP(OP_REG_PPU, R76_PPU_PAD_MIN, R76_PPU_PAD_VAL3);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_VAL0, R76_PPU_PAD_MIN);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_VAL1, R76_PPU_PAD_MIN);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_VAL2, R76_PPU_PAD_MIN);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_VAL3, R76_PPU_PAD_MIN);
     } else {
         /* The zero point times one to four, each sign-extended into the 19-bit field:
          * the captures carry -35, -70, -105, -140 for a zero point of -35, so the
          * multiply happens before the truncation and a negative one must not be masked
          * first. Four values because a window can straddle up to four padded taps. */
         int32_t z = p->input_zero_point;
-        ops[i++] = NPUOP(OP_REG_PPU, (uint32_t)(z * 1) & 0x7ffffu, R76_PPU_PAD_VAL0);
-        ops[i++] = NPUOP(OP_REG_PPU, (uint32_t)(z * 2) & 0x7ffffu, R76_PPU_PAD_VAL1);
-        ops[i++] = NPUOP(OP_REG_PPU, (uint32_t)(z * 3) & 0x7ffffu, R76_PPU_PAD_VAL2);
-        ops[i++] = NPUOP(OP_REG_PPU, (uint32_t)(z * 4) & 0x7ffffu, R76_PPU_PAD_VAL3);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_VAL0, (uint32_t)(z * 1) & 0x7ffffu);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_VAL1, (uint32_t)(z * 2) & 0x7ffffu);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_VAL2, (uint32_t)(z * 3) & 0x7ffffu);
+        ops[i++] = REGCMD(TARGET_PPU, R76_PPU_PAD_VAL3, (uint32_t)(z * 4) & 0x7ffffu);
     }
-    ops[i++] = NPUOP(OP_REG_PPU, dst_reg == R76_PPU_ZERO_6054 ? p->output_dma : 0u,
-                     R76_PPU_ZERO_6054);
-    ops[i++] = NPUOP(OP_REG_PPU, dst_reg == R76_PPU_ZERO_6058 ? p->output_dma : 0u,
-                     R76_PPU_ZERO_6058);
-    ops[i++] = NPUOP(OP_REG_PPU, dst_reg == R76_PPU_ZERO_605C ? p->output_dma : 0u,
-                     R76_PPU_ZERO_605C);
-    ops[i++] = NPUOP(OP_REG_PPU, dst_reg == R76_PPU_ZERO_6070 ? p->output_dma : 0u,
-                     R76_PPU_ZERO_6070);
-    ops[i++] = NPUOP(OP_REG_PPU, dst_surf * 16u, R76_PPU_DST_SURF0);
-    ops[i++] = NPUOP(OP_REG_PPU, dst_surf * 16u, R76_PPU_DST_SURF1);
-    ops[i++] = NPUOP(OP_REG_PPU, dst_reg == R76_PPU_ZERO_60DC ? p->output_dma : 0u,
-                     R76_PPU_ZERO_60DC);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_ZERO_6054,
+                      dst_reg == R76_PPU_ZERO_6054 ? p->output_iova : 0u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_ZERO_6058,
+                      dst_reg == R76_PPU_ZERO_6058 ? p->output_iova : 0u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_ZERO_605C,
+                      dst_reg == R76_PPU_ZERO_605C ? p->output_iova : 0u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_ZERO_6070,
+                      dst_reg == R76_PPU_ZERO_6070 ? p->output_iova : 0u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_DST_SURF0, dst_surf * 16u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_DST_SURF1, dst_surf * 16u);
+    ops[i++] = REGCMD(TARGET_PPU, R76_PPU_ZERO_60DC,
+                      dst_reg == R76_PPU_ZERO_60DC ? p->output_iova : 0u);
 
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, 0xE, R76_PPUR_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, in_w - 1u, R76_PPUR_IN_WIDTH);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, in_h - 1u, R76_PPUR_IN_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, creg - 1u, R76_PPUR_IN_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, p->input_dma, R76_PPUR_SRC_BASE);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, pitch * 16u, R76_PPUR_SRC_LINE);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA,
-                     (p->src_surf_elems ? p->src_surf_elems
-                                        : r76_round4(pitch * ih)) * 16u,
-                     R76_PPUR_SRC_SURF);
-    ops[i++] = NPUOP(OP_REG_PPU_RDMA, 0x40, R76_PPUR_CONST_7030);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, R76_PPUR_S_POINTER, 0xE);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, R76_PPUR_IN_WIDTH, in_w - 1u);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, R76_PPUR_IN_HEIGHT, in_h - 1u);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, R76_PPUR_IN_CHANNEL, creg - 1u);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, R76_PPUR_SRC_BASE, p->input_iova);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, R76_PPUR_SRC_LINE, pitch * 16u);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, R76_PPUR_SRC_SURF,
+                      (p->src_surf_elems ? p->src_surf_elems
+                                         : r76_round4(pitch * ih)) * 16u);
+    ops[i++] = REGCMD(TARGET_PPU_RDMA, R76_PPUR_CONST_7030, 0x40);
 
     /* The same four-word PC trailer every program on this part ends with — and the
      * LAST word is not the same value.
@@ -3920,10 +3920,10 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
      * whole register sweep before the raw capture was read word by word rather than
      * through the block classifier. Transcribe the WHOLE program, trailer included.
      * [Manufactured capture, RKNN-Toolkit2 for rk3576] */
-    ops[i++] = NPUOP(OP_NONE, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
-    ops[i++] = NPUOP(OP_40, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_ENABLE, R76_PPU_ENABLE_WORD, PC_OPERATION_ENABLE);
+    ops[i++] = REGCMD(TARGET_NONE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x0);
+    ops[i++] = REGCMD(TARGET_PRE_ENABLE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_ENABLE, REG_PC_OPERATION_ENABLE, R76_PPU_ENABLE_WORD);
 
     p->task_count = (uint32_t)i;
     return 0;
@@ -3940,7 +3940,7 @@ int gen_pool_rk3576(pool_params_rk3576_t *p)
  * ==========================================================================*/
 
 /* DPU + DPU_RDMA. [Manufactured capture] */
-#define R76_LUT_ENABLE_WORD  0x18
+#define R76_LUT_ENABLE_WORD  NPU_ENABLE_DPU   /* 0x18 */
 
 int gen_lut_load_rk3576(lut_load_params_rk3576_t *p)
 {
@@ -3951,108 +3951,108 @@ int gen_lut_load_rk3576(lut_load_params_rk3576_t *p)
     if (rk3576_encoding_only("gen_lut_load_rk3576")) return -1;
     if (!p || !ops || !p->lo || !p->hi) return -1;
 
-    ops[i++] = NPUOP(OP_REG_DPU,      0xE, R76_DPU_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE, R76_RDMA_S_POINTER);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_S_POINTER, 0xE);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_S_POINTER, 0xE);
 
     /* The dummy cube: one pixel, sixteen channels, all-int8 precision. Nothing here
      * is arithmetic — the surface exists so the DPU has a well-formed job while the
      * table burst goes through. */
-    ops[i++] = NPUOP(OP_REG_DPU, 0x5u, R76_DPU_FEATURE_MODE);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_DATA_FORMAT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OFFSET_PEND);
-    ops[i++] = NPUOP(OP_REG_DPU, p->scratch_dma, R76_DPU_DST_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x1u, R76_DPU_DST_SURF);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_WIDTH);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_NOTCH);
-    ops[i++] = NPUOP(OP_REG_DPU, 0xFu, R76_DPU_CUBE_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x000F0F00u, R76_DPU_WDMA_SIZE0);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_WDMA_SIZE1);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x00000053u, R76_DPU_NOTCH_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_403C);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x2u, R76_DPU_BS_ALU_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BS_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BS_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x00020000u, R76_DPU_BS_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BN_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BN_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x903u, R76_DPU_BN_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN2);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX2);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x010041C1u, R76_DPU_EW_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_CVT_OFFSET);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x1u, R76_DPU_EW_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_CLAMP_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_CLAMP_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE0);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE1);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_409C);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_OUT_CLAMP_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_OUT_CLAMP_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OUT_CVT_OFFSET);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x00010001u, R76_DPU_OUT_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OUT_CVT_SHIFT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_SURFACE_ADD);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40BC);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x04440000u, R76_DPU_CONST_40C0);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40C8);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40CC);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0040FFFFu, R76_DPU_CONST_40D0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_FEATURE_MODE, 0x5u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DATA_FORMAT, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OFFSET_PEND, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DST_BASE_ADDR, p->scratch_iova);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DST_SURF, 0x1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_WIDTH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_HEIGHT, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_NOTCH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_CHANNEL, 0xFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_WDMA_SIZE0, 0x000F0F00u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_WDMA_SIZE1, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_NOTCH_CFG, 0x00000053u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_403C, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_ALU_CFG, 0x2u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_CFG, 0x00020000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_CFG, 0x903u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MIN2, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MAX2, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CFG, 0x010041C1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CVT_OFFSET, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CVT_SCALE, 0x1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CLAMP_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CLAMP_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_OP_VALUE0, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_OP_VALUE1, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_409C, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CLAMP_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CLAMP_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_OFFSET, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_SCALE, 0x00010001u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_SHIFT, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_SURFACE_ADD, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40BC, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CONST_40C0, 0x04440000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40C8, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40CC, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CONST_40D0, 0x0040FFFFu);
 
     /* The preamble: one write through the window at offset zero, then LUT_CFG into
      * its load value. The order is the capture's. */
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_LUT_ACCESS_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_LUT_ACCESS_DATA);
-    ops[i++] = NPUOP(OP_REG_DPU, R76_LUT_CFG_LOAD, R76_LUT_CFG);
+    ops[i++] = REGCMD(TARGET_DPU, R76_LUT_ACCESS_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_LUT_ACCESS_DATA, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_LUT_CFG, R76_LUT_CFG_LOAD);
     for (e = 0x410C; e <= 0x4120; e += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4130);
+        ops[i++] = REGCMD(TARGET_DPU, e, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4130, 0x0);
     for (e = 0x4140; e <= 0x4154; e += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4160);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4170);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4174);
+        ops[i++] = REGCMD(TARGET_DPU, e, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4160, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4170, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4174, 0x0);
     for (e = 0x4184; e <= 0x4194; e += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
+        ops[i++] = REGCMD(TARGET_DPU, e, 0x0);
 
     /* ---- DPU_RDMA: the dummy cube's source ---- */
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_CUBE_WIDTH);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_CUBE_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xFu, R76_RDMA_CUBE_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, p->scratch_dma, R76_RDMA_SRC_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BRDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BS_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BS_BASE_ADDR1);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_NRDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BN_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5030);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x1u, R76_RDMA_ERDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_SURF);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x9u, R76_RDMA_FEATURE_MODE);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SRC_DMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x504C);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x5064);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x506C);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x5078);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, 0x507C);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_WIDTH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_HEIGHT, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_CHANNEL, 0xFu);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_SRC_BASE_ADDR, p->scratch_iova);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BRDMA_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BS_BASE_ADDR, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BS_BASE_ADDR1, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_NRDMA_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BN_BASE_ADDR, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ZERO_5030, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ERDMA_CFG, 0x1u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_EW_BASE_ADDR, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_EW_SURF, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_FEATURE_MODE, 0x9u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_SRC_DMA_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, 0x504C, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, 0x5064, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, 0x506C, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, 0x5078, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, 0x507C, 0x0);
 
     /* The two bursts. The select word carries the table and the start offset; each
      * data write stores one entry and advances, so the 513 writes are consecutive
      * and their order IS the table order. */
-    ops[i++] = NPUOP(OP_REG_DPU, R76_LUT_SELECT_LO, R76_LUT_ACCESS_CFG);
+    ops[i++] = REGCMD(TARGET_DPU, R76_LUT_ACCESS_CFG, R76_LUT_SELECT_LO);
     for (e = 0; e < RK3576_LUT_ENTRIES; e++)
-        ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)(uint16_t)p->lo[e], R76_LUT_ACCESS_DATA);
-    ops[i++] = NPUOP(OP_REG_DPU, R76_LUT_SELECT_HI, R76_LUT_ACCESS_CFG);
+        ops[i++] = REGCMD(TARGET_DPU, R76_LUT_ACCESS_DATA, (uint32_t)(uint16_t)p->lo[e]);
+    ops[i++] = REGCMD(TARGET_DPU, R76_LUT_ACCESS_CFG, R76_LUT_SELECT_HI);
     for (e = 0; e < RK3576_LUT_ENTRIES; e++)
-        ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)(uint16_t)p->hi[e], R76_LUT_ACCESS_DATA);
+        ops[i++] = REGCMD(TARGET_DPU, R76_LUT_ACCESS_DATA, (uint32_t)(uint16_t)p->hi[e]);
 
-    ops[i++] = NPUOP(OP_NONE, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
-    ops[i++] = NPUOP(OP_40, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_ENABLE, R76_LUT_ENABLE_WORD, PC_OPERATION_ENABLE);
+    ops[i++] = REGCMD(TARGET_NONE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x0);
+    ops[i++] = REGCMD(TARGET_PRE_ENABLE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_ENABLE, REG_PC_OPERATION_ENABLE, R76_LUT_ENABLE_WORD);
 
     r76_apply_overrides(ops, i);
     r76_dump_program(ops, i);
@@ -4076,7 +4076,7 @@ int gen_lut_load_rk3576(lut_load_params_rk3576_t *p)
  * ==========================================================================*/
 
 /* DPU + DPU_RDMA, as the LUT load. [Manufactured capture] */
-#define R76_EW_ENABLE_WORD   0x18
+#define R76_EW_ENABLE_WORD   NPU_ENABLE_DPU   /* 0x18 */
 
 /* EW_CFG. Add: the stage on (bit 0 clear), the LUT bypassed (bit 7), the operand from
  * memory (bit 6). Mul carries a different word entire — emitted, not decomposed, since
@@ -4118,103 +4118,100 @@ int gen_ew_int8_rk3576(ew_params_rk3576_t *p)
     surf = p->surf_elems ? p->surf_elems : (unsigned)w * h;
     dst_surf = p->dst_surf_elems ? p->dst_surf_elems : (unsigned)w * h;
 
-    ops[i++] = NPUOP(OP_REG_DPU,      0xE, R76_DPU_S_POINTER);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0xE, R76_RDMA_S_POINTER);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_S_POINTER, 0xE);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_S_POINTER, 0xE);
 
-    ops[i++] = NPUOP(OP_REG_DPU, 0x5u, R76_DPU_FEATURE_MODE);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_DATA_FORMAT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_OFFSET_PEND);
-    ops[i++] = NPUOP(OP_REG_DPU, p->dst_dma, R76_DPU_DST_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU, dst_surf, R76_DPU_DST_SURF);
-    ops[i++] = NPUOP(OP_REG_DPU, w - 1u, R76_DPU_CUBE_WIDTH);
-    ops[i++] = NPUOP(OP_REG_DPU, h - 1u, R76_DPU_CUBE_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_CUBE_NOTCH);
-    ops[i++] = NPUOP(OP_REG_DPU, c - 1u, R76_DPU_CUBE_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_DPU, ((c - 1u) << 16) | 0x0F00u, R76_DPU_WDMA_SIZE0);
-    ops[i++] = NPUOP(OP_REG_DPU, ((h - 1u) << 16) | (w - 1u), R76_DPU_WDMA_SIZE1);
-    ops[i++] = NPUOP(OP_REG_DPU, R76_EW_NOTCH_CFG, R76_DPU_NOTCH_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_403C);
-    ops[i++] = NPUOP(OP_REG_DPU, mul ? R76_EW_BS_ALU_MUL : 0x0, R76_DPU_BS_ALU_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BS_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BS_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, mul ? R76_EW_BS_CFG_MUL : 0x0, R76_DPU_BS_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_BN_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_BN_MAX);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_FEATURE_MODE, 0x5u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DATA_FORMAT, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OFFSET_PEND, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DST_BASE_ADDR, p->dst_iova);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_DST_SURF, dst_surf);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_WIDTH, w - 1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_HEIGHT, h - 1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_NOTCH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CUBE_CHANNEL, c - 1u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_WDMA_SIZE0, ((c - 1u) << 16) | 0x0F00u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_WDMA_SIZE1, ((h - 1u) << 16) | (w - 1u));
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_NOTCH_CFG, R76_EW_NOTCH_CFG);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_403C, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_ALU_CFG, mul ? R76_EW_BS_ALU_MUL : 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BS_CFG, mul ? R76_EW_BS_CFG_MUL : 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_MAX, 0x7FFFFFFFu);
     /* 0x903 here as everywhere: the vendor's 0x20 pins the LUT at its table join and
      * makes the BN stage multiply by an operand no program writes. */
-    ops[i++] = NPUOP(OP_REG_DPU, 0x903u, R76_DPU_BN_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_MIN2);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_MAX2);
-    ops[i++] = NPUOP(OP_REG_DPU, mul ? R76_EW_CFG_MUL : R76_EW_CFG_ADD,
-                     R76_DPU_EW_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->ew_offset, R76_DPU_EW_CVT_OFFSET);
-    ops[i++] = NPUOP(OP_REG_DPU,
-                     ((uint32_t)p->ew_shift << 16) | p->ew_scale,
-                     R76_DPU_EW_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x80000000u, R76_DPU_EW_CLAMP_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x7FFFFFFFu, R76_DPU_EW_CLAMP_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE0);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_EW_OP_VALUE1);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_409C);
-    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->clamp_lo, R76_DPU_OUT_CLAMP_MIN);
-    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->clamp_hi, R76_DPU_OUT_CLAMP_MAX);
-    ops[i++] = NPUOP(OP_REG_DPU, (uint32_t)p->out_offset, R76_DPU_OUT_CVT_OFFSET);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x00010000u | p->out_scale, R76_DPU_OUT_CVT_SCALE);
-    ops[i++] = NPUOP(OP_REG_DPU, npu_out_cvt_round_bit(0) | p->out_shift,
-                     R76_DPU_OUT_CVT_SHIFT);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_SURFACE_ADD);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40BC);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x04440000u, R76_DPU_CONST_40C0);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40C8);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, R76_DPU_ZERO_40CC);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_BN_CFG, 0x903u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MIN2, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_MAX2, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CFG, mul ? R76_EW_CFG_MUL : R76_EW_CFG_ADD);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CVT_OFFSET, (uint32_t)p->ew_offset);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CVT_SCALE,
+                      ((uint32_t)p->ew_shift << 16) | p->ew_scale);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CLAMP_MIN, 0x80000000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_CLAMP_MAX, 0x7FFFFFFFu);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_OP_VALUE0, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_EW_OP_VALUE1, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_409C, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CLAMP_MIN, (uint32_t)p->clamp_lo);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CLAMP_MAX, (uint32_t)p->clamp_hi);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_OFFSET, (uint32_t)p->out_offset);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_SCALE, 0x00010000u | p->out_scale);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_OUT_CVT_SHIFT, npu_out_cvt_round_bit(0) | p->out_shift);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_SURFACE_ADD, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40BC, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CONST_40C0, 0x04440000u);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40C8, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_ZERO_40CC, 0x0);
     /* Verbatim. Every capture of every op class on this part carries this word, and
      * its sub-bits are not pinned by any of them — reading it as a clamp pair and
      * writing 0x00407F80 instead saturated the whole surface to +127. */
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0040FFFFu, R76_DPU_CONST_40D0);
+    ops[i++] = REGCMD(TARGET_DPU, R76_DPU_CONST_40D0, 0x0040FFFFu);
 
     /* The LUT bank, written to zero exactly as the capture does. The tables are not
      * loaded for this op and the bank must not carry a previous program's map: the
      * register file is NOT cleared between jobs on this part. */
     for (e = 0x4100; e <= 0x4120; e += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4130);
+        ops[i++] = REGCMD(TARGET_DPU, e, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4130, 0x0);
     for (e = 0x4140; e <= 0x4154; e += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4160);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4170);
-    ops[i++] = NPUOP(OP_REG_DPU, 0x0, 0x4174);
+        ops[i++] = REGCMD(TARGET_DPU, e, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4160, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4170, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU, 0x4174, 0x0);
     for (e = 0x4184; e <= 0x4194; e += 4)
-        ops[i++] = NPUOP(OP_REG_DPU, 0x0, e);
+        ops[i++] = REGCMD(TARGET_DPU, e, 0x0);
 
     /* ---- DPU_RDMA: both operands ---- */
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, w - 1u, R76_RDMA_CUBE_WIDTH);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, h - 1u, R76_RDMA_CUBE_HEIGHT);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, c - 1u, R76_RDMA_CUBE_CHANNEL);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, p->src_dma, R76_RDMA_SRC_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, mul ? R76_EW_BRDMA_MUL : R76_EW_BRDMA_ADD,
-                     R76_RDMA_BRDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BS_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BS_BASE_ADDR1);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_NRDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_BN_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5030);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, R76_EW_ERDMA_CFG, R76_RDMA_ERDMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, p->ew_dma, R76_RDMA_EW_BASE_ADDR);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, surf, R76_RDMA_EW_SURF);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, R76_EW_FEATURE_MODE, R76_RDMA_FEATURE_MODE);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SRC_DMA_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_SURF_NOTCH);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_PAD_CFG);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_EW_SURF_NOTCH);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_5078);
-    ops[i++] = NPUOP(OP_REG_DPU_RDMA, 0x0, R76_RDMA_ZERO_507C);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_WIDTH, w - 1u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_HEIGHT, h - 1u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_CUBE_CHANNEL, c - 1u);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_SRC_BASE_ADDR, p->src_iova);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BRDMA_CFG,
+                      mul ? R76_EW_BRDMA_MUL : R76_EW_BRDMA_ADD);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BS_BASE_ADDR, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BS_BASE_ADDR1, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_NRDMA_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_BN_BASE_ADDR, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ZERO_5030, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ERDMA_CFG, R76_EW_ERDMA_CFG);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_EW_BASE_ADDR, p->ew_iova);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_EW_SURF, surf);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_FEATURE_MODE, R76_EW_FEATURE_MODE);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_SRC_DMA_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_SURF_NOTCH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_PAD_CFG, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_EW_SURF_NOTCH, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ZERO_5078, 0x0);
+    ops[i++] = REGCMD(TARGET_DPU_RDMA, R76_RDMA_ZERO_507C, 0x0);
 
-    ops[i++] = NPUOP(OP_NONE, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_REG_PC, 0x0, PC_REGISTER_AMOUNTS);
-    ops[i++] = NPUOP(OP_40, 0x0, 0x0);
-    ops[i++] = NPUOP(OP_ENABLE, R76_EW_ENABLE_WORD, PC_OPERATION_ENABLE);
+    ops[i++] = REGCMD(TARGET_NONE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x0);
+    ops[i++] = REGCMD(TARGET_PRE_ENABLE, 0x0, 0x0);
+    ops[i++] = REGCMD(TARGET_ENABLE, REG_PC_OPERATION_ENABLE, R76_EW_ENABLE_WORD);
 
     r76_apply_overrides(ops, i);
     r76_dump_program(ops, i);
@@ -4298,177 +4295,170 @@ int64_t rocket_rk3576_ew_params(double gain,
  * SECTION — the matmul-form fp16 program
  *
  * One job, the whole of K. The fp16 convolution above contracts sixteen input channels
- * a task, and that bound is the program's rather than the part's: this program is
- * charsiu's (gahingwoo/charsiu 524e10a, charsiu_emit_job, no CHARSIU_* environment),
- * which contracts K 2048 exactly in one job on the H96 [HW sweep,
- * 2026-09-24].
+ * a task, and that bound is the program's rather than the part's: this program contracts
+ * the whole of K in one task.
  *
- * The table is that emitter's output at m=1 k=256 n=64, in its order. Every word the
- * shape moves was found by sweeping m over 1-32, k over 32-4096 and n over 16-1024 and
- * reading which words change; each closed form in r76_mmf16_word() reproduces all 441
- * swept streams. The words it does not name are constant across the sweep.
+ * THE PROGRAM IS ROCKCHIP'S COMPILED FORM. RKLLM-Toolkit compiles an LLM's fp16 attention
+ * matmuls for the RK3576 to it, and a .rkllm file stores each compiled program verbatim:
+ * 118 register words, then the PC trailer. The table is that program in its order,
+ * followed by that trailer. It programs no DPU_RDMA and reads no coefficient buffer, and its
+ * trailer enables CNA, CORE and DPU only.
  *
- * WHAT IS NOT DECODED, and why that is not a guess. The coefficient buffer carries
- * charsiu's int8 records (a bias with a +128 lift, a 0x80 weight correction, a C of 16),
- * and the fp32 result comes back exact with no 128 in it, so the lift at least is not
- * added [inferred]. It is reproduced byte for byte anyway: which words the fp16 job
- * reads is unmeasured, and a buffer the RDMA under-reads times the job out with every
- * register correct (charsiu's round 147).
+ * Every word the shape moves has a closed form in r76_mmf16_word(), which replaces the
+ * table's value there at every shape. The table holds the values at m=4 k=64 n=32. The
+ * words it does not name are constant. tests/rk3576_mm_fp16_vendor_gate.c finds every such
+ * program in a .rkllm and holds this emitter to it word for word at that program's own
+ * shape. Two .rkllm files, both RKLLM-Toolkit 1.3.0 at w4a16 g128 for the RK3576, match in
+ * every word, and so do their trailers [host-computed, 2026-11-09]:
+ *
+ *   - SmolLM2-1.7B-Instruct, compiled for this check: 2116 programs in this CBUF
+ *     arrangement at 867 shapes over M 14-128, K 32-4096 and N 32-4352.
+ *   - Llama-3.2-1B-Instruct (HanzoHuang/Llama-3.2-1B-Instruct-RKLLM): 3104 programs at
+ *     1267 shapes over M 4-256, K 32-4096 and N 32-4352.
+ *
+ * The compiler also emits the program in other CBUF arrangements (CNA 0x1018, 0x1038,
+ * 0x103C, 0x1040), and those match in every other word: 2840 and 4340 programs. This
+ * emitter keeps the one arrangement in the table at every K.
+ *
+ * On the part this program is exact at every shape tests/rk3576_mm_fp16_gate runs, and the
+ * window bound below holds for it unchanged: 128x1024 and 21x6144 exact, one row past each
+ * wrong on every row [HW sweep, H96 MAX M9, Armbian 7.3.3 `rocket`, 2026-11-09]. The K and N
+ * bounds below were measured on an earlier form, which also programmed the DPU RDMA to read
+ * a coefficient buffer and enabled the blocks one by one.
  * ==========================================================================*/
 
-/* The block charsiu writes the five 0x28xx words through. npu_hw.h names no block at
- * 0x0400; the words are all zero. */
-#define R76_OP_0401 0x0401
+/* The trailer's enable word: the blocks the program runs. NPU_ENABLE_CONV also enables the
+ * DPU RDMA, which this program does not program. */
+#define R76_MMF16_ENABLE ((1u << GLOBAL_OPERATION_ENABLE_CNA_OP_EN__SHIFT) |         \
+                          (1u << GLOBAL_OPERATION_ENABLE_CORE_OP_EN__SHIFT) |        \
+                          (1u << GLOBAL_OPERATION_ENABLE_DPU_OP_EN__SHIFT)) /* 0x0D */
 
 static const struct { uint16_t op, reg; uint32_t val; } r76_mmf16_tab[RK3576_MM_FP16_OPS] = {
-    { OP_REG_CNA, 0x1004, 0x0000000e },
-    { OP_REG_CORE, 0x3004, 0x0000000e },
-    { OP_REG_CNA, 0x1038, 0x00000007 },
-    { OP_REG_DPU, 0x4004, 0x0000000e },
-    { OP_REG_DPU_RDMA, 0x5004, 0x0000000e },
-    { OP_REG_CNA, 0x100C, 0x20200120 },
-    { OP_REG_CNA, 0x1010, 0x00000fff },
-    { OP_REG_CNA, 0x1014, 0x00000009 },
-    { OP_REG_CNA, 0x1018, 0x40000404 },
-    { OP_REG_CNA, 0x101C, 0x00008000 }, /* shape */
-    { OP_REG_CNA, 0x1020, 0x00000200 }, /* shape */
-    { OP_REG_CNA, 0x1024, 0x0000003f }, /* shape */
-    { OP_REG_CNA, 0x1028, 0x000800ff }, /* shape */
-    { OP_REG_CNA, 0x102C, 0x00000000 }, /* shape */
-    { OP_REG_CNA, 0x1030, 0x02000000 }, /* shape */
-    { OP_REG_CNA, 0x1034, 0x00000000 }, /* shape */
-    { OP_REG_CNA, 0x1038, 0x00000007 },
-    { OP_REG_CNA, 0x103C, 0x00080000 }, /* shape */
-    { OP_REG_CNA, 0x1040, 0x10000000 },
-    { OP_REG_CNA, 0x1044, 0x00010008 }, /* shape */
-    { OP_REG_CNA, 0x1048, 0x0000000b },
-    { OP_REG_CNA, 0x104C, 0x00010001 },
-    { OP_REG_CNA, 0x1050, 0x00010001 },
-    { OP_REG_CNA, 0x1054, 0x00000000 },
-    { OP_REG_CNA, 0x1058, 0x00000000 },
-    { OP_REG_CNA, 0x105C, 0x00000000 },
-    { OP_REG_CNA, 0x1060, 0x00000000 },
-    { OP_REG_CNA, 0x1064, 0x00000000 },
-    { OP_REG_CNA, 0x1068, 0x00000000 },
-    { OP_REG_CNA, 0x106C, 0x00000000 },
-    { OP_REG_CNA, 0x1070, 0x00000000 },
-    { OP_REG_CNA, 0x1074, 0x00000000 },
-    { OP_REG_CNA, 0x1078, 0x00000000 }, /* shape */
-    { OP_REG_CNA, 0x107C, 0x000000ff }, /* shape */
-    { OP_REG_CNA, 0x1080, 0x00000000 },
-    { OP_REG_CNA, 0x1084, 0x00000000 },
-    { OP_REG_CNA, 0x1088, 0x11000000 }, /* address */
-    { OP_REG_CNA, 0x108C, 0x000f000f },
-    { OP_REG_CNA, 0x1090, 0x00000020 }, /* shape */
-    { OP_REG_CNA, 0x1094, 0x00000001 },
-    { OP_REG_CNA, 0x1098, 0x00000004 }, /* shape */
-    { OP_REG_CNA, 0x109C, 0x00000000 },
-    { OP_REG_CNA, 0x1100, 0x00000000 },
-    { OP_REG_CNA, 0x1104, 0x00000000 },
-    { OP_REG_CNA, 0x1110, 0x33000000 }, /* address */
-    { OP_REG_CNA, 0x1140, 0x00000000 },
-    { OP_REG_CNA, 0x1144, 0x00000000 },
-    { OP_REG_CNA, 0x118C, 0x00000000 },
-    { R76_OP_0401, 0x2810, 0x00000000 },
-    { R76_OP_0401, 0x2814, 0x00000000 },
-    { R76_OP_0401, 0x2818, 0x00000000 },
-    { R76_OP_0401, 0x281C, 0x00000000 },
-    { R76_OP_0401, 0x2820, 0x00000000 },
-    { OP_REG_CORE, 0x3018, 0x10000200 },
-    { OP_REG_CORE, 0x301C, 0x00000000 }, /* shape */
-    { OP_REG_CORE, 0x3020, 0x0000003f }, /* shape */
-    { OP_REG_CORE, 0x3024, 0x00000000 },
-    { OP_REG_DPU, 0x400C, 0x40000004 },
-    { OP_REG_DPU, 0x4010, 0xa0000002 },
-    { OP_REG_DPU, 0x4014, 0x00000000 },
-    { OP_REG_DPU, 0x4018, 0x22000000 }, /* address */
-    { OP_REG_DPU, 0x401C, 0x00000001 },
-    { OP_REG_DPU, 0x4020, 0x00000000 },
-    { OP_REG_DPU, 0x4024, 0x00000000 }, /* shape */
-    { OP_REG_DPU, 0x4028, 0x0000000f }, /* shape */
-    { OP_REG_DPU, 0x402C, 0x0000003f }, /* shape */
-    { OP_REG_DPU, 0x4030, 0x003f0310 }, /* shape */
-    { OP_REG_DPU, 0x4034, 0x00000000 }, /* shape */
-    { OP_REG_DPU, 0x4038, 0x00000053 },
-    { OP_REG_DPU, 0x403C, 0x00000000 },
-    { OP_REG_DPU, 0x4044, 0x00000002 },
-    { OP_REG_DPU, 0x4048, 0x80000000 },
-    { OP_REG_DPU, 0x404C, 0x7fffffff },
-    { OP_REG_DPU, 0x4050, 0x00023333 },
-    { OP_REG_DPU, 0x4058, 0x80000000 },
-    { OP_REG_DPU, 0x405C, 0x7fffffff },
-    { OP_REG_DPU, 0x4060, 0x00000903 },
-    { OP_REG_DPU, 0x406C, 0x80000000 },
-    { OP_REG_DPU, 0x4070, 0x7fffffff },
-    { OP_REG_DPU, 0x4074, 0x80000000 },
-    { OP_REG_DPU, 0x4078, 0x7fffffff },
-    { OP_REG_DPU, 0x407C, 0x010041c1 },
-    { OP_REG_DPU, 0x4080, 0x00000000 },
-    { OP_REG_DPU, 0x4084, 0x00000001 },
-    { OP_REG_DPU, 0x4088, 0x80000000 },
-    { OP_REG_DPU, 0x408C, 0x7fffffff },
-    { OP_REG_DPU, 0x4090, 0x00000000 },
-    { OP_REG_DPU, 0x4094, 0x00000000 },
-    { OP_REG_DPU, 0x409C, 0x00000000 },
-    { OP_REG_DPU, 0x40A4, 0x80000000 },
-    { OP_REG_DPU, 0x40A8, 0x7fffffff },
-    { OP_REG_DPU, 0x40AC, 0x00000000 },
-    { OP_REG_DPU, 0x40B0, 0x00000001 },
-    { OP_REG_DPU, 0x40B4, 0x00000000 },
-    { OP_REG_DPU, 0x40B8, 0x00000003 }, /* shape */
-    { OP_REG_DPU, 0x40BC, 0x00000000 },
-    { OP_REG_DPU, 0x40C0, 0x04440100 },
-    { OP_REG_DPU, 0x40C8, 0x00000000 },
-    { OP_REG_DPU, 0x40CC, 0x00000000 },
-    { OP_REG_DPU, 0x40D0, 0x0040ffff },
-    { OP_REG_DPU, 0x4100, 0x00000000 },
-    { OP_REG_DPU, 0x4104, 0x00000000 },
-    { OP_REG_DPU, 0x4108, 0x00000000 },
-    { OP_REG_DPU, 0x410C, 0x00000000 },
-    { OP_REG_DPU, 0x4110, 0x00000000 },
-    { OP_REG_DPU, 0x4114, 0x00000000 },
-    { OP_REG_DPU, 0x4118, 0x00000000 },
-    { OP_REG_DPU, 0x411C, 0x00000000 },
-    { OP_REG_DPU, 0x4120, 0x00000000 },
-    { OP_REG_DPU, 0x4130, 0x00000000 },
-    { OP_REG_DPU, 0x4140, 0x00000000 },
-    { OP_REG_DPU, 0x4144, 0x00000000 },
-    { OP_REG_DPU, 0x4148, 0x00000000 },
-    { OP_REG_DPU, 0x414C, 0x00000000 },
-    { OP_REG_DPU, 0x4150, 0x00000000 },
-    { OP_REG_DPU, 0x4154, 0x00000000 },
-    { OP_REG_DPU, 0x4160, 0x00000000 },
-    { OP_REG_DPU, 0x4170, 0x00000000 },
-    { OP_REG_DPU, 0x4174, 0x00000000 },
-    { OP_REG_DPU, 0x4184, 0x00000000 },
-    { OP_REG_DPU, 0x4188, 0x00000000 },
-    { OP_REG_DPU, 0x418C, 0x00000000 },
-    { OP_REG_DPU, 0x4190, 0x00000000 },
-    { OP_REG_DPU, 0x4194, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x500C, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x5010, 0x00000000 }, /* shape */
-    { OP_REG_DPU_RDMA, 0x5014, 0x0000003f }, /* shape */
-    { OP_REG_DPU_RDMA, 0x5018, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x501C, 0x00000710 },
-    { OP_REG_DPU_RDMA, 0x5020, 0x44000000 }, /* address */
-    { OP_REG_DPU_RDMA, 0x5024, 0x44000280 }, /* address */
-    { OP_REG_DPU_RDMA, 0x5028, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x502C, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x5030, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x5034, 0x00000041 },
-    { OP_REG_DPU_RDMA, 0x5038, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x5040, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x5044, 0x40000010 },
-    { OP_REG_DPU_RDMA, 0x5048, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x504C, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x5064, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x506C, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x5078, 0x00000000 },
-    { OP_REG_DPU_RDMA, 0x507C, 0x00000000 },
-    { OP_REG_CNA, 0x1008, 0x0000001d },
-    { OP_REG_CORE, 0x3008, 0x0000001d },
-    { OP_REG_DPU, 0x4008, 0x0000001d },
-    { OP_REG_DPU_RDMA, 0x5008, 0x0000001d },
+    { TARGET_CNA, 0x1004, 0x0000000e },
+    { TARGET_CORE, 0x3004, 0x0000000e },
+    { TARGET_CNA, 0x1038, 0x00000007 },
+    { TARGET_DPU, 0x4004, 0x0000000e },
+    { TARGET_CNA, 0x100C, 0x20200120 },
+    { TARGET_CNA, 0x1010, 0x00000fff },
+    { TARGET_CNA, 0x1014, 0x00000009 },
+    { TARGET_CNA, 0x1018, 0x40000404 },
+    { TARGET_CNA, 0x101C, 0x00001000 }, /* shape */
+    { TARGET_CNA, 0x1020, 0x00000080 }, /* shape */
+    { TARGET_CNA, 0x1024, 0x0000001f }, /* shape */
+    { TARGET_CNA, 0x1028, 0x0008003f }, /* shape */
+    { TARGET_CNA, 0x102C, 0x00000003 }, /* shape */
+    { TARGET_CNA, 0x1030, 0x00800000 }, /* shape */
+    { TARGET_CNA, 0x1034, 0x00000003 }, /* shape */
+    { TARGET_CNA, 0x1038, 0x00000007 },
+    { TARGET_CNA, 0x103C, 0x00020000 }, /* shape */
+    { TARGET_CNA, 0x1040, 0x10000000 },
+    { TARGET_CNA, 0x1044, 0x00010002 }, /* shape */
+    { TARGET_CNA, 0x1048, 0x0000000b },
+    { TARGET_CNA, 0x104C, 0x00010001 },
+    { TARGET_CNA, 0x1050, 0x00010001 },
+    { TARGET_CNA, 0x1054, 0x00000000 },
+    { TARGET_CNA, 0x1058, 0x00000000 },
+    { TARGET_CNA, 0x105C, 0x00000000 },
+    { TARGET_CNA, 0x1060, 0x00000000 },
+    { TARGET_CNA, 0x1064, 0x00000000 },
+    { TARGET_CNA, 0x1068, 0x00000000 },
+    { TARGET_CNA, 0x106C, 0x00000000 },
+    { TARGET_CNA, 0x1070, 0x00000000 },
+    { TARGET_CNA, 0x1074, 0x00000000 },
+    { TARGET_CNA, 0x1078, 0x00000003 }, /* shape */
+    { TARGET_CNA, 0x107C, 0x0000003f }, /* shape */
+    { TARGET_CNA, 0x1080, 0x00000000 },
+    { TARGET_CNA, 0x1084, 0x00000000 },
+    { TARGET_CNA, 0x1088, 0x00000000 }, /* address */
+    { TARGET_CNA, 0x108C, 0x000f000f },
+    { TARGET_CNA, 0x1090, 0x00000008 }, /* shape */
+    { TARGET_CNA, 0x1094, 0x00000001 },
+    { TARGET_CNA, 0x1098, 0x00000004 }, /* shape */
+    { TARGET_CNA, 0x109C, 0x00000000 },
+    { TARGET_CNA, 0x1100, 0x00000000 },
+    { TARGET_CNA, 0x1104, 0x00000000 },
+    { TARGET_CNA, 0x1110, 0x00000000 }, /* address */
+    { TARGET_CNA, 0x1140, 0x00000000 },
+    { TARGET_CNA, 0x1144, 0x00000000 },
+    { TARGET_CNA, 0x118C, 0x00000000 },
+    { TARGET_CORE, 0x3018, 0x10000200 },
+    { TARGET_CORE, 0x301C, 0x00030000 }, /* shape */
+    { TARGET_CORE, 0x3020, 0x0000001f }, /* shape */
+    { TARGET_CORE, 0x3024, 0x00000000 },
+    { TARGET_DPU, 0x400C, 0x40000004 },
+    { TARGET_DPU, 0x4010, 0xa0000002 },
+    { TARGET_DPU, 0x4014, 0x00000000 },
+    { TARGET_DPU, 0x4018, 0x00000000 }, /* address */
+    { TARGET_DPU, 0x401C, 0x00000001 },
+    { TARGET_DPU, 0x4020, 0x00000000 },
+    { TARGET_DPU, 0x4024, 0x00000003 }, /* shape */
+    { TARGET_DPU, 0x4028, 0x00000007 }, /* shape */
+    { TARGET_DPU, 0x402C, 0x0000001f }, /* shape */
+    { TARGET_DPU, 0x4030, 0x001f0310 }, /* shape */
+    { TARGET_DPU, 0x4034, 0x00030000 }, /* shape */
+    { TARGET_DPU, 0x4038, 0x00000053 },
+    { TARGET_DPU, 0x403C, 0x00000000 },
+    { TARGET_DPU, 0x4044, 0x00000002 },
+    { TARGET_DPU, 0x4048, 0x80000000 },
+    { TARGET_DPU, 0x404C, 0x7fffffff },
+    { TARGET_DPU, 0x4050, 0x00023333 },
+    { TARGET_DPU, 0x4058, 0x80000000 },
+    { TARGET_DPU, 0x405C, 0x7fffffff },
+    { TARGET_DPU, 0x4060, 0x00000903 },
+    { TARGET_DPU, 0x406C, 0x80000000 },
+    { TARGET_DPU, 0x4070, 0x7fffffff },
+    { TARGET_DPU, 0x4074, 0x80000000 },
+    { TARGET_DPU, 0x4078, 0x7fffffff },
+    { TARGET_DPU, 0x407C, 0x010041c1 },
+    { TARGET_DPU, 0x4080, 0x00000000 },
+    { TARGET_DPU, 0x4084, 0x00000001 },
+    { TARGET_DPU, 0x4088, 0x80000000 },
+    { TARGET_DPU, 0x408C, 0x7fffffff },
+    { TARGET_DPU, 0x4090, 0x00000000 },
+    { TARGET_DPU, 0x4094, 0x00000000 },
+    { TARGET_DPU, 0x409C, 0x00000000 },
+    { TARGET_DPU, 0x40A4, 0x80000000 },
+    { TARGET_DPU, 0x40A8, 0x7fffffff },
+    { TARGET_DPU, 0x40AC, 0x00000000 },
+    { TARGET_DPU, 0x40B0, 0x00000001 },
+    { TARGET_DPU, 0x40B4, 0x00000000 },
+    { TARGET_DPU, 0x40B8, 0xffffffeb }, /* shape */
+    { TARGET_DPU, 0x40BC, 0x00000000 },
+    { TARGET_DPU, 0x40C0, 0x04440100 },
+    { TARGET_DPU, 0x40C8, 0x00000000 },
+    { TARGET_DPU, 0x40CC, 0x00000000 },
+    { TARGET_DPU, 0x40D0, 0x0040ffff },
+    { TARGET_DPU, 0x4100, 0x00000000 },
+    { TARGET_DPU, 0x4104, 0x00000000 },
+    { TARGET_DPU, 0x4108, 0x00000000 },
+    { TARGET_DPU, 0x410C, 0x00000000 },
+    { TARGET_DPU, 0x4110, 0x00000000 },
+    { TARGET_DPU, 0x4114, 0x00000000 },
+    { TARGET_DPU, 0x4118, 0x00000000 },
+    { TARGET_DPU, 0x411C, 0x00000000 },
+    { TARGET_DPU, 0x4120, 0x00000000 },
+    { TARGET_DPU, 0x4130, 0x00000000 },
+    { TARGET_DPU, 0x4140, 0x00000000 },
+    { TARGET_DPU, 0x4144, 0x00000000 },
+    { TARGET_DPU, 0x4148, 0x00000000 },
+    { TARGET_DPU, 0x414C, 0x00000000 },
+    { TARGET_DPU, 0x4150, 0x00000000 },
+    { TARGET_DPU, 0x4154, 0x00000000 },
+    { TARGET_DPU, 0x4160, 0x00000000 },
+    { TARGET_DPU, 0x4170, 0x00000000 },
+    { TARGET_DPU, 0x4174, 0x00000000 },
+    { TARGET_DPU, 0x4184, 0x00000000 },
+    { TARGET_DPU, 0x4188, 0x00000000 },
+    { TARGET_DPU, 0x418C, 0x00000000 },
+    { TARGET_DPU, 0x4190, 0x00000000 },
+    { TARGET_DPU, 0x4194, 0x00000000 },
+    /* The PC trailer. The compiler writes the next task's address and register amount
+     * into the first two words of a chained task; the driver chains the tasks itself, so
+     * every task here carries the last task's trailer. */
+    { TARGET_NONE, 0x0000, 0x00000000 },
+    { TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x00000000 },
+    { TARGET_PRE_ENABLE, 0x0000, 0x00000000 },
+    { TARGET_ENABLE, REG_PC_OPERATION_ENABLE, R76_MMF16_ENABLE },
 };
 
 /* ONE TASK'S ENVELOPE, and every bound in it was found on the part rather than read off
@@ -4479,14 +4469,13 @@ static const struct { uint16_t op, reg; uint32_t val; } r76_mmf16_tab[RK3576_MM_
  *     that 0x1040 sets: (K/32)*M <= 4096 exactly, with M not rounded. 85x1536 (4080),
  *     1365x96 (4095), 21x6144 and 512x256 are exact; 86x1536, 1366x96, 22x6144 and
  *     1024x256 come back WRONG on every row, not short by the rows past the window, and
- *     the same way twice. Nothing in the stream moves at the boundary: charsiu's own
- *     emitter writes the same words there.
+ *     the same way twice. Nothing in the stream moves at the boundary.
  *   - K <= 6144: 6144 is exact and 6176 never reports completion, the int8 program's
  *     boundary too.
  *   - N <= 8192: 8192 is exact, and at 8960 the job wrote exactly the first 768 columns
  *     and hung, which is 8959 mod 8192 + 1 [inferred: 0x1024's kernel count is 13 bits].
  *   - Nothing else bounds it that the sweep reached: a 96 MiB weight at K 6144 N 8192,
- *     M*N to 4096*2048 (0x40B8's closed form wraps there, as charsiu's does), exact.
+ *     M*N to 4096*2048, exact.
  *
  * THE ENTRY'S ENVELOPE tiles M over tasks of at most the window's rows, so M is bounded
  * by what the entry's gate runs, not by the window. */
@@ -4513,11 +4502,6 @@ int rocket_rk3576_mm_fp16_shape_ok(unsigned m, unsigned k, unsigned n)
     return m >= 1 && m <= R76_MMF16_MAX_M && rocket_rk3576_mm_fp16_task_ok(1, k, n);
 }
 
-/* charsiu's record table (8 channels a 64-byte group) and its fp16 scale table. The
- * RDMA reads the second operand at their end, so 0x5024 = coef + 10n at n%8 == 0. */
-static size_t r76_mmf16_table_bytes(unsigned n) { return (size_t)((n + 7) / 8) * 64; }
-static size_t r76_mmf16_scale_bytes(unsigned n) { return (size_t)((n + 7) & ~7u) * 2; }
-
 size_t rocket_rk3576_mm_fp16_in_bytes(unsigned m, unsigned k)
 {
     return (size_t)m * k * 2 + 4096;
@@ -4533,17 +4517,9 @@ size_t rocket_rk3576_mm_fp16_out_bytes(unsigned m, unsigned n)
     return (size_t)m * n * 4 + 4096;
 }
 
-/* charsiu_coef_bytes() at its default of 65536 float elements. The float region is far
- * larger than anything written into it; charsiu sized it against RDMA reads that ran
- * off a smaller buffer and faulted. */
-size_t rocket_rk3576_mm_fp16_coef_bytes(unsigned n)
-{
-    return r76_mmf16_table_bytes(n) + 65536u * 4u + 0x100u;
-}
-
 static uint32_t r76_mmf16_word(uint16_t reg, uint32_t val, unsigned m, unsigned k,
-                               unsigned n, uint32_t in_dma, uint32_t w_dma,
-                               uint32_t out_dma, uint32_t coef_dma)
+                               unsigned n, uint32_t in_iova, uint32_t w_iova,
+                               uint32_t out_iova)
 {
     unsigned kd = k / 32;    /* CBUF entries a row: k/8 atoms, four to an entry */
     switch (reg) {
@@ -4558,47 +4534,43 @@ static uint32_t r76_mmf16_word(uint16_t reg, uint32_t val, unsigned m, unsigned 
     case 0x1044: return 0x10000u | kd;
     case 0x1078: return m - 1;
     case 0x107C: return k - 1;
-    case 0x1088: return in_dma;
+    case 0x1088: return in_iova;
     case 0x1090: return k / 8;                                 /* the row-major line  */
     case 0x1098: return (m + 3) & ~3u;
-    case 0x1110: return w_dma;
+    case 0x1110: return w_iova;
     case 0x301C: return (m - 1) << 16;
     case 0x3020: return n - 1;
-    case 0x4018: return out_dma;
+    case 0x4018: return out_iova;
     case 0x4024: return m - 1;
     case 0x4028: return n / 4 - 1;
     case 0x402C: return n - 1;
     case 0x4030: return ((n - 1) << 16) | 0x310u;
     case 0x4034: return (m - 1) << 16;
-    case 0x40B8: return (n / 4 + 3) - (m * n) / 4;             /* wraps, as charsiu's */
-    case 0x5010: return m - 1;
-    case 0x5014: return n - 1;
-    case 0x5020: return coef_dma;
-    case 0x5024: return coef_dma + (uint32_t)(r76_mmf16_table_bytes(n) +
-                                              r76_mmf16_scale_bytes(n));
+    case 0x40B8: return (n / 4 + 3) - (m * n) / 4;             /* negative past m 1   */
     default:     return val;
     }
 }
 
 static int r76_mmf16_emit(uint64_t *ops, unsigned m, unsigned k, unsigned n,
-                          uint32_t in_dma, uint32_t weight_dma, uint32_t out_dma,
-                          uint32_t coef_dma)
+                          uint32_t in_iova, uint32_t weight_iova, uint32_t out_iova)
 {
     unsigned i;
 
     for (i = 0; i < RK3576_MM_FP16_OPS; i++) {
         uint32_t v = r76_mmf16_tab[i].val;
-        if (r76_mmf16_tab[i].op != R76_OP_0401)
-            v = r76_mmf16_word(r76_mmf16_tab[i].reg, v, m, k, n, in_dma, weight_dma,
-                               out_dma, coef_dma);
-        ops[i] = NPUOP(r76_mmf16_tab[i].op, v, r76_mmf16_tab[i].reg);
+        /* Only the CNA, CORE and DPU words have closed forms; the trailer's registers
+         * share offsets with none of them, but they are skipped by block, not by luck. */
+        if (r76_mmf16_tab[i].op == TARGET_CNA || r76_mmf16_tab[i].op == TARGET_CORE ||
+            r76_mmf16_tab[i].op == TARGET_DPU)
+            v = r76_mmf16_word(r76_mmf16_tab[i].reg, v, m, k, n, in_iova, weight_iova,
+                               out_iova);
+        ops[i] = REGCMD(r76_mmf16_tab[i].op, r76_mmf16_tab[i].reg, v);
     }
     return RK3576_MM_FP16_OPS;
 }
 
-int gen_matmul_fp16_rk3576(uint64_t *ops, unsigned m, unsigned k, unsigned n,
-                           uint32_t in_dma, uint32_t weight_dma, uint32_t out_dma,
-                           uint32_t coef_dma)
+int gen_gemm_fp16_rk3576(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                           uint32_t in_iova, uint32_t weight_iova, uint32_t out_iova)
 {
     if (!ops) return -1;
     if (!rocket_rk3576_mm_fp16_task_ok(m, k, n)) {
@@ -4608,21 +4580,21 @@ int gen_matmul_fp16_rk3576(uint64_t *ops, unsigned m, unsigned k, unsigned n,
                     R76_MMF16_WINDOW);
         return -1;
     }
-    return r76_mmf16_emit(ops, m, k, n, in_dma, weight_dma, out_dma, coef_dma);
+    return r76_mmf16_emit(ops, m, k, n, in_iova, weight_iova, out_iova);
 }
 
-int gen_matmul_fp16_rk3576_unchecked(uint64_t *ops, unsigned m, unsigned k, unsigned n,
-                                     uint32_t in_dma, uint32_t weight_dma,
-                                     uint32_t out_dma, uint32_t coef_dma)
+int gen_gemm_fp16_rk3576_unchecked(uint64_t *ops, unsigned m, unsigned k, unsigned n,
+                                     uint32_t in_iova, uint32_t weight_iova,
+                                     uint32_t out_iova)
 {
     if (!ops || !m || k < 32 || k % 32 || n < 16 || n % 16) return -1;
-    return r76_mmf16_emit(ops, m, k, n, in_dma, weight_dma, out_dma, coef_dma);
+    return r76_mmf16_emit(ops, m, k, n, in_iova, weight_iova, out_iova);
 }
 
-/* [n/16][k/32][n%16][k%32]: charsiu's CHARSIU_W16_GROUP, the int8 weight tiling with
- * two-byte elements, and the one layout of its three candidates that comes back exact
- * (the dense row-major one was wrong on 64 of 64 outputs). With k%32 and n%16 there are no edge
- * tiles, so a row of 32 is contiguous at both ends. */
+/* [n/16][k/32][n%16][k%32]: the fp16 native B layout of Rockchip's matmul API,
+ * (N/16, K/32, 16, 32), and the int8 weight tiling with two-byte elements. A row-major
+ * control computes wrong on 64 of 64 outputs with this program. With k%32 and
+ * n%16 there are no edge tiles, so a row of 32 is contiguous at both ends. */
 int rocket_rk3576_mm_fp16_pack_weights(void *dst, size_t dst_bytes, const uint16_t *B,
                                        unsigned k, unsigned n)
 {
@@ -4636,37 +4608,5 @@ int rocket_rk3576_mm_fp16_pack_weights(void *dst, size_t dst_bytes, const uint16
             memcpy(d + (size_t)(nn / 16) * 16 * k + (size_t)(kk / 32) * 32 * 16 +
                        (size_t)(nn % 16) * 32,
                    B + (size_t)nn * k + kk, 32 * sizeof(uint16_t));
-    return 0;
-}
-
-/* charsiu_build_coefs() for this job: zero bias and weight sums, zero points 0, every
- * scale 1.0. Per 8-channel group of 64 bytes: eight int32 A of 128 (its lift,
- * 128/mult rounded), eight int16 B of 0x80, eight int16 C of 16. Then one fp16 1.0 per
- * channel padded to 8, then the int32 0x1004 its RDMA reads as the second operand, and
- * zeros to the end. */
-int rocket_rk3576_mm_fp16_pack_coef(void *dst, size_t dst_bytes, unsigned n)
-{
-    uint8_t *d = (uint8_t *)dst;
-    size_t tb = r76_mmf16_table_bytes(n), sb = r76_mmf16_scale_bytes(n);
-    unsigned oc;
-    uint32_t op2 = 0x1004;
-
-    if (!dst || !n || dst_bytes < rocket_rk3576_mm_fp16_coef_bytes(n)) return -1;
-    memset(d, 0, rocket_rk3576_mm_fp16_coef_bytes(n));
-    /* The padding channels past n carry the last real record, as charsiu's do; every
-     * record is the same here, so that is every channel of the last group. */
-    for (oc = 0; oc < ((n + 7) & ~7u); oc++) {
-        unsigned g = oc / 8, i = oc % 8;
-        int32_t a = 128;
-        int16_t b = 0x80, c = 16;
-        memcpy(d + g * 64 + i * 4, &a, 4);
-        memcpy(d + g * 64 + 32 + i * 2, &b, 2);
-        memcpy(d + g * 64 + 48 + i * 2, &c, 2);
-    }
-    for (oc = 0; oc < sb / 2; oc++) {
-        uint16_t one = 0x3C00;   /* fp16 1.0 */
-        memcpy(d + tb + oc * 2, &one, 2);
-    }
-    memcpy(d + tb + sb, &op2, 4);
     return 0;
 }

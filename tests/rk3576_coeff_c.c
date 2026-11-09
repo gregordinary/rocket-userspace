@@ -45,8 +45,8 @@
 #define SENTINEL 0xAA
 
 /* Both are 1-BASED on every axis, and both live in the library. */
-int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
-int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+int feature_index(int C, int H, int W, int C2_, int c, int h, int w);
+int conv_weight_index_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
 
 /* The DPU shift word the `shift` mode writes (bits[5:0] shift the non-negative results,
  * bits[13:8] the negative ones). Zero, as every other mode leaves it, is no shift. */
@@ -102,7 +102,7 @@ static int run_one_scaled(int fd, unsigned oc_n, unsigned nic, int fval, int wva
         for (j = 0; j < nic; j++)
             for (y = 0; y < ih; y++)
                 for (x = 0; x < iw; x++)
-                    f[feature_data((int)icreg, (int)ih, (int)iw, C2,
+                    f[feature_index((int)icreg, (int)ih, (int)iw, C2,
                                    (int)j + 1, (int)y + 1, (int)x + 1)] = (int8_t)fval;
     }
     rocket_bo_fini(fd, &bo_in);
@@ -114,7 +114,7 @@ static int run_one_scaled(int fd, unsigned oc_n, unsigned nic, int fval, int wva
         unsigned j;
         for (c = 0; c < oc_n; c++)
             for (j = 0; j < nic; j++)
-                w8[weight_conv_int8((int)ocreg, (int)icreg, (int)k, (int)k,
+                w8[conv_weight_index_int8((int)ocreg, (int)icreg, (int)k, (int)k,
                                     (int)c + 1, (int)j + 1, 1, 1)] = (int8_t)wval;
     }
     rocket_bo_fini(fd, &bo_w);
@@ -138,10 +138,10 @@ static int run_one_scaled(int fd, unsigned oc_n, unsigned nic, int fval, int wva
     p.in_scale = conv_scale; p.w_scale = 1.0f; p.out_scale = 1.0f;
     p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
     p.tasks       = ops;
-    p.input_dma   = bo_in.dma_address;
-    p.weights_dma = bo_w.dma_address;
-    p.bias_dma    = bo_b.dma_address;
-    p.output_dma  = bo_o.dma_address;
+    p.input_iova   = bo_in.dma_address;
+    p.weights_iova = bo_w.dma_address;
+    p.bias_iova    = bo_b.dma_address;
+    p.output_iova  = bo_o.dma_address;
     p.ih_full = (uint16_t)ih; p.oh_full = (uint16_t)oh;
 
     in_h[0] = bo_in.handle; in_h[1] = bo_w.handle;

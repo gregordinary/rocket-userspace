@@ -78,8 +78,8 @@
  * not recover. */
 #define R76_I32_TASK_ATTEMPTS 8
 
-int feature_data(int C, int H, int W, int C2_, int c, int h, int w);
-int weight_conv_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
+int feature_index(int C, int H, int W, int C2_, int c, int h, int w);
+int conv_weight_index_int8(int OCn, int ICn, int KH, int KW, int oc, int ic, int kh, int kw);
 
 /* ============================================================================
  * SECTION — phase profiling
@@ -502,9 +502,9 @@ static size_t g_r76_bo_pool_bytes;
  * consumers bound every access by the size they asked for). It is not free: a pooled BO
  * keeps its allocated size, so once the mix of shapes or entries changes a small request
  * can settle onto a far larger BO, and PREP_BO/FINI_BO sync the whole of it every call.
- * The fp16 per-call entry's 8 KiB weight request settles onto a 257 KiB coefficient BO
- * after one shape change [HW sweep 2026-09-25, rk3576_mm_fp16_cost; the matching is
- * inferred from the sizes]. */
+ * On the fp16 per-call entry an 8 KiB weight request settled onto a 257 KiB BO after one
+ * shape change [HW sweep 2026-09-25, rk3576_mm_fp16_cost; the matching is inferred from
+ * the sizes]. */
 static int r76_bo_get(int fd, size_t size, rocket_bo *bo)
 {
     if (r76_bo_pool_on()) {
@@ -567,7 +567,7 @@ void rocket_rk3576_bo_pool_drain(int fd)
  * puts column n's 32-byte k-runs at (n/32)*nK1*1024 + (n%32)*32 + (k/32)*1024, and
  * the tile loop steps n0 by a multiple of 32, so the whole-N cube is exactly the
  * concatenation of the per-tile cubes and one BO serves every N tile at every M —
- * a tile's program just offsets weights_dma by (n0/32)*nK1*1024. The contract, and
+ * a tile's program just offsets weights_iova by (n0/32)*nK1*1024. The contract, and
  * what a stale object computes, are on the declarations in rocket_matmul.h.
  * ==========================================================================*/
 struct rocket_rk3576_wbo {
@@ -944,7 +944,7 @@ static int r76_mm_int8(int fd, int M, int K, int N,
     /* The FEATURE cube is packed once and shared by every N tile: the tiling is on the
      * output-channel axis, which the feature side does not see.
      *
-     * BLOCKED, NOT PER ELEMENT. feature_data() at C2=16 puts channel k of pixel m at
+     * BLOCKED, NOT PER ELEMENT. feature_index() at C2=16 puts channel k of pixel m at
      * (k/16)*ih*iw*16 + 16*m + (k%16), so sixteen consecutive channels are sixteen
      * consecutive bytes at BOTH ends — a copy rather than a scatter. K is a multiple of
      * 32 on this path, so every run is a whole sixteen. The per-element form is what
@@ -1019,7 +1019,7 @@ static int r76_mm_int8(int fd, int M, int K, int N,
             rocket_bo_prep(fd, &b.w, 1, 0);
             memset(b.w.ptr, 0, w_bytes);
             /* BLOCKED, NOT PER ELEMENT — and this is the one that mattered. At kh=kw=1
-             * weight_conv_int8() reduces to (n/32)*nK1*1024 + (k/32)*1024 + (n%32)*32 +
+             * conv_weight_index_int8() reduces to (n/32)*nK1*1024 + (k/32)*1024 + (n%32)*32 +
              * (k%32), so thirty-two consecutive k are thirty-two consecutive bytes at
              * both ends. A K*N element-at-a-time scatter through the index function is
              * a million calls at K=N=1024, which was most of that shape's wall clock;
@@ -1117,12 +1117,12 @@ static int r76_mm_int8(int fd, int M, int K, int N,
         p.output_zero_point = 0x80;
         p.weight_zero_point = 0x80;
         p.tasks       = ops;
-        p.input_dma   = b.in.dma_address;
-        p.weights_dma = wbo ? wbo->bo.dma_address
+        p.input_iova   = b.in.dma_address;
+        p.weights_iova = wbo ? wbo->bo.dma_address
                               + (size_t)(n0 / 32u) * (((unsigned)K + 31u) / 32u) * 1024u
                             : b.w.dma_address;
-        p.bias_dma    = b.coeff.dma_address;
-        p.output_dma  = b.out.dma_address;
+        p.bias_iova    = b.coeff.dma_address;
+        p.output_iova  = b.out.dma_address;
 
         pt0 = PROF_T0();
         {
@@ -1166,8 +1166,8 @@ static int r76_mm_int8(int fd, int M, int K, int N,
             conv_params_t q = p;
             q.ih = plan[t].ih; q.oh = plan[t].oh;
             q.pad_top = plan[t].pad_top;
-            q.input_dma  = p.input_dma  + plan[t].feature_off;
-            q.output_dma = p.output_dma + plan[t].output_off;
+            q.input_iova  = p.input_iova  + plan[t].feature_off;
+            q.output_iova = p.output_iova + plan[t].output_off;
             /* ALWAYS, not only when the plan split: the emitter derives the DDR
              * channel-group stride from the FULL plane, and leaving these at the
              * window makes every group past the first read at the wrong offset. */
@@ -2194,7 +2194,7 @@ static int r76_i32_dense(int fd, int M, int K, int N, const int8_t *A, const int
         int m;
         for (m = 0; m < M; m++)
             for (k = 0; k < kslice; k++)
-                slot[feature_data((int)kslice, (int)ih, (int)iw, C2, (int)k + 1,
+                slot[feature_index((int)kslice, (int)ih, (int)iw, C2, (int)k + 1,
                                   m / (int)iw + 1, m % (int)iw + 1)] = A[(size_t)m * K + k0 + k];
     }
     rocket_bo_fini(fd, &b.in);
@@ -2244,7 +2244,7 @@ static int r76_i32_dense(int fd, int M, int K, int N, const int8_t *A, const int
             memset(b.w.ptr, 0, w_bytes);
             for (n = 0; n < tile_n; n++)
                 for (k = 0; k < kslice; k++)
-                    ((int8_t *)b.w.ptr)[weight_conv_int8((int)oc_prog, (int)kslice, 1, 1,
+                    ((int8_t *)b.w.ptr)[conv_weight_index_int8((int)oc_prog, (int)kslice, 1, 1,
                                                          (int)n + 1, (int)k + 1, 1, 1)] =
                         B[(size_t)(n0 + n) * K + k0 + k];
             rocket_bo_fini(fd, &b.w);
@@ -2265,8 +2265,8 @@ static int r76_i32_dense(int fd, int M, int K, int N, const int8_t *A, const int
             p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
             p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
             p.tasks = ops;
-            p.weights_dma = b.w.dma_address;
-            p.bias_dma    = b.coeff.dma_address;
+            p.weights_iova = b.w.dma_address;
+            p.bias_iova    = b.coeff.dma_address;
             in_h[0] = b.in.handle; in_h[1] = b.w.handle;
             in_h[2] = b.coeff.handle; in_h[3] = b.rc.handle;
             out_h[0] = b.out.handle;
@@ -2281,9 +2281,9 @@ static int r76_i32_dense(int fd, int M, int K, int N, const int8_t *A, const int
                     const unsigned char *sp;
                     q.ih = plan[t].oh; q.oh = plan[t].oh; q.oh_full = plan[t].oh;
                     q.pad_top = 0;
-                    q.input_dma  = b.in.dma_address + (uint32_t)((size_t)(k0 / ks) * in_slot) +
+                    q.input_iova  = b.in.dma_address + (uint32_t)((size_t)(k0 / ks) * in_slot) +
                                    (uint32_t)plan[t].oy0 * iw * C2;
-                    q.output_dma = b.out.dma_address + (uint32_t)task_off[t];
+                    q.output_iova = b.out.dma_address + (uint32_t)task_off[t];
                     if (gen_conv2d_int8_rk3576_i32out_dense(&q) != 0) {
                         rc = ROCKET_E_SHAPE; goto done;
                     }
@@ -2489,7 +2489,7 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
         for (m = 0; m < M; m++) {
             unsigned k;
             for (k = 0; k < kslice; k++)
-                slot[feature_data((int)kslice, (int)ih, (int)iw, C2,
+                slot[feature_index((int)kslice, (int)ih, (int)iw, C2,
                                   (int)k + 1, m / (int)iw + 1, m % (int)iw + 1)] =
                     A[(size_t)m * K + k0 + k];
         }
@@ -2658,7 +2658,7 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
             memset(b.w.ptr, 0, w_bytes);
             for (n = 0; n < tile_n; n++)
                 for (k = 0; k < kslice; k++)
-                    ((int8_t *)b.w.ptr)[weight_conv_int8((int)oc_prog, (int)kslice, 1, 1,
+                    ((int8_t *)b.w.ptr)[conv_weight_index_int8((int)oc_prog, (int)kslice, 1, 1,
                                                          (int)r76_i32_prog_oc(n, mult) + 1,
                                                          (int)k + 1, 1, 1)] =
                         B[(size_t)(n0 + n) * K + k0 + k];
@@ -2685,10 +2685,10 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
             p.output_zero_point = 0x80;
             p.weight_zero_point = 0x80;
             p.tasks       = ops;
-            p.input_dma   = b.in.dma_address + (uint32_t)((size_t)(k0 / ks) * in_slot);
-            p.weights_dma = b.w.dma_address;
-            p.bias_dma    = b.coeff.dma_address;
-            p.output_dma  = b.out.dma_address;
+            p.input_iova   = b.in.dma_address + (uint32_t)((size_t)(k0 / ks) * in_slot);
+            p.weights_iova = b.w.dma_address;
+            p.bias_iova    = b.coeff.dma_address;
+            p.output_iova  = b.out.dma_address;
 
             in_h[0] = b.in.handle; in_h[1] = b.w.handle;
             in_h[2] = b.coeff.handle; in_h[3] = b.rc.handle;
@@ -2732,12 +2732,12 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                 uint64_t tjob, jns;
                 q.ih = plan[t].ih; q.oh = plan[t].oh;
                 q.pad_top = plan[t].pad_top;
-                q.input_dma  = p.input_dma  + plan[t].feature_off;
+                q.input_iova  = p.input_iova  + plan[t].feature_off;
                 if (mult == 4u) {
                     /* The narrow writer's surface is one shared cube and the row plan's
                      * output offset counts int8 atoms; a 32-bit element moves the same
                      * 16-byte atom, so the offset carries over unchanged. */
-                    q.output_dma = p.output_dma + plan[t].output_off;
+                    q.output_iova = p.output_iova + plan[t].output_off;
                     q.ih_full = (uint16_t)ih; q.oh_full = (uint16_t)ih;
                 } else {
                     /* The WIDE writer's surface cannot be entered part-way. Its map is
@@ -2752,9 +2752,9 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                      * into a larger convolution at all — it is a smaller convolution.
                      * Each one gets its OWN full surface, laid end to end in the same
                      * BO, and the de-scatter walks them. */
-                    q.input_dma  = p.input_dma +
+                    q.input_iova  = p.input_iova +
                                    (uint32_t)plan[t].iy0 * iw * C2;
-                    q.output_dma = p.output_dma + (uint32_t)task_off[t];
+                    q.output_iova = p.output_iova + (uint32_t)task_off[t];
                     /* ih_full stays the FULL plane — it is the feature cube's
                      * channel-group stride, and the cube in the BO is the whole one.
                      * Only oh_full moves, which is the output surface's. */
@@ -2768,15 +2768,15 @@ int rocket_matmul_int8_rk3576_i32(int fd, int M, int K, int N,
                 }
                 ROCKET_LOGD("rk3576 matmul i32: submit k0=%u n0=%u ic=%u oc=%u "
                             "in@%08x[%d %d %d %d] w@%08x[%d %d %d %d] out@%08x\n",
-                            k0, n0, kslice, oc_prog, q.input_dma,
+                            k0, n0, kslice, oc_prog, q.input_iova,
                             ((const int8_t *)b.in.ptr)[(size_t)(k0 / ks) * in_slot + 0],
                             ((const int8_t *)b.in.ptr)[(size_t)(k0 / ks) * in_slot + 1],
                             ((const int8_t *)b.in.ptr)[(size_t)(k0 / ks) * in_slot + 2],
                             ((const int8_t *)b.in.ptr)[(size_t)(k0 / ks) * in_slot + 3],
-                            q.weights_dma,
+                            q.weights_iova,
                             ((const int8_t *)b.w.ptr)[0], ((const int8_t *)b.w.ptr)[1],
                             ((const int8_t *)b.w.ptr)[2], ((const int8_t *)b.w.ptr)[3],
-                            q.output_dma);
+                            q.output_iova);
                 /* AN i32out JOB POISONS THE NEXT SUBMIT, and what clears it is a
                  * POWER CYCLE rather than elapsed time.
                  *
@@ -3179,10 +3179,10 @@ done:
 /* ============================================================================
  * The matmul-form fp16 program: one job, the whole of K, an fp32 output.
  *
- * The register program is gen_matmul_fp16_rk3576() in npu_regcmd_rk3576.c; this is the
+ * The register program is gen_gemm_fp16_rk3576() in npu_regcmd_rk3576.c; this is the
  * userspace around it. There is no tiling and no scatter: the activation goes in
  * row-major as it arrives, and the output comes back m rows of n fp32 values. What this
- * layer adds is the weight permutation, the coefficient buffer and the write check.
+ * layer adds is the weight permutation and the write check.
  *
  * THE WRITE CHECK IS PER ELEMENT. An output element still holding the sentinel stamp
  * after the fence is one the job did not write. The whole call is then redone after a
@@ -3198,12 +3198,11 @@ unsigned rocket_rk3576_mm_fp16_last_attempts(void)
     return atomic_load_explicit(&g_r76_mmf16_attempts, memory_order_relaxed);
 }
 
-/* The resident weight and coefficient buffer. The weight BO is the per-call path's
- * permutation of B over the whole N, and the coefficient buffer depends on N alone, so
- * both are what one call used to build; the contract is on the declarations in
+/* The resident weight. The weight BO is the per-call path's permutation of B over the
+ * whole N, which is what one call would build; the contract is on the declarations in
  * rocket_matmul.h. */
 struct rocket_rk3576_wbo_fp16 {
-    rocket_bo w, coef;
+    rocket_bo w;
     int K, N;
 };
 
@@ -3229,8 +3228,7 @@ int rocket_rk3576_wbo_fp16_create(int fd, int K, int N, const _Float16 *B,
     h = calloc(1, sizeof *h);
     if (!h) return ROCKET_E_NOMEM;
     if (rocket_bo_alloc32(fd, rocket_rk3576_mm_fp16_weight_bytes((unsigned)K, (unsigned)N),
-                          &h->w) != 0 ||
-        rocket_bo_alloc32(fd, rocket_rk3576_mm_fp16_coef_bytes((unsigned)N), &h->coef) != 0) {
+                          &h->w) != 0) {
         rocket_rk3576_wbo_fp16_free(fd, h);
         return ROCKET_E_NOMEM;
     }
@@ -3238,11 +3236,6 @@ int rocket_rk3576_wbo_fp16_create(int fd, int K, int N, const _Float16 *B,
     rc = rocket_rk3576_mm_fp16_pack_weights(h->w.ptr, h->w.size, (const uint16_t *)B,
                                             (unsigned)K, (unsigned)N);
     rocket_bo_fini(fd, &h->w);
-    if (!rc) {
-        rocket_bo_prep(fd, &h->coef, 1, 0);
-        rc = rocket_rk3576_mm_fp16_pack_coef(h->coef.ptr, h->coef.size, (unsigned)N);
-        rocket_bo_fini(fd, &h->coef);
-    }
     if (rc) { rocket_rk3576_wbo_fp16_free(fd, h); return ROCKET_E_SHAPE; }
     h->K = K; h->N = N;
     *out = h;
@@ -3252,7 +3245,6 @@ int rocket_rk3576_wbo_fp16_create(int fd, int K, int N, const _Float16 *B,
 void rocket_rk3576_wbo_fp16_free(int fd, struct rocket_rk3576_wbo_fp16 *h)
 {
     if (!h) return;
-    if (h->coef.ptr) rocket_bo_free(fd, &h->coef);
     if (h->w.ptr) rocket_bo_free(fd, &h->w);
     free(h);
 }
@@ -3270,7 +3262,7 @@ void rocket_rk3576_wbo_fp16_free(int fd, struct rocket_rk3576_wbo_fp16 *h)
  * on a line of their own, so a process that ran both does not blend them. `scan` is the
  * copy out to C with the stamp check folded into it; `read` is the FINI_BO after it. */
 struct r76_f16_prof {
-    double alloc, packB, coeff, packA, gen, stamp, submit, wait, scan, read, bofree, wall;
+    double alloc, packB, packA, gen, stamp, submit, wait, scan, read, bofree, wall;
     long tasks, submits;
 };
 static struct r76_f16_prof g_prof_f16;
@@ -3281,9 +3273,9 @@ static void r76_f16_prof_dump(void)
 {
     const struct r76_f16_prof *g = &g_prof_f16;
     ROCKET_LOGI("ROCKET rk3576 fp16 matmul profile total(ms): wall=%.1f alloc=%.1f "
-                "packB=%.1f coeff=%.1f packA=%.1f gen=%.1f stamp=%.1f submit=%.1f "
+                "packB=%.1f packA=%.1f gen=%.1f stamp=%.1f submit=%.1f "
                 "wait=%.1f scan=%.1f read=%.1f bofree=%.1f  over %ld calls / %ld tasks / "
-                "%ld submits\n", g->wall, g->alloc, g->packB, g->coeff, g->packA, g->gen,
+                "%ld submits\n", g->wall, g->alloc, g->packB, g->packA, g->gen,
                 g->stamp, g->submit, g->wait, g->scan, g->read, g->bofree,
                 g_prof_f16_calls, g->tasks, g->submits);
 }
@@ -3293,7 +3285,7 @@ static void r76_f16_prof_fold(const struct r76_f16_prof *p)
     struct r76_f16_prof *g = &g_prof_f16;
     pthread_mutex_lock(&g_prof_r76_mu);
     if (!g_prof_f16_armed) { atexit(r76_f16_prof_dump); g_prof_f16_armed = 1; }
-    g->alloc += p->alloc; g->packB += p->packB; g->coeff += p->coeff;
+    g->alloc += p->alloc; g->packB += p->packB;
     g->packA += p->packA; g->gen += p->gen; g->stamp += p->stamp;
     g->submit += p->submit; g->wait += p->wait; g->scan += p->scan;
     g->read += p->read; g->bofree += p->bofree; g->wall += p->wall;
@@ -3312,17 +3304,17 @@ static unsigned r76_mmf16_tile(unsigned M, unsigned K, unsigned *rows)
     return (M + mt - 1u) / mt;
 }
 
-/* The one body. `wbo` NULL is the per-call entry, which builds the weight and
- * coefficient BOs from B; non-NULL takes both from the handle and never reads B. */
+/* The one body. `wbo` NULL is the per-call entry, which builds the weight BO from B;
+ * non-NULL takes it from the handle and never reads B. */
 static int r76_mm_fp16(int fd, int M, int K, int N, const _Float16 *A,
                        const _Float16 *B, const struct rocket_rk3576_wbo_fp16 *wbo,
                        float *C)
 {
     const struct rocket_hw_profile *hw = rocket_hw_current();
-    rocket_bo in = {0}, w = {0}, coef = {0}, out = {0}, rc = {0};
-    const rocket_bo *wp = &w, *cp = &coef;
+    rocket_bo in = {0}, w = {0}, out = {0}, rc = {0};
+    const rocket_bo *wp = &w;
     rocket_task_desc td[R76_MMF16_MAX_TASKS];
-    uint32_t in_h[4], out_h[1];
+    uint32_t in_h[3], out_h[1];
     unsigned char blank = rocket_rk3576_sentinel_on() ? (unsigned char)R76_SENTINEL_BYTE : 0;
     size_t ib, ob, oelems, e;
     unsigned attempt, ntask, mt, t;
@@ -3365,11 +3357,10 @@ static int r76_mm_fp16(int fd, int M, int K, int N, const _Float16 *A,
     }
     PROF_ADD(alloc, pt0);
     if (wbo) {
-        wp = &wbo->w; cp = &wbo->coef;
+        wp = &wbo->w;
     } else {
         pt0 = PROF_T0();
-        if (r76_bo_get(fd, rocket_rk3576_mm_fp16_weight_bytes((unsigned)K, (unsigned)N), &w) ||
-            r76_bo_get(fd, rocket_rk3576_mm_fp16_coef_bytes((unsigned)N), &coef)) {
+        if (r76_bo_get(fd, rocket_rk3576_mm_fp16_weight_bytes((unsigned)K, (unsigned)N), &w)) {
             ret = ROCKET_E_NOMEM; goto done;
         }
         PROF_ADD(alloc, pt0);
@@ -3379,12 +3370,6 @@ static int r76_mm_fp16(int fd, int M, int K, int N, const _Float16 *A,
                                                  (unsigned)K, (unsigned)N);
         rocket_bo_fini(fd, &w);
         PROF_ADD(packB, pt0);
-        if (ret) { ret = ROCKET_E_SHAPE; goto done; }
-        pt0 = PROF_T0();
-        rocket_bo_prep(fd, &coef, 1, 0);
-        ret = rocket_rk3576_mm_fp16_pack_coef(coef.ptr, coef.size, (unsigned)N);
-        rocket_bo_fini(fd, &coef);
-        PROF_ADD(coeff, pt0);
         if (ret) { ret = ROCKET_E_SHAPE; goto done; }
     }
 
@@ -3400,11 +3385,11 @@ static int r76_mm_fp16(int fd, int M, int K, int N, const _Float16 *A,
     for (t = 0; t < ntask; t++) {
         unsigned r0 = t * mt, rows = (unsigned)M - r0 < mt ? (unsigned)M - r0 : mt;
         uint64_t *slot = (uint64_t *)rc.ptr + (size_t)t * RK3576_MM_FP16_OPS;
-        if (gen_matmul_fp16_rk3576(slot, rows, (unsigned)K, (unsigned)N,
+        if (gen_gemm_fp16_rk3576(slot, rows, (unsigned)K, (unsigned)N,
                                    (uint32_t)(in.dma_address + (uint64_t)r0 * K * 2),
                                    (uint32_t)wp->dma_address,
-                                   (uint32_t)(out.dma_address + (uint64_t)r0 * N * 4),
-                                   (uint32_t)cp->dma_address) != RK3576_MM_FP16_OPS) {
+                                   (uint32_t)(out.dma_address + (uint64_t)r0 * N * 4))
+                != RK3576_MM_FP16_OPS) {
             rocket_bo_fini(fd, &rc);
             ret = ROCKET_E_SHAPE; goto done;
         }
@@ -3414,7 +3399,7 @@ static int r76_mm_fp16(int fd, int M, int K, int N, const _Float16 *A,
     }
     rocket_bo_fini(fd, &rc);
     PROF_ADD(gen, pt0);
-    in_h[0] = in.handle; in_h[1] = wp->handle; in_h[2] = cp->handle; in_h[3] = rc.handle;
+    in_h[0] = in.handle; in_h[1] = wp->handle; in_h[2] = rc.handle;
     out_h[0] = out.handle;
     pr.tasks = ntask;
 
@@ -3435,8 +3420,8 @@ static int r76_mm_fp16(int fd, int M, int K, int N, const _Float16 *A,
         pt0 = PROF_T0();
         tjob = rocket_rk3576_job_clock();
         srv = ntask == 1
-            ? rocket_submit_matmul(fd, &rc, RK3576_MM_FP16_OPS, in_h, 4, out_h, 1, 4000)
-            : rocket_submit_tasks(fd, td, ntask, in_h, 4, out_h, 1);
+            ? rocket_submit_matmul(fd, &rc, RK3576_MM_FP16_OPS, in_h, 3, out_h, 1, 4000)
+            : rocket_submit_tasks(fd, td, ntask, in_h, 3, out_h, 1);
         PROF_ADD(submit, pt0);
         pr.submits++;
         if (srv != 0) goto done;
@@ -3487,7 +3472,6 @@ done:
     pt0 = PROF_T0();
     if (rc.ptr)   r76_bo_put(fd, &rc);
     if (out.ptr)  r76_bo_put(fd, &out);
-    if (coef.ptr) r76_bo_put(fd, &coef);
     if (w.ptr)    r76_bo_put(fd, &w);
     if (in.ptr)   r76_bo_put(fd, &in);
     if (prof) {

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "npu_matmul.h"
 
 static int fails;
@@ -34,12 +35,12 @@ static int fails;
 static size_t chain_words(uint32_t n)   { return (size_t)((n + 1u) & ~1u); }
 static uint32_t amount_encode(uint32_t n){ return (n + 1u) / 2u - 1u; }
 
-/* Index of the trailer PC_REGISTER_AMOUNTS op (the single OP_REG_PC write to
+/* Index of the trailer PC_REGISTER_AMOUNTS op (the single TARGET_PC write to
  * 0x14), scanning from the end. -1 if absent. */
 static int find_trailer(const uint64_t *rc, int n) {
     for (int j = n - 1; j >= 0; j--)
-        if ((uint16_t)(rc[j] >> 48) == OP_REG_PC &&
-            (uint16_t)(rc[j] & 0xffff) == PC_REGISTER_AMOUNTS)
+        if ((uint16_t)(rc[j] >> 48) == TARGET_PC &&
+            (uint16_t)(rc[j] & 0xffff) == REG_PC_REGISTER_AMOUNTS)
             return j;
     return -1;
 }
@@ -47,13 +48,13 @@ static int find_trailer(const uint64_t *rc, int n) {
 /* Generate a single TILE's regcmd (the granularity the tiler hands to gen — never
  * the whole matrix) for the requested dtype. Returns the op count, or 0 if gen
  * rejected the shape. dt: 0=fp16, 1=int8, 2=int4 — all three route through the
- * shared gen_matmul_task trailer-emitter, so the chained layout must hold for each. */
+ * shared trailer emitter (npu_regcmd.c), so the chained layout must hold for each. */
 static uint32_t gen_dt(uint64_t *ops, int dt, int M, int K, int N) {
-    matmul_params_t p = { .m = M, .k = K, .n = N, .input_dma = 0x1000,
-        .weights_dma = 0x2000, .output_dma = 0x3000, .tasks = ops, .fp32tofp16 = 1 };
-    int r = (dt == 1) ? gen_matmul_int8(&p)
-          : (dt == 2) ? gen_matmul_int4(&p)
-                      : gen_matmul_fp16(&p);
+    gemm_params_t p = { .m = M, .k = K, .n = N, .input_iova = 0x1000,
+        .weights_iova = 0x2000, .output_iova = 0x3000, .tasks = ops, .fp16_out = 1 };
+    int r = (dt == 1) ? gen_gemm_int8(&p)
+          : (dt == 2) ? gen_gemm_int4(&p)
+                      : gen_gemm_fp16(&p);
     return r ? 0 : p.task_count;
 }
 
@@ -86,8 +87,8 @@ static void check_dtype(const char *name, int dt, int M0, int K0, int N0,
     uint32_t val = (uint32_t)((a[t] >> 16) & 0xffffffff);
     CHECK(val == 0, "[%s] default trailer amount is %u, expected 0 (end marker)", name, val);
     uint16_t lastop = (uint16_t)(a[na - 1] >> 48);
-    CHECK(lastop == OP_ENABLE, "[%s] last op is 0x%04x, expected OP_ENABLE 0x%04x",
-          name, lastop, OP_ENABLE);
+    CHECK(lastop == TARGET_ENABLE, "[%s] last op is 0x%04x, expected TARGET_ENABLE 0x%04x",
+          name, lastop, TARGET_ENABLE);
 
     /* Contiguous 3-task layout at the chained stride: each task's first op lands at
      * i*stride (gaps poisoned, so a short copy or wrong stride is caught). */
@@ -99,19 +100,19 @@ static void check_dtype(const char *name, int dt, int M0, int K0, int N0,
         memcpy(buf + (size_t)i * stride, srcs[i], (size_t)na * sizeof(uint64_t));
     for (int i = 0; i < 3; i++) {
         uint64_t first = buf[(size_t)i * stride];
-        CHECK((uint16_t)(first >> 48) == OP_REG_DPU &&
-              (uint16_t)(first & 0xffff) == DPU_S_POINTER,
+        CHECK((uint16_t)(first >> 48) == TARGET_DPU &&
+              (uint16_t)(first & 0xffff) == REG_DPU_S_POINTER,
               "[%s] task %d first op = (0x%04x,0x%04x), expected DPU_S_POINTER",
               name, i, (uint16_t)(first >> 48), (uint16_t)(first & 0xffff));
     }
 
-    /* The OP_NONE filler at count-4 is the slot the PC_BASE_ADDRESS redirect claims;
-     * confirm it is inert and that OP_40 follows the amount op (the trailer shape the
-     * chain rewrite depends on, identical across dtypes via gen_matmul_task). */
-    CHECK((uint16_t)(a[t - 1] >> 48) == OP_NONE,
-          "[%s] trailer slot count-4 is 0x%04x, expected OP_NONE filler",
+    /* The TARGET_NONE filler at count-4 is the slot the PC_BASE_ADDRESS redirect claims;
+     * confirm it is inert and that TARGET_PRE_ENABLE follows the amount op (the trailer shape the
+     * chain rewrite depends on, identical across dtypes via the shared emitter). */
+    CHECK((uint16_t)(a[t - 1] >> 48) == TARGET_NONE,
+          "[%s] trailer slot count-4 is 0x%04x, expected TARGET_NONE filler",
           name, (uint16_t)(a[t - 1] >> 48));
-    CHECK((uint16_t)(a[t + 1] >> 48) == OP_40, "[%s] op after amount is not OP_40 magic", name);
+    CHECK((uint16_t)(a[t + 1] >> 48) == TARGET_PRE_ENABLE, "[%s] op after amount is not TARGET_PRE_ENABLE magic", name);
     printf("[%s] contiguous stride=%zu words, trailer idx=%d, layout OK\n", name, stride, t);
 }
 
@@ -136,9 +137,9 @@ int main(void) {
         CHECK(t == (int)na - 3, "trailer at idx %d, expected count-3 (%d)", t, na - 3);
         uint32_t val = (uint32_t)((a[t] >> 16) & 0xffffffff);
         CHECK(val == 0, "default trailer amount is %u, expected 0 (end marker)", val);
-        /* the OP_ENABLE must be the very last op */
+        /* the TARGET_ENABLE must be the very last op */
         uint16_t lastop = (uint16_t)(a[na - 1] >> 48);
-        CHECK(lastop == OP_ENABLE, "last op is 0x%04x, expected OP_ENABLE 0x%04x", lastop, OP_ENABLE);
+        CHECK(lastop == TARGET_ENABLE, "last op is 0x%04x, expected TARGET_ENABLE 0x%04x", lastop, TARGET_ENABLE);
     }
 
     /* Build a 3-task contiguous buffer at the chained stride and confirm each
@@ -153,7 +154,7 @@ int main(void) {
         uint64_t first = buf[(size_t)i * stride];
         uint16_t op  = (uint16_t)(first >> 48);
         uint16_t reg = (uint16_t)(first & 0xffff);
-        CHECK(op == OP_REG_DPU && reg == DPU_S_POINTER,
+        CHECK(op == TARGET_DPU && reg == REG_DPU_S_POINTER,
               "task %d first op = (0x%04x,0x%04x), expected DPU_S_POINTER", i, op, reg);
     }
     printf("contiguous layout: stride=%zu words (%zu bytes), 3 tasks span %zu bytes\n",
@@ -163,33 +164,33 @@ int main(void) {
     if (t >= 0) {
         uint64_t before = a[t];
         uint32_t amt = amount_encode(na);
-        a[t] = ((uint64_t)OP_REG_PC << 48) | ((uint64_t)amt << 16) | PC_REGISTER_AMOUNTS;
-        CHECK((uint16_t)(a[t] >> 48) == OP_REG_PC, "rewrite clobbered op field");
-        CHECK((uint16_t)(a[t] & 0xffff) == PC_REGISTER_AMOUNTS, "rewrite clobbered reg field");
+        a[t] = ((uint64_t)TARGET_PC << 48) | ((uint64_t)amt << 16) | REG_PC_REGISTER_AMOUNTS;
+        CHECK((uint16_t)(a[t] >> 48) == TARGET_PC, "rewrite clobbered op field");
+        CHECK((uint16_t)(a[t] & 0xffff) == REG_PC_REGISTER_AMOUNTS, "rewrite clobbered reg field");
         CHECK((uint32_t)((a[t] >> 16) & 0xffffffff) == amt, "rewrite value wrong");
         printf("chained encoded amount = %u (0x%04x); trailer 0x%016llx -> 0x%016llx\n",
                amt, amt, (unsigned long long)before, (unsigned long long)a[t]);
     }
 
-    /* Chained base-address op: the OP_NONE just before the amount op (count-4) is
+    /* Chained base-address op: the TARGET_NONE just before the amount op (count-4) is
      * the inert filler we repurpose into a PC_BASE_ADDRESS write. Confirm it is
-     * OP_NONE, then that the rewrite lands a raw next-address in the value field
-     * with op=OP_REG_PC reg=PC_BASE_ADDRESS — and does NOT disturb the amount op
-     * or the OP_40 magic / OP_ENABLE that follow. */
+     * TARGET_NONE, then that the rewrite lands a raw next-address in the value field
+     * with op=TARGET_PC reg=PC_BASE_ADDRESS — and does NOT disturb the amount op
+     * or the TARGET_PRE_ENABLE magic / TARGET_ENABLE that follow. */
     if (t >= 1) {
-        CHECK((uint16_t)(b[t - 1] >> 48) == OP_NONE,
-              "trailer slot count-4 is 0x%04x, expected OP_NONE filler", (uint16_t)(b[t - 1] >> 48));
-        CHECK((uint16_t)(b[t + 1] >> 48) == OP_40, "op after amount is not OP_40 magic");
+        CHECK((uint16_t)(b[t - 1] >> 48) == TARGET_NONE,
+              "trailer slot count-4 is 0x%04x, expected TARGET_NONE filler", (uint16_t)(b[t - 1] >> 48));
+        CHECK((uint16_t)(b[t + 1] >> 48) == TARGET_PRE_ENABLE, "op after amount is not TARGET_PRE_ENABLE magic");
         uint32_t next = 0x2000 + (uint32_t)(chain_words(nb) * 8);   /* task-1 IOVA in a 2-task chain */
-        b[t - 1] = ((uint64_t)OP_REG_PC << 48) | ((uint64_t)next << 16) | PC_BASE_ADDRESS;
-        CHECK((uint16_t)(b[t - 1] >> 48) == OP_REG_PC, "base rewrite clobbered op field");
-        CHECK((uint16_t)(b[t - 1] & 0xffff) == PC_BASE_ADDRESS, "base rewrite clobbered reg field");
+        b[t - 1] = ((uint64_t)TARGET_PC << 48) | ((uint64_t)next << 16) | REG_PC_BASE_ADDRESS;
+        CHECK((uint16_t)(b[t - 1] >> 48) == TARGET_PC, "base rewrite clobbered op field");
+        CHECK((uint16_t)(b[t - 1] & 0xffff) == REG_PC_BASE_ADDRESS, "base rewrite clobbered reg field");
         CHECK((uint32_t)((b[t - 1] >> 16) & 0xffffffff) == next, "base rewrite value wrong");
         printf("chained base op -> next IOVA 0x%08x; slot count-4 = 0x%016llx\n",
                next, (unsigned long long)b[t - 1]);
     }
 
-    /* int8 / int4 share gen_matmul_task's trailer, so the chained LAYOUT holds for
+    /* int8 / int4 share the fp16 matmul's trailer, so the chained LAYOUT holds for
      * them too (validated below). This check guards the layout math only. Execution is
      * tests/int8_chain_probe's: independent int8 tasks chain bit-exactly on the RK3588,
      * and int4's int16 writer has not been run chained. The resident int8/int4 paths

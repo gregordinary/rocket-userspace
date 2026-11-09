@@ -98,7 +98,7 @@ static void deadline_checks(int fd, rocket_bo *out, rocket_bo *in)
     CHECK(rocket_bo_fini(fd, in) == 0, "FINI_BO succeeds");
 }
 
-/* The canary's RK3576 job. gen_matmul_fp16() refuses on this part — its
+/* The canary's RK3576 job. gen_gemm_fp16() refuses on this part — its
  * geometry-register encoding is re-packed and the fp16 matmul has no encoder here —
  * so the canary builds what the part DOES run: a 1x1 int8 convolution, which is the
  * same thing a matmul is on this hardware. The arithmetic is irrelevant (the cubes
@@ -133,10 +133,10 @@ static int conv_canary(int fd)
         .kh = 1, .kw = 1, .stride_y = 1, .stride_x = 1, .dil_y = 1, .dil_x = 1,
         .ih_full = IH, .oh_full = IH, .int8_out = 1, .tasks = ops,
         .in_scale = 1.0f, .w_scale = 1.0f, .out_scale = 1.0f,
-        .input_dma   = (uint32_t)in.dma_address,
-        .weights_dma = (uint32_t)wt.dma_address,
-        .bias_dma    = (uint32_t)coeff.dma_address,
-        .output_dma  = (uint32_t)out.dma_address,
+        .input_iova   = (uint32_t)in.dma_address,
+        .weights_iova = (uint32_t)wt.dma_address,
+        .bias_iova    = (uint32_t)coeff.dma_address,
+        .output_iova  = (uint32_t)out.dma_address,
     };
     if (gen_conv2d_int8_rk3576(&p) != 0 || p.task_count == 0) {
         INFO("the part's int8 conv generator refused too: canary skipped");
@@ -234,18 +234,18 @@ int main(void)
         if (ok) {
             rocket_bo_prep(fd,&in,1,0);  memset(in.ptr,0,in.size);
             for(int h=1;h<=M;h++) for(int c=1;c<=K;c++)
-                ((_Float16*)in.ptr)[feature_data(K,M,1,8,c,h,1)]=(_Float16)(0.01f*((h+c)%7));
+                ((_Float16*)in.ptr)[feature_index(K,M,1,8,c,h,1)]=(_Float16)(0.01f*((h+c)%7));
             rocket_bo_fini(fd,&in);
             rocket_bo_prep(fd,&wt,1,0);  memset(wt.ptr,0,wt.size);
             for(int k=1;k<=N;k++) for(int c=1;c<=K;c++)
-                ((_Float16*)wt.ptr)[weight_fp16(K,k,c)]=(_Float16)(0.01f*((k*c)%5));
+                ((_Float16*)wt.ptr)[gemm_weight_index_fp16(K,k,c)]=(_Float16)(0.01f*((k*c)%5));
             rocket_bo_fini(fd,&wt);
 
             uint64_t ops[512]={0};
-            matmul_params_t p={.m=M,.k=K,.n=N,.input_dma=(uint32_t)in.dma_address,
-                .weights_dma=(uint32_t)wt.dma_address,.output_dma=(uint32_t)out.dma_address,
-                .tasks=ops,.fp32tofp16=1};
-            int genrc = gen_matmul_fp16(&p);
+            gemm_params_t p={.m=M,.k=K,.n=N,.input_iova=(uint32_t)in.dma_address,
+                .weights_iova=(uint32_t)wt.dma_address,.output_iova=(uint32_t)out.dma_address,
+                .tasks=ops,.fp16_out=1};
+            int genrc = gen_gemm_fp16(&p);
 
             /* The canary needs a REAL job in flight, and this datapath's generator
              * refuses on a part it has no encoder for (the RK3576 runs a re-packed
@@ -257,12 +257,12 @@ int main(void)
              * generate would crash the box it is meant to be conformance-testing. */
             const int have_regcmd = (genrc == 0 && p.task_count > 0);
             if (!have_regcmd) {
-                INFO("gen_matmul_fp16 refused on this part (%s): the canary needs a "
+                INFO("gen_gemm_fp16 refused on this part (%s): the canary needs a "
                      "regcmd this part RUNS, so it builds a 1x1 int8 conv instead",
                      rocket_hw_current()->name);
                 conv_canary(fd);
             } else {
-            CHECK(genrc == 0, "gen_matmul_fp16 (build a real regcmd)");
+            CHECK(genrc == 0, "gen_gemm_fp16 (build a real regcmd)");
             rocket_bo_prep(fd,&rc_bo,1,0); memcpy(rc_bo.ptr,ops,p.task_count*sizeof(uint64_t));
             rocket_bo_fini(fd,&rc_bo);
 

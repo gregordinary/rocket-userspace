@@ -158,7 +158,7 @@ NETENV=(ROCKET_RK3576_NET_RESIDENT=1 ROCKET_RK3576_NET_CUBE=1)
 
 # --- host-only: no device, never skips ------------------------------------------
 # `chain_layout_rocket` is NOT here: it is host-only but not chip-neutral — it drives
-# gen_matmul_fp16/int8/int4, which refuse on this part by construction, so it fails
+# gen_gemm_fp16/int8/int4, which refuse on this part by construction, so it fails
 # rather than skipping. It is an RK3588 gate.
 g regcmd_rk3576              -- regcmd_rk3576_gate
 # The claim-time plan against the run's own verdict, over the whole envelope table. Pure —
@@ -181,9 +181,9 @@ g conv_sym                   -- rk3576_conv_sym all
 g fp16_drain                 -- rk3576_drain_probe gate
 g refusal_gate               -- rk3576_refusal_gate
 g matmul_gate                -- rk3576_matmul_gate
-# The matmul-form fp16 program, one job for the whole of K: its host half holds the
-# transcription to charsiu's own output, and its device half is exact against the CPU with a
-# wrong-layout control that must come back wrong.
+# The matmul-form fp16 program, one job for the whole of K: its host half holds every
+# emitted stream to the form RKLLM-Toolkit compiles, and its device half is exact against
+# the CPU with a wrong-layout control that must come back wrong.
 g mm_fp16_gate               -- rk3576_mm_fp16_gate
 # The matmul entry's REQUANT against a host model of it, per-tensor and per-column. The
 # only gate anywhere that scores what the DPU's output convertor computes on the matmul

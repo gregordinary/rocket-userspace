@@ -239,7 +239,7 @@ static int run_rk3576(int fd, const probe_scale *ps, int round_bit, int verbose)
 
 static unsigned rup(unsigned a, unsigned b) { return ((a + b - 1) / b) * b; }
 
-/* One int8 matmul through gen_matmul_int8 with the integer convert armed, read back as
+/* One int8 matmul through gen_gemm_int8 with the integer convert armed, read back as
  * fp32. acc[m][n] = (m+1)*(n-32): a rank-1 product over both signs and both parities. */
 static int run_rk3588(int fd, unsigned shift, int round_bit, int verbose)
 {
@@ -275,18 +275,18 @@ static int run_rk3588(int fd, unsigned shift, int round_bit, int verbose)
     setenv("ROCKET_INT8_DEQ_SHIFT", b, 1);
     set_round(round_bit);
     {
-        matmul_params_t p = { .m = DQ_M, .k = DQ_K, .n = DQ_N,
-            .input_dma = (uint32_t)input.dma_address,
-            .weights_dma = (uint32_t)weights.dma_address,
-            .output_dma = (uint32_t)output.dma_address, .tasks = regs };
-        int g = gen_matmul_int8(&p);
+        gemm_params_t p = { .m = DQ_M, .k = DQ_K, .n = DQ_N,
+            .input_iova = (uint32_t)input.dma_address,
+            .weights_iova = (uint32_t)weights.dma_address,
+            .output_iova = (uint32_t)output.dma_address, .tasks = regs };
+        int g = gen_gemm_int8(&p);
         unsetenv("ROCKET_INT8_DEQ");
         unsetenv("ROCKET_INT8_DEQ_PREC");
         unsetenv("ROCKET_INT8_DEQ_CVTTYPE");
         unsetenv("ROCKET_INT8_DEQ_SCALE");
         unsetenv("ROCKET_INT8_DEQ_SHIFT");
         unsetenv("ROCKET_OUT_CVT_ROUND");
-        if (g != 0) { printf("      gen_matmul_int8 refused (%d)\n", g); goto done; }
+        if (g != 0) { printf("      gen_gemm_int8 refused (%d)\n", g); goto done; }
 
         rocket_bo_prep(fd, &regcmd, 1, 0);
         memcpy(regcmd.ptr, regs, (size_t)p.task_count * sizeof(uint64_t));
@@ -296,7 +296,7 @@ static int run_rk3588(int fd, unsigned shift, int round_bit, int verbose)
         memset(input.ptr, 0, input.size);
         for (m = 1; m <= DQ_M; m++)
             for (kk = 1; kk <= DQ_K; kk++)
-                ((int8_t *)input.ptr)[feature_data(DQ_K, DQ_M, 1, 16, kk, m, 1)] =
+                ((int8_t *)input.ptr)[feature_index(DQ_K, DQ_M, 1, 16, kk, m, 1)] =
                     A[(m - 1) * DQ_K + (kk - 1)];
         rocket_bo_fini(fd, &input);
 
@@ -304,7 +304,7 @@ static int run_rk3588(int fd, unsigned shift, int round_bit, int verbose)
         memset(weights.ptr, 0, weights.size);
         for (n = 1; n <= DQ_N; n++)
             for (kk = 1; kk <= DQ_K; kk++)
-                ((int8_t *)weights.ptr)[weight_int8(DQ_K, n, kk)] = B[(n - 1) * DQ_K + (kk - 1)];
+                ((int8_t *)weights.ptr)[gemm_weight_index_int8(DQ_K, n, kk)] = B[(n - 1) * DQ_K + (kk - 1)];
         rocket_bo_fini(fd, &weights);
 
         /* Bracketed, never a bare memset: dirty CPU lines race the DPU's write DMA. */
@@ -327,7 +327,7 @@ static int run_rk3588(int fd, unsigned shift, int round_bit, int verbose)
     }
     for (m = 1; m <= DQ_M; m++)
         for (n = 1; n <= DQ_N; n++) {
-            size_t idx = (size_t)feature_data(DQ_N, DQ_M, 1, 4, n, m, 1);
+            size_t idx = (size_t)feature_index(DQ_N, DQ_M, 1, 4, n, m, 1);
             float f;
             memcpy(&f, (uint8_t *)output.ptr + idx * 4, 4);
             acc[(m - 1) * DQ_N + (n - 1)] = (int64_t)m * (n - 1 - 32);

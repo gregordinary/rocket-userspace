@@ -31,10 +31,12 @@ static double now_ms(void) {
     return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
 }
 
-/* fp16 output-cube de-tile index — identical to feat_idx() in rocket_matmul.c
- * (C2=8). This is the exact gather mm_compute does on readback. */
-static inline size_t feat_idx(int H, int ch, int h) {
-    return ((size_t)(ch - 1) / 8) * (size_t)H * 8 + 8 * (size_t)(h - 1) + (ch - 1) % 8;
+/* fp16 output-cube de-tile index, the library's feat_idx() (rocket_cube.h, C2=8): the
+ * channel group outermost, then the row, then the channel within its group. This is the
+ * exact gather mm_compute does on readback. */
+static inline size_t feat_idx(int H, int n, int h) {
+    const size_t c = (size_t)(n - 1), g = 8;
+    return ((c / g) * (size_t)H + (size_t)(h - 1)) * g + c % g;
 }
 
 int main(void) {

@@ -9,12 +9,14 @@
  *   out = (float)( (acc_i32 * OUT_CVT_SCALE) >> OUT_CVT_SHIFT )     then optional ->fp16
  *   - OUT_CVT_SCALE and the BN-MUL operand are uint16 INTEGER multipliers (NOT fp16
  *     and NOT fixed-point: scale=2 -> x2, BN-MUL 0x3800 -> x14336);
- *   - OUT_CVT_SHIFT (bits[5:0]) is an INTEGER right-shift applied in the integer
+ *   - OUT_CVT_SHIFT (bits[11:0]) is an INTEGER right-shift applied in the integer
  *     domain BEFORE the float cast, so the fraction is lost: it ROUNDS to the nearest
  *     integer, an exact half going where OUT_CVT_SHIFT bit 30 says (0, which this test
  *     writes, is half to even; tests/requant_round_probe.c measures both);
- *   - the float-affine minus_exp / cvt_type decode (the LUT path) is a NO-OP on the
- *     raw int32 CACC — it only applies to the LUT/EW float datapath;
+ *   - minus_exp is a NO-OP on the raw int32 CACC; it applies only to the LUT/EW float
+ *     datapath. cvt_type is not: it selects where OUT_CVT_OFFSET enters (0 at the output
+ *     scale before the rounding, 1 before the multiply), so the two compute the same value
+ *     at the zero offset this test writes [HW sweep 2026-11-02, 17 settings];
  *   - fp16 output uses the int8-datapath writer geometry size_e=3 / surf_add=stride*2.
  *
  * CONSEQUENCES (the deliverable):
@@ -63,7 +65,7 @@ static void ref_matmul_int8(int m, int k, int n,
         }
 }
 
-/* Run ONE int8 matmul through gen_matmul_int8 (which reads the current ROCKET_INT8_*
+/* Run ONE int8 matmul through gen_gemm_int8 (which reads the current ROCKET_INT8_*
  * env) and de-tile the output into out[M*N] as float. want_fp16 selects the readback
  * cube (C2=8 fp16 vs C2=4 fp32/int32-as-float). Returns 0, or <0 on a shim error. */
 static int run_once(int fd, int M, int K, int N, const int8_t *A, const int8_t *B,
@@ -81,10 +83,10 @@ static int run_once(int fd, int M, int K, int N, const int8_t *A, const int8_t *
         fprintf(stderr, "ERROR: BO dma_address exceeds 32 bits\n"); ret = -1; goto done; }
 
     uint64_t regs[256] = {0};
-    matmul_params_t p = { .m=(uint16_t)M, .k=(uint16_t)K, .n=(uint16_t)N,
-        .input_dma=(uint32_t)input.dma_address, .weights_dma=(uint32_t)weights.dma_address,
-        .output_dma=(uint32_t)output.dma_address, .tasks=regs };
-    if ((ret = gen_matmul_int8(&p)) != 0) { fprintf(stderr, "gen=%d\n", ret); ret = -1; goto done; }
+    gemm_params_t p = { .m=(uint16_t)M, .k=(uint16_t)K, .n=(uint16_t)N,
+        .input_iova=(uint32_t)input.dma_address, .weights_iova=(uint32_t)weights.dma_address,
+        .output_iova=(uint32_t)output.dma_address, .tasks=regs };
+    if ((ret = gen_gemm_int8(&p)) != 0) { fprintf(stderr, "gen=%d\n", ret); ret = -1; goto done; }
 
     CK(rocket_bo_prep(fd, &regcmd, 1, 0));
     CK(rocket_bo_prep(fd, &input,  1, 0));
@@ -93,9 +95,9 @@ static int run_once(int fd, int M, int K, int N, const int8_t *A, const int8_t *
     memset(input.ptr, 0, input.size); memset(weights.ptr, 0, weights.size);
     int8_t *wdst = weights.ptr, *idst = input.ptr;
     for (int n = 1; n <= N; n++) for (int k = 1; k <= K; k++)
-        wdst[weight_int8(K, n, k)] = B[(n-1)*K + (k-1)];
+        wdst[gemm_weight_index_int8(K, n, k)] = B[(n-1)*K + (k-1)];
     for (int m = 1; m <= M; m++) for (int k = 1; k <= K; k++)
-        idst[feature_data(K, M, 1, 16, k, m, 1)] = A[(m-1)*K + (k-1)];
+        idst[feature_index(K, M, 1, 16, k, m, 1)] = A[(m-1)*K + (k-1)];
     CK(rocket_bo_fini(fd, &regcmd));
     CK(rocket_bo_fini(fd, &input));
     CK(rocket_bo_fini(fd, &weights));
@@ -111,7 +113,7 @@ static int run_once(int fd, int M, int K, int N, const int8_t *A, const int8_t *
         fprintf(stderr, "PREP_BO(out)=%d (%s)\n", ret, strerror(-ret)); ret = -1; goto done; }
 
     for (int m = 1; m <= M; m++) for (int n = 1; n <= N; n++) {
-        size_t idx = (size_t)feature_data(N, M, 1, C2, n, m, 1);
+        size_t idx = (size_t)feature_index(N, M, 1, C2, n, m, 1);
         if (want_fp16) { _Float16 h; memcpy(&h, (uint8_t*)output.ptr + idx*esz, 2); out[(m-1)*N+(n-1)] = (float)h; }
         else           { float f;    memcpy(&f, (uint8_t*)output.ptr + idx*esz, 4); out[(m-1)*N+(n-1)] = f; }
     }

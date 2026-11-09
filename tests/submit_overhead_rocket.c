@@ -142,15 +142,15 @@ int main(int argc, char **argv)
 
     /* generate the regcmd ONCE */
     uint64_t ops[256] = {0};
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = M, .k = K, .n = N,
-        .input_dma   = (uint32_t)in.dma_address,
-        .weights_dma = (uint32_t)wt.dma_address,
-        .output_dma  = (uint32_t)out.dma_address,
-        .tasks = ops, .fp32tofp16 = 1,
-        .accumulate = 0, .add_dma = 0,
+        .input_iova   = (uint32_t)in.dma_address,
+        .weights_iova = (uint32_t)wt.dma_address,
+        .output_iova  = (uint32_t)out.dma_address,
+        .tasks = ops, .fp16_out = 1,
+        .accumulate = 0, .add_iova = 0,
     };
-    if (gen_matmul_fp16(&p)) { fprintf(stderr, "gen_matmul_fp16 failed\n"); return 1; }
+    if (gen_gemm_fp16(&p)) { fprintf(stderr, "gen_gemm_fp16 failed\n"); return 1; }
     rocket_bo_prep(fd, &rc, 1, 0);
     memcpy(rc.ptr, ops, (size_t)p.task_count * sizeof(uint64_t));
     rocket_bo_fini(fd, &rc);

@@ -27,7 +27,7 @@
 #include "rocket_npu.h"
 #include "rocket_activation.h"
 #include "npu_activation.h"
-#include "npu_matmul.h"   /* gen_matmul_fp16 + feature_data/weight_fp16 (on-NPU EW mul) */
+#include "npu_matmul.h"   /* gen_gemm_fp16 + feature_index/gemm_weight_index_fp16 (on-NPU EW mul) */
 #include "rocket_op.h"      /* the shared one-shot scaffolding */
 #include "rocket_log.h"     // centralized log channel
 
@@ -193,159 +193,159 @@ void rocket_prelu_ref_fp16(int C, int S, const _Float16 *x, const float *alpha, 
 
 /* ============================================================================
  * SECTION — DPU LUT table builders
+ *
+ * A LUT image is 1026 unsigned Q0.15 samples in the order emit_lut_tables() writes them:
+ * entries 0..512 are the LE table (table id 0) and entries 513..1025 the LO table (table
+ * id 1). Every builder here is one of two sampling plans over a function f, with f(x)
+ * normalised to [0,1] as (f(x) - lo) / span before it is quantized:
+ *
+ *   SPLIT     LE covers x in [-512*step, 0] and LO covers [0, 512*step], one entry per
+ *             `step`, where step = 32 / index_scale. The DPU picks the table by the sign
+ *             of x, so a function with a kink at 0 meets it on the shared edge.
+ *   SHIFTED   LO alone covers [x_lo, x_hi] in 512 equal steps, and the BN-ALU bias moves
+ *             every input onto the non-negative index range, so LE is never read. LE
+ *             repeats LO's first entry.
  * ==========================================================================*/
 
-/* Build the LE+LO Q0.15 tables for a [0,1]-output activation on the sigmoid grid.
- *   LE[i] = f( -((512-i)*step) )   inputs -range .. 0   (table id 0)
- *   LO[i] = f(    i*step       )   inputs 0 .. +range    (table id 1)
- * with step = 32/index_scale. Computed directly from f; for f = sigmoid this is the
- * standard sigmoid LUT, and any other f with codomain [0,1] (e.g. hardsigmoid) drops in. */
-static void build_lut_unit(int kind, double index_scale, uint16_t lut[1026])
+/* What a table samples: an activation kind of act_eval(), LeakyReLU, or ELU/SELU. */
+enum lut_fn_kind { LUT_FN_ACT, LUT_FN_LEAKY, LUT_FN_ELU };
+
+struct lut_fn {
+    enum lut_fn_kind fn;
+    int    act;              /* LUT_FN_ACT: the ROCKET_ACTIVATION_* kind              */
+    double alpha;            /* LUT_FN_LEAKY: the negative slope; LUT_FN_ELU: alpha   */
+    double lambda;           /* LUT_FN_ELU: the output scale (1 for ELU)              */
+};
+
+static double lut_fn_at(const struct lut_fn *f, double x)
 {
-    const double step = 32.0 / index_scale;
-    for (int i = 0; i <= 512; i++) {
-        double y = act_eval(kind, -((double)(512 - i) * step));
-        long q = lround(y * 32768.0);
-        if (q < 0) q = 0;
-        if (q > 32767) q = 32767;
-        lut[i] = (uint16_t)q;
-    }
-    for (int i = 0; i <= 512; i++) {
-        double y = act_eval(kind, (double)i * step);
-        long q = lround(y * 32768.0);
-        if (q < 0) q = 0;
-        if (q > 32767) q = 32767;
-        lut[513 + i] = (uint16_t)q;
+    switch (f->fn) {
+    case LUT_FN_LEAKY: return x >= 0.0 ? x : f->alpha * x;
+    case LUT_FN_ELU:   return elu_d(f->alpha, f->lambda, x);
+    default:           return act_eval(f->act, x);
     }
 }
 
-/* Build the LE+LO tables for a SIGNED [lo,hi]-output activation via the bias trick:
- * store the normalized g(x) = (f(x) - lo) / (hi - lo) in [0,1] (the proven unsigned
- * Q0.15 grid), and let the DPU OUT_CVT affine-decode f back. For an odd function with
- * codomain [-1,1] (tanh) this is the standard (tanh+1)/2 bias encoding. The OUT_CVT then
- * recovers f = q*2^-shift*(hi-lo) + lo (the runtime programs shift/scale/offset). */
-static void build_lut_affine(int kind, double index_scale, double lo, double hi,
-                             uint16_t lut[1026])
+/* One normalised sample as unsigned Q0.15: rounded to nearest, then held to
+ * [qmin, 32767]. */
+static uint16_t lut_q15(double unit, long qmin)
 {
-    const double step = 32.0 / index_scale;
-    const double span = (hi - lo) != 0.0 ? (hi - lo) : 1.0;
-    for (int i = 0; i <= 512; i++) {
-        double g = (act_eval(kind, -((double)(512 - i) * step)) - lo) / span;
-        long q = lround(g * 32768.0);
-        if (q < 0) q = 0;
-        if (q > 32767) q = 32767;
-        lut[i] = (uint16_t)q;
-    }
-    for (int i = 0; i <= 512; i++) {
-        double g = (act_eval(kind, (double)i * step) - lo) / span;
-        long q = lround(g * 32768.0);
-        if (q < 0) q = 0;
-        if (q > 32767) q = 32767;
-        lut[513 + i] = (uint16_t)q;
+    long q = lround(unit * 32768.0);
+    q = q < qmin ? qmin : q;
+    return (uint16_t)(q > 32767 ? 32767 : q);
+}
+
+/* The SPLIT plan. LE entry e samples x = -(512 - e) * step, so LE[512] is the sample at
+ * zero, and LO entry e samples x = e * step. */
+static void lut_fill_split(uint16_t lut[1026], const struct lut_fn *f, double step,
+                           double lo, double span)
+{
+    for (int e = 0; e < 1026; e++) {
+        const double x = e <= 512 ? -((double)(512 - e) * step) : (double)(e - 513) * step;
+        lut[e] = lut_q15((lut_fn_at(f, x) - lo) / span, 0);
     }
 }
 
-/* fp32 bit pattern (for the BN_ALU pre-scale bias on the shifted single-table path). */
-static uint32_t fp32_bits(double v) { float f=(float)v; uint32_t b; memcpy(&b,&f,4); return b; }
-
-/* SHIFTED single-table build. Instead of splitting LE=[neg,0] / LO=[0,pos] at the data's
- * zero, map the whole input domain [x_lo,x_hi] onto the POSITIVE index range. The BN-ALU
- * bias is added after the BN-MUL scale, in the index domain:
- *
- *     index = x*scale + B,  scale = 16384/(x_hi-x_lo),  B = -x_lo*scale
- *
- * With it, x in [x_lo,x_hi] maps to index [0,16384]. A data range strictly inside
- * [x_lo,x_hi] is INTERIOR (index never 0 or 16384), with no overflow edge. The LO table
- * holds f over the full domain, and LE is never hit (filled flat = LO[0]). OUT_CVT
- * (out_lo,S) is unchanged, because it decodes f's OUTPUT range. Table sample j maps to
- * x = x_lo + j*(x_hi-x_lo)/512.
- *
- * The mapping does not remove the x~0 LE/LO sign-mux glitch, because the mux selects on
- * sign(x), not on the index. A kind built here is clean at x~0 only if its domain stays on
- * one side of 0 or its output decode is unsigned (see act_shifted_domain). With a signed
- * decode over a domain that straddles 0 (the ROCKET_LUT_SHIFT tanh/SiLU/GELU tables), the
- * x~0 band still spikes.
- *
- * HW FACT (found 2026-06-22 bringing up EXP): a LUT table entry of EXACTLY q=0 mis-decodes
+/* HW FACT (found 2026-06-22 bringing up EXP): a LUT table entry of EXACTLY q=0 mis-decodes
  * to a garbage constant (~4.0 in the fp16 output) — NOT 0. EXP's deep tail (exp(x)<~1.5e-5,
  * x<~-11 for the [-16,0] domain) quantizes to q=0 and so read ~4 instead of ~0, blowing up
  * the softmax sum. Flooring every entry to q>=1 fixes it: the floored value decodes to ~3e-5
  * (rounds to ~0 on readback), correct for the tail. sqrt/rsqrt/reciprocal never produce a
  * q=0 entry over their domains, so the floor is a no-op for them. ROCKET_LUT_QFLOOR overrides
- * (0 reproduces the raw glitch for RE). */
+ * (0 reproduces the raw glitch for RE). The SHIFTED tables take this floor. */
+static long lut_shifted_floor(void)
+{
+    const char *e = getenv("ROCKET_LUT_QFLOOR");
+    return e ? strtol(e, NULL, 0) : 1;
+}
+
+/* The SHIFTED plan. LO entry 513 + j samples x = x_lo + j * (x_hi - x_lo) / 512. */
+static void lut_fill_shifted(uint16_t lut[1026], const struct lut_fn *f, double x_lo,
+                             double x_hi, double lo, double span)
+{
+    const double dx = (x_hi - x_lo) / 512.0;
+    const long qmin = lut_shifted_floor();
+    for (int j = 0; j <= 512; j++)
+        lut[513 + j] = lut_q15((lut_fn_at(f, x_lo + j * dx) - lo) / span, qmin);
+    for (int e = 0; e <= 512; e++)
+        lut[e] = lut[513];
+}
+
+/* A [0,1]-output activation (sigmoid, hardsigmoid) on the SPLIT plan, stored as f itself.
+ * index_scale 2596 is the sigmoid grid: it spans x in +/-6.31, where sigmoid has
+ * saturated. Any f with codomain [0,1] takes the same geometry. */
+static void build_lut_unit(int kind, double index_scale, uint16_t lut[1026])
+{
+    const struct lut_fn f = { LUT_FN_ACT, kind, 0.0, 0.0 };
+    lut_fill_split(lut, &f, 32.0 / index_scale, 0.0, 1.0);
+}
+
+/* A signed activation with output in [lo, hi] on the SPLIT plan. The table holds
+ * (f - lo) / (hi - lo), which is in [0,1], and the runtime programs the DPU OUT_CVT to
+ * decode q * 2^-shift * (hi - lo) + lo back to f. For tanh, with [lo, hi] = [-1, 1], the
+ * table is (tanh + 1) / 2. */
+static void build_lut_affine(int kind, double index_scale, double lo, double hi,
+                             uint16_t lut[1026])
+{
+    const struct lut_fn f = { LUT_FN_ACT, kind, 0.0, 0.0 };
+    const double span = hi - lo;
+    lut_fill_split(lut, &f, 32.0 / index_scale, lo, span != 0.0 ? span : 1.0);
+}
+
+/* fp32 bit pattern (for the BN_ALU pre-scale bias on the shifted single-table path). */
+static uint32_t fp32_bits(double v) { float f=(float)v; uint32_t b; memcpy(&b,&f,4); return b; }
+
+/* An activation over the input domain [x_lo, x_hi] on the SHIFTED plan, with output
+ * decoded by the affine OUT_CVT as (out_lo, S). The BN-ALU bias is added after the BN-MUL
+ * scale, in the index domain:
+ *
+ *     index = x*scale + B,  scale = 16384/(x_hi-x_lo),  B = -x_lo*scale
+ *
+ * so x in [x_lo,x_hi] maps to index [0,16384]. A data range strictly inside [x_lo,x_hi]
+ * is INTERIOR (index never 0 or 16384), with no overflow edge.
+ *
+ * The mapping does not remove the x~0 LE/LO sign-mux glitch, because the mux selects on
+ * sign(x), not on the index. A kind built here is clean at x~0 only if its domain stays on
+ * one side of 0 or its output decode is unsigned (see act_shifted_domain). With a signed
+ * decode over a domain that straddles 0 (the ROCKET_LUT_SHIFT tanh/SiLU/GELU tables), the
+ * x~0 band still spikes. */
 static void build_lut_shifted(int kind, double x_lo, double x_hi, double out_lo, double S,
                               uint16_t lut[1026])
 {
-    const double dx = (x_hi - x_lo) / 512.0;
-    long qfloor = 1;   /* a q=0 entry mis-decodes to ~4 (HW); floor to 1 (== ~3e-5 out) */
-    { const char *e = getenv("ROCKET_LUT_QFLOOR"); if (e) qfloor = strtol(e, NULL, 0); }
-    for (int j = 0; j <= 512; j++) {
-        double g = (act_eval(kind, x_lo + j * dx) - out_lo) / S;
-        long q = lround(g * 32768.0);
-        if (q < qfloor) q = qfloor;
-        if (q > 32767) q = 32767;
-        lut[513 + j] = (uint16_t)q;          /* LO = the full-range table */
-    }
-    for (int j = 0; j <= 512; j++) lut[j] = lut[513];   /* LE never hit (index>=0): flat */
+    const struct lut_fn f = { LUT_FN_ACT, kind, 0.0, 0.0 };
+    lut_fill_shifted(lut, &f, x_lo, x_hi, out_lo, S);
 }
 
-/* Build LeakyReLU into the natural LE/LO split. LE (table id 0) is the NEGATIVE branch
- * (x in [-range,0], slope alpha). LO (table id 1) is the POSITIVE branch (x in [0,range],
- * slope 1), a structural fit for the kink at 0. Both encode g=(f-out_lo)/S in Q0.15, and
- * the affine OUT_CVT decodes f back. The step is 32/index_scale in the x domain, and
- * |x|>range saturates at the table edge.
+/* LeakyReLU on the SPLIT plan: LE carries the negative branch (slope alpha) and LO the
+ * positive one (slope 1), so the kink at 0 is the shared table edge. Both tables hold
+ * (f - out_lo) / S, decoded by the affine OUT_CVT; |x| past the grid saturates at the
+ * table edge.
  *
- * The kink at x=0 falls on the shared table edge, and LeakyReLU is linear on each side.
- * Linear interpolation between samples is therefore exact, and the result is exact
- * (Q0.15 + fp16 quant) for x in [-range,range], with range = R in rocket_leaky_relu_fp16.
- * The output span is [-R*alpha, R], and the caller's S (a power of two) covers it. The
- * LE/LO mux glitches at exactly x=0 (sign-based, HW quirk), and the runtime repairs that
- * razor-thin band on the host. */
+ * LeakyReLU is linear on each side of the kink, so the hardware's linear interpolation
+ * between samples is exact, and the result is exact (Q0.15 + fp16 quant) for x in
+ * [-range,range], with range = R in rocket_leaky_relu_fp16. The output span is
+ * [-R*alpha, R], and the caller's S (a power of two) covers it. The LE/LO mux glitches at
+ * exactly x=0 (sign-based, HW quirk), and the runtime repairs that razor-thin band on the
+ * host. */
 static void build_lut_leaky(double alpha, double index_scale, double out_lo, double S,
                             uint16_t lut[1026])
 {
-    const double step = 32.0 / index_scale;
-    for (int i = 0; i <= 512; i++) {                     /* LE: x in [-range, 0] */
-        double x = -((double)(512 - i)) * step;
-        double f = (x >= 0.0) ? x : alpha * x;
-        long q = lround((f - out_lo) / S * 32768.0);
-        if (q < 0) q = 0;
-        if (q > 32767) q = 32767;
-        lut[i] = (uint16_t)q;
-    }
-    for (int i = 0; i <= 512; i++) {                     /* LO: x in [0, +range] */
-        double x = (double)i * step;
-        double f = (x >= 0.0) ? x : alpha * x;
-        long q = lround((f - out_lo) / S * 32768.0);
-        if (q < 0) q = 0;
-        if (q > 32767) q = 32767;
-        lut[513 + i] = (uint16_t)q;
-    }
+    const struct lut_fn f = { LUT_FN_LEAKY, 0, alpha, 0.0 };
+    lut_fill_split(lut, &f, 32.0 / index_scale, out_lo, S);
 }
 
-/* SHIFTED single-table build for ELU/SELU over a SYMMETRIC domain [-R,R] (the Abs trick).
- * The x=0 kink lands on the middle sample (j=256), and the BN-ALU bias maps the whole
- * domain onto the positive LUT index half. The output is signed (out_lo<0), and the x~0
- * band still meets the LE/LO sign-mux glitch, as in every signed-output kind measured. The
- * host repairs that band in elu_run after readback, unless ROCKET_ELU_NOREPAIR is set.
- * f(x) = lambda*(x>=0 ? x : alpha*(e^x-1)); the curved negative branch interpolates on the
- * uniform grid (error ~ lambda*alpha*dx^2/8). out_lo is the negative saturation (-lambda*alpha);
- * S (a power of two) covers [out_lo, lambda*R]. Like build_lut_shifted, every entry is floored
- * to q>=1 (a q=0 entry mis-decodes to ~4 on this HW — the EXP finding). */
+/* ELU/SELU on the SHIFTED plan over a SYMMETRIC domain [-R,R] (the Abs trick):
+ * f(x) = lambda*(x>=0 ? x : alpha*(e^x-1)). The x=0 kink lands on the middle sample
+ * (j=256). The output is signed (out_lo<0), so the x~0 band still meets the LE/LO
+ * sign-mux glitch, as in every signed-output kind measured; the host repairs that band in
+ * elu_run after readback, unless ROCKET_ELU_NOREPAIR is set. The curved negative branch
+ * interpolates on the uniform grid (error ~ lambda*alpha*dx^2/8). out_lo is the negative
+ * saturation (-lambda*alpha); S (a power of two) covers [out_lo, lambda*R]. */
 static void build_lut_shifted_elu(double alpha, double lambda, double x_lo, double x_hi,
                                   double out_lo, double S, uint16_t lut[1026])
 {
-    const double dx = (x_hi - x_lo) / 512.0;
-    long qfloor = 1;
-    { const char *e = getenv("ROCKET_LUT_QFLOOR"); if (e) qfloor = strtol(e, NULL, 0); }
-    for (int j = 0; j <= 512; j++) {
-        double f = elu_d(alpha, lambda, x_lo + j * dx);
-        long q = lround((f - out_lo) / S * 32768.0);
-        if (q < qfloor) q = qfloor;
-        if (q > 32767) q = 32767;
-        lut[513 + j] = (uint16_t)q;            /* LO = the full-range table */
-    }
-    for (int j = 0; j <= 512; j++) lut[j] = lut[513];   /* LE never hit (index>=0): flat */
+    const struct lut_fn f = { LUT_FN_ELU, 0, alpha, lambda };
+    lut_fill_shifted(lut, &f, x_lo, x_hi, out_lo, S);
 }
 
 /* ============================================================================
@@ -396,7 +396,12 @@ int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
         }
     }
 
-    /* Per-kind geometry. tanh: [-1,1], S=2, saturating tail (tuned LE slope). silu/
+    /* Per-kind geometry. tanh: [-1,1], S=2. Index scale 4096 spans x in +/-4, where tanh is
+     * within half an fp16 ulp of +/-1: the largest scale whose error outside the x~0 band
+     * reaches that floor, 0.00049, over every fp16 input in [-8,8] [HW sweep, RK3588,
+     * 2026-11-09]. A larger scale saturates early, 0.0039 at 5216. The LE slope is the one
+     * RKNN-Toolkit2 programs for sigmoid; it leaves the maximum alone and fewer outputs
+     * inexact. silu/
      * gelu: asymptotic (no flat run), wide +-16 table, S=32 — for x beyond the table
      * the LO tail saturates (slope 0), an approximation for |x|>16 (rare post-norm).
      * hardswish: KNEE-ONLY +-3 (S=4) — the NVDLA flat-tail quirk forbids its x<=-3
@@ -445,7 +450,7 @@ int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
     uint16_t le_slope_sc = 0, lo_slope_sc = 0; uint8_t le_slope_sh = 0, lo_slope_sh = 0;
     switch (kind) {
     case ROCKET_ACTIVATION_TANH:
-        index_scale = 5216.0; lo = -1.0; Sexp = 1;
+        index_scale = 4096.0; lo = -1.0; Sexp = 1;
         le_slope_sc = 23107; le_slope_sh = 22; break;
     case ROCKET_ACTIVATION_SILU:
         index_scale = 1024.0; lo = -0.5; Sexp = 5; break;
@@ -483,7 +488,7 @@ int rocket_lut_epilogue_build(int kind, uint16_t *lut, lut_epilogue_t *ep)
 
 /* Run a populated DPU LUT job: alloc BOs, lay the flat fp16 input cube, gen the regcmd,
  * submit, fence, read back. `p` must already carry .n (padded to 8), .lut and every
- * BN/OUT_CVT/LUT/slope constant; this fills .input_dma/.output_dma/.tasks. Shared by the
+ * BN/OUT_CVT/LUT/slope constant; this fills .input_iova/.output_iova/.tasks. Shared by the
  * enum activations and the parametric LeakyReLU. n = real element count (<= p->n). */
 /* Per-op element cap for the LUT tiling. The DPU_DATA_CUBE_WIDTH (cols=n/8) is 13 bits, so the
  * hard ceiling is n/8 <= 0x1FFF => n <= 65528. We tile WELL UNDER that (32768 => cols 4096):
@@ -518,8 +523,8 @@ static int run_dpu_lut(int fd, lut_act_params_t *p, const _Float16 *in, _Float16
     for (int base = 0; base < n; base += DPU_LUT_MAXN) {
         int cn = n - base; if (cn > DPU_LUT_MAXN) cn = DPU_LUT_MAXN;
         p->n          = (cn + 7) & ~7;          /* pad chunk to the C2=8 atom */
-        p->input_dma  = in_bo.dma_address;
-        p->output_dma = out_bo.dma_address;
+        p->input_iova  = in_bo.dma_address;
+        p->output_iova = out_bo.dma_address;
         p->tasks      = regs;
 
         rocket_bo_prep(fd, &in_bo, 1, 0);
@@ -772,13 +777,12 @@ int rocket_leaky_relu_fp16(int fd, float alpha, const _Float16 *in, _Float16 *ou
  * Mechanism (the conv-main EW op the Teflon RE prescribed): an IDENTITY matmul
  * C[M,NN] = a[M,NN] · I[NN,NN]^T reproduces `a` into the DPU conv accumulator (CACC)
  * as the EW MAIN feed, then the EW unit combines it with the operand `b`, delivered via
- * ERDMA EW_BASE + MRDMA SRC_BASE + COMB_USE(5). gen_matmul_fp16 accumulate=1 selects the
+ * ERDMA EW_BASE + MRDMA SRC_BASE + COMB_USE(5). gen_gemm_fp16 accumulate=1 selects the
  * op: ew_mul=1 => EW_OP_TYPE=1 (the fp16 eltwise-multiply word); ew_mul=0 => the proven
  * fp16 K-accum eltwise-ADD. SUBTRACT reuses the ADD datapath with the operand negated
  * during packing (a-b == a+(-b); fp16 negate is an exact sign-bit flip), so it inherits
  * the add path bit-for-bit. The EW runs through ERDMA + MRDMA with COMB_USE(5) so it has a
- * main feed; a flying-MRDMA gen_ew_mul with no main feed does not fire. HW-validated
- * bit-exact (tests/ew_mul_rocket.c). The flat
+ * main feed. HW-validated bit-exact (tests/ew_mul_rocket.c). The flat
  * vector is reshaped to [M,NN] with NN=32 (K%32, N%16 satisfied) and M-tiled to fit CBUF. */
 enum { EW_OP_ADD = 0, EW_OP_MUL = 1, EW_OP_SUB = 2, EW_OP_MAX = 3, EW_OP_MIN = 4 };
 static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
@@ -787,13 +791,13 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
     if (fd < 0 || n <= 0) return ROCKET_E_SHAPE;
 
     const int NN = 32;                 /* N == K; identity I_32                    */
-    /* rows/tile cap: gen_matmul_task asserts feature_grains (= M+1) <= 0x3FF, so
+    /* rows/tile cap: the emitter refuses feature_grains (= M+1) > 0x3FF, so
      * M <= 1022; 1020 is the largest %4 value under that (CBUF is not the limit
      * here — M=1020,K=32 is ~2 banks). */
     const int M_TILE = 1020;
 
     /* Every tile is at least 12 rows (and %4), the extra rows zero-padded and unread.
-     * The EW operand's surface stride is M at any height (gen_matmul_fp16), so this is a
+     * The EW operand's surface stride is M at any height (gen_gemm_fp16), so this is a
      * library rule, not a hardware floor. */
     const int M_MIN = 12;
     int total_rows = (n + NN - 1) / NN;
@@ -825,7 +829,7 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
     memset(wt.ptr, 0, wt.size);
     for (int kk = 1; kk <= NN; kk++)
         for (int c = 1; c <= NN; c++)
-            ((_Float16 *)wt.ptr)[weight_fp16(NN, kk, c)] = (_Float16)(kk == c ? 1.0f : 0.0f);
+            ((_Float16 *)wt.ptr)[gemm_weight_index_fp16(NN, kk, c)] = (_Float16)(kk == c ? 1.0f : 0.0f);
     rocket_bo_fini(fd, &wt);
 
     for (int base = 0; base < n; base += M_TILE * NN) {
@@ -840,7 +844,7 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
         {
             _Float16 *ip = in_bo.ptr, *bp = op_bo.ptr;
             for (int t = 0; t < telems; t++) {
-                int pos = feature_data(NN, M, 1, 8, (t % NN) + 1, (t / NN) + 1, 1);
+                int pos = feature_index(NN, M, 1, 8, (t % NN) + 1, (t / NN) + 1, 1);
                 ip[pos] = a[base + t];
                 bp[pos] = (op == EW_OP_SUB) ? (_Float16)(-(float)b[base + t]) : b[base + t];
             }
@@ -850,15 +854,15 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
 
         rocket_bo_prep(fd, &out_bo, 1, 0); memset(out_bo.ptr, 0, out_bo.size); rocket_bo_fini(fd, &out_bo);
 
-        matmul_params_t p = { .m = (uint16_t)M, .k = (uint16_t)NN, .n = (uint16_t)NN,
-            .input_dma   = (uint32_t)in_bo.dma_address,
-            .weights_dma = (uint32_t)wt.dma_address,
-            .output_dma  = (uint32_t)out_bo.dma_address,
-            .tasks = regs, .fp32tofp16 = 1,
+        gemm_params_t p = { .m = (uint16_t)M, .k = (uint16_t)NN, .n = (uint16_t)NN,
+            .input_iova   = (uint32_t)in_bo.dma_address,
+            .weights_iova = (uint32_t)wt.dma_address,
+            .output_iova  = (uint32_t)out_bo.dma_address,
+            .tasks = regs, .fp16_out = 1,
             .accumulate = 1, .ew_mul = (op == EW_OP_MUL),
             .ew_op = (op == EW_OP_MAX) ? 2 : (op == EW_OP_MIN) ? 3 : 0,
-            .add_dma = (uint32_t)op_bo.dma_address };
-        int g = gen_matmul_fp16(&p);
+            .add_iova = (uint32_t)op_bo.dma_address };
+        int g = gen_gemm_fp16(&p);
         if (g != 0 || p.task_count <= 0 ||
             (size_t)p.task_count > sizeof(regs)/sizeof(regs[0])) {   /* bound the stack regs[] */
             ROCKET_LOGE("rocket_ew_mul_fp16: gen failed (%d, count=%d)\n", g, p.task_count);
@@ -874,7 +878,7 @@ static int ew_binary_fp16(int fd, const _Float16 *a, const _Float16 *b,
         {
             _Float16 *ob = out_bo.ptr;
             for (int t = 0; t < telems; t++)
-                out[base + t] = ob[feature_data(NN, M, 1, 8, (t % NN) + 1, (t / NN) + 1, 1)];
+                out[base + t] = ob[feature_index(NN, M, 1, 8, (t % NN) + 1, (t / NN) + 1, 1)];
         }
         rocket_bo_fini(fd, &out_bo);
     }

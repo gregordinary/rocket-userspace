@@ -7,7 +7,7 @@
 // FC_DATA_BANK is the 3-bit "fully-connected data bank" field of CNA_CBUF_CON0 (0x1040),
 // alongside WEIGHT_BANK[7:4] and DATA_BANK[3:0]. The matmul regcmd generator drives the
 // CNA in CONV mode (a matmul is a 1x1 conv) and leaves FC_DATA_BANK == 0. This sweep forces
-// it 0..7 via the ROCKET_FC_DATA_BANK sentinel (npu_regcmd.c gen_matmul_task) and checks
+// it 0..7 via the ROCKET_FC_DATA_BANK sentinel (npu_regcmd.c, every matmul) and checks
 // whether the matmul output stays byte-identical and the wall time stays flat — i.e. whether
 // the field is a genuine don't-care on the conv-mode (matmul) datapath. A non-zero field that
 // is silently ignored => don't-care confirmed; a divergence or a wedge => it is live and the

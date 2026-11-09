@@ -148,10 +148,10 @@ int main(int argc, char **argv)
                 .dil_y = 1, .dil_x = 1, .ih_full = 8, .oh_full = 8,
                 .int8_out = 1, .tasks = ops,
                 .in_scale = 1.0f, .w_scale = 1.0f, .out_scale = 1.0f,
-                .input_dma   = (uint32_t)in.dma_address,
-                .weights_dma = (uint32_t)wt.dma_address,
-                .bias_dma    = (uint32_t)bias.dma_address,
-                .output_dma  = UNMAPPED_IOVA,   /* the ONLY thing wrong with it */
+                .input_iova   = (uint32_t)in.dma_address,
+                .weights_iova = (uint32_t)wt.dma_address,
+                .bias_iova    = (uint32_t)bias.dma_address,
+                .output_iova  = UNMAPPED_IOVA,   /* the ONLY thing wrong with it */
             };
             if (gen_conv2d_int8_rk3576(&p) != 0 || p.task_count == 0) {
                 printf("  info : this part has no int8 conv encoder -- `write` needs "
@@ -164,14 +164,14 @@ int main(int argc, char **argv)
         } else {
             /* The RK3588 side: an fp16 matmul, whose operands may be zero because
              * only the destination of its writes is under test. */
-            matmul_params_t p = {
-                .m = 64, .k = 64, .n = 64, .tasks = ops, .fp32tofp16 = 1,
-                .input_dma   = (uint32_t)in.dma_address,
-                .weights_dma = (uint32_t)wt.dma_address,
-                .output_dma  = UNMAPPED_IOVA,   /* the ONLY thing wrong with it */
+            gemm_params_t p = {
+                .m = 64, .k = 64, .n = 64, .tasks = ops, .fp16_out = 1,
+                .input_iova   = (uint32_t)in.dma_address,
+                .weights_iova = (uint32_t)wt.dma_address,
+                .output_iova  = UNMAPPED_IOVA,   /* the ONLY thing wrong with it */
             };
-            if (gen_matmul_fp16(&p) != 0 || p.task_count == 0) {
-                printf("  info : gen_matmul_fp16 refused on this part -- `write` needs "
+            if (gen_gemm_fp16(&p) != 0 || p.task_count == 0) {
+                printf("  info : gen_gemm_fp16 refused on this part -- `write` needs "
                        "a program it runs (skip)\n");
                 goto out;
             }

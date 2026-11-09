@@ -104,7 +104,7 @@ static int run_shape(int fd, const rocket_pool_desc *d, int is_uint8, int neg)
             .stride_y=d->stride_y,.stride_x=d->stride_x,.pad_top=d->pad_top,.pad_left=d->pad_left,
             .pad_bottom=d->pad_bottom,.pad_right=d->pad_right,.method=(uint8_t)d->method,
             .recip_w=ppu_recip_kernel_fp16(d->kw),.recip_h=ppu_recip_kernel_fp16(d->kh),
-            .input_dma=0x1000,.output_dma=0x3000,.tasks=regs };
+            .input_iova=0x1000,.output_iova=0x3000,.tasks=regs };
         int g = gen_pool_fp16(&p);
         if (!(g==0 && p.task_count>0)) { printf("  gen_pool_fp16: ret=%d -> FAIL\n", g); fail = 1; }
     }

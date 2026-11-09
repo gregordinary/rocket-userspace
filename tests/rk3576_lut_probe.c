@@ -319,11 +319,11 @@ static int harness_init(harness *h, int fd)
                             sizeof(uint64_t), &h->rc) < 0) goto done;
 
     for (n = 0; n < NPIX; n++)
-        in_cube[feature_data((int)IC, (int)PLANE, (int)PLANE, (int)C2,
+        in_cube[feature_index((int)IC, (int)PLANE, (int)PLANE, (int)C2,
                              1, (int)(n / PLANE) + 1, (int)(n % PLANE) + 1)] =
             (int8_t)((int)n - 128);
     for (c = 0; c < OC; c++)
-        w_cube[weight_conv_int8((int)OC, (int)IC, 1, 1, (int)c + 1, 1, 1, 1)] = 1;
+        w_cube[conv_weight_index_int8((int)OC, (int)IC, 1, 1, (int)c + 1, 1, 1, 1)] = 1;
 
     rocket_bo_prep(fd, &h->in, 1, 0);
     memcpy(h->in.ptr, in_cube, in_bytes);
@@ -353,7 +353,7 @@ static int run_pair(harness *h, const int16_t *lo, const int16_t *hi,
     int miss;
 
     lp.lo = lo; lp.hi = hi;
-    lp.scratch_dma = h->scratch.dma_address;
+    lp.scratch_iova = h->scratch.dma_address;
     lp.tasks = h->lut_ops;
     if (gen_lut_load_rk3576(&lp) != 0) {
         printf("  the table-load generator refused\n");
@@ -383,10 +383,10 @@ static int run_pair(harness *h, const int16_t *lo, const int16_t *hi,
     p.output_zero_point = 0x80;
     p.weight_zero_point = 0x80;
     p.tasks       = h->conv_ops;
-    p.input_dma   = h->in.dma_address;
-    p.weights_dma = h->w.dma_address;
-    p.bias_dma    = h->coeff.dma_address;
-    p.output_dma  = h->out.dma_address;
+    p.input_iova   = h->in.dma_address;
+    p.weights_iova = h->w.dma_address;
+    p.bias_iova    = h->coeff.dma_address;
+    p.output_iova  = h->out.dma_address;
 
     /* The BN stage sits between the BS output and the LUT, and the two registers that
      * configure its multiply are ones the vendor's programs never write — so on a part
@@ -529,7 +529,7 @@ static int mode_load(harness *h)
     }
 
     lp.lo = lo; lp.hi = hi;
-    lp.scratch_dma = h->scratch.dma_address;
+    lp.scratch_iova = h->scratch.dma_address;
     lp.tasks = h->lut_ops;
     if (gen_lut_load_rk3576(&lp) != 0) { printf("generator refused\n"); goto done; }
 

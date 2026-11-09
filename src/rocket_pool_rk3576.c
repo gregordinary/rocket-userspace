@@ -515,10 +515,10 @@ static int r76p_build(const struct rocket_pool_int8_rk3576_handle *h, const char
      * what TFLite computes, since its quantized average pool averages the STORED values
      * over the valid count and requires the input and output quantization to match. */
     p.input_zero_point = h->d.avg_exclude_pad ? 0 : h->in_zp;
-    p.input_dma  = h->cube_in
+    p.input_iova  = h->cube_in
                      ? h->src.dma_address + h->src_off + (size_t)h->src_col * C2
                      : h->in.dma_address;
-    p.output_dma = (uint32_t)((h->out_ext.ptr ? h->out_ext.dma_address + h->out_off
+    p.output_iova = (uint32_t)((h->out_ext.ptr ? h->out_ext.dma_address + h->out_off
                                              : h->out.dma_address));
     p.src_surf_elems = h->in_surf;
     p.src_line_elems = h->src_pitch;
@@ -587,8 +587,8 @@ int rocket_rk3576_pool_link(struct rocket_pool_int8_rk3576_handle *h,
 
     memset(out, 0, sizeof *out);
     out->fd         = h->fd;
-    out->feat_dma   = h->cube_in ? h->src.dma_address + h->src_off : h->in.dma_address;
-    out->surf_dma   = h->out_ext.ptr ? h->out_ext.dma_address + h->out_off
+    out->feat_iova   = h->cube_in ? h->src.dma_address + h->src_off : h->in.dma_address;
+    out->surf_iova   = h->out_ext.ptr ? h->out_ext.dma_address + h->out_off
                                      : h->out.dma_address;
     out->cube_in    = h->cube_in;
     out->cube_out   = h->cube_out;
@@ -615,6 +615,11 @@ rocket_pool_int8_pack_rk3576(int fd, const rocket_pool_desc *d, int in_zp)
     if (!r76p_is_this_chip(entry)) return NULL;
     if (rocket_pool_int8_rk3576_plan(d) != ROCKET_OK) return NULL;
     if (in_zp < -128 || in_zp > 127) return NULL;
+    /* The pool program raises no DPU completion, and a driver without the PPU-completion
+     * flag (the upstream series at interface 1.0) retires it only at the job timeout. Asked
+     * here and not in the plan, which stays pure so a frontend can price a shape off-device;
+     * the frontend asks rocket_pool_npu_supported() at claim time itself. */
+    if (!rocket_pool_npu_supported()) return NULL;
 
     /* A PLANE TOO WIDE FOR ONE TASK IS N HANDLES, and this is where that is decided —
      * once, at pack time, so an inference is the same loop whatever the shape. The parent

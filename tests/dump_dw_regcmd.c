@@ -4,7 +4,7 @@
  * dump_dw_regcmd.c — host-only: emit gen_conv2d_dw_fp16's regcmd for a depthwise
  * shape as a raw little-endian u64 stream, so it can be decoded with the Mesa
  * rocket decoder (decode.py --xml registers.xml) and diffed against a captured
- * Teflon depthwise regcmd. No hardware. Our NPUOP word encoding
+ * Teflon depthwise regcmd. No hardware. Our regcmd word encoding
  * (target<<48 | value<<16 | reg) is identical to Mesa's, so decode.py decodes
  * either stream. Build:
  *   gcc -O2 -Iinclude -D__fp16=_Float16 tests/dump_dw_regcmd.c src/npu_regcmd.c -o dump_dw_regcmd
@@ -30,8 +30,8 @@ int main(int argc, char **argv)
     p.stride_y = 1; p.stride_x = 1;
     p.dil_y = 1; p.dil_x = 1;
     p.pad_top = 1; p.pad_left = 1;
-    p.input_dma = 0x2000; p.weights_dma = 0x3000; p.output_dma = 0x4000;
-    p.tasks = tasks; p.fp32tofp16 = 1; p.dw_group = 32;  /* fp16 DW group=32 (HW-confirmed) */
+    p.input_iova = 0x2000; p.weights_iova = 0x3000; p.output_iova = 0x4000;
+    p.tasks = tasks; p.fp16_out = 1; p.dw_group = 32;  /* fp16 DW group=32 (HW-confirmed) */
 
     int r = gen_conv2d_dw_fp16(&p);
     fprintf(stderr, "gen_conv2d_dw_fp16 ret=%d task_count=%u -> %s\n", r, p.task_count, out);

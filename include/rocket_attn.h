@@ -201,11 +201,15 @@ void           rocket_fa_ctx_free(rocket_fa_ctx *c);
  * It applies to every entry (single-fd, `_mt`, `_ctx`), because it acts in the shared
  * per-head range.
  *
- * Caution: the scores are fp16, and they saturate. A score past 65504 (scale·q·k, before the
- * soft-cap) is written as ±65504, not as inf. The keys past it tie. The softmax then returns a
- * complete, finite output of the right size with wrong values [HW sweep 2026-10-09, RK3588
- * at ~816 MHz]. Every path (fused, separate mask pass, on-NPU softmax, online-tiled) checks the raw
- * scores in its host mask pass. When a real key reached the limit, the entry returns
+ * Caution: the scores are fp16. A raw score (q·k on the surface, before the scale and the
+ * soft-cap) from 65504 to 65519 is written as ±65504, and one of 65520 or more as ±inf. That
+ * holds whether one product or a sum passes the range. The products and their sum are held
+ * wide, and only the output narrows [HW sweep 2026-11-07, RK3588 at 928 MHz,
+ * tests/fp16_mm_product_overflow_probe.c]. Either corrupts the softmax, with tied keys or a
+ * NaN row.
+ *
+ * Every path (fused, separate mask pass, on-NPU softmax, online-tiled) checks the raw scores
+ * in its host mask pass. When a real key reached the limit, the entry returns
  * `ROCKET_E_RANGE` and `out` is not valid.
  *
  * A caller that holds the operands at higher precision can then recompute from them. Folding

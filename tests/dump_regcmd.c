@@ -23,12 +23,12 @@ static const char *blk(uint16_t op) {
 int main(void) {
     int M=4, K=64, N=16;
     uint64_t a[256]={0}, b[256]={0};
-    matmul_params_t p0 = { .m=M,.k=K,.n=N,.input_dma=0x1000,.weights_dma=0x2000,
-        .output_dma=0x3000,.tasks=a,.fp32tofp16=1,.accumulate=0,.add_dma=0 };
-    matmul_params_t p1 = { .m=M,.k=K,.n=N,.input_dma=0x1000,.weights_dma=0x2000,
-        .output_dma=0x3000,.tasks=b,.fp32tofp16=1,.accumulate=1,.add_dma=0x3000 };
-    gen_matmul_fp16(&p0);
-    gen_matmul_fp16(&p1);
+    gemm_params_t p0 = { .m=M,.k=K,.n=N,.input_iova=0x1000,.weights_iova=0x2000,
+        .output_iova=0x3000,.tasks=a,.fp16_out=1,.accumulate=0,.add_iova=0 };
+    gemm_params_t p1 = { .m=M,.k=K,.n=N,.input_iova=0x1000,.weights_iova=0x2000,
+        .output_iova=0x3000,.tasks=b,.fp16_out=1,.accumulate=1,.add_iova=0x3000 };
+    gen_gemm_fp16(&p0);
+    gen_gemm_fp16(&p1);
     printf("accumulate=0: %u ops   accumulate=1: %u ops\n\n", p0.task_count, p1.task_count);
 
     int n = p0.task_count > p1.task_count ? p0.task_count : p1.task_count;

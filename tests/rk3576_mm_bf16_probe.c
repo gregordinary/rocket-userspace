@@ -6,17 +6,16 @@
  * A probe, not a gate. The RK3588 runs bf16 at precision 3 on the same IP. The only RK3576
  * evidence against it is CORE 0x3018 = 3 run on fp16 BYTES, which returns a wrong surface
  * whether or not the part can do bf16, so it could not have found the positive. This runs
- * the matmul-form fp16 program (gen_matmul_fp16_rk3576) with its precision words moved to
+ * the matmul-form fp16 program (gen_gemm_fp16_rk3576) with its precision words moved to
  * 3 and bf16 bytes in both operands, and scores the result against an exact reference.
  *
  * Three words carry the precision in that stream:
  *   CNA  0x100C  proc_precision [9:7] and in_precision [6:4]   (0x20200120 at fp16)
  *   CORE 0x3018  proc_precision [10:8]                         (0x10000200 at fp16)
  *   DPU  0x4010  proc_precision [2:0]; [31:29] = 5 stays the fp32 output width
- * The arms patch different subsets of them, so a positive says which words it needs. The
- * coefficient buffer holds a scale table of fp16 1.0 (0x3C00). Read as bf16 that is 2^-7,
- * so the arms run it both ways, and a surface that is the reference times one constant is
- * reported as a UNIFORM SCALE rather than as wrong.
+ * The arms patch different subsets of them, so a positive says which words it needs. A
+ * surface that is the reference times one constant is reported as a UNIFORM SCALE rather
+ * than as wrong.
  *
  * Two fills, both exact in fp32 whatever the accumulation order:
  *   int   A = ai/4, B = bi/2 with ai in [-6,6], bi in [-3,3]: the fp16 gate's value set.
@@ -66,19 +65,16 @@ struct arm {
     const char *name;
     int bf16_data;      /* operands are bf16 bytes, not fp16            */
     int cna, core, dpu; /* which precision words move to 3              */
-    int bf16_scale;     /* the coefficient scale table holds bf16 1.0   */
 };
 
 static const struct arm ARMS[] = {
-    { "fp16 control",          0, 0, 0, 0, 0 },
-    { "bf16 all three",        1, 1, 1, 1, 0 },
-    { "bf16 all three, bscale",1, 1, 1, 1, 1 },
-    { "bf16 core+dpu",         1, 0, 1, 1, 0 },
-    { "bf16 core+dpu, bscale", 1, 0, 1, 1, 1 },
-    { "bf16 cna+core",         1, 1, 1, 0, 0 },
-    { "bf16 core only",        1, 0, 1, 0, 0 },
-    { "bf16 data, fp16 prog",  1, 0, 0, 0, 0 },
-    { "fp16 control (canary)", 0, 0, 0, 0, 0 },
+    { "fp16 control",          0, 0, 0, 0 },
+    { "bf16 all three",        1, 1, 1, 1 },
+    { "bf16 core+dpu",         1, 0, 1, 1 },
+    { "bf16 cna+core",         1, 1, 1, 0 },
+    { "bf16 core only",        1, 0, 1, 0 },
+    { "bf16 data, fp16 prog",  1, 0, 0, 0 },
+    { "fp16 control (canary)", 0, 0, 0, 0 },
 };
 #define N_ARMS (sizeof ARMS / sizeof ARMS[0])
 
@@ -122,17 +118,16 @@ static int run_arm(int fd, const struct arm *a, int fill, unsigned m, unsigned k
 {
     size_t ib = rocket_rk3576_mm_fp16_in_bytes(m, k);
     size_t wb = rocket_rk3576_mm_fp16_weight_bytes(k, n);
-    size_t cb = rocket_rk3576_mm_fp16_coef_bytes(n);
     size_t ob = rocket_rk3576_mm_fp16_out_bytes(m, n);
     size_t ne = (size_t)m * n, e;
     const double a_sc = fill == FILL_WIDE ? ldexp(0.25, 40) : 0.25;
     const double b_sc = fill == FILL_WIDE ? ldexp(0.5, -50) : 0.5;
-    rocket_bo in = {0}, w = {0}, coef = {0}, out = {0}, rc = {0};
+    rocket_bo in = {0}, w = {0}, out = {0}, rc = {0};
     uint64_t ops[RK3576_MM_FP16_OPS];
     int8_t *ai = malloc((size_t)m * k), *bi = malloc((size_t)n * k);
     uint16_t *B = malloc((size_t)n * k * 2);
     int32_t *ref = malloc(ne * 4);
-    uint32_t in_h[4], out_h[1];
+    uint32_t in_h[3], out_h[1];
     int exact = 0;
 
     if (!ai || !bi || !B || !ref) { printf("  out of memory\n"); goto out; }
@@ -150,7 +145,7 @@ static int run_arm(int fd, const struct arm *a, int fill, unsigned m, unsigned k
         }
 
     if (rocket_bo_alloc32(fd, ib, &in) || rocket_bo_alloc32(fd, wb, &w) ||
-        rocket_bo_alloc32(fd, cb, &coef) || rocket_bo_alloc32(fd, ob, &out) ||
+        rocket_bo_alloc32(fd, ob, &out) ||
         rocket_bo_alloc32(fd, sizeof ops, &rc)) {
         printf("  BO allocation failed\n");
         goto out;
@@ -167,20 +162,9 @@ static int run_arm(int fd, const struct arm *a, int fill, unsigned m, unsigned k
     rocket_bo_prep(fd, &w, 1, 0);
     rocket_rk3576_mm_fp16_pack_weights(w.ptr, w.size, B, k, n);
     rocket_bo_fini(fd, &w);
-    rocket_bo_prep(fd, &coef, 1, 0);
-    rocket_rk3576_mm_fp16_pack_coef(coef.ptr, coef.size, n);
-    if (a->bf16_scale) {
-        /* The scale table follows the 64-byte-a-group record table: see
-         * r76_mmf16_table_bytes() / r76_mmf16_scale_bytes(). */
-        size_t tb = (size_t)((n + 7) / 8) * 64, sb = (size_t)((n + 7) & ~7u) * 2;
-        uint16_t one = 0x3F80;   /* bf16 1.0 */
-        for (size_t i = 0; i < sb / 2; i++)
-            memcpy((unsigned char *)coef.ptr + tb + i * 2, &one, 2);
-    }
-    rocket_bo_fini(fd, &coef);
-    if (gen_matmul_fp16_rk3576(ops, m, k, n, (uint32_t)in.dma_address,
-                               (uint32_t)w.dma_address, (uint32_t)out.dma_address,
-                               (uint32_t)coef.dma_address) != RK3576_MM_FP16_OPS) {
+    if (gen_gemm_fp16_rk3576(ops, m, k, n, (uint32_t)in.dma_address,
+                               (uint32_t)w.dma_address, (uint32_t)out.dma_address)
+            != RK3576_MM_FP16_OPS) {
         printf("  the generator refused\n");
         goto out;
     }
@@ -193,7 +177,7 @@ static int run_arm(int fd, const struct arm *a, int fill, unsigned m, unsigned k
     rocket_bo_prep(fd, &rc, 1, 0);
     memcpy(rc.ptr, ops, sizeof ops);
     rocket_bo_fini(fd, &rc);
-    in_h[0] = in.handle; in_h[1] = w.handle; in_h[2] = coef.handle; in_h[3] = rc.handle;
+    in_h[0] = in.handle; in_h[1] = w.handle; in_h[2] = rc.handle;
     out_h[0] = out.handle;
 
     {
@@ -206,7 +190,7 @@ static int run_arm(int fd, const struct arm *a, int fill, unsigned m, unsigned k
         memset(out.ptr, STAMP, ob);
         rocket_bo_fini(fd, &out);
         t0 = now_ms();
-        src = rocket_submit_matmul(fd, &rc, RK3576_MM_FP16_OPS, in_h, 4, out_h, 1, 4000);
+        src = rocket_submit_matmul(fd, &rc, RK3576_MM_FP16_OPS, in_h, 3, out_h, 1, 4000);
         if (src == 0 && rocket_bo_prep(fd, &out, 0, 4000000000ull) < 0) src = -1;
         dev = now_ms() - t0;
         if (src != 0) {
@@ -252,7 +236,6 @@ static int run_arm(int fd, const struct arm *a, int fill, unsigned m, unsigned k
 out:
     if (rc.ptr) rocket_bo_free(fd, &rc);
     if (out.ptr) rocket_bo_free(fd, &out);
-    if (coef.ptr) rocket_bo_free(fd, &coef);
     if (w.ptr) rocket_bo_free(fd, &w);
     if (in.ptr) rocket_bo_free(fd, &in);
     free(ai); free(bi); free(B); free(ref);
@@ -339,15 +322,14 @@ static int npu_bf16(int fd, unsigned m, unsigned k, unsigned n, const uint16_t *
                     const uint16_t *B, float *C)
 {
     size_t ib = rocket_rk3576_mm_fp16_in_bytes(m, k), ob = rocket_rk3576_mm_fp16_out_bytes(m, n);
-    rocket_bo in = {0}, w = {0}, coef = {0}, out = {0}, rc = {0};
+    rocket_bo in = {0}, w = {0}, out = {0}, rc = {0};
     uint64_t ops[RK3576_MM_FP16_OPS];
-    uint32_t in_h[4], out_h[1];
+    uint32_t in_h[3], out_h[1];
     size_t unwritten = 0;
     int ret = -1;
 
     if (rocket_bo_alloc32(fd, ib, &in) ||
         rocket_bo_alloc32(fd, rocket_rk3576_mm_fp16_weight_bytes(k, n), &w) ||
-        rocket_bo_alloc32(fd, rocket_rk3576_mm_fp16_coef_bytes(n), &coef) ||
         rocket_bo_alloc32(fd, ob, &out) || rocket_bo_alloc32(fd, sizeof ops, &rc))
         goto out;
     rocket_bo_prep(fd, &in, 1, 0);
@@ -357,12 +339,8 @@ static int npu_bf16(int fd, unsigned m, unsigned k, unsigned n, const uint16_t *
     rocket_bo_prep(fd, &w, 1, 0);
     rocket_rk3576_mm_fp16_pack_weights(w.ptr, w.size, B, k, n);
     rocket_bo_fini(fd, &w);
-    rocket_bo_prep(fd, &coef, 1, 0);
-    rocket_rk3576_mm_fp16_pack_coef(coef.ptr, coef.size, n);
-    rocket_bo_fini(fd, &coef);
-    if (gen_matmul_fp16_rk3576(ops, m, k, n, (uint32_t)in.dma_address, (uint32_t)w.dma_address,
-                               (uint32_t)out.dma_address, (uint32_t)coef.dma_address)
-            != RK3576_MM_FP16_OPS ||
+    if (gen_gemm_fp16_rk3576(ops, m, k, n, (uint32_t)in.dma_address, (uint32_t)w.dma_address,
+                               (uint32_t)out.dma_address) != RK3576_MM_FP16_OPS ||
         patch(ops, RK3576_MM_FP16_OPS, 0x100C, 0x3f0u, (3u << 7) | (3u << 4)) ||
         patch(ops, RK3576_MM_FP16_OPS, 0x3018, 0x700u, 3u << 8) ||
         patch(ops, RK3576_MM_FP16_OPS, 0x4010, 0x7u, 3u))
@@ -370,12 +348,12 @@ static int npu_bf16(int fd, unsigned m, unsigned k, unsigned n, const uint16_t *
     rocket_bo_prep(fd, &rc, 1, 0);
     memcpy(rc.ptr, ops, sizeof ops);
     rocket_bo_fini(fd, &rc);
-    in_h[0] = in.handle; in_h[1] = w.handle; in_h[2] = coef.handle; in_h[3] = rc.handle;
+    in_h[0] = in.handle; in_h[1] = w.handle; in_h[2] = rc.handle;
     out_h[0] = out.handle;
     rocket_bo_prep(fd, &out, 1, 0);
     memset(out.ptr, STAMP, ob);
     rocket_bo_fini(fd, &out);
-    if (rocket_submit_matmul(fd, &rc, RK3576_MM_FP16_OPS, in_h, 4, out_h, 1, 4000) ||
+    if (rocket_submit_matmul(fd, &rc, RK3576_MM_FP16_OPS, in_h, 3, out_h, 1, 4000) ||
         rocket_bo_prep(fd, &out, 0, 4000000000ull) < 0)
         goto out;
     for (size_t e = 0; e < (size_t)m * n; e++)
@@ -386,7 +364,6 @@ static int npu_bf16(int fd, unsigned m, unsigned k, unsigned n, const uint16_t *
 out:
     if (rc.ptr) rocket_bo_free(fd, &rc);
     if (out.ptr) rocket_bo_free(fd, &out);
-    if (coef.ptr) rocket_bo_free(fd, &coef);
     if (w.ptr) rocket_bo_free(fd, &w);
     if (in.ptr) rocket_bo_free(fd, &in);
     return ret;

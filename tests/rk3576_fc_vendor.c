@@ -41,6 +41,7 @@
 #include "rocket_npu.h"
 #include "npu_matmul.h"
 #include "npu_hw.h"
+#include "npu_regmap.h"   /* the register offsets and fields (src/) */
 #include "npu_regcmd_rk3576.h"
 #include "rocket_hw_profile.h"
 
@@ -70,8 +71,8 @@ static size_t feature_bytes(const struct rk3576_golden_case *c, unsigned ic_img)
  * or 0 if the generator refused. */
 static unsigned emit_ours(const struct rk3576_golden_case *c, unsigned ic_img,
                           uint64_t *ops, unsigned max_ops,
-                          uint64_t in_dma, uint64_t w_dma, uint64_t o_dma,
-                          uint64_t b_dma)
+                          uint64_t in_iova, uint64_t w_iova, uint64_t o_iova,
+                          uint64_t b_iova)
 {
     conv_params_t p = {0};
     char fbuf[32];
@@ -91,8 +92,8 @@ static unsigned emit_ours(const struct rk3576_golden_case *c, unsigned ic_img,
     p.int8_out = 1;
     p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
     p.input_zero_point = 0x80; p.output_zero_point = 0x80; p.weight_zero_point = 0x80;
-    p.input_dma = in_dma; p.weights_dma = w_dma;
-    p.output_dma = o_dma; p.bias_dma = b_dma;
+    p.input_iova = in_iova; p.weights_iova = w_iova;
+    p.output_iova = o_iova; p.bias_iova = b_iova;
     p.tasks = ops;
 
     /* The vendor allocator's own CBUF allowance, so the comparison is of the program
@@ -171,14 +172,14 @@ static int run_case(int fd, const struct rk3576_golden_case *c, int ours)
                 case 0x5024: v = (uint32_t)(b_bo.dma_address + coeff - 64u); break;
                 default: break;
             }
-            ops[i] = NPUOP(c->ops[i].target, v, c->ops[i].reg);
+            ops[i] = REGCMD(c->ops[i].target, c->ops[i].reg, v);
         }
         /* The PC trailer the vendor stream does not carry: its kernel starts the PC
          * outside the regcmd, and `rocket` needs the start inside it. */
-        ops[c->n_ops + 0] = NPUOP(OP_NONE,   0x0,  0x0);
-        ops[c->n_ops + 1] = NPUOP(OP_REG_PC, 0x0,  PC_REGISTER_AMOUNTS);
-        ops[c->n_ops + 2] = NPUOP(OP_40,     0x0,  0x0);
-        ops[c->n_ops + 3] = NPUOP(OP_ENABLE, 0x1D, PC_OPERATION_ENABLE);
+        ops[c->n_ops + 0] = REGCMD(TARGET_NONE, 0x0, 0x0);
+        ops[c->n_ops + 1] = REGCMD(TARGET_PC, REG_PC_REGISTER_AMOUNTS, 0x0);
+        ops[c->n_ops + 2] = REGCMD(TARGET_PRE_ENABLE, 0x0, 0x0);
+        ops[c->n_ops + 3] = REGCMD(TARGET_ENABLE, REG_PC_OPERATION_ENABLE, 0x1D);
     }
 
     rocket_bo_prep(fd, &r_bo, 1, 0);

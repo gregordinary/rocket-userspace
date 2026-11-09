@@ -30,7 +30,7 @@
  *     ACCUMULATION REGIME (≈1e-5 => exact products + fp32 accumulate; ≈0.4% =>
  *     product or accumulate rounded to bf16). Either way bf16 matmul is real.
  *
- * Sweep knobs (passed through to gen_matmul_bf16 via env; this harness only prints
+ * Sweep knobs (passed through to gen_gemm_bf16 via env; this harness only prints
  * them + sizes the output BO):
  *   ROCKET_BF16_PREC      in/proc precision (default 3 = bf16; try 7 = tf32 control)
  *   ROCKET_BF16_OUT_PREC  output precision  (default 5 = fp32)
@@ -85,7 +85,7 @@ static inline float bf16_to_fp32(uint16_t h) {
 /* fp32 output read index (cube C2, default 4 = the 4-byte fp32 cube). 1-based n,m
  * to match the pack loops, like matmul_fp16.c / matmul_int16_rocket.c. */
 static size_t out_index(int N, int M, int out_c2, int n, int m) {
-    return (size_t)feature_data(N, M, 1, out_c2, n, m, 1);
+    return (size_t)feature_index(N, M, 1, out_c2, n, m, 1);
 }
 
 int main(int argc, char **argv) {
@@ -134,15 +134,15 @@ int main(int argc, char **argv) {
     }
 
     uint64_t npu_regs[256] = {0};
-    matmul_params_t p = {
+    gemm_params_t p = {
         .m = (uint16_t)M, .k = (uint16_t)K, .n = (uint16_t)N,
-        .input_dma = (uint32_t)input.dma_address,
-        .weights_dma = (uint32_t)weights.dma_address,
-        .output_dma = (uint32_t)output.dma_address,
+        .input_iova = (uint32_t)input.dma_address,
+        .weights_iova = (uint32_t)weights.dma_address,
+        .output_iova = (uint32_t)output.dma_address,
         .tasks = npu_regs,
     };
-    if ((ret = gen_matmul_bf16(&p)) != 0) {
-        fprintf(stderr, "gen_matmul_bf16 = %d (CBUF banks? -1 fd, -2 weight/kernel)\n", ret);
+    if ((ret = gen_gemm_bf16(&p)) != 0) {
+        fprintf(stderr, "gen_gemm_bf16 = %d (CBUF banks? -1 fd, -2 weight/kernel)\n", ret);
         goto out;
     }
     printf("regcmd ops = %u\n", p.task_count);
@@ -178,15 +178,15 @@ int main(int argc, char **argv) {
     memcpy(regcmd.ptr, npu_regs, (size_t)p.task_count * sizeof(uint64_t));
     memset(input.ptr, 0, input.size);
     memset(weights.ptr, 0, weights.size);
-    /* pack bf16 bits into the NPU native layouts: weight_fp16 (bf16 == fp16 2-byte
+    /* pack bf16 bits into the NPU native layouts: gemm_weight_index_fp16 (bf16 == fp16 2-byte
      * layout), feature cube C2 (default 8 = fp16's 2-byte atom). Raw 2-byte stores. */
     uint16_t *wdst = weights.ptr, *idst = input.ptr;
     for (int n = 1; n <= N; n++)
         for (int k = 1; k <= K; k++)
-            wdst[weight_fp16(K, n, k)] = Bb[(n-1)*K + (k-1)];
+            wdst[gemm_weight_index_fp16(K, n, k)] = Bb[(n-1)*K + (k-1)];
     for (int m = 1; m <= M; m++)
         for (int k = 1; k <= K; k++)
-            idst[feature_data(K, M, 1, c2, k, m, 1)] = Ab[(m-1)*K + (k-1)];
+            idst[feature_index(K, M, 1, c2, k, m, 1)] = Ab[(m-1)*K + (k-1)];
     CK(rocket_bo_fini(fd, &regcmd));
     CK(rocket_bo_fini(fd, &input));
     CK(rocket_bo_fini(fd, &weights));
