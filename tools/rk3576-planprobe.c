@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 The rocket-userspace authors
 /* What the RK3576 int8 matmul entry PLANS and EMITS for a shape, with NO DEVICE.
  *
  * Every quantity this prints is pure: the route the entry will take, the K slice, the

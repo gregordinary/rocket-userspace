@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Manufacture the RK3576 vendor INT8 convolution captures beside this script.
 
 These are the quantized programs the regcmd gate is anchored on: the int8 packed-image

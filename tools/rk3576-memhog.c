@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 The rocket-userspace authors
 /* rk3576-memhog — a DRAM-bandwidth load, so memory pressure can be DIALLED rather than
  * inferred from a context.
  *

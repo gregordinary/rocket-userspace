@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # Build the RK3576 `rocket` driver out of tree, so a driver change can be A/B'd on a board
 # whose kernel source is not installed.
 #

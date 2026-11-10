@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """What register BLOCKS does an .rknn capture drive, and which registers in each?
 
 mkgolden.py only scans for runs of the six block targets a convolution uses, so a

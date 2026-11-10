@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 @PACKAGE_INIT@
 
 # rocketnpu exposes Threads::Threads through its public interface; re-find it so

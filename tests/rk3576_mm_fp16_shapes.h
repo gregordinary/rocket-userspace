@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 The rocket-userspace authors
 /* The shapes tests/rk3576_mm_fp16_gate.c runs, as { m, k, n }. The first six are the
  * gate's original shapes; the rest move one axis each (M, then a K and an N that are not powers of two,
  * then N), and the next three were the corners of the first envelope. The last five are one task at the

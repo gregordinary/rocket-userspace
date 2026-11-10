@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Decode the DPU LUT programming protocol out of the manufactured activation captures.
 
 The captures beside this script (mklut.py) are the first programs anyone has of this

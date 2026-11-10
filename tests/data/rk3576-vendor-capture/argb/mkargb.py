@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """First-conv ARGB captures whose weights NAME themselves, and the decoder that reads
 the ARGB weight cube's layout out of them.
 

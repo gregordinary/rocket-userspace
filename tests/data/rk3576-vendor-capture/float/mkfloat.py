@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Rebuild the RK3576 vendor FLOAT captures beside this script.
 
 Every capture in ../int8 and ../dw is int8, so the fp16 precision fields had no

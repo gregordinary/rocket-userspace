@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """
 rk3576-w8a8-dump.py -- a real model's W8A8 GEMM operands, as the RK3576 route hands them to
 the per-column entry, for tests/rk3576_mm_percol_err.c. Host only.

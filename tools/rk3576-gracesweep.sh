@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # Make the drain deadline's cut land EARLIER and read what the failure's extent does.
 #
 # The tail form is confined to one 16-channel group (`c 32-47` in 56 of 56 wrong reps at

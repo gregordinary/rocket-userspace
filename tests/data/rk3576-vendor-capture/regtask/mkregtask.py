@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Map the vendor compiler's geometry-field widths by overflowing them on purpose.
 
 RKNN-Toolkit2 checks every register field it emits against the field's width and prints

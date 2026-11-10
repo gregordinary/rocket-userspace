@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 The rocket-userspace authors
 /* rk3576-npu-grf: read the RK3576 NPU GRF (0x26018000) through /dev/mem, and sample
  * NPU_GRF_RKNNST (+0x1C), whose bits 0 and 1 the TRM names core0_work_on and core1_work_on.
  *

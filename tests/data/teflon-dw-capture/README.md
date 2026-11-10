@@ -9,7 +9,7 @@ Capture shape: `IC=64, 8×8, K3×3, stride 1, pad 1`, per-tensor int8
 
 | File | What it is |
 |---|---|
-| `dw_pt.tflite` | the source TFLite model |
+| `dw_pt.tflite` | the source TFLite model, written by tflite-rocket's `tools/make_depthwise_tflite.py` at its defaults |
 | `mesa-input-000-000.bin` | Mesa's captured input feature cube (NC1HWC2). The capture's input is constant zero |
 | `mesa-weights-000-000.bin` | Mesa's captured weight cube |
 | `mesa-biases-000-000.bin` | Mesa's captured int32 bias cube |

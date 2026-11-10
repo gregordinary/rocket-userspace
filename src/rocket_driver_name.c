@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 The rocket-userspace authors
 /* Which kernel driver this build reaches, as a short human name.
  *
  * NOT part of the submit seam: the seam is exactly what src/rocket_npu.c defines, and

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Find the LUT's INPUT map: what carries an input value onto the 512 intervals.
 
 The output side reads (decode_lut.py): two 513-entry tables are the lower and upper

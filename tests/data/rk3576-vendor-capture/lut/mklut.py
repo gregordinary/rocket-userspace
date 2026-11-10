@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Manufacture RK3576 vendor captures that DRIVE THE DPU's LUT.
 
 No capture anyone has of this part programs the LUT bank: every convolution capture

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Decode the RK3576's elementwise-ADD program out of the manufactured captures.
 
 `dumpblocks.py ../add/*.rknn` says the shape of it: an elementwise add is a program of

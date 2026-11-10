@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # rocket-userspace — FOSS userspace driver/library for the RK3588 NPU via the mainline
 # "rocket" DRM-accel driver. This builds the DRIVER project: a standalone library
 # (librocketnpu) exposing the shim + fp16 matmul (tiled + multicore). It has NO

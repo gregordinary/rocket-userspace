@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # rk3576-lag-pressure.sh — the divisor lag's RATE against a DIALLED memory load.
 #
 # The lag's two recorded high-rate contexts (inside a kick; reading a host-scattered

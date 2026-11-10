@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """
 w8a8_layer_error.py -- what one per-tensor int8 scale does to a REAL model's own
 prefill activations, measured against the fp32 reference. Host only, no device.

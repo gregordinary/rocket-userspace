@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """
 w8a8_where.py -- WHERE the per-tensor output requant does its damage, per call and
 per region, under each arm's own inputs. One window, no perplexity.

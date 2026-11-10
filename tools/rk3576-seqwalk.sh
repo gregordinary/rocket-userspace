@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # Per-rep readout of the drain deadline's two failure forms, at the heights the shipped
 # planner still honours on `k7ic64-g2`. One process per pass, so the position of a rep
 # within a process is readable; the aggregate `rowmap` line is printed alongside.

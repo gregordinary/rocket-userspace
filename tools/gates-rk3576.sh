@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # The RK3576 gate list: every asserting gate this part has, one row each.
 #
 # Run it from the source root (the network gates read their blobs from

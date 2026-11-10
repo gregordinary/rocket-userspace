@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Extract the RK3576 vendor register programs from the .rknn captures into a C
 header the host-only gate can compile against.
 

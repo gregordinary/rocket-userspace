@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 The rocket-userspace authors
 /* ONE cell of the int32 K-split ladder, one per PROCESS, since a cell can wedge the device.
  *
  * Calls rocket_matmul_int8_rk3576_i32() directly — the route the int8 entry falls onto

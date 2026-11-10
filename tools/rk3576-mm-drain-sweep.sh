@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # How far does the RK3576 drain-deadline exposure reach on the int8 matmul entry?
 #
 # The recorded map — one shape wrong in 12 of 14 reps at the shipped dpu_grace_us=500,

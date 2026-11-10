@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Manufacture RK3576 vendor captures that DRIVE THE POOLING ENGINE (PPU).
 
 Nothing in any capture of this part drives the PPU, so its register page is undecoded

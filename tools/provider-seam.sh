@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # Print librocketnpu's submit seam, or check a provider against it.
 #
 # The library reaches the kernel through one set of C symbols, and that set has more than

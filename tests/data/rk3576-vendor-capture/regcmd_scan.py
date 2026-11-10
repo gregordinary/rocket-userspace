@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Find the register programs embedded in a compiled .rknn model.
 
 RKNN-Toolkit2 stores each task's register program verbatim, as an array of 64-bit

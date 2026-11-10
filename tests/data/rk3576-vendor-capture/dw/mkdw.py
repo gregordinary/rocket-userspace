@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Manufacture RK3576 vendor DEPTHWISE captures.
 
 The eight int8 captures in ../int8 carry twenty depthwise programs

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 # The int32 K-split ladder, ONE CELL PER PROCESS, ascending in submits.
 #
 # A cell in this class can take the device down across processes, so: nothing shares a

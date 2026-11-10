@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """
 w8a8_ppl.py -- what rocket_matmul_int8_rk3576()'s contract does to a real model's
 OUTPUT, not to one GEMM. Host only, no device.

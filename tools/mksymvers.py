@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rocket-userspace authors
 """Synthesize a Module.symvers for an out-of-tree build against a running kernel
 whose build tree is gone.
 
