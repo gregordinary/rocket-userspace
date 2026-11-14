@@ -527,7 +527,7 @@ optional kernel patches:
 
 ## License and credits
 
-`librocketnpu` is MIT-licensed; see [LICENSE](LICENSE).
+`librocketnpu` is MIT-licensed. See [LICENSE](LICENSE).
 
 It builds on prior work:
 

@@ -493,42 +493,121 @@ static size_t r76_bo_pool_cap(void)
     }
     return (size_t)c;
 }
+/* THE OVERSIZE BOUND, ROCKET_RK3576_BO_POOL_MAXOVER (default 2, 0 = unbounded). A pooled BO
+ * serves a request only if it is at most this many times the request, or at most 64 KiB
+ * larger. A BO keeps its size in the pool and PREP_BO/FINI_BO walk the whole of it, so
+ * without the bound a small request that once found only a large BO keeps taking it: the
+ * pool never sees the small size again. The int8 entry walks its output BO about twelve
+ * times a four-task tile, and the cache walk runs at 10.45 GB/s a direction on the RK3576
+ * [HW sweep, H96 MAX M9, rocket 1.6.0, tests/rk3576_prep_floor, 2026-11-11]. A request the
+ * bound refuses allocates its own BO, which the next put keeps. */
+static size_t r76_bo_pool_maxover(void)
+{
+    static _Atomic long v = -1;
+    long c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        const char *e = getenv("ROCKET_RK3576_BO_POOL_MAXOVER");
+        c = (e && *e) ? atol(e) : 2;
+        if (c < 0) c = 2;
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return (size_t)c;
+}
+#define R76_BO_POOL_SLACK ((size_t)64u << 10)
 #define R76_BO_POOL_SLOTS 16
 static pthread_mutex_t g_r76_bo_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { int fd; rocket_bo bo; } g_r76_bo_pool[R76_BO_POOL_SLOTS];
 static size_t g_r76_bo_pool_bytes;
 
-/* Smallest pooled BO that covers the request wins; a larger BO is always safe (the
- * consumers bound every access by the size they asked for). It is not free: a pooled BO
- * keeps its allocated size, so once the mix of shapes or entries changes a small request
- * can settle onto a far larger BO, and PREP_BO/FINI_BO sync the whole of it every call.
- * On the fp16 per-call entry an 8 KiB weight request settled onto a 257 KiB BO after one
- * shape change [HW sweep 2026-09-25, rk3576_mm_fp16_cost; the matching is inferred from
- * the sizes]. */
+/* THE POOL'S READOUT, on the ROCKET_MM_PROFILE knob: print-only, one line at exit.
+ * `requested` is what the entries asked for and `served` the size of the BO each get
+ * returned, so their difference is the oversize that PREP_BO/FINI_BO walk on every sync of
+ * that BO. `alloc` and `free` time the BO create and release the pool exists to avoid;
+ * `peak` is the most bytes the pool held at once. A process with the pool off prints the
+ * same line, with every get a miss. */
+static struct {
+    long gets, hits, puts, kept, freed;
+    double requested, served, over_hit, alloc_ms, free_ms;
+    size_t peak;
+} g_r76_bo_stat;
+static int g_r76_bo_stat_armed;
+
+static void r76_bo_stat_dump(void)
+{
+    ROCKET_LOGI("ROCKET rk3576 BO pool: %ld gets, %ld hits; requested %.1f MiB, served "
+                "%.1f MiB (oversize %.1f MiB, all on hits); alloc %.1f ms over %ld; "
+                "%ld puts, %ld kept, %ld freed in %.1f ms; peak held %.1f MiB\n",
+                g_r76_bo_stat.gets, g_r76_bo_stat.hits, g_r76_bo_stat.requested / 1048576.0,
+                g_r76_bo_stat.served / 1048576.0, g_r76_bo_stat.over_hit / 1048576.0,
+                g_r76_bo_stat.alloc_ms, g_r76_bo_stat.gets - g_r76_bo_stat.hits,
+                g_r76_bo_stat.puts, g_r76_bo_stat.kept, g_r76_bo_stat.freed,
+                g_r76_bo_stat.free_ms, (double)g_r76_bo_stat.peak / 1048576.0);
+}
+
+/* Called with g_r76_bo_pool_mu held. */
+static void r76_bo_stat_arm(void)
+{
+    if (!g_r76_bo_stat_armed) { atexit(r76_bo_stat_dump); g_r76_bo_stat_armed = 1; }
+}
+
+/* Smallest pooled BO that covers the request wins, within the oversize bound above; a
+ * larger BO is always safe (the consumers bound every access by the size they asked for).
+ * It is not free: a pooled BO keeps its allocated size, and PREP_BO/FINI_BO sync the whole
+ * of it every call. Unbounded, one 64x2048x2048 fp16 call left 16x256x64 calls at 1.5-1.6 ms
+ * against 0.11 ms bounded, on 8.7 MiB of oversize a call [HW sweep, H96 MAX M9, rocket
+ * 1.6.0, governor `performance`, tests/rk3576_bo_pool_cost f16:LS, 2026-11-11]. */
 static int r76_bo_get(int fd, size_t size, rocket_bo *bo)
 {
+    const int prof = r76_mm_profile();
+    double t0;
+    int rc;
     if (r76_bo_pool_on()) {
         int i, best = -1;
         pthread_mutex_lock(&g_r76_bo_pool_mu);
+        const size_t over = r76_bo_pool_maxover();
         for (i = 0; i < R76_BO_POOL_SLOTS; i++) {
+            size_t have = g_r76_bo_pool[i].bo.size;
             if (!g_r76_bo_pool[i].bo.ptr || g_r76_bo_pool[i].fd != fd) continue;
-            if (g_r76_bo_pool[i].bo.size < size) continue;
-            if (best < 0 || g_r76_bo_pool[i].bo.size < g_r76_bo_pool[best].bo.size)
+            if (have < size) continue;
+            if (over && have - size > R76_BO_POOL_SLACK && have / over > size) continue;
+            if (best < 0 || have < g_r76_bo_pool[best].bo.size)
                 best = i;
         }
         if (best >= 0) {
             *bo = g_r76_bo_pool[best].bo;
             g_r76_bo_pool_bytes -= g_r76_bo_pool[best].bo.size;
             memset(&g_r76_bo_pool[best], 0, sizeof g_r76_bo_pool[best]);
+            if (prof) {
+                r76_bo_stat_arm();
+                g_r76_bo_stat.gets++;
+                g_r76_bo_stat.hits++;
+                g_r76_bo_stat.requested += (double)size;
+                g_r76_bo_stat.served += (double)bo->size;
+                g_r76_bo_stat.over_hit += (double)(bo->size - size);
+            }
             pthread_mutex_unlock(&g_r76_bo_pool_mu);
             return 0;
         }
         pthread_mutex_unlock(&g_r76_bo_pool_mu);
     }
-    return rocket_bo_alloc32(fd, size, bo);
+    t0 = prof ? r76_now_ms() : 0.0;
+    rc = rocket_bo_alloc32(fd, size, bo);
+    if (prof) {
+        double dt = r76_now_ms() - t0;
+        pthread_mutex_lock(&g_r76_bo_pool_mu);
+        r76_bo_stat_arm();
+        g_r76_bo_stat.gets++;
+        g_r76_bo_stat.requested += (double)size;
+        g_r76_bo_stat.served += rc < 0 ? 0.0 : (double)bo->size;
+        g_r76_bo_stat.alloc_ms += dt;
+        pthread_mutex_unlock(&g_r76_bo_pool_mu);
+    }
+    return rc;
 }
 static void r76_bo_put(int fd, rocket_bo *bo)
 {
+    const int prof = r76_mm_profile();
+    double t0;
     if (bo->ptr && r76_bo_pool_on()) {
         int i;
         pthread_mutex_lock(&g_r76_bo_pool_mu);
@@ -539,13 +618,31 @@ static void r76_bo_put(int fd, rocket_bo *bo)
                 g_r76_bo_pool[i].bo = *bo;
                 g_r76_bo_pool_bytes += bo->size;
                 memset(bo, 0, sizeof *bo);
+                if (prof) {
+                    r76_bo_stat_arm();
+                    g_r76_bo_stat.puts++;
+                    g_r76_bo_stat.kept++;
+                    if (g_r76_bo_pool_bytes > g_r76_bo_stat.peak)
+                        g_r76_bo_stat.peak = g_r76_bo_pool_bytes;
+                }
                 pthread_mutex_unlock(&g_r76_bo_pool_mu);
                 return;
             }
         }
         pthread_mutex_unlock(&g_r76_bo_pool_mu);
     }
-    if (bo->ptr) rocket_bo_free(fd, bo);
+    if (!bo->ptr) return;
+    t0 = prof ? r76_now_ms() : 0.0;
+    rocket_bo_free(fd, bo);
+    if (prof) {
+        double dt = r76_now_ms() - t0;
+        pthread_mutex_lock(&g_r76_bo_pool_mu);
+        r76_bo_stat_arm();
+        g_r76_bo_stat.puts++;
+        g_r76_bo_stat.freed++;
+        g_r76_bo_stat.free_ms += dt;
+        pthread_mutex_unlock(&g_r76_bo_pool_mu);
+    }
 }
 void rocket_rk3576_bo_pool_drain(int fd)
 {

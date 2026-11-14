@@ -43,7 +43,13 @@
  *
  * Rates are read out of `rocket_rk3576_i32_last_stats()`, which counts the detector's own
  * firings per ROW TASK, so a cell's rate is comparable across shapes with different task
- * counts. Every rep is also checked against a CPU model, and a rep that is wrong ANYWAY
+ * counts. THE DENSE WRITER, the entry's default, has no zero-run detector: it scans for
+ * atoms never written and redoes a retired job, nothing else. So on the default path the
+ * `zeroruns` column reads 0 by construction, and a dropped atom can only show up in the
+ * `wrong` column, with its element count and how many of those are zero. The `load` and
+ * `hammer` modes leave the writer to the planner and therefore measure the dense writer;
+ * ROCKET_RK3576_I32_DENSE=0 measures the narrow and wide writers instead. Every rep is
+ * also checked against a CPU model, and a rep that is wrong ANYWAY
  * is a different and far more serious finding than one that was repaired: the repair is
  * supposed to make the answer exact.
  *
@@ -140,6 +146,8 @@ struct zr_cell {
     unsigned redo_empty;        /* task attempts redone for atoms never emitted   */
     unsigned atoms_zeroed;
     unsigned reps_hit;          /* reps in which the zero-run detector fired      */
+    unsigned long elems_wrong;  /* elements wrong against the CPU model, all reps  */
+    unsigned long elems_zero;   /* of those, elements that came back ZERO          */
     double   ms;
 };
 
@@ -208,6 +216,8 @@ static void zr_cell(int fd, int M, int K, int N, unsigned reps, int force_ow1,
                 }
             if (!nbad) continue;
             out->wrong++;
+            out->elems_wrong += nbad;
+            out->elems_zero  += nzero;
             /* WHAT the wrong elements are decides what could repair them. An element
              * that came back ZERO is an atom the writer emitted empty, which a sentinel
              * can see and a redo can heal; anything else is a value that was computed
@@ -242,6 +252,7 @@ static void zr_row(const char *label, const struct zr_cell *c)
     if (c->tasks)
         printf("   %.2f%% of tasks", 100.0 * c->redo_zeroed / c->tasks);
     if (c->refused) printf("   %u REFUSED", c->refused);
+    if (c->wrong) printf("   %lu elems wrong, %lu of them zero", c->elems_wrong, c->elems_zero);
     printf("\n");
     fflush(stdout);
 }

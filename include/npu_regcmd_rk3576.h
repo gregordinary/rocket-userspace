@@ -244,8 +244,14 @@ int gen_conv2d_fp16_rk3576(conv_params_t *params);
  *
  * The output is fp32 in the plain int32 cube (`rocket_rk3576_f32_cube_accumulate`), exact
  * against a CPU model at k 1 and 3. The caller must size the output for
- * `rocket_rk3576_f32_cube_bytes()`. The entry refuses the packed-image first conv
- * (ic <= 4), which has not run under the stage. Returns 0 or -1. */
+ * `rocket_rk3576_f32_cube_bytes()`.
+ *
+ * At ic <= 4 it emits the packed-image first conv on the same stage. There a task can be a
+ * row window of a larger plane, with `oh` below `oh_full`. The window writes its rows into
+ * the whole plane's cube, at `output_iova` advanced by `oy0 * ow * 16` bytes. It is exact on
+ * random integer operands at 13 shapes, 16x16 to 224x224, windows of 1-16 rows [HW sweep,
+ * H96 MAX M9, rocket 1.6.0]. A row window at ic > 4 is refused, because it
+ * has not run under the stage. Returns 0 or -1. */
 int gen_conv2d_fp16_rk3576_f32out(conv_params_t *params);
 /* Emits the int8 direct program on the same whole output stage, a dense int32 writer. It
  * writes every accumulator of the task as a raw int32 with no bias, in oc*ow*oh words. It

@@ -331,7 +331,8 @@ static int r76_task_wrote(const unsigned char *o, const struct r76_task_extent *
  * wide-output submits and the poisoning retries they carry, is set by the sixteen-channel
  * contraction either way. So the lever is only worth building if the readback is a real
  * share of the wall, and this is what says. ROCKET_RK3576_FP16_PROF=1 logs one line per
- * call, at ROCKET_LOG_INFO. */
+ * call, at ROCKET_LOG_INFO. The packed-image first conv logs its own line under the same
+ * knob, split into allocation, packing, stamp, submit, readback and release. */
 struct r76_fp16_prof {
     int      on;
     unsigned slices;
@@ -5725,27 +5726,40 @@ restamp:
  * each. [HW sweep, H96 MAX M9] */
 #define R76_ARGB_OC_MAX 32u
 
+/* THE fp32 OUTPUT STAGE ON THIS PATH. With `f32` set, each program is the first conv on the
+ * whole output stage (gen_conv2d_fp16_rk3576_f32out()), which poisons nothing: a tile's row
+ * windows go out as ONE job, chained into one kick where the kernel honours
+ * DRM_ROCKET_JOB_BATCHED (r76_batch_on()), each window writing its own rows of the whole
+ * plane's fp32 cube, and the call leaves the part clean with no power cycle on the way out.
+ * The result is the fp32 sum rounded once to fp16. Without `f32` (ROCKET_RK3576_FP16_F32OUT=0)
+ * each program writes fp16 and poisons the next submit, so every task after the first waits
+ * for a power cycle (r76_fp16_submit_task) and the call cycles once on exit. */
 static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_desc *d,
                               const _Float16 *in, const _Float16 *W, _Float16 *out,
-                              unsigned ow, unsigned oh)
+                              unsigned ow, unsigned oh, int f32)
 {
     struct r76_conv_bos b = {0};
     uint64_t *ops = NULL;
     float *acc = NULL;
     _Float16 *wtile = NULL;
+    struct r76_task_extent *ext = NULL;
     unsigned IC = (unsigned)d->ic, OC = (unsigned)d->oc;
     unsigned IH = (unsigned)d->ih, IW = (unsigned)d->iw;
     unsigned KH = (unsigned)d->kh, KW = (unsigned)d->kw;
     unsigned tile = OC < R76_ARGB_OC_MAX ? OC : R76_ARGB_OC_MAX;
     unsigned tilepad = rocket_rk3576_fp16_pad_oc(tile);
-    unsigned oc0, nrow = 0, r, submitted = 0;
+    unsigned oc0, nrow = 0, r, submitted = 0, last0, lastpad;
     rocket_rk3576_row_task *rows = NULL;
-    size_t in_bytes, w_bytes, coeff_bytes, surf, tile_elems;
+    size_t in_bytes, w_bytes, coeff_bytes, surf, tile_elems, esz;
     conv_params_t plan = {0};
     struct r76_task_extent e = {0};
     uint32_t in_h[4], out_h[1];
     unsigned char stamp;
-    int rc;
+    int multi = 0, chained = 0, rc;
+    /* ROCKET_RK3576_FP16_PROF=1: one line a call, the wall split by phase. */
+    const int prof = r76_fp16_prof_on();
+    double pt = 0, t_alloc = 0, t_pack = 0, t_stamp = 0, t_sub = 0, t_read = 0, t_free = 0;
+    double t_call = prof ? r76_now_us() : 0;
 
     /* This path's four geometry bounds are jointly the ONNX symmetric-SAME convention, and
      * an explicit output extent is not one of them: an asymmetric pad is refused here rather
@@ -5756,25 +5770,33 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
         return ROCKET_E_UNSUPPORTED;
     }
 
+    /* The fp32 cube holds every tile at oc0 * ow * oh words, four channels to an atom, so
+     * it is sized to the last tile's padded channels. */
+    last0   = ((OC - 1u) / tile) * tile;
+    lastpad = rocket_rk3576_fp16_pad_oc(OC - last0);
+    esz     = f32 ? sizeof(float) : sizeof(_Float16);
+
     in_bytes    = (size_t)IH * IW * IC * sizeof(_Float16);
     w_bytes     = rocket_rk3576_weight_argb_fp16_bytes(tilepad, KH, KW);
     coeff_bytes = rocket_rk3576_coeff_bytes(tilepad);
-    surf        = rocket_rk3576_fp16_out_bytes(OC, oh, ow);
+    surf        = f32 ? rocket_rk3576_f32_cube_bytes(last0 + lastpad, oh, ow)
+                      : rocket_rk3576_fp16_out_bytes(OC, oh, ow);
     tile_elems  = (size_t)tilepad * IC * KH * KW;
     stamp = rocket_rk3576_sentinel_on() ? (unsigned char)ROCKET_RK3576_SENTINEL_BYTE : 0;
 
-    ops   = calloc(RK3576_CONV_TASK_OPS, sizeof *ops);
     acc   = calloc((size_t)OC * oh * ow, sizeof *acc);
     wtile = calloc(tile_elems, sizeof *wtile);
     rows  = calloc(oh ? oh : 1u, sizeof *rows);
-    if (!ops || !acc || !wtile || !rows) { rc = ROCKET_E_NOMEM; goto done; }
+    if (!acc || !wtile || !rows) { rc = ROCKET_E_NOMEM; goto done; }
 
     /* The row window, on the same axis and the same planner as every other path. A
      * stem-sized plane does not fit the CBUF in one task — 224x224 is 6272 granules
      * against a 6144 ceiling — so the plane is cut into windows, each reading the input
      * rows its output rows need. The offsets come back in PACKED-IMAGE row units here,
      * which is why the planner has to be told the precision: a float packed image is
-     * `ic` interleaved halfwords per pixel where an int8 one is bytes. */
+     * `ic` interleaved halfwords per pixel where an int8 one is bytes. The output offset
+     * is oy0 * ow * 16 bytes, one 16-byte atom per pixel, which is the fp32 cube's atom as
+     * well as the fp16 surface's. */
     plan.ic = (uint16_t)IC; plan.ih = (uint16_t)IH; plan.iw = (uint16_t)IW;
     plan.oc = (uint16_t)tilepad; plan.oh = (uint16_t)oh; plan.ow = (uint16_t)ow;
     plan.kh = (uint16_t)KH; plan.kw = (uint16_t)KW;
@@ -5788,13 +5810,26 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
         rc = ROCKET_E_UNSUPPORTED; goto done;
     }
 
+    /* On the stage a tile's windows are one job when the job can lay them all out, and one
+     * submit each when it cannot. */
+    if (f32) {
+        multi   = nrow <= R76_MAX_CHAIN_TASKS;
+        chained = multi && nrow > 1u && r76_batch_on();
+    }
+    ops = calloc((size_t)(multi ? nrow : 1u) * RK3576_CONV_TASK_OPS, sizeof *ops);
+    ext = calloc(nrow, sizeof *ext);
+    if (!ops || !ext) { rc = ROCKET_E_NOMEM; goto done; }
+
+    pt = prof ? r76_now_us() : 0;
     if (rocket_bo_alloc32(fd, in_bytes, &b.in) < 0 ||
         rocket_bo_alloc32(fd, w_bytes, &b.w) < 0 ||
         rocket_bo_alloc32(fd, coeff_bytes, &b.coeff) < 0 ||
         rocket_bo_alloc32(fd, surf, &b.out) < 0 ||
-        rocket_bo_alloc32(fd, RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
+        rocket_bo_alloc32(fd, multi ? (size_t)nrow * R76_TASK_SLOT_WORDS * sizeof(uint64_t)
+                                    : RK3576_CONV_TASK_OPS * sizeof(uint64_t), &b.rc) < 0) {
         rc = ROCKET_E_NOMEM; goto done;
     }
+    if (prof) { t_alloc += r76_now_us() - pt; pt = r76_now_us(); }
 
     /* CHW in, interleaved out — the packed image the CNA reads. Shared by every tile. */
     rocket_bo_prep(fd, &b.in, 1, 0);
@@ -5816,6 +5851,7 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
                                        PREC_FP16);
     rocket_bo_fini(fd, &b.coeff);
     if (rc < 0) { rc = ROCKET_E_SHAPE; goto done; }
+    if (prof) { t_pack += r76_now_us() - pt; pt = r76_now_us(); }
 
     in_h[0] = b.in.handle; in_h[1] = b.w.handle;
     in_h[2] = b.coeff.handle; in_h[3] = b.rc.handle;
@@ -5826,10 +5862,12 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
         memset(b.out.ptr, stamp, surf);
         rocket_bo_fini(fd, &b.out);
     }
+    if (prof) { t_stamp += r76_now_us() - pt; pt = r76_now_us(); }
 
     for (oc0 = 0; oc0 < OC; oc0 += tile) {
         unsigned n = OC - oc0 < tile ? OC - oc0 : tile;
         unsigned npad = rocket_rk3576_fp16_pad_oc(n);
+        uint32_t task_ops = 0;
 
         /* This tile's channels, renumbered from zero — its own whole convolution. The
          * cube is the same for every row window, so it is packed once per tile. */
@@ -5841,6 +5879,7 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
                                                   KH, KW);
         rocket_bo_fini(fd, &b.w);
         if (rc < 0) { rc = ROCKET_E_SHAPE; goto done; }
+        if (prof) { t_pack += r76_now_us() - pt; pt = r76_now_us(); }
 
         for (r = 0; r < nrow; r++) {
             conv_params_t p = {0};
@@ -5854,7 +5893,7 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
             p.ih_full = (uint16_t)IH; p.oh_full = (uint16_t)oh;
             p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
             p.input_zero_point = 0; p.output_zero_point = 0; p.weight_zero_point = 0;
-            p.tasks       = ops;
+            p.tasks       = ops + (size_t)(multi ? r : 0u) * RK3576_CONV_TASK_OPS;
             p.input_iova   = b.in.dma_address + rows[r].feature_off;
             p.weights_iova = b.w.dma_address;
             p.bias_iova    = b.coeff.dma_address;
@@ -5862,14 +5901,40 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
              * starting on a group boundary is the same BO at a plane offset, and a row
              * window is that plus the planner's own row offset. */
             p.output_iova  = b.out.dma_address +
-                            (uint32_t)((size_t)oc0 * oh * ow * sizeof(_Float16)) +
+                            (uint32_t)((size_t)oc0 * oh * ow * esz) +
                             rows[r].output_off;
-            if (gen_conv2d_fp16_rk3576(&p) != 0) {
+            if ((f32 ? gen_conv2d_fp16_rk3576_f32out(&p) : gen_conv2d_fp16_rk3576(&p)) != 0) {
                 ROCKET_LOGE("%s: the generator refused the first-conv program (ic=%u "
                             "%ux%u k%ux%u oc %u..%u rows %u..%u)\n", entry, IC, IW, IH,
                             KW, KH, oc0, oc0 + n, rows[r].oy0,
                             rows[r].oy0 + rows[r].oh);
                 rc = ROCKET_E_UNSUPPORTED; goto done;
+            }
+
+            if (f32) {
+                /* One job lays every program out at one stride, so the windows of a tile
+                 * must be the same length. They write the same registers with different
+                 * values; check rather than assume. */
+                if (!r) task_ops = p.task_count;
+                else if (multi && p.task_count != task_ops) {
+                    ROCKET_LOGE("%s: window %u is %u ops against window 0's %u, so this "
+                                "tile cannot go out as one job\n", entry, r, p.task_count,
+                                task_ops);
+                    rc = ROCKET_E_UNSUPPORTED; goto done;
+                }
+                /* Per window, per channel quad: the write guard asks each window about
+                 * its own rows of every quad plane. */
+                ext[r].base        = (size_t)oc0 * oh * ow * sizeof(float);
+                ext[r].groups      = (npad + 3u) / 4u;
+                ext[r].group_bytes = (size_t)ow * oh * 16u;
+                ext[r].row_off     = (size_t)rows[r].output_off;
+                ext[r].span        = (size_t)rows[r].oh * ow * 16u;
+                if (!multi) {
+                    rc = r76_submit_ops(fd, &b, ops, p.task_count, in_h, 4u, out_h,
+                                        &ext[r], 1u, 0, stamp, 0u, entry);
+                    if (rc != ROCKET_OK) goto done;
+                }
+                continue;
             }
 
             /* Per TASK, not per tile: one poisoned submit among several leaves its own
@@ -5883,10 +5948,18 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
                                       &submitted, entry);
             if (rc != ROCKET_OK) goto done;
         }
+
+        if (f32 && multi) {
+            rc = r76_submit_ops(fd, &b, ops, task_ops, in_h, 4u, out_h, ext, nrow,
+                                chained, stamp, 0u, entry);
+            if (rc != ROCKET_OK) goto done;
+        }
+        if (prof) { t_sub += r76_now_us() - pt; pt = r76_now_us(); }
     }
 
     rocket_bo_prep(fd, &b.out, 0, 2000000000ull);
-    rc = rocket_rk3576_fp16_accumulate(acc, b.out.ptr, surf, OC, oh, ow);
+    rc = f32 ? rocket_rk3576_f32_cube_accumulate(acc, b.out.ptr, surf, OC, oh, ow)
+             : rocket_rk3576_fp16_accumulate(acc, b.out.ptr, surf, OC, oh, ow);
     rocket_bo_fini(fd, &b.out);
     if (rc < 0) { rc = ROCKET_E_SHAPE; goto done; }
 
@@ -5894,14 +5967,27 @@ static int r76_conv_fp16_argb(const char *entry, int fd, const rocket_conv2d_des
         size_t i, n = (size_t)OC * oh * ow;
         for (i = 0; i < n; i++) out[i] = (_Float16)acc[i];
     }
+    if (prof) { t_read += r76_now_us() - pt; pt = r76_now_us(); }
     rc = ROCKET_OK;
 
 done:
-    /* Leave the part as this call found it: the last task poisoned it (see
-     * r76_fp16_submit_task). */
+    /* Leave the part as this call found it: on the fp16 writer the last task poisoned it
+     * (see r76_fp16_submit_task). The stage submits none through that helper. */
     if (submitted) rocket_rk3576_power_idle();
-    free(ops); free(acc); free(wtile); free(rows);
+    free(ops); free(acc); free(wtile); free(rows); free(ext);
     r76_conv_free(fd, &b);
+    if (prof && rc == ROCKET_OK) {
+        double now = r76_now_us(), tot;
+        t_free = now - pt;
+        tot = now - t_call;
+        ROCKET_LOGI("rk3576 fp16 first conv ic=%u oc=%u %ux%u k%ux%u, %s, %u windows: "
+                    "%.2f ms -- alloc %.2f  pack %.2f  stamp %.2f  submit %.2f  read %.2f  "
+                    "free %.2f  other %.2f\n", IC, OC, IW, IH, KW, KH,
+                    f32 ? (chained ? "stage, chained" : "stage") : "fp16 writer", nrow,
+                    tot / 1e3, t_alloc / 1e3, t_pack / 1e3, t_stamp / 1e3, t_sub / 1e3,
+                    t_read / 1e3, t_free / 1e3,
+                    (tot - t_alloc - t_pack - t_stamp - t_sub - t_read - t_free) / 1e3);
+    }
     return rc;
 }
 
@@ -5962,8 +6048,8 @@ static unsigned r76_fp16_oc_tile(unsigned iw, unsigned ih, unsigned ocpad,
     return tile;
 }
 
-/* THE fp32 OUTPUT STAGE, ON BY DEFAULT. ROCKET_RK3576_FP16_F32OUT=0 restores the fp16
- * writer.
+/* THE fp32 OUTPUT STAGE, ON BY DEFAULT, for the slice program and the packed-image first
+ * conv alike. ROCKET_RK3576_FP16_F32OUT=0 restores the fp16 writer on both.
  *
  * The slice program's own fp16 output poisons the next submit, so that writer pays a power
  * cycle before every task after the first and one on exit (r76_fp16_submit_task), about
@@ -6034,9 +6120,10 @@ int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
     KH = (unsigned)d->kh; KW = (unsigned)d->kw;
 
     /* Four or fewer channels is the packed-image first conv, a different CNA program
-     * with a different feature buffer and a different weight cube. */
+     * with a different feature buffer and a different weight cube. The same knob moves it
+     * onto the stage. */
     if (IC <= 4u)
-        return r76_conv_fp16_argb(entry, fd, d, in, W, out, ow, oh);
+        return r76_conv_fp16_argb(entry, fd, d, in, W, out, ow, oh, f32);
 
     icpad = rocket_rk3576_fp16_pad_ic(IC);
     ocpad = rocket_rk3576_fp16_pad_oc(OC);

@@ -451,9 +451,18 @@ int rocket_matmul_int8_rk3576_perc_wbo(int fd, int M, int K, int N,
  * mapping churn inside what the BO-lifetime fixes were written for is unmeasured.
  *
  * A pooled BO keeps the size it was allocated at, and a request takes the smallest free BO
- * that covers it. After the mix of entries or shapes changes, a small request can hold a
- * far larger buffer. `PREP_BO` and `FINI_BO` sync the whole BO, so the call costs cache
- * maintenance at that size. A pooled cost therefore depends on what the process ran before.
+ * that covers it, within a bound. `PREP_BO` and `FINI_BO` sync the whole BO, so a small
+ * request on a large BO pays cache maintenance at the large size on every sync. A pooled
+ * BO therefore serves a request only if it is at most `ROCKET_RK3576_BO_POOL_MAXOVER` times
+ * the request (default 2) or at most 64 KiB larger. `0` removes the bound. A pooled cost
+ * still depends on what the process ran before.
+ *
+ * Unbounded, one 1536x8960 call slowed the next 1536x256 calls from 2.05 ms to 2.75 ms. One
+ * fp16 64x2048x2048 call slowed the next 16x256x64 calls fourteen times. Over a Qwen2.5-1.5B
+ * layer at M 512 the bound cuts the oversize from 7.9 MiB to 0.8 MiB. The k and v
+ * projections then gain 0.47 ms each. Evidence: [HW sweep, H96 MAX M9, rocket 1.6.0,
+ * governor `performance`, `tests/rk3576_bo_pool_cost`, 2026-11-11].
+ *
  * Five entries sharing a pool put the fp16 resident call 0.09-0.16 ms above its device
  * time at 9 of 18 shapes. One entry alone, whose three buffers are all small, stayed
  * 0.014-0.043 ms above at all 18 [HW sweep, H96 MAX M9, `tests/rk3576_mm_fp16_cost`,

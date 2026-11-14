@@ -3304,8 +3304,12 @@ int gen_conv2d_fp16_rk3576(conv_params_t *p)
 /* THE WHOLE WIDE OUTPUT STAGE, over an already-emitted direct program.
  *
  * Nine DPU words: 0x4010 out 5 proc 2, 0x4030's low half 0x0310, 0x4038 0x53, 0x4044 2,
- * 0x4050 0x00023333, OUT_CVT 0/1/0 (no requant and no bias), and 0x40B8 at three task
- * surfaces. The first eight are the output stage of Rockchip's compiled fp16 matmul, which
+ * 0x4050 0x00023333, OUT_CVT 0/1/0 (no requant and no bias), and 0x40B8 at four destination
+ * surfaces less the task's own rows, 4*ow*oh_full - ow*oh. On a task that covers the whole
+ * plane that is three task surfaces. On a row window it is the only value at which every
+ * channel quad past the first lands: 3*ow*oh_task writes the first quad and misplaces the
+ * rest [HW sweep, H96 MAX M9, rocket 1.6.0, tests/rk3576_argb_f32out_probe stage and stage3t,
+ * 2026-11-10]. The first eight are the output stage of Rockchip's compiled fp16 matmul, which
  * carries all eight together (gen_gemm_fp16_rk3576(), whose table is RKLLM-Toolkit output,
  * and tests/rk3576_mm_fp16_vendor_gate.c). Over
  * the int8 program they make a dense int32 writer and over the fp16 slice program an fp32
@@ -3317,7 +3321,8 @@ int gen_conv2d_fp16_rk3576(conv_params_t *p)
  * it found all nine words in the program. */
 static int r76_whole_output_stage(conv_params_t *p)
 {
-    unsigned i, found = 0, surf = (unsigned)p->ow * p->oh;
+    unsigned i, found = 0, ohf = p->oh_full ? p->oh_full : p->oh;
+    unsigned add = 4u * (unsigned)p->ow * ohf - (unsigned)p->ow * p->oh;
     for (i = 0; i < p->task_count; i++) {
         uint64_t op = p->tasks[i];
         uint32_t v = (uint32_t)((op >> 16) & 0xFFFFFFFFu), nv;
@@ -3331,7 +3336,7 @@ static int r76_whole_output_stage(conv_params_t *p)
         case R76_DPU_OUT_CVT_OFFSET: nv = 0u; break;
         case R76_DPU_OUT_CVT_SCALE:  nv = 1u; break;
         case R76_DPU_OUT_CVT_SHIFT:  nv = 0u; break;
-        case R76_DPU_SURFACE_ADD:    nv = 3u * surf; break;
+        case R76_DPU_SURFACE_ADD:    nv = add; break;
         default: continue;
         }
         p->tasks[i] = (op & ~(0xFFFFFFFFull << 16)) | ((uint64_t)nv << 16);
@@ -3357,14 +3362,22 @@ static int r76_whole_output_stage(conv_params_t *p)
  *
  * THE SURFACE IS THE PLAIN INT32 CUBE, not the float cube: four fp32 lanes to a 16-byte
  * atom, one atom per pixel, each quad of channels a plane of ow*oh atoms.
- * rocket_rk3576_f32_cube_accumulate() reads it. The packed-image first conv (ic <= 4) has
- * not run under the stage with non-uniform operands and is refused. */
+ * rocket_rk3576_f32_cube_accumulate() reads it.
+ *
+ * THE PACKED-IMAGE FIRST CONV (ic <= 4) TAKES THE SAME STAGE, and there a task may be a row
+ * window of a larger plane. On random small-integer operands it is exact at 13 shapes (ic
+ * 1, 3 and 4, k 3/5/7, stride 1 and 2, oc 16-64, 16x16 to 224x224 at TFLite SAME lead pads,
+ * windows of 1-16 rows), with each window writing into the whole plane's cube at its row
+ * offset and an int8 canary exact after each [HW sweep, H96 MAX M9, rocket 1.6.0,
+ * tests/rk3576_argb_f32out_probe, 2026-11-10]. A row window of the slice program (ic > 4)
+ * has not run under the stage and is refused: no caller windows that program. */
 int gen_conv2d_fp16_rk3576_f32out(conv_params_t *p)
 {
     if (!p) return -1;
-    if (p->ic <= 4u) {
-        ROCKET_LOGE("rk3576 fp16 conv: the fp32 output stage is measured on the "
-                    "input-channel slice program, not the packed-image first conv\n");
+    if (p->ic > 4u && p->oh_full && p->oh != p->oh_full) {
+        ROCKET_LOGE("rk3576 fp16 conv: a row window (oh %u of %u) of the input-channel "
+                    "slice program has not run on the fp32 output stage\n", p->oh,
+                    p->oh_full);
         return -1;
     }
     if (gen_conv2d_fp16_rk3576(p) != 0) return -1;

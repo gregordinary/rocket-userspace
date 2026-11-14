@@ -550,6 +550,55 @@ static void sweep_rk3576(void)
             }
     }
 
+    /* The packed-image fp16 first conv on the fp32 output stage, window by window: the one
+     * caller of gen_conv2d_fp16_rk3576_f32out() whose tasks are row windows of a larger plane,
+     * which is where 0x40B8 takes 4*ow*oh_full - ow*oh. The sweep above never sets oh_full. */
+    group_open("r76/fc_f32_rows");
+    {
+        static const int FS[][7] = { /* ic oc iw ih k s rows (0: the planner's own) */
+            {3, 32, 224, 224, 3, 2, 0}, {3, 32, 224, 224, 7, 2, 0}, {4, 16, 48, 36, 5, 1, 7},
+        };
+        for (unsigned s = 0; s < sizeof FS / sizeof FS[0]; s++) {
+            conv_params_t p;
+            rocket_rk3576_row_task t[64];
+            unsigned cnt = 0;
+            char tag[64];
+            int rc;
+            memset(&p, 0, sizeof p);
+            p.ic = (uint16_t)FS[s][0]; p.oc = (uint16_t)FS[s][1];
+            p.iw = (uint16_t)FS[s][2]; p.ih = (uint16_t)FS[s][3];
+            p.kh = p.kw = (uint16_t)FS[s][4];
+            p.stride_x = p.stride_y = (uint8_t)FS[s][5]; p.dil_x = p.dil_y = 1;
+            p.pad_top = p.pad_left = (uint8_t)(FS[s][4] / 2);
+            p.ow = (uint16_t)((p.iw + 2 * p.pad_left - p.kw) / p.stride_x + 1);
+            p.oh = (uint16_t)((p.ih + 2 * p.pad_top - p.kh) / p.stride_y + 1);
+            p.ih_full = p.ih; p.oh_full = p.oh;
+            p.in_scale = 1.0f; p.w_scale = 1.0f; p.out_scale = 1.0f;
+            if (FS[s][6]) {
+                char b[16];
+                snprintf(b, sizeof b, "%d", FS[s][6]);
+                setenv("ROCKET_RK3576_MAX_ROWS", b, 1);
+            }
+            rc = rocket_rk3576_plan_rows_prec(&p, 0, PREC_FP16, t, 64, &cnt);
+            unsetenv("ROCKET_RK3576_MAX_ROWS");
+            snprintf(tag, sizeof tag, "plan_s%u", s);
+            clear_ops();
+            record(tag, rc, (long)cnt);
+            if (rc != 0) continue;
+            for (unsigned j = 0; j < cnt; j++) {
+                conv_params_t q = p;
+                q.ih = t[j].ih; q.oh = t[j].oh; q.pad_top = t[j].pad_top;
+                q.input_iova = 0x81000000u + t[j].feature_off;
+                q.output_iova = 0x83000000u + t[j].output_off;
+                q.weights_iova = 0x82000000u; q.bias_iova = 0x85000000u; q.tasks = ops;
+                snprintf(tag, sizeof tag, "s%u_t%u", s, j);
+                clear_ops();
+                rc = gen_conv2d_fp16_rk3576_f32out(&q);
+                record(tag, rc, (long)q.task_count);
+            }
+        }
+    }
+
     group_open("r76/pool");
     for (int mode = 0; mode <= 2; mode++)
         for (int k = 2; k <= 3; k++)

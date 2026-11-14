@@ -378,6 +378,7 @@ if(ROCKETNPU_BUILD_TESTS)
             cpend_wzp_probe        # probe: DPU_BS_OW_OP (CPEND) as an asymmetric weight zero point; a partial 64-ch DW group
             dw_perc_probe          # probe: the int8-out depthwise BS stage with a per-channel multiplier from BRDMA (per-axis requant)
             conv_i8out_probe       # probe: the DIRECT int8 conv on Mesa's int8-out writer; CPEND and the per-channel BS multiplier on it
+            bs_addr1_probe         # RK3588 board: is DPU_RDMA 0x5024 (the RK3576's BS shift-word base) live here?
             dw_int8_cost_probe     # probe: where the int8 depthwise entry's per-call time goes (the call, its scalar pack, a blocked one)
             conv_pack_cost_probe   # probe: the fp16 conv's and the int8 direct conv's per-element pack against the whole call
             reduce_feature_rocket  # feature-axis reduce (ones-matmul): sum/mean over H per row vs fp64 oracle
@@ -508,6 +509,11 @@ if(ROCKETNPU_BUILD_TESTS)
             rk3576_conv_band_probe # RK3576 board: does a direct int8 conv stall where the weight-slice phase rule says?
             rk3576_drain_probe     # RK3576 board: which programs raise the DPU's completion; GATE: the fp16 conv returns drained
             rk3576_fp16_fp32out_probe # RK3576 board: the fp16 direct program under the whole wide output stage (fp32 out)
+            rk3576_partial_oc_probe # RK3576 board: can a direct int8 conv program a partial 32-channel output group (0x4050 odd word + a narrow trailing weight group)?
+            rk3576_i32_route_cost  # RK3576 board: an exact int32 route against the int8-out route, per call at an LLM layer's shapes
+            rk3576_argb_f32out_probe # RK3576 board: the packed-image fp16 first conv on the whole output stage, random operands and row windows
+            rk3576_fc_stage_gate   # RK3576 board GATE: the fp16 first conv through the entry on the whole output stage, exact, back to back, and its price
+            rk3576_bo_pool_cost    # RK3576 board: what the transient-BO pool's oversize costs a matmul call, per call sequence
             rk3576_rowplan         # RK3576 host: the row window the planner chooses for one layer, and what it stages
             requant_round_probe    # board: which way does the DPU's OUT_CVT round an exact TIE?
             requant_edge_probe     # board: does the OUT_CVT program the float scale at the derivation's carry edge?
@@ -608,7 +614,7 @@ if(ROCKETNPU_BUILD_TESTS)
     # Tests that build or patch a register program by hand take the register map
     # (src/npu_regmap.h over Mesa's generated src/rkt_registers.h), which is private to the
     # library and not installed.
-    foreach(t chain_layout_rocket chain_verify_gate conv_i8out_probe cpend_wzp_probe
+    foreach(t bs_addr1_probe chain_layout_rocket chain_verify_gate conv_i8out_probe cpend_wzp_probe
               dw_perc_probe ew_int_probe pool_int8_native_probe
               regcmd_delta_probe regcmd_persist_rocket regcmd_rk3576_gate replay_dw_mesa
               rk3576_fc_vendor rowmajor_kacc_chain_probe rowmajor_matmul_probe

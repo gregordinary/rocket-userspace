@@ -216,6 +216,10 @@ g argb_ic1                   -- rk3576_argb_ic1
 g argb_pad                   -- rk3576_argb_pad
 g argb_extent                -- rk3576_argb_extent
 g argb_extend                -- rk3576_argb_extend
+# The fp16 first conv through the entry on the whole output stage: 26 shapes on random
+# operands (row windows to one output row, 32-channel tiles to 96), every element against
+# a CPU model, an int8 canary after each.
+g fc_stage                   -- rk3576_fc_stage_gate gate
 
 # --- chained streams ------------------------------------------------------------
 g chain_raw                  -- rk3576_chain_raw gate
@@ -285,9 +289,9 @@ g net_guard_perkick_v1       "${NETENV[@]}" ROCKET_NET=v1 ROCKET_RK3576_GUARD_PE
     ROCKET_RK3576_NET_VARY=1 ROCKET_RK3576_NET_POISON=1 -- rk3576_net_gate bench 50
 
 echo
-# Every full-list row is unskippable today, so the full list must pass all 69. A filter
+# Every full-list row is unskippable today, so the full list must pass all 70. A filter
 # lowers the minimum to the rows it selected.
-FULL_ROWS=69
+FULL_ROWS=70
 min=$need
 [ -z "$FILTER" ] && [ "$min" -lt "$FULL_ROWS" ] && min=$FULL_ROWS
 echo "pass=$pass skip=$skip fail=$fail   minimum pass=$min   ($(($(date +%s) - t0)) s)"

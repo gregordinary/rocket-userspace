@@ -1613,18 +1613,25 @@ unsigned rocket_conv2d_int8_chain_max_programs_rk3576(void);
  * depthwise fp16 cube is not decoded. Four or fewer input channels take the packed-image
  * first conv instead, with one program per row window and 32 output channels.
  *
- * The slice programs write fp32 through a whole output stage
+ * Both programs write fp32 through a whole output stage
  * (`gen_conv2d_fp16_rk3576_f32out`), which corrupts nothing. The programs of a call
  * therefore go back to back, and the call leaves the RK3576 clean. The slices sum as fp32
  * partials and round once, to the fp16 result, and every element is exact. At k9 and k11
  * over 32 channels on 120x64 a call takes 9.5-9.9 ms, and at k9 over two slices 15.1 ms. At
  * 28x28 k3, ic 128 into oc 256 is 64 programs in 47 ms.
  *
- * `ROCKET_RK3576_FP16_F32OUT=0` restores the fp16 writer, whose own fp16 output prevents the
- * next submit from writing. The fp16 writer takes a power cycle per program, about 105 ms at
- * the stock 50 ms autosuspend, and one more on exit. The cycles made the same calls 115-227
- * ms. The packed-image first conv (ic <= 4) has not run under the fp32 stage, and still
- * cycles per program.
+ * The first conv's row windows of one 32-channel tile go out as one job, and its result is
+ * the fp32 sum rounded once. On random integer operands it is exact at 26 shapes. They cover
+ * ic 1-4, k 3/5/7, strides 1 and 2, oc 16-96 and planes to 224x224, with windows down to one
+ * output row. A 224x224 k3 s2 stem, 3 into 32, takes 9.4 ms a call back to back, against
+ * 13.2 ms on the fp16 writer. The device takes 1.0 ms of it. The rest is host work: the
+ * buffers allocated and released per call (3.6 ms), the output stamp (1.6 ms), the readback
+ * (2.3 ms) and the image pack (0.7 ms).
+ *
+ * `ROCKET_RK3576_FP16_F32OUT=0` restores the fp16 writer on both programs. Its own fp16
+ * output prevents the next submit from writing, so it takes a power cycle per program and
+ * one more on exit. On the slice program the cycles made the calls above 115-227 ms, at the
+ * stock 50 ms autosuspend.
  *
  * The entry returns with every element written. Each program raises the DPU's own completion
  * and goes out without `ROCKET_JOB_NO_DPU_DONE`, so the driver waits for it.
@@ -1635,7 +1642,9 @@ unsigned rocket_conv2d_int8_chain_max_programs_rk3576(void);
  *
  * Evidence: [HW sweep, H96 MAX M9, rocket 1.6.0, `tests/rk3576_drain_probe gate`,
  * 2026-09-27] for the completion. The timings are [HW sweep, H96 MAX M9, rocket 1.6.0,
- * `tests/rk3576_drain_probe gate` and `rk3576_fp16_split_cost`, 2026-09-30].
+ * `tests/rk3576_drain_probe gate` and `rk3576_fp16_split_cost`, 2026-09-30]. The first conv
+ * on the stage is [HW sweep, H96 MAX M9, rocket 1.6.0, 594 MHz, governor `ondemand`,
+ * `tests/rk3576_fc_stage_gate`, 2026-11-11].
  */
 int rocket_conv2d_fp16_rk3576(int fd, const rocket_conv2d_desc *d,
                               const _Float16 *in, const _Float16 *W, _Float16 *out);
