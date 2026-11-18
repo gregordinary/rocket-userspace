@@ -237,9 +237,10 @@ static int rki_worker_alloc(int fd, rki_worker *w, int M, int tileM, int K, int 
     w->nMt = (M + w->Mt - 1) / w->Mt;
     w->nNt = (nsub + w->Nt - 1) / w->Nt;
     w->nKt = (K + w->Kt - 1) / w->Kt;
-    w->in_slot  = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Kt, 32);   /* int8  */
+    const int slot_M = M < w->Mt ? M : w->Mt;
+    w->in_slot  = (size_t)rocket_rup_sz(slot_M, 4) * rocket_rup_sz(w->Kt, 32);   /* int8  */
     w->wt_slot  = (size_t)rocket_rup_sz(w->Nt, 32) * rocket_rup_sz(w->Kt, 32);   /* int8  */
-    w->out_slot = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Nt, 16);   /* int32 */
+    w->out_slot = (size_t)rocket_rup_sz(slot_M, 4) * rocket_rup_sz(w->Nt, 16);   /* int32 */
 
     /* A job batches at most I8_BATCH tiles and never more than the call has, and PREP/FINI
      * sync a BO's whole allocation on every batch, so the output and regcmd BOs hold
