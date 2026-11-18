@@ -154,9 +154,15 @@ static int rk4_worker_alloc(int fd, rk4_worker *w, int M, int tileM, int K, int 
     w->nMt = (M + w->Mt - 1) / w->Mt;
     w->nNt = (nsub + w->Nt - 1) / w->Nt;
     w->nKt = (K + w->Kt - 1) / w->Kt;
-    w->in_slot  = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Kt, 32);   /* int4 nibbles */
+    /* The tiling is canonical, the scratch is not: a call with fewer rows than Mt fills
+     * only its own rows of each input and output slot, so those two slots are sized from
+     * min(M, Mt). Each task programs its own Mtile, and the slots are only strides between
+     * tiles. The weight slot keeps the canonical Nt and Kt. tests/prepacked_cost_gate holds
+     * this path and its int8 and fp16 siblings to it. */
+    const int slot_M = M < w->Mt ? M : w->Mt;
+    w->in_slot  = (size_t)rocket_rup_sz(slot_M, 4) * rocket_rup_sz(w->Kt, 32);   /* int4 nibbles */
     w->wt_slot  = (size_t)rocket_rup_sz(w->Nt, 64) * rocket_rup_sz(w->Kt, 32);   /* int4 nibbles */
-    w->out_slot = (size_t)rocket_rup_sz(w->Mt, 4)  * rocket_rup_sz(w->Nt, 16);   /* int16 elems  */
+    w->out_slot = (size_t)rocket_rup_sz(slot_M, 4) * rocket_rup_sz(w->Nt, 16);   /* int16 elems  */
 
     size_t in_sz  = (size_t)w->nMt * w->nKt * (w->in_slot / 2) + I4_CBUF_BANK;
     size_t rc_sz  = (size_t)I4_BATCH * I4_RC_STRIDE * sizeof(uint64_t);

@@ -448,6 +448,7 @@ if(ROCKETNPU_BUILD_TESTS)
             regcmd_rk3576_gate     # host-only GATE: RK3576 conv regcmd vs the vendor capture (no HW)
             pool_rk3576_bracket_gate # host-only GATE: the RK3576 pool's PREP/FINI brackets against a mock provider (no HW)
             pool_stock_kernel_gate # host-only GATE: no pool reaches a driver without the PPU completion (mock provider, no HW)
+            prepacked_cost_gate    # host-only GATE: resident scratch grows with the call's rows, the pack scatters once (mock provider, no HW)
             iface_minor_trust_gate # host-only GATE: a private interface minor counts only with its patch series (no HW)
             rk3576_first_light     # RK3576 board: does the RK3576 emitter make the NPU compute?
             rk3576_conv_gate       # RK3576 board GATE: the int8 conv envelope + row windows + depthwise
@@ -596,7 +597,8 @@ if(ROCKETNPU_BUILD_TESTS)
               replay_dump rk3576_mm_fp16_envelope rk3576_mm_bf16_probe
               rk3576_conv_width_probe cube_transpose_gate cube_index_gate rk3576_stallk_map
               conv_dw_int8_perc_runtime conv2d_int8_q_perc_rocket conv_model_bench
-              open_guard_race_rocket matmul_batch_rocket iface_minor_trust_gate)
+              open_guard_race_rocket matmul_batch_rocket iface_minor_trust_gate
+              prepacked_cost_gate)
         if(TARGET ${t})
             target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         endif()
@@ -752,6 +754,12 @@ if(ROCKETNPU_BUILD_TESTS)
     # On a driver without the PPU completion, no pool entry allocates or submits, against a
     # mock provider whose rocket_ppu_done_supported() answers 0. Forces ROCKET_CHIP=rk3576.
     rocket_host_test(pool_stock_kernel_gate)
+
+    # A resident matmul's input and output scratch grows with the call's rows below the
+    # canonical tile, and its pack costs one scatter pass, against a mock provider whose
+    # submits record the BOs they name. Neither cost changes a result, so no device gate
+    # sees it. Forces ROCKET_CHIP=rk3588.
+    rocket_host_test(prepacked_cost_gate)
 
     # A private interface minor counts only where the series' rocket_batch_submit parameter
     # exists, against sysfs trees the test builds in a temporary directory.
