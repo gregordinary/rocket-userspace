@@ -799,6 +799,7 @@ static int down_proj(rocket_mb_ctx *c, int wi, int Mlive, int M, int K, const fl
     const int d = c->m.d;
     int e = 0;
     while (e < 24 && amax * ldexpf(1.f, -e) > MB_DOWN_LIMIT) e++;
+    /* repeat: each retry scales the operand down by a further 2^-4 (e += 4) */
     for (int attempt = 0; attempt <= MB_DOWN_RETRIES; attempt++, e += 4) {
         scale_arg sa = { p, c->a16, K, ldexpf(1.f, -e) };
         pfor(Mlive, c->ht, scale_rows, &sa);

@@ -738,14 +738,22 @@ if(ROCKETNPU_BUILD_TESTS)
         add_test(NAME rk3576_mm_fp16_vendor_gate COMMAND rk3576_mm_fp16_vendor_gate)
         set_tests_properties(rk3576_mm_fp16_vendor_gate PROPERTIES SKIP_RETURN_CODE 2 TIMEOUT 300)
     endif()
-    # src/rkt_registers.h against what third_party/mesa-rocket generates from registers.xml.
-    # Only where Python 3 is present: the build itself never runs the generator.
+    # src/rkt_registers.h against what third_party/mesa-rocket generates from registers.xml,
+    # and the loop-counter lint. Only where Python 3 is present: the build itself never runs
+    # either.
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME regmap_current
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/regmap_current.py
                          ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/regmap)
         set_tests_properties(regmap_current PROPERTIES TIMEOUT 60)
+        # No library loop may carry a counter its body never reads, unless a "repeat:"
+        # comment says the repeat is meant. A stale outer loop around a callee that now
+        # iterates itself repeats idempotent work, which no output comparison can see.
+        add_test(NAME loop_counter_lint
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/loop_counter_lint.py
+                         ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/graph)
+        set_tests_properties(loop_counter_lint PROPERTIES TIMEOUT 60)
     endif()
     # Every PREP/FINI the RK3576 pool takes, on every path, against a host-memory provider
     # defined in the test itself. Forces ROCKET_CHIP=rk3576 itself.

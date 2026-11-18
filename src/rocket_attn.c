@@ -564,6 +564,7 @@ static int fa_batch_ensure(fa_scratch *s, int Gmax, int Tp, int Kn, int dh, int 
 static int fa_bcls(int Tp, int Kn)
 {
     int c = 0;
+    /* repeat: c counts the quarterings of Tp x Kn above 4096 */
     for (size_t e = (size_t)Tp * Kn; e > 4096 && c < FA_BCLS - 1; e >>= 2) c++;
     return c;
 }

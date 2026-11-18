@@ -318,7 +318,7 @@ static inline size_t wt_idx_tf32(int K, int n, int k)   { return tile_pos(K, 16,
 static inline void rc_tr16x16_u8(uint8x16_t v[16])
 {
 #pragma GCC unroll 4
-    for (int st = 0; st < 4; st++) {
+    for (int st = 0; st < 4; st++) {   /* repeat: log2(16) zip stages */
         uint8x16_t n[16];
 #pragma GCC unroll 8
         for (int j = 0; j < 8; j++) {
@@ -332,7 +332,7 @@ static inline void rc_tr16x16_u8(uint8x16_t v[16])
 static inline void rc_tr8x8_u16(uint16x8_t v[8])
 {
 #pragma GCC unroll 3
-    for (int st = 0; st < 3; st++) {
+    for (int st = 0; st < 3; st++) {   /* repeat: log2(8) zip stages */
         uint16x8_t n[8];
 #pragma GCC unroll 4
         for (int j = 0; j < 4; j++) {

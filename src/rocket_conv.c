@@ -401,6 +401,7 @@ rocket_conv_pool *rocket_conv_pool_create(int nthreads)
     if (nthreads > ROCKET_CONV_POOL_MAX) nthreads = ROCKET_CONV_POOL_MAX;
     rocket_conv_pool *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
+    /* repeat: one fd and context per worker, appended at p->n */
     for (int i = 0; i < nthreads; i++) {
         int fd = rocket_open();
         if (fd < 0) break;                       /* degrade to however many opened */
