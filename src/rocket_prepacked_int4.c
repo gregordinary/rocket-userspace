@@ -293,8 +293,7 @@ static int rk4_scatter_weights(rocket_i4_ctx *ctx, rk4_scratch *sc, rocket_i4_we
             for (int ki = 0; ki < ww->nKt; ki++) {
                 int k0 = ki * ww->Kt, Ktile = (K - k0 < ww->Kt) ? (K - k0) : ww->Kt;
                 uint8_t *slot = (uint8_t *)w->wt[t].ptr + (size_t)(ni * ww->nKt + ki) * (ww->wt_slot / 2);
-                for (int kk = 1; kk <= Ntile; kk++)
-                    i4_wt_scatter(slot, Bslice, (size_t)K, n0, k0, Ntile, Ktile);
+                i4_wt_scatter(slot, Bslice, (size_t)K, n0, k0, Ntile, Ktile);
             }
         }
         rocket_bo_fini(ctx->fd[t], &w->wt[t]);
