@@ -862,6 +862,8 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_npu_test(cross_entropy_rocket)
     rocket_npu_test(layernorm_rocket)
     rocket_npu_test(mha_rocket)
+    # the on-NPU softmax route, which the host default no longer exercises
+    rocket_npu_test(mha_rocket_npu_softmax COMMAND mha_rocket ENVIRONMENT "ROCKET_ATTN_HOST_SOFTMAX=0")
     # Default invocation: per-worker QK/AV submit chaining is ON by default (the persistent
     # batched-context path), so this gates the chained path across every FA shape (cos=1.0).
     # Uses the gapped one-job layout (no kernel param); the fully-chained one-IRQ layout adds
@@ -871,6 +873,8 @@ if(ROCKETNPU_BUILD_TESTS)
     rocket_npu_test(flash_attn_rocket_nochain COMMAND flash_attn_rocket TIMEOUT 600
                     ENVIRONMENT "ROCKET_FA_CHAIN=0")
     rocket_npu_test(encoder_block_rocket)
+    rocket_npu_test(encoder_block_rocket_npu_softmax COMMAND encoder_block_rocket
+                    ENVIRONMENT "ROCKET_ATTN_HOST_SOFTMAX=0")
     # The ViT encoders score against artifacts extracted on a host with the models
     # (tools/siglip_extract.py, tools/sam_extract.py), which are not committed. Name their
     # directories at configure time and the gates run, the resident path included, and

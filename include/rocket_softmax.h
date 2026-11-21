@@ -34,8 +34,14 @@ extern "C" {
  * then the same O(M*N) memory pass the packing already makes, with no extra round trip.
  *
  * The row-max subtraction is required, because exp overflows fast. It maps xs into (-∞,0],
- * the EXP LUT's default domain [-16,0], where the deep tail clamps to ~0, which is correct.
- * The host computes inv exactly, in O(M).
+ * the EXP LUT's default domain [-16,0]. The host computes inv exactly, in O(M).
+ *
+ * Accuracy: the EXP table holds exp(x) in 15 fractional bits, so every element 10 or more
+ * below its row maximum reads exactly 0. A short row loses little. A long row whose mass lies
+ * in that tail reads its largest probability high. With every other score 10 below the
+ * maximum, a 4096-column row reads it 18.6% high. With every other score 12 below, a
+ * 1500-column row reads it 0.92% high [HW sweep, RK3588, 2026-11-20]. A caller that needs the
+ * tail must use the host softmax (`fd` < 0).
  *
  * With `fd` < 0 it computes the exact host reference. Returns 0 on success and a negative
  * value on error.

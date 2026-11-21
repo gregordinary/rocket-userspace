@@ -16,7 +16,8 @@
  * `rocket_encoder_block_fp16` runs these on the NPU:
  *
  * - Both LayerNorms.
- * - All attention matmuls and every softmax (`rocket_mha_self_fp16`).
+ * - All attention matmuls (`rocket_mha_self_fp16`). Its softmax runs on the host by default,
+ *   and on the NPU with `ROCKET_ATTN_HOST_SOFTMAX=0`.
  * - Both residual adds (`rocket_ew_add_fp16`).
  * - The two FFN projection matmuls.
  * - The Φ-gate DPU LUT of the FFN's GELU, the 2-pass GELU(x)=x·Φ(x).

@@ -2,12 +2,14 @@
 // Copyright (C) 2026 The rocket-userspace authors
 /*
  * mha_rocket.c — HW gate for on-NPU multi-head self-attention (rocket_mha_self_fp16), the
- * encoder capstone: the composition that drives the new on-NPU softmax inside real
- * scaled-dot-product attention (QKV matmuls -> per-head scores -> softmax -> P·V -> out-proj).
+ * encoder capstone: real scaled-dot-product attention (QKV matmuls -> per-head scores ->
+ * softmax -> P·V -> out-proj).
  *
  * Validated against an fp64 attention oracle at Whisper-base shapes (d_model 512, 8 heads).
- * The chain runs every matmul + every softmax on the NPU; only the head slicing, scale, bias
- * adds, and per-head V transpose are host glue. Metrics: cosine similarity (the prompt's
+ * Every matmul runs on the NPU. The softmax runs where ROCKET_ATTN_HOST_SOFTMAX puts it: the
+ * host by default, so ctest also runs this gate as mha_rocket_npu_softmax with it at 0 to keep
+ * the on-NPU softmax covered. The head slicing, scale, bias adds and per-head V transpose are
+ * host glue. Metrics: cosine similarity (the prompt's
  * per-layer criterion) + max abs/rel vs the oracle. Off-device: ref self-check + SKIP.
  *
  * Usage: mha_rocket            (sweep)

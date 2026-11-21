@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rocket-userspace authors
 /*
- * rocket_attn.c — multi-head self-attention on the NPU, composed from the validated matmul +
- * the new on-NPU softmax. See rocket_attn.h for the math and the NPU/host work split.
+ * rocket_attn.c — multi-head self-attention on the NPU, composed from the validated matmul and
+ * a row softmax (host by default, the on-NPU softmax on request). See rocket_attn.h for the math
+ * and the NPU/host work split.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,18 +28,20 @@
  * PART 1 — Encoder multi-head self-attention (q/k/v + on-NPU/host softmax)
  * ##########################################################################*/
 
-/* Optional host-side softmax (ROCKET_ATTN_HOST_SOFTMAX=1). The attention scores are already
- * host-resident after the scores matmul, so a host softmax skips the three NPU jobs the on-NPU
- * softmax submits (exp / row-sum / scale) and their per-call host<->NPU transfers of the [Tp,Tn]
- * score matrix — which DOMINATE the on-NPU softmax (it is transfer-bound, not exp-compute-bound:
- * a host expf softmax measured ~3x faster than the NPU LUT path on a Whisper-base encoder). Default
- * off, so attention stays fully on the NPU; a fully on-NPU RESIDENT softmax (scores kept in a BO,
- * on-NPU row-max) would remove the transfers without the CPU cost. */
+/* The encoder MHA path's softmax runs on the HOST by default (ROCKET_ATTN_HOST_SOFTMAX=0 selects
+ * the on-NPU softmax). The attention scores are already host-resident after the scores matmul,
+ * so a host softmax skips the three NPU jobs the on-NPU softmax submits (exp / row-sum / scale)
+ * and their per-call host<->NPU transfers of the [Tp,Tn] score matrix, which dominate it (it is
+ * transfer-bound, not exp-bound). At d 384, 6 heads, T 101-1616 the host route makes
+ * rocket_mha_self_fp16 1.63-1.78x faster AND uses 0.68-0.69x the process CPU time (user+sys),
+ * because the transfers' system time outweighs the host exp [HW sweep, RK1, 2026-11-20]. It is
+ * also exact in the deep tail, where the on-NPU EXP table reads 0 for scores 10+ below the row
+ * max (rocket_softmax.h). A fully on-NPU RESIDENT softmax (scores kept in a BO, on-NPU row-max)
+ * would remove the transfers; it does not exist. */
 static _Atomic int g_attn_host_sm = -1;
 
 /* ROCKET_ATTN_HOST_SOFTMAX reads the same on every attention path: a nonzero value runs the
- * softmax on the host and 0 runs it on the NPU. Unset, each path takes its own default: the
- * encoder MHA path the NPU, flash attention the host. */
+ * softmax on the host and 0 runs it on the NPU. Unset, every path runs it on the host. */
 static int attn_host_softmax_env(int dflt)
 {
     const char *e = getenv("ROCKET_ATTN_HOST_SOFTMAX");
@@ -242,7 +245,7 @@ int rocket_mha_self_fp16(int fd, int T, int d, int n_head, const _Float16 *x,
      *    The key count T is padded to Tn (matmul N/K alignment); the pad key columns get a
      *    score of 0 from the zero keys, which we MASK to a large negative before softmax so
      *    they contribute ~0 (exp underflow) — and the zero pad v rows add nothing to ctx. */
-    if (g_attn_host_sm < 0) g_attn_host_sm = attn_host_softmax_env(0);
+    if (g_attn_host_sm < 0) g_attn_host_sm = attn_host_softmax_env(1);
     for (int h = 0; h < n_head; h++) {
         int off = h*dh;
         for (int t = 0; t < Tp; t++) memcpy(qh+(size_t)t*dh, q+(size_t)t*d+off, dh*sizeof(_Float16));
@@ -259,8 +262,8 @@ int rocket_mha_self_fp16(int fd, int T, int d, int n_head, const _Float16 *x,
             for (int j = T; j < Tn; j++) row[j] = (_Float16)(-30000.f);  /* mask pad keys */
         }
 
-        /* P = softmax(scores) row-wise over the Tn columns; pad columns -> ~0. On-NPU by default;
-         * host softmax when ROCKET_ATTN_HOST_SOFTMAX=1 (the on-NPU softmax is transfer-bound). */
+        /* P = softmax(scores) row-wise over the Tn columns; pad columns -> ~0. On the host by
+         * default; the on-NPU softmax when ROCKET_ATTN_HOST_SOFTMAX=0 (it is transfer-bound). */
         if (g_attn_host_sm) host_softmax_rows(Tp, Tn, sc, P);
         else if ((rc = rocket_softmax_fp16(fd, Tp, Tn, sc, P)) != 0) goto out;
 
@@ -332,8 +335,8 @@ void rocket_flash_attn_ref_fp16(int n_tokens, int n_kv, int head_dim, int dv,
     free(sc);
 }
 
-/* Flash-attn softmax placement. Unlike the encoder MHA path (g_attn_host_sm, on-NPU by
- * default), the FA primitive ALWAYS brings the scores to the host for the mandatory additive
+/* Flash-attn softmax placement. As on the encoder MHA path (g_attn_host_sm), the default is the
+ * host. The FA primitive ALWAYS brings the scores to the host for the mandatory additive
  * mask + scale + soft-cap, so the on-NPU softmax is a pure round-trip here (upload scores, 3
  * submits, download P, then re-upload P for the AV matmul) — measured ~5-10% slower than a
  * host pass, the gap growing with n_kv. So the FA default is HOST softmax;

@@ -18,12 +18,12 @@ extern "C" {
 #endif
 /*
  * Computes multi-head self-attention on the NPU, the attention sublayer of a Whisper or
- * transformer encoder. It composes the NPU matmul and the on-NPU softmax:
+ * transformer encoder. It composes the NPU matmul and a row softmax:
  *
  *     q = x·Wq^T + bq ,  k = x·Wk^T + bk ,  v = x·Wv^T + bv          (NPU matmuls)
  *     per head h (d_head = d / n_head, scale = d_head^-0.5):
  *       scores = (q_h · k_h^T) * scale                               (NPU matmul)
- *       P      = softmax(scores)  row-wise over the key axis          (NPU softmax)
+ *       P      = softmax(scores)  row-wise over the key axis          (host, or NPU)
  *       ctx_h  = P · v_h                                              (NPU matmul)
  *     out = concat_h(ctx_h)·Wo^T + bo                                 (NPU matmul)
  *
@@ -32,10 +32,14 @@ extern "C" {
  * `rocket_matmul_fp16` C=A·B^T convention, which matches a PyTorch nn.Linear weight. Biases
  * are optional, and NULL means none (Whisper has bq, bv and bo, and no bk).
  *
- * The matmuls and the softmax run on the NPU by default. `ROCKET_ATTN_HOST_SOFTMAX=1` runs the
- * softmax on the host, which skips the softmax's score transfers to and from the NPU. The
- * variable reads the same on every attention path: a nonzero value selects the host and 0 the
- * NPU.
+ * The matmuls run on the NPU. The softmax runs on the host by default, because the scores are
+ * already there. The on-NPU softmax costs two transfers of the score plane and three jobs. At
+ * d 384, 6 heads and T 101-1616, the host default makes the call 1.63-1.78x faster. It also
+ * uses 0.68-0.69x the CPU time [HW sweep, RK3588, 2026-11-20].
+ *
+ * `ROCKET_ATTN_HOST_SOFTMAX=0` runs the softmax on the NPU, with the accuracy
+ * `rocket_softmax_fp16` states. The variable reads the same on every attention path: a nonzero
+ * value selects the host and 0 the NPU.
  *
  * The head slicing, the d_head^-0.5 scale, the bias adds and the per-head V transpose (the
  * matmul needs B as [N,K]) run on the host, at O(T*d) cost. The scale is the standard 1/sqrt(d_head) applied to the scores. Applying
