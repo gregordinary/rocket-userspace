@@ -175,6 +175,14 @@ int rocket_rk3576_plan_percol(unsigned n0, unsigned tile_n, unsigned nreg,
  * job, so "it still computes" is not evidence that the base moved. */
 void rocket_rk3576_set_cbuf_bias(unsigned granules);
 
+/* The CBUF BANK base, a bring-up knob, zero for every shipped path: moves the task's
+ * whole data and weight window up `bank` banks (0x1018, 0x1038, 0x103c, 0x1040), the
+ * layout an external report gives for the vendor's core-1 program at bank 7. Set PER
+ * THREAD for the same reason as the bias; ROCKET_RK3576_CBUF_BANK is the fallback. A
+ * window that would leave the 16-bank array is refused. See tests/rk3576_cbuf_base.c,
+ * modes `bankx` and `bankpair`. */
+void rocket_rk3576_set_cbuf_bank(unsigned bank);
+
 /* WHAT A CROSS-LAYER CHAIN NEEDS OF A POOLING HANDLE.
  *
  * A pool is its own register program here — PPU and PPU_RDMA only, PC_OPERATION_ENABLE

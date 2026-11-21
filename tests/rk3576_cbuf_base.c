@@ -48,6 +48,15 @@
  *            choice and the corruption goes to zero. If it does not move, the cores
  *            are not separated by anything an encoder writes.
  *
+ * The bias moved a window inside its own banks and did not separate the cores. Two more
+ * modes move the BANKS (rocket_rk3576_set_cbuf_bank()), the layout an external report
+ * gives for the vendor's core-1 program:
+ *
+ *   bankx    — SOLO, one core. Does a program moved up b banks still compute, and do the
+ *              moved fields matter (two half-moved liveness rows)?
+ *   bankpair — TWO CORES. The pair cell with disjoint banks, with a shared-bank control,
+ *              an overlapping-bank control and a both-moved control.
+ *
  * A CELL IS NOT A MEASUREMENT UNTIL IT OVERLAPPED — the driver's stat_overlap counter,
  * printed per cell, and "-" on a stock module. A clean pair cell with zero overlap is a
  * one-core control wearing a different label, and that is the trap this whole line of
@@ -381,7 +390,7 @@ static int cb_bits(int reps)
 struct cb_worker {
     pthread_t thread;
     int fd, cpu, calls, rc, continuous;
-    unsigned bias;
+    unsigned bias, bank;
     float scale;
     struct cb_prob *p;
     pthread_barrier_t *start;
@@ -403,6 +412,7 @@ static void *cb_run(void *arg)
     /* Per THREAD, which is the whole reason the knob is not just an environment
      * variable: the two workers must stage at different bases in one process. */
     rocket_rk3576_set_cbuf_bias(w->bias);
+    rocket_rk3576_set_cbuf_bank(w->bank);
     pthread_barrier_wait(w->start);
     for (int c = 0; w->continuous ? !*w->done : c < w->calls; c++) {
         unsigned bad;
@@ -426,7 +436,7 @@ struct cb_cell {
 };
 
 static int cb_cell_run(struct cb_prob *pv, struct cb_prob *pa,
-                       unsigned bias_v, unsigned bias_a,
+                       unsigned bias_v, unsigned bias_a, unsigned bank_v, unsigned bank_a,
                        int calls, unsigned reps, float scale, struct cb_cell *out)
 {
     unsigned o0 = 0, o1 = 0;
@@ -450,6 +460,7 @@ static int cb_cell_run(struct cb_prob *pv, struct cb_prob *pa,
             w[i].done       = &done;
             w[i].p          = i ? pa : pv;
             w[i].bias       = i ? bias_a : bias_v;
+            w[i].bank       = i ? bank_a : bank_v;
             w[i].continuous = i;              /* the aggressor drives until told to stop */
             w[i].fd         = rocket_open();
             if (w[i].fd < 0) {
@@ -523,7 +534,7 @@ static int cb_pair(int calls, unsigned reps)
            "aggr base", "byte off", "victim wrong", "aggr wrong", "overlap");
     for (size_t i = 0; i < sizeof biases / sizeof biases[0]; i++) {
         struct cb_cell c;
-        if (cb_cell_run(&pv, &pa, 0u, biases[i], calls, reps, 0.02f, &c) != 0) {
+        if (cb_cell_run(&pv, &pa, 0u, biases[i], 0u, 0u, calls, reps, 0.02f, &c) != 0) {
             rc = 1; break;
         }
         {
@@ -551,6 +562,170 @@ static int cb_pair(int calls, unsigned reps)
     return rc;
 }
 
+/* ------------------------------------------------------------- bankx (solo) --
+ *
+ * The bias moved a window inside its own banks. This moves the BANKS: the whole data and
+ * weight window up b banks, the arithmetic an external report gives for the vendor's
+ * core-1 program at b = 7 (see rocket_rk3576_set_cbuf_bank()). One core is enough.
+ *
+ * Exact at every b says the program stays self-consistent, which is necessary and not
+ * sufficient, for the same reason a bias that is ignored computes everywhere. So two
+ * LIVENESS rows follow at b = 7, each forcing one of the moved fields of 0x1040 back to
+ * its bank-0 value on a shape whose natural word is known (0x10000000): the weight bank
+ * alone, then the pointer alone. If the bank fields are read, a half-moved program
+ * disagrees with itself and goes wrong; if both rows stay exact, the field is not what
+ * places the window and the pair cell cannot be read as a partition. */
+static int cb_bankx(int reps)
+{
+    static const struct cb_shape shapes[] = {
+        { "tiny",     8,  32,   64 },
+        { "small",    8, 512,  256 },
+        { "victim", 256, 512, 2048 },
+    };
+    static const unsigned banks[] = { 0, 1, 2, 4, 7, 9 };
+    static const struct { const char *label; const char *set; } live[] = {
+        { "b=7, 0x1040 weight bank at bank 0", "0x1040=0x10001c00" },
+        { "b=7, 0x1040 pointer at bank 0",     "0x1040=0x2c000000" },
+    };
+    int rc = 0;
+
+    printf("== bankx: does a program moved up b CBUF banks still compute, alone?\n\n");
+    for (size_t s = 0; s < sizeof shapes / sizeof shapes[0]; s++) {
+        struct cb_prob p;
+        int fd;
+        if (!cb_prob_init(&p, shapes[s], 11u, 0.02f)) {
+            printf("   %-6s FAIL: no stable golden at bank 0\n", shapes[s].name);
+            rc = 1;
+            continue;
+        }
+        fd = rocket_open();
+        if (fd < 0) { cb_prob_free(&p); return 1; }
+        printf("   %-6s M=%d K=%d N=%d, %u granules\n", shapes[s].name,
+               shapes[s].M, shapes[s].K, shapes[s].N, cb_granules(shapes[s]));
+        for (size_t i = 0; i < sizeof banks / sizeof banks[0]; i++) {
+            unsigned worst = 0;
+            int failed_call = 0;
+            rocket_rk3576_set_cbuf_bank(banks[i]);
+            for (int r = 0; r < reps; r++) {
+                unsigned bad;
+                memset(p.C, 0, p.elems);
+                if (rocket_matmul_int8_rk3576(fd, shapes[s].M, shapes[s].K, shapes[s].N,
+                                              p.A, p.B, NULL, 0.02f, p.C) != 0) {
+                    failed_call = 1; break;
+                }
+                bad = cb_diff(&p);
+                if (bad > worst) worst = bad;
+            }
+            printf("       bank %2u  %6.2f%%  %s\n", banks[i],
+                   100.0 * worst / (double)p.elems,
+                   failed_call ? "CALL FAILED" : worst ? "WRONG" : "exact");
+        }
+        rocket_rk3576_set_cbuf_bank(0);
+        rocket_close(fd);
+        cb_prob_free(&p);
+    }
+
+    /* Liveness, on the one shape whose natural 0x1040 is known. */
+    {
+        struct cb_shape s = { "small", 8, 512, 256 };
+        struct cb_prob p;
+        int fd;
+        if (!cb_prob_init(&p, s, 11u, 0.02f)) { printf("   FAIL: liveness golden\n"); return 1; }
+        fd = rocket_open();
+        if (fd < 0) { cb_prob_free(&p); return 1; }
+        printf("\n   liveness, shape small (natural 0x1040 0x10000000, moved 0x2c001c00)\n");
+        rocket_rk3576_set_cbuf_bank(7);
+        for (size_t i = 0; i < sizeof live / sizeof live[0]; i++) {
+            unsigned worst = 0;
+            int failed_call = 0;
+            setenv("ROCKET_RK3576_SET", live[i].set, 1);
+            for (int r = 0; r < reps; r++) {
+                unsigned bad;
+                memset(p.C, 0, p.elems);
+                if (rocket_matmul_int8_rk3576(fd, s.M, s.K, s.N, p.A, p.B, NULL,
+                                              0.02f, p.C) != 0) { failed_call = 1; break; }
+                bad = cb_diff(&p);
+                if (bad > worst) worst = bad;
+            }
+            printf("       %-36s %6.2f%%  %s\n", live[i].label,
+                   100.0 * worst / (double)p.elems,
+                   failed_call ? "CALL FAILED" : worst ? "WRONG — field live" : "exact");
+        }
+        unsetenv("ROCKET_RK3576_SET");
+        rocket_rk3576_set_cbuf_bank(0);
+        rocket_close(fd);
+        cb_prob_free(&p);
+    }
+    printf("\n   Reading: exact at every bank AND wrong on a liveness row means the window\n"
+           "   moves with the bank fields, and bankpair can test it as a partition.\n"
+           "   Exact on both liveness rows means the fields do not place it.\n");
+    return rc;
+}
+
+/* --------------------------------------------------------- bankpair (2 cores) --
+ *
+ * The pair cell with BANKS where the bias was. The victim, the aggressor and the
+ * continuous-aggressor rule are cb_pair()'s, so the 0/0 row must reproduce its control.
+ *
+ *   0 / 0   control: both at bank 0, today's behaviour, the known 72-76% corruption
+ *   0 / 2   negative control: the aggressor's banks 2..8 overlap the victim's 0..6
+ *   0 / 7   the partition under test: the vendor's core-1 layout, disjoint banks
+ *   7 / 0   the same partition with the roles swapped
+ *   7 / 7   positive control for the knob: both moved, overlapping again, so it must
+ *           corrupt; clean here means the bank never reached one of the threads
+ *
+ * A clean 0/7 and 7/0 with the controls wrong, and non-zero overlap on every row, is a
+ * partition userspace can express. */
+static int cb_bankpair(int calls, unsigned reps)
+{
+    struct cb_shape sv = { "victim", 256, 512, 2048 };
+    struct cb_shape sa = { "tiny",     8,  32,   64 };
+    static const struct { unsigned v, a; const char *what; } rows[] = {
+        { 0, 0, "control, shared banks" },
+        { 0, 2, "overlapping banks" },
+        { 0, 7, "disjoint: aggressor on core-1 layout" },
+        { 7, 0, "disjoint: victim on core-1 layout" },
+        { 7, 7, "both moved, overlapping" },
+    };
+    struct cb_prob pv, pa;
+    int rc = 0;
+
+    if (cb_ndev() < 2) {
+        printf("SKIP: %d rocket device(s) bound; bankpair needs BOTH cores.\n"
+               "  echo 27708000.npu | sudo tee /sys/bus/platform/drivers/rocket/bind\n",
+               cb_ndev());
+        return 2;
+    }
+    printf("== bankpair: does placing the two jobs in disjoint CBUF banks stop the corruption?\n");
+    printf("   victim  M=%d K=%d N=%d, aggressor M=%d K=%d N=%d\n\n",
+           sv.M, sv.K, sv.N, sa.M, sa.K, sa.N);
+    if (!cb_prob_init(&pv, sv, 11u, 0.02f)) { printf("   FAIL: victim golden\n"); return 1; }
+    if (!cb_prob_init(&pa, sa, 29u, 0.02f)) { printf("   FAIL: aggressor golden\n");
+                                              cb_prob_free(&pv); return 1; }
+
+    printf("   %4s %4s  %14s  %14s  %8s  %s\n",
+           "vict", "aggr", "victim wrong", "aggr wrong", "overlap", "row");
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        struct cb_cell c;
+        char ov[16];
+        if (cb_cell_run(&pv, &pa, 0u, 0u, rows[i].v, rows[i].a, calls, reps, 0.02f, &c)
+            != 0) { rc = 1; break; }
+        if (c.overlap_present) snprintf(ov, sizeof ov, "%u", c.overlap);
+        else                   snprintf(ov, sizeof ov, "-");
+        printf("   %4u %4u  %5u/%-5u %4.0f%%  %5u/%-5u %4.0f%%  %8s  %s\n",
+               rows[i].v, rows[i].a,
+               c.wrong[0], c.calls[0], c.calls[0] ? 100.0 * c.wrong[0] / c.calls[0] : 0.0,
+               c.wrong[1], c.calls[1], c.calls[1] ? 100.0 * c.wrong[1] / c.calls[1] : 0.0,
+               ov, rows[i].what);
+        if (c.overlap_present && !c.overlap)
+            printf("     ^ ZERO OVERLAP — not a measurement. The two jobs never ran "
+                   "together.\n");
+    }
+    cb_prob_free(&pv);
+    cb_prob_free(&pa);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     /* This probe exists to put two jobs in flight at once, which is what the
@@ -567,6 +742,8 @@ int main(int argc, char **argv)
     if (!strcmp(mode, "bound"))  return cb_bound(reps);
     if (!strcmp(mode, "bits"))   return cb_bits(reps);
     if (!strcmp(mode, "pair"))   return cb_pair(20, (unsigned)reps);
+    if (!strcmp(mode, "bankx"))    return cb_bankx(reps);
+    if (!strcmp(mode, "bankpair")) return cb_bankpair(20, (unsigned)reps);
     if (!strcmp(mode, "all")) {
         int a = cb_extent(reps);
         int b = cb_bound(reps);
@@ -574,6 +751,7 @@ int main(int argc, char **argv)
         int d = cb_pair(20, (unsigned)reps);
         return a ? a : b ? b : c ? c : (d == 2 ? 0 : d);
     }
-    fprintf(stderr, "usage: %s [extent|bound|bits|pair|all] [reps]\n", argv[0]);
+    fprintf(stderr, "usage: %s [extent|bound|bits|pair|bankx|bankpair|all] [reps]\n",
+            argv[0]);
     return 1;
 }

@@ -795,6 +795,8 @@ static const profile_t PROFILES[] = {
     { { "ROCKET_RK3576_ADD=0x4050=0x55" }, F_R76 },
     { { "ROCKET_RK3576_SET=0x1010=0x1234" }, F_R76 },
     { { "ROCKET_OUT_CVT_ROUND=1" }, F_R76 },
+    { { "ROCKET_RK3576_CBUF_BANK=7" }, F_R76 },
+    { { "ROCKET_RK3576_CBUF_BANK=12" }, F_R76 },
 };
 #define NPROF (sizeof PROFILES / sizeof PROFILES[0])
 

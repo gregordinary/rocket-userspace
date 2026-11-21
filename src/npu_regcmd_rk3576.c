@@ -939,6 +939,93 @@ static unsigned r76_cbuf_bias(void)
     return s && *s ? (unsigned)strtoul(s, NULL, 0) : 0u;
 }
 
+/* ---- The CBUF bank base, and the RE knob that moves it ----
+ *
+ * The bias above moves a task's window INSIDE its own banks, and it did not separate the
+ * two cores: the pair cell corrupted the same at every base. It never moved the BANKS. An
+ * external RK3576 stack (Fexiven's rk3576-npu-open, mesa patch 0012) reports that the
+ * vendor's program for a model pinned to core 1 is core 0's moved up by seven banks, in
+ * four CNA words, and that with core 1 on banks 7..13 two cores and four processes run
+ * with 0 of 1000 results wrong [their claim, one RK3576S board, 2026-11-10]:
+ *
+ *     0x1018  [15:8] data banks D, [7:0] first data bank B + D
+ *     0x1038  [7:0] end of the weight banks (7 on core 0's layout), bit 8 set on the
+ *             moved layout
+ *     0x103c  low half: read pointer + B * 1024
+ *     0x1040  [31:24] 4 * first weight bank, low half: write pointer + B * 1024
+ *
+ * That reading agrees with ours. This encoder's 0x1040 is `bit28 | F<<16 | base`, so
+ * [31:24] is 0x10 (four data banks of 1024 granules) plus the allowance F in quarter
+ * banks, and 0x1038's 7 is the end of the 7168-granule (448 KiB) pool measured here. So
+ * the move is the same arithmetic on every program this encoder emits.
+ *
+ * ROCKET_RK3576_CBUF_BANK=<b> applies it with bank base b; rocket_rk3576_set_cbuf_bank()
+ * sets it PER THREAD, as the bias knob does, because the pair cell gives two workers in
+ * one process different banks. b = 7 is the vendor's core-1 layout. The window must stay
+ * inside the 16-bank array, so b + 0x1038's end bank may not pass 16, and an emitted
+ * program that would leave it is refused rather than silently left at bank 0 (an
+ * unmoved program and a move the hardware ignores would otherwise read the same).
+ * Zero for every shipped path, and the fp16 compiled-form matmul (r76_mmf16_emit) does
+ * not read it. See tests/rk3576_cbuf_base.c, modes `bankx` and `bankpair`. */
+static __thread unsigned r76_cbuf_bank_tls = ~0u;   /* ~0u: unset, take the env */
+
+void rocket_rk3576_set_cbuf_bank(unsigned bank)
+{
+    r76_cbuf_bank_tls = bank;
+}
+
+static unsigned r76_cbuf_bank(void)
+{
+    const char *s;
+    if (r76_cbuf_bank_tls != ~0u) return r76_cbuf_bank_tls;
+    s = getenv("ROCKET_RK3576_CBUF_BANK");
+    return s && *s ? (unsigned)strtoul(s, NULL, 0) : 0u;
+}
+
+#define R76_CBUF_BANKS 16u
+
+static int r76_apply_cbuf_bank(uint64_t *ops, int n)
+{
+    unsigned b = r76_cbuf_bank();
+    int i;
+    if (!b) return 0;
+    for (i = 0; i < n; i++) {
+        uint32_t v = (uint32_t)((ops[i] >> 16) & 0xFFFFFFFFu);
+        uint16_t reg = (uint16_t)(ops[i] & 0xFFFF);
+        unsigned lo;
+        if (((ops[i] >> 48) & 0xFF00u) != NPU_TARGET_CNA) continue;
+        switch (reg) {
+        case R76_CNA_FORMAT:
+            v = (v & 0xFFFFFF00u) | (((v & 0xFFu) + b) & 0xFFu);
+            break;
+        case R76_CNA_WEIGHT_SIZE2:
+            if ((v & 0xFFu) + b > R76_CBUF_BANKS) {
+                ROCKET_LOGE("rk3576 CBUF bank base %u: the weight banks would end at %u, "
+                            "past the %u-bank array\n", b, (v & 0xFFu) + b, R76_CBUF_BANKS);
+                return -1;
+            }
+            v = (v & 0xFFFFFE00u) | 0x100u | ((v & 0xFFu) + b);
+            break;
+        case R76_CNA_CBUF_ENTRIES:
+        case R76_CNA_CBUF_CON0:
+            lo = (v & 0xFFFFu) + b * 1024u;
+            if (lo > 0xFFFFu) {
+                ROCKET_LOGE("rk3576 CBUF bank base %u: 0x%04x's pointer %u passes its "
+                            "16-bit field\n", b, reg, lo);
+                return -1;
+            }
+            v = (v & 0xFFFF0000u) | lo;
+            if (reg == R76_CNA_CBUF_CON0)
+                v = (v & 0x00FFFFFFu) | ((((v >> 24) + 4u * b) & 0xFFu) << 24);
+            break;
+        default:
+            continue;
+        }
+        ops[i] = (ops[i] & ~(0xFFFFFFFFull << 16)) | ((uint64_t)v << 16);
+    }
+    return 0;
+}
+
 /* The weight footprint that must be resident at once. The weight path stages per
  * output-channel group of 32 rather than per cube — a 441 KiB cube at oc=224
  * computes bit-exactly while one group's 200 KiB slice does not — so the cube size
@@ -2642,6 +2729,7 @@ static int gen_conv2d_rk3576_fill(conv_params_t *p, int dw, unsigned prec,
                                         cbuf_f, reuse, p->lut, p->in_surf_elems,
                                         p->in_pitch_w);
         if (rc < 0) return rc;
+        if (r76_apply_cbuf_bank(p->tasks, rc) < 0) return -1;
         r76_apply_overrides(p->tasks, rc);
         r76_dump_program(p->tasks, rc);
         p->task_count = (uint32_t)rc;
