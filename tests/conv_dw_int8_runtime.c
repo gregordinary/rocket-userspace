@@ -229,6 +229,13 @@ int main(int argc, char **argv) {
     fail |= run_shape(fd, 128, 12, 12, 5, 1, 1, 2, 0.0213f, 0.00347f, 0.0925f, -128, -15, 127);
     fail |= run_shape(fd, 768, 24, 24, 5, 1, 1, 0, 0.0213f, 0.00347f, 0.0925f, -128, 4, -128);
 
+    /* TALL AND NARROW: an input 8 or fewer wide and taller than Mesa's FEATURE_GRAINS
+     * constant (50 + stride_y + 1) reads 1185-5045 elements wrong unless the program writes
+     * IH + 1 [HW sweep 2026-11-20]. One CBUF pass each. */
+    printf("tall and narrow planes:\n");
+    fail |= run_shape(fd, 64, 64, 8, 3, 1, 1, 1, CAP_IN_S, CAP_W_S, CAP_OUT_S, -2, 0, 5);
+    fail |= run_shape(fd, 64, 120, 4, 3, 2, 2, 1, 0.0213f, 0.00347f, 0.0925f, 37, 0, -20);
+
     /* A PLANE PAST ONE CBUF PASS runs in row bands with the halo materialized as the input
      * zero point: SSD MobileNet v2's two 150x150 layers (the stride-2 one host-padded to an
      * odd plane, as the delegate feeds it), and an odd padded plane at 5x5 with an

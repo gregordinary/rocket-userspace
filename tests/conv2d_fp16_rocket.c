@@ -270,6 +270,10 @@ int main(int argc, char **argv)
             { .ic=64,.ih=8, .iw=8, .oc=64,.kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1,.depthwise=1 }, /* 3x3 DW same-pad */
             { .ic=64,.ih=8, .iw=12,.oc=64,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1,.depthwise=1 }, /* 3x3 DW stride2 */
             { .ic=128,.ih=7,.iw=7, .oc=128,.kh=5,.kw=5,.stride_y=1,.stride_x=1,.pad_top=2,.pad_left=2,.dil_y=1,.dil_x=1,.depthwise=1 }, /* 5x5 DW, 2 groups */
+            /* tall and narrow: an input 8 or fewer wide and taller than Mesa's FEATURE_GRAINS
+             * constant (52-53) computes wrong unless the program writes IH + 1 */
+            { .ic=32,.ih=64,.iw=8, .oc=32,.kh=3,.kw=3,.stride_y=1,.stride_x=1,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1,.depthwise=1 }, /* 8x64 DW */
+            { .ic=32,.ih=200,.iw=2,.oc=32,.kh=3,.kw=3,.stride_y=2,.stride_x=2,.pad_top=1,.pad_left=1,.dil_y=1,.dil_x=1,.depthwise=1 }, /* 2x200 DW stride2 */
         };
         for (size_t i = 0; i < sizeof(shapes)/sizeof(shapes[0]); i++) {
             fail |= run_shape(fd, &shapes[i]);

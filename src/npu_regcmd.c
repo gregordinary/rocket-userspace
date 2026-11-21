@@ -1249,13 +1249,18 @@ static int conv_emit(conv_params_t *p, struct conv_task *t)
  * (G=64 fails with max_abs 6/24, G=32 is exact on every depthwise shape) [HW sweep, RK3588,
  * 2026-06-20]. The depthwise output writer is Mesa's depthwise branch, from a diff against a
  * Teflon capture: SIZE_E 3 whatever the output type, OD_BYPASS clear, SURFACE_ADD doubled,
- * FEATURE_GRAINS 50 + stride_y + 1, and CPEND 0x80 (0x80 minus a zero weight zero point). A
- * depthwise program that copies the direct program's values computes plausible channels in
- * the wrong places. ROCKET_CONV_DW_GROUP, _SIZEE and _BSOWOP override the group and the two
- * writer fields, and ROCKET_CONV_DW_OCPAD pads the output channels as Mesa does (a multiple of
- * 32, doubled at 32 or fewer, a multiple of 64). params->act fuses an activation into the DPU
- * epilogue: BN maps the result onto the table's index grid, EW runs the LUT and OUT_CVT decodes
- * the result to fp16, so the caller must set fp16_out.
+ * and CPEND 0x80 (0x80 minus a zero weight zero point). A depthwise program that copies the
+ * direct program's values for those fields computes plausible channels in the wrong places.
+ * FEATURE_GRAINS is NOT Mesa's: Mesa programs 50 + stride_y + 1, which computes a plausible
+ * wrong surface on an input 8 or fewer wide and taller than it (fp16 and int8, stride 1 and 2);
+ * the depthwise program keeps conv_common's IH + 1, exact over widths 1-8, heights 56-400,
+ * strides 1-2 and kernels 3 and 5 [HW sweep, RK3588, 2026-11-20]. The vendor runtime programs
+ * IH + KH + pad_top, exact on the same sweep. ROCKET_CONV_DW_GROUP, _SIZEE and _BSOWOP
+ * override the group and the two writer fields, and ROCKET_CONV_DW_OCPAD pads the output
+ * channels as Mesa does (a multiple of 32, doubled at 32 or fewer, a multiple of 64).
+ * params->act fuses an activation into the DPU epilogue: BN maps the result onto the table's
+ * index grid, EW runs the LUT and OUT_CVT decodes the result to fp16, so the caller must set
+ * fp16_out.
  */
 static int conv_fp16(conv_params_t *p, int depthwise)
 {
@@ -1295,7 +1300,6 @@ static int conv_fp16(conv_params_t *p, int depthwise)
         t.size_e = 3;
         t.od_bypass = 0;
         t.surf_add *= 2;
-        if (!getenv("ROCKET_CONV_GRAINS")) t.grains = (uint16_t)(50 + p->stride_y + 1);
         t.ow_op = 0x80;
         if ((e = getenv("ROCKET_CONV_DW_SIZEE"))) t.size_e = (unsigned)strtoul(e, NULL, 0) & 0x7;
         if ((e = getenv("ROCKET_CONV_DW_BSOWOP"))) t.ow_op = (uint32_t)strtoul(e, NULL, 0);
@@ -1419,7 +1423,6 @@ static int conv_int8(conv_params_t *p, int depthwise)
     }
     if (depthwise) {
         t.od_bypass = 0;
-        if (!getenv("ROCKET_CONV_GRAINS")) t.grains = (uint16_t)(50 + p->stride_y + 1);
         t.ow_op = 0x80 - (uint32_t)p->weight_zero_point;
         if (p->int8_out) {
             int8_out_epilogue(&t, p);
