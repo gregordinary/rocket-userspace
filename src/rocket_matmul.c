@@ -741,17 +741,21 @@ static int mm_pick_nt(int N, int max_tile, int na)
  * which caps Nt and multiplies the task count. gen_gemm_fp16 instead streams a weight
  * cube larger than its banks: the input tile stays resident, the weights cycle through
  * the banks it leaves (at least npu_stream_weight_banks()), and one task covers a whole N
- * slice. On one core with every task its own
- * kick, 160x1024x4096 ran at 766 GFLOP/s against 223 for the best whole-tile tiling
- * (3.4x), and 128x2560x4096 at 1.3x [HW sweep 2026-10-21, tests/weight_stream_probe].
+ * slice. On one core with every task its own kick, 160x1024x4096 runs at 873-876 GFLOP/s
+ * against 386-417 for the best whole-tile tiling with DATA_REUSE (2.09-2.27x), and
+ * 128x2560x4096 at 1.50-1.51x [HW sweep 2026-11-21, RK1 at 1028 MHz, SPLL programmed,
+ * tests/weight_stream_probe]. With SPLL unprogrammed (928 MHz, 2026-10-21), when the default
+ * was set, the same probe measured 766 against 223 GFLOP/s (3.4x) and 1.3x.
  *
  * What the streamed tile costs instead is weight DMA: every M-tile re-reads the whole
- * weight slice (~5.4 GB/s a core, tests/gemv_bw_probe), and the atom grows with Kt, so a
- * deep K shrinks Mt. The plan therefore trades Kt against Mt.
+ * weight slice (10.4-10.8 GB/s a core with SPLL programmed, about half that without,
+ * tests/gemv_bw_probe), and the atom grows with Kt, so a deep K shrinks Mt. The plan
+ * therefore trades Kt against Mt.
  *
  * In a model it measured pp512 1.13-1.14x on Llama-3.2-3B F16 and 1.16x on its Q4_K_M
  * under quant residency, 1.12-1.15x on Ministral-3-3B F16 and 1.07-1.11x on Qwen3.5-9B
- * Q4_K_M, perplexity unchanged to 0.02% [HW sweep 2026-10-21, RK1, three passes rotated]. */
+ * Q4_K_M, perplexity unchanged to 0.02% [HW sweep 2026-10-21, RK1 at 928 MHz, SPLL
+ * unprogrammed, three passes rotated]. */
 static int stream_on(void) {
     static _Atomic int v = -1;
     if (v < 0) { const char *e = getenv("ROCKET_MM_STREAM"); v = e ? atoi(e) > 0 : 1; }
@@ -800,16 +804,29 @@ static int stream_kt_force(void) {
  *     reads and sums every pass.
  *
  * Fitted to a sweep of every streamed Kt at six fp16 and six int8 LLM projection shapes, M
- * 512, five workers [HW sweep 2026-10-21, ROCKET_MM_STREAM_KT]: a crossover of 128 rows for
- * both datatypes, a host-read pass at ~8x its bytes, and no fixed charge per task or pass
- * (fitted as zero). It picks the measured-fastest Kt, or one within 2%, at 11 of the 12; the
- * byte-count model it replaces picked Kt 1.10-2.0x slower at 10 of them. Against that model
- * at 24 fp16 and 20 int8 shapes it is 1.06x and 1.23x faster (geo-mean), with one fp16
- * mispick: 3584x1024 takes Kt 608 at 0.87x, because the slice's 76-row tail tile is charged
- * as a whole exposed weight read. Costing tiles continuously fixes that shape and picks
- * Kt 960 at K 3840, which is 1.25-1.6x slower than its neighbours for no reason the model
- * has; the tail form stays. */
-#define STREAM_XM    128
+ * 512, five workers [HW sweep 2026-10-21, RK1 at 928 MHz, SPLL unprogrammed,
+ * ROCKET_MM_STREAM_KT]: a crossover of 128 rows for both datatypes, a host-read pass at ~8x
+ * its bytes, and no fixed charge per task or pass (fitted as zero). It picks the
+ * measured-fastest Kt, or one within 2%, at 11 of the 12; the byte-count model it replaces
+ * picked Kt 1.10-2.0x slower at 10 of them. Against that model at 24 fp16 and 20 int8 shapes
+ * it is 1.06x and 1.23x faster (geo-mean), with one fp16 mispick: 3584x1024 takes Kt 608 at
+ * 0.87x, because the slice's 76-row tail tile is charged as a whole exposed weight read.
+ * Costing tiles continuously fixes that shape and picks Kt 960 at K 3840, which is 1.25-1.6x
+ * slower than its neighbours for no reason the model has; the tail form stays.
+ *
+ * Re-swept with SPLL programmed, the same six shapes a datatype, 97 forced-Kt configurations
+ * [HW sweep 2026-11-21, RK1 at 1028 MHz]: this cost picks within 5% of the fastest Kt at 8 of
+ * the 12 and within 2% at 7. Its mispicks are fp16 Kt 640 at Mt 256 for 3840x15360 (1.20x),
+ * fp16 Kt 1120 at Mt 128 for K 12288 and 15360 (1.12-1.13x; their neighbours run within 2-4%
+ * of Kt 1024, cause not characterized), and int8 Kt 2048 for 12288x4096 (1.25x) and
+ * 4096x12288 (1.05x). A crossover of 96-116 rows fits that sweep best, within 2% at 8 and 5%
+ * at 9; 64 rows is within 5% at only 4. The crossover does not move with the read rate.
+ *
+ * STREAM_XM is 112. Against 128 it changes one of the twelve picks: fp16 3840x15360 takes Kt
+ * 960 at Mt 168 instead of Kt 640 at Mt 256, and runs in 0.95-0.99x the time; the other eleven
+ * plans are the same, the int8 12288x4096 mispick included [HW sweep 2026-11-22, RK1 at
+ * 1028 MHz, SPLL programmed, matmul_dtype_perf_rocket M 512, five workers, three passes]. */
+#define STREAM_XM    112
 #define STREAM_HOSTW 8.0
 static int mm_plan_stream(const struct mm_geom *g, int M, int K, int N, int budget,
                           int max_mt, int *pMt, int *pKt, int *pNt)
