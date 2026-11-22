@@ -33,11 +33,13 @@
  * so a host softmax skips the three NPU jobs the on-NPU softmax submits (exp / row-sum / scale)
  * and their per-call host<->NPU transfers of the [Tp,Tn] score matrix, which dominate it (it is
  * transfer-bound, not exp-bound). At d 384, 6 heads, T 101-1616 the host route makes
- * rocket_mha_self_fp16 1.63-1.78x faster AND uses 0.68-0.69x the process CPU time (user+sys),
- * because the transfers' system time outweighs the host exp [HW sweep, RK1, 2026-11-20]. It is
- * also exact in the deep tail, where the on-NPU EXP table reads 0 for scores 10+ below the row
- * max (rocket_softmax.h). A fully on-NPU RESIDENT softmax (scores kept in a BO, on-NPU row-max)
- * would remove the transfers; it does not exist. */
+ * rocket_mha_self_fp16 1.54-1.83x faster [HW sweep, RK1 at 1028 MHz, SPLL programmed,
+ * 2026-11-21]. With SPLL unprogrammed (928 MHz) it measured 1.63-1.78x AND used 0.68-0.69x the
+ * process CPU time (user+sys), because the transfers' system time outweighs the host exp
+ * [HW sweep, RK1, 2026-11-20]. It is also exact in the deep tail, where the on-NPU EXP table
+ * reads 0 for scores 10+ below the row max (rocket_softmax.h). A fully on-NPU RESIDENT
+ * softmax (scores kept in a BO, on-NPU row-max) would remove the transfers; it does not
+ * exist. */
 static _Atomic int g_attn_host_sm = -1;
 
 /* ROCKET_ATTN_HOST_SOFTMAX reads the same on every attention path: a nonzero value runs the

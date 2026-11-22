@@ -47,11 +47,11 @@
  * one call, and the two edge tiles in one call each. Banding takes 13-14% off a 639- and a
  * 726-token encode.
  *
- * `ROCKET_MB_ATTN=host` runs every attention in fp32 on the host instead. Against the
- * 2026-09-27 library, host attention tied the NPU at 58 tokens and was slower at 639 [HW sweep,
- * RK1, ~816 MHz]. The NPU path's flash-attention host passes are faster in later builds. Not
- * characterized: the crossover in those builds. `ROCKET_MB_PROF=1` prints each encode's phase
- * split.
+ * `ROCKET_MB_ATTN=host` runs every attention in fp32 on the host instead. Host attention ties
+ * the NPU at 58 tokens, where its encode takes 0.99-1.00x the NPU's time. At 639 tokens
+ * (ModernBERT-large) and 726 (mmBERT-base) it takes 1.59-1.81x the NPU's time [HW sweep
+ * 2026-11-22, RK3588 at 927.5 MHz, rocket 1.3.0, SPLL programmed].
+ * `ROCKET_MB_PROF=1` prints each encode's phase split.
  *
  * Against ONNX Runtime's fp32 CPU provider on the Laya decision model, the worst layer cosine
  * is 0.9999936 (ModernBERT-large, 639 tokens) and 0.99995 (mmBERT-base, 726 tokens). The

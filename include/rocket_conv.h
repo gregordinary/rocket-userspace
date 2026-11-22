@@ -733,12 +733,13 @@ void rocket_conv_transpose2d_weights_free(struct rocket_ctx *ctx,
  * shapes, with real-valued data and a bias. Against an fp64 reference, the worst |err| / mag
  * is 2^-14.8 to 2^-11.0 per layer, under a tested limit of 2^-9.
  *
- * A call takes 0.21-0.62x ONNX Runtime 1.27.0's 4-thread per-node time at pix2pix's layers
- * c2-c8 and 1.16x at c1, which has three input channels (50 MMAC over 16384 pixels). At
- * Depth Anything v2-small's neck at 518x518 it takes 0.12-1.43x. It is slower at the 19x19
- * and 37x37 3x3 convs, and 8.2x faster at the 3x3 stride-2 one. These times are [HW sweep,
- * mainline RK1 at ~816 MHz, three-worker context, governor ondemand, ORT at allow_spinning 0
- * on the A76s, 2026-10-08, tests/conv_model_bench.c].
+ * A call takes 0.13-0.51x ONNX Runtime 1.27.0's 4-thread per-node time at pix2pix's layers
+ * c2-c8 and 1.07-1.26x at c1, which has three input channels (50 MMAC over 16384 pixels). At
+ * Depth Anything v2-small's DPT head at 518x518 it takes 0.09-1.23x. Its 3x3 conv at 19x19
+ * with 64 channels is at parity (0.97-1.23x), and its other 3x3 convs take 0.59-0.91x. The
+ * 3x3 stride-2 one at 37x37 takes 0.09x. These times are [HW sweep 2026-11-21, RK3588 at
+ * 1028 MHz, rocket 1.3.0, SPLL programmed, tests/conv_model_bench.c]. The context had three
+ * workers under governor performance on cores 4-7, and ORT ran at allow_spinning 0 on the A76s.
  *
  * The unfold is the host's share of the time, and a frontend adds its own conversions.
  * `rocket_conv2d_prepacked_estimate_ms()` below models these times.
@@ -775,11 +776,13 @@ int rocket_conv2d_prepacked_plan(const rocket_conv2d_desc *d);
  * fitted to the warm median of 22 shapes on a three-worker context. The shapes are pix2pix's
  * eight encoder layers, Depth Anything v2-small's neck at 518x518 (1x1 and 3x3, stride 1 and
  * 2, 19x19 to 296x296), and the DINOv2 and ViT-B/16 patch embeddings. Over those shapes it is
- * within 0.85-1.16x of the measured time [HW sweep, mainline RK1 at 928 MHz (the 900 MHz
- * request), rocket 1.3.0, governor ondemand, 2026-10-27, tests/conv_model_bench.c].
+ * within 0.85-1.16x of the measured time [HW sweep, RK1 at 928 MHz (the 900 MHz request),
+ * rocket 1.3.0, SPLL unprogrammed, governor ondemand, 2026-10-27, tests/conv_model_bench.c].
+ * With SPLL programmed, at 1028 MHz under ondemand, the same shapes measure 0.68-1.07x the
+ * estimate, median 0.90 [HW sweep 2026-11-22].
  *
- * Note: it is a model, not a measurement. Another clock, worker count or governor moves
- * every term, and a shape far outside the fit set can fall outside that spread. */
+ * Note: it is a model, not a measurement. Another clock, boot loader, worker count or governor
+ * moves every term, and a shape far outside the fit set can fall outside that spread. */
 double rocket_conv2d_prepacked_estimate_ms(const rocket_conv2d_desc *d);
 rocket_conv2d_weights *rocket_conv2d_weights_pack(struct rocket_ctx *ctx, const rocket_conv2d_desc *d,
                                                   const _Float16 *W, const _Float16 *bias);

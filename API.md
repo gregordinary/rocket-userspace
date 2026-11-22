@@ -359,11 +359,13 @@ The unfold runs on the context's worker count of threads (`ROCKET_IM2COL_THREADS
 A 1x1 stride-1 unpadded conv reads its input in place. An explicit `oh` or `ow` sets a
 trailing pad. The worst element error measured is 2^-11.0 of its magnitude sum.
 
-A forward call takes 1.1-5.8 ms at pix2pix's eight encoder layers (c2-c8 sum 19.7 ms). At
-Depth Anything v2-small's neck it takes 0.5-11.9 ms [HW sweep, mainline RK1 at ~816 MHz,
-governor `ondemand`, two passes, 2026-10-08, `tests/conv_model_bench.c`].
-`_prepacked_estimate_ms` is a linear model of a call, for a frontend deciding whether to claim
-a node. It is fitted to 22 shapes at 928 MHz, and within 0.85-1.16x of the measured time there.
+A forward call takes 0.13-0.51x ONNX Runtime's 4-thread per-node time at pix2pix's encoder
+layers c2-c8, and 1.07-1.26x at c1. At Depth Anything v2-small's DPT head it takes 0.09-1.23x
+[HW sweep 2026-11-21, RK3588 at 1028 MHz, [SPLL](README.md#terms) programmed,
+`tests/conv_model_bench.c`]. `_prepacked_estimate_ms` is a linear model of a call, for a
+frontend deciding whether to claim a node. It is fitted to 22 shapes at 928 MHz with SPLL
+unprogrammed, and within 0.85-1.16x of the measured time there. With SPLL programmed, at
+1028 MHz, the same shapes measure 0.68-1.07x the estimate.
 
 ### RK3576 convolution, pooling and activation
 
@@ -574,11 +576,15 @@ The scale, soft-cap, mask and softmax run as one fp32 host pass per row by defau
 MHA path, where the host is also the default.
 
 > [!CAUTION]
-> The scores are fp16 and saturate. A score `scale·q·k` past 65504 is written as ±65504, not
-> inf. The keys past it tie, and the softmax returns finite, wrong values [HW sweep
-> 2026-10-09, RK1, ~816 MHz]. Every path checks the raw scores in its host mask pass. It
-> returns `ROCKET_E_RANGE` when a real key reaches the limit, and `out` is then not valid. A
-> caller holding the operands at higher precision can recompute.
+> The scores are fp16. A raw score `q·k` from 65504 to 65519 is written as ±65504. One of 65520
+> or more is written as ±inf. A sum past the range narrows the same way as one product does
+> [HW sweep 2026-11-07, RK1 at 928 MHz]. Either corrupts the softmax, with tied keys or a NaN
+> row.
+>
+> Every path checks the raw scores in its host mask pass. It returns `ROCKET_E_RANGE` when a
+> real key reaches the limit, and `out` is then not valid. A caller holding the operands at
+> higher precision can recompute. Folding the scale into Q before the call moves the limit from
+> a raw `q·k` of 65504 to a scaled one.
 
 `rocket_flash_attn_fp16_mt(…, nthreads)` fans the heads across worker fds, and the cores run
 head ranges in parallel. `rocket_fa_ctx` with `rocket_flash_attn_fp16_ctx` is the persistent
@@ -594,8 +600,14 @@ per-head path.
 
 Chaining cuts the small-GEMM fixed dispatch overhead. It nearly doubles the flash-attention
 throughput against a per-call batch. Against the per-head path it is ~2.0-3.8x faster in
-head-range time (186->50 ms @512, 363->183 ms @2K). The crossover where the NPU beats the CPU
-at prefill moves from ~6K to ~2K. Chained and per-head outputs are identical (cos = 1.000000).
+head-range time (186->50 ms @512, 363->183 ms @2K, RK3588 at ~816 MHz, SPLL unprogrammed).
+Chained and per-head outputs are identical (cos = 1.000000).
+
+`ggml-rocket` offloads an attention op from 1024 keys. Through it, the chained attention runs
+Gemma-4-12B F16 prefill 1.07-1.09x as fast as llama.cpp's CPU flash attention at a 1024-token
+prompt. It runs 1.20x as fast at 2048 tokens and 1.94x at 16384. Offloading every op of a
+512-token prompt measures 0.99-1.00x the CPU's rate [HW sweep 2026-11-21, RK3588 at 927.5 MHz,
+SPLL programmed].
 
 `ROCKET_FA_CHAIN_ELEMS` (default 32M score elements) bounds the chained head group. A worker's
 ~3-head range then stays batched up to ~20K context, at ~150-200 MB/worker scratch. Collapsing
@@ -613,11 +625,15 @@ row-major write costs the device more. The handoff needs the persistent `rocket_
 `ROCKET_FA_CHAIN` and the fused host softmax (`ROCKET_FA_FUSED_SOFTMAX`). QK must also plan the
 head dimension in one K tile, or the cube handoff runs.
 
-The row handoff takes 0.64-0.69x the cube handoff's time at a 1370-token ViT layer. At a
-512-query prefill shape from 2048 to 32768 keys it takes 0.73-0.82x, with the output
-bit-identical. Both were measured on the RK1 at ~816 MHz [HW sweep 2026-10-11]. The one
-exception is a head that runs alone in its chained group. It keeps fp32 host K-accumulation for AV, where the cube handoff's
-one-shot matmul accumulates in fp16 on the device. The two differ by a few fp16 ulps.
+At a 512-query LLM prefill shape (head dimension 256, 16 query and 8 KV heads, causal) the row
+handoff takes 0.65-0.76x the cube handoff's time from 2048 to 32768 keys. It writes plain rows
+at 2048 keys and blocks at 8192 and 32768. Plain rows past a 4 KiB row take 0.83-0.86x [HW sweep
+2026-11-21, RK3588 at 1028 MHz, SPLL programmed]. At a 1370-token ViT layer the row handoff
+takes 0.64-0.69x [HW sweep 2026-10-11, RK3588 at ~816 MHz, SPLL unprogrammed].
+
+The output is bit-identical to the cube handoff's, with one exception: a head that runs alone in
+its chained group. It keeps fp32 host K-accumulation for AV, where the cube handoff's one-shot
+matmul accumulates in fp16 on the device. The two differ by a few fp16 ulps.
 
 `ROCKET_FA_TILE_KV` (default off) is the opt-in tiled long-context variant. It walks the key
 axis in `ROCKET_FA_TILE_KV`-wide tiles that keep the FlashAttention-2 running softmax (fp32
@@ -697,11 +713,15 @@ native dtype (the per-dtype alignment atoms are listed in the matmul API above).
 | dtype | support | use |
 |---|---|---|
 | fp16 -> fp32 | native, validated | the core path, coherent Gemma-4-12B prefill |
-| int8 -> int32 | native, bit-exact | W8A8 (+Hadamard) = char-identical to fp16, for RAM rather than speed |
-| int4 -> int16 | native, bit-exact | W4A4, for RAM, can reach single-pass K |
+| int8 -> int32 | native, bit-exact | W8A8 (+Hadamard) = char-identical to fp16, at half its weight bytes |
+| int4 -> int16 | native, bit-exact | W4A4, at a quarter of fp16's weight bytes, can reach single-pass K |
 | bf16 -> fp32 | native, validated | fp32 range with no activation scaling, token-identical to fp16 |
 | tf32 -> fp32 | native, validated | first 4-byte-input path, for coverage (half-rate) |
 | int16 -> int32 | native single task, **saturating**, no tiled entry | int64-exact via int8 byte-decomposition |
+
+With SPLL programmed, int8 with streamed weights runs 1.53-1.55x fp16's rate at `512×3840×4096`,
+and int8 prefill in a model 0.98-1.10x resident fp16's
+([Performance](README.md#performance)).
 
 **int16's int32 output saturates.** `gen_gemm_int16` writes the whole int32 output in one
 task. It is bit-exact against the int64 dot product clamped to int32 (`int16_native_probe`,
@@ -1017,7 +1037,7 @@ and are not listed. A caller has no reason to set them.
 | `ROCKET_SIGLIP_FA` | on | With more than one worker, `rocket_siglip_ctx_create` fans the attention heads across the worker fds through a flash-attention context. `0` keeps one resident single-stream context. An integer switch, so `on` turns it off. Read at context creation |
 | `ROCKET_SIGLIP_PIN` | on | The SigLIP encoder pins its host worker threads, and the calling thread's serial work, to the big cores. `0` leaves them unpinned. An integer switch, so `on` turns it off. Read once |
 | `ROCKET_MB_BAND_TILE` | 128 | `rocket_modernbert`'s banded sliding attention query tile, in rows. `0` computes every sliding layer dense, and a negative value selects 0. Read at context creation |
-| `ROCKET_MB_ATTN` | npu | `host` runs `rocket_modernbert`'s attention in fp32 on the host, and any other value keeps the NPU. Against the 2026-09-27 library, host attention tied the NPU at 58 tokens and was slower at 639 [HW sweep, RK1, ~816 MHz]. The crossover in later builds is not characterized. Read at context creation |
+| `ROCKET_MB_ATTN` | npu | `host` runs `rocket_modernbert`'s attention in fp32 on the host, and any other value keeps the NPU. Host attention ties the NPU at 58 tokens, and its encode takes 1.59-1.81x the NPU's time at 639 and 726 tokens [HW sweep 2026-11-22, RK3588 at 927.5 MHz, SPLL programmed]. Read at context creation |
 
 ### Convolution and activations
 
@@ -1226,11 +1246,18 @@ whole-tile plan.
 The streamed plan costs one 256-row slice of M, so every M of 256 or more plans the same Kt and
 Nt. A resident weight packed at one row count therefore serves every prefill row count.
 
-The plan's cost model charges each task the larger of its weight stream and its MACs. It charges
-each K pass its partial output, eight times over when the host sums the passes (int8, or fp16
-with `ROCKET_KACC=0`). It was fitted to a sweep of every streamed Kt at twelve shapes. Against
-a byte-count model at 44 shapes it is 1.06x faster in fp16 and 1.23x in int8 (geo-mean). It is
-slower at one shape, fp16 3584×1024, at 0.87x [HW sweep 2026-10-21].
+The plan's cost model charges each task the larger of its weight stream and the MACs of 128 rows
+per weight byte. An M tile of 128 rows or more therefore hides its weight re-read. It charges
+each K pass its partial output, eight times over when the host sums the passes (int8, or fp16 with
+`ROCKET_KACC=0`). The 128-row crossover and the factor of 8 were fitted to a sweep of every
+streamed Kt at twelve shapes, with SPLL unprogrammed. Against a byte-count model at 44 shapes the
+plan is 1.06x faster in fp16 and 1.23x in int8 (geo-mean). It is slower at one shape, fp16
+3584×1024, at 0.87x [HW sweep 2026-10-21].
+
+With SPLL programmed, at 1028 MHz, the plan picks within 5% of the fastest Kt at 8 of 12 pairs
+of shape and datatype. It picks within 2% at 7. Its worst pick, int8 at K 12288 and N 4096,
+takes 1.25x the fastest's time. A crossover set to 96-116 rows picks within 2% at 8 pairs and
+within 5% at 9 [HW sweep 2026-11-21, host-computed].
 
 At M 512 on five workers, the resident entries' streamed plan is 1.10-1.51x faster than the
 whole-tile plan at LLM projection shapes in fp16. In int8 it is 0.99-2.43x. The int8 gain
@@ -1249,7 +1276,8 @@ End-to-end prefill through `ggml-rocket` on three cores, pp512, against `ROCKET_
 | Qwen3.5-9B Q4_K_M, quantized weights held resident | 1.069-1.110x |
 
 **Conditions:** RK3588, NPU clock 928 MHz (the 900 MHz request), kernel 7.2.9, `rocket` 1.3.0,
-CPU governor `performance`, three passes with the order rotated, 2026-10-21 [HW sweep].
+SPLL unprogrammed, CPU governor `performance`, three passes with the order rotated, 2026-10-21
+[HW sweep].
 
 Every result is bit-exact against its reference. Llama-3.2-3B F16's wikitext perplexity is
 10.9135 with the whole-tile plan and 10.9120 with the streamed one.

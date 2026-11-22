@@ -23,8 +23,8 @@ The `rocket` driver is a generic register-command submitter (`CREATE_BO` / `SUBM
 `PREP_BO` / `FINI_BO`). It runs whatever register program it is handed, so op coverage is a
 userspace matter. The library emits its own matmul register programs and the kernel runs
 them, where a matmul is a 1×1 convolution over the NVDLA-style CNA→CORE→DPU blocks.
-Gemma-4-12B prefill runs on the NPU through this path. Decode stays on the CPU. An M=1 GEMV
-is bound by the DDR bandwidth the NPU shares with the CPU, and the NPU adds a dispatch to it.
+Gemma-4-12B prefill runs on the NPU through this path, and the frontends run decode, an M=1
+GEMV, on the CPU ([Decode](#decode)).
 
 ## Operations
 
@@ -62,8 +62,9 @@ different things, and conflating them is the common mistake:
 | CBUF | The on-chip buffer the CNA fills. Tile sizes are chosen to fit it. |
 | Cube layout | The NPU's native tensor format. The host scatters row-major data into it and de-tiles the result. |
 | Resident weights | Weights left in device memory across calls, so a repeated layer packs them once. |
-| Prefill, decode | The two LLM phases. Prefill is a batched GEMM and runs here, and decode is `M=1` and stays on the CPU. |
+| Prefill, decode | The two LLM phases. Prefill processes the prompt as a batched GEMM. Decode generates one token a step, an `M=1` GEMV. |
 | The submit seam | The `rocket_*` symbols every kernel interaction goes through, and the swap point for a non-mainline driver. |
+| SPLL | The PLL in the RK3588's secure bus clock unit that clocks the center interconnect, the path the NPU reads DDR through. Only the boot loader programs it ([Boot loader](#boot-loader)). |
 
 Submits, tasks and kicks vary independently, which is what makes them worth separating:
 
@@ -119,19 +120,52 @@ clock comes from a PVTPLL, a ring oscillator whose frequency follows the rail vo
 requested rate is therefore not the running clock.
 
 Apply the `patches/rocket` clock and voltage patches and load the module with
-`rocket_npu_clk_hz=900000000`. On the RK1's 0.80 V rail that request runs at 928 MHz. It held
-922-928 MHz through 15 minutes of continuous load, at a 49 °C peak, with every matmul
-bit-exact. The patches also trim dispatch latency.
+`rocket_npu_clk_hz=900000000`. On a Turing RK1's 0.80 V rail that request runs at 928 MHz. It
+held 922-928 MHz through 15 minutes of continuous load, at a 49 °C peak, with every matmul
+bit-exact. A second RK1 runs the same request at 1028 MHz, so each RK3588 figure below states
+the clock its board ran at. The patches also trim dispatch latency.
 
-Most RK3588 performance figures below were measured with the 600 MHz request, which runs at
-~816 MHz on the same rail, and each states its clock. On matmul device time the 900 MHz request
-is 1.044x faster than the 600 MHz one. The RK3576 figures state their own clock, which the
-board's device tree assigns.
+The share of a call's device time that scales with the NPU clock depends on the boot loader
+([Boot loader](#boot-loader)). With SPLL programmed, ~70% of one core's fp16 matmul device time
+at `512×3840×4096` scales with the clock at 1028 MHz. With SPLL unprogrammed, ~39% of the
+whole-tile fp16 program's device time on two cores scales with it at ~816 MHz (the 600 MHz
+request). A call dominated by its weight read gains 1.02x from 905 to 1028 MHz, the 600 and
+900 MHz requests on the second RK1 [HW sweep 2026-11-21]. The RK3576 figures state their own
+clock, which the board's device tree assigns.
 
 > [!CAUTION]
 > With the NPU cores pinned on (`power/control=on`), an `rmmod` at the 900 MHz request
 > hard-locks the board, and only a power cycle recovers it. Unload the module only while all
 > three cores are runtime-suspended.
+
+### Boot loader
+
+On the RK3588, the NPU's DDR read rate depends on the boot loader. The NPU reads DDR through
+the center interconnect, whose clock, `aclk_center_root`, runs from SPLL. Linux describes SPLL as
+a fixed 702 MHz clock and neither programs nor measures it. Behind a boot loader that leaves it
+unprogrammed, the NPU reads DDR at half the rate. The NPU's output writes and the CPU's reads
+keep their rate [HW sweep 2026-11-21].
+
+| Boot loader | SPLL |
+|---|---|
+| Mainline U-Boot v2026.07 and v2026.10, Turing RK1, eMMC boot | Not programmed [HW sweep] |
+| Other mainline U-Boot from v2026.01 to v2027.01-rc1, where no SPL device requests a secure bus clock | Not programmed [expected] |
+| Mainline U-Boot with commit `514663543ecf`, first released in v2027.01-rc2 | Programmed [HW sweep] |
+| Armbian's `2026.07_armbian` build for the Turing RK1 | Programmed [HW sweep] |
+
+With SPLL programmed, a read-dominated call runs up to 1.98x as fast, and three cores stream
+1.7x as fast. Work that host time or output writes bound gains less: LLM prefill through
+`ggml-rocket` gains 1.01-1.11x, and a Whisper encoder 0.99-1.03x [HW sweep 2026-11-21].
+
+**Conditions:** Turing RK1, kernel 7.3.3, `rocket` 1.3.0, the 900 MHz request (1028 MHz on that
+board), CPU governor `performance`, DDR at 2112 MHz. Each ratio compares two boot loaders on one
+board. Measured 2026-11-21.
+
+> [!CAUTION]
+> `clk_summary` reports SPLL and `aclk_center_root` at 702 MHz whether or not the boot loader
+> programmed SPLL. To check a board, time a weight read on one core with
+> `sudo -E build/gemv_bw_probe int8 4096 4096`. It streams about 10.4 GB/s with SPLL
+> programmed, and about 5.4 GB/s without.
 
 ## Quickstart
 
@@ -335,20 +369,35 @@ wrong parameters.
 
 ## Performance
 
-The matmul is a prefill and batched-GEMM engine. At ~816 MHz (the 600 MHz request) the
-whole-tile program's resident throughput on `512×3840×4096` is 461 GOP/s in fp16, 413 in int4
-and 386 in int8. It is DMA-bound and dispatch-bound rather than MAC-bound.
+The matmul is a prefill and batched-GEMM engine. The fp16 planner streams the weights through
+the CBUF by default (`ROCKET_MM_STREAM`), which runs `512×3840×4096` in 12 tasks instead of the
+whole-tile program's 512. With resident weights on three cores, that shape runs at these rates
+[HW sweep 2026-11-21]:
 
-As an LLM prefill through `ggml-rocket`, with the weights streamed through the CBUF, it runs
-Gemma-4-12B F16 at 24.6 t/s at pp2048. The 8-thread CPU runs 4.7 t/s there, so the speedup is
-5.2x, and 5.1x at pp512. Measured 2026-11-01 at 928 MHz (the 900 MHz request), CPU governor `performance`,
-llama.cpp b11539.
+| Program | GOP/s | Against fp16 streamed | MAC rate against fp16 |
+|---|---:|---:|---:|
+| fp16, streamed weights (the default) | 959-971 | 1x | 1x |
+| fp16, whole-tile (`ROCKET_MM_STREAM=0`) | 754-794 | 0.78-0.83x | 1x |
+| int8, streamed weights (the default) | 1482-1486 | 1.53-1.55x | 2x |
+| int8, whole-tile (`ROCKET_MM_STREAM_INT8=0`) | 629-645 | 0.65-0.67x | 2x |
+| int4, whole-tile (it has no streamed plan) | 1166-1214 | 1.20-1.27x | 4x |
 
-The fp16 planner streams the weights through the CBUF by default (`ROCKET_MM_STREAM`), which
-runs `512×3840×4096` in 12 tasks instead of the whole-tile program's 512. Through `ggml-rocket`
-it runs pp512 1.07-1.17x faster than the whole-tile program on four models, at 928 MHz (the
-900 MHz request). The step table below is the whole-tile program's.
-[API.md](API.md#matmul-tiling-plans) has the streamed plan's conditions and per-model figures.
+**Conditions:** RK3588 (Turing RK1), kernel 7.3.3, `rocket` 1.3.0, the 900 MHz request (1028 MHz
+on this board), a boot loader that programs SPLL, CPU governor `performance`. Five worker fds,
+K-accumulation on, the fastest of seven warm calls (`tests/matmul_dtype_perf_rocket.c`).
+Measured 2026-11-21.
+
+The MAC array does not bound the three-core call. At fp16 host work does [hypothesis]: the
+three-core call takes 16.6-16.8 ms, less than one core's 19.0-21.4 ms of device time for the
+same call. On one core the device runs at 73-83% of the fp16 MAC rate.
+
+As an LLM prefill through `ggml-rocket`, with the weights streamed through the CBUF, the library
+runs Gemma-4-12B F16 at 24.6 t/s at pp2048. The 8-thread CPU runs 4.7 t/s there, so the speedup
+is 5.2x, and 5.1x at pp512. Measured 2026-11-01 at 928 MHz (the 900 MHz request), behind a boot
+loader that leaves SPLL unprogrammed, CPU governor `performance`, llama.cpp b11539. Under the same
+conditions the streamed plan runs pp512 1.07-1.17x faster than the whole-tile program on four
+models. [API.md](API.md#matmul-tiling-plans) has the streamed plan's per-model figures. The step
+table below is the whole-tile program's.
 
 ### Gemma-4-12B fp16 prefill
 
@@ -363,8 +412,8 @@ The whole-tile program reached ~15 t/s on Gemma-4-12B pp2048 through these steps
 | CBUF DATA_REUSE | 1.08x -> ~14.5 |
 | Resident weights (prefill-only) | 1.04x -> ~15.1 |
 
-**Conditions:** RK3588, Gemma-4-12B F16 through `ggml-rocket`, the whole-tile fp16 program,
-the clock step measured 2026-06-15.
+**Conditions:** RK3588, Gemma-4-12B F16 through `ggml-rocket`, the whole-tile fp16 program, a
+boot loader that leaves SPLL unprogrammed, the clock step measured 2026-06-15.
 
 A76 affinity, NEON fp16 conversion and the NEON readback de-tile reduce the host time around
 these steps. The remaining host work is memory-bound and gather-bound rather than
@@ -372,16 +421,40 @@ instruction-bound.
 
 ### Quantization and prefill speed
 
-At equal residency, quantization does not speed prefill at this operating point. At
-`512×3840×4096`, int8 with streamed weights and int4 run 1.14-1.20x the streamed fp16 matmul,
-against MAC rates of 2x and 4x [HW sweep 2026-11-02]. In a model, `ggml-rocket`'s resident int8
-route prefills at 0.95-0.99x resident fp16, with half the resident weight bytes [HW sweep
-2026-11-06]. The models were Llama-3.2-3B-Instruct and Ministral-3-3B-Instruct F16. Both were
-measured at 928 MHz.
+At equal residency, int8 changes prefill speed by a few percent, and int4 slows it. In a model,
+`ggml-rocket`'s resident int8 path prefills at 0.98-1.10x resident fp16, with half the resident
+weight bytes [HW sweep 2026-11-21]. The models are Llama-3.2-3B-Instruct, Ministral-3-3B-Instruct,
+Ministral-3-8B-Instruct and Qwen3.5-9B. On Gemma-4-12B, where resident fp16 places 94% of the
+weights, int8 places all of them and runs at 1.11-1.19x resident fp16 at pp2048. Resident
+group-wise int4 runs Gemma-4-12B at 0.28x resident fp16 at pp512 [HW sweep 2026-11-22].
 
-The int8 and int4 paths therefore save RAM and fit larger models rather than raising
-throughput. The result holds while prefill is DMA-bound and dispatch-bound. The [datatype
-matrix](API.md#datatype-matrix) has the full per-dtype detail.
+**Conditions:** as the matmul table above. llama.cpp b11539, F16 GGUFs, `llama-bench -n 0 -r 3
+-t 8` unpinned at the default `-b` and `-ub`, pp512 and pp2048 unless stated. The int8 weights
+are quantized once, at the first prefill, and held resident. Measured 2026-11-21 and 2026-11-22.
+
+The int8 matmul's 1.53-1.55x does not reach a model, because the int8 path does per-call host
+work. It quantizes each activation, reads back an int32 partial for each K pass and dequantizes
+the output. The int8 and int4 paths therefore mainly reduce memory, which fits larger models.
+The [datatype matrix](API.md#datatype-matrix) has the per-dtype detail.
+
+### Decode
+
+Decode is a GEMV, bound by DDR bandwidth, which the NPU shares with the CPU. At M 4 one core
+streams resident weights at 10.4-10.8 GB/s, fp16 and int8 alike. Three cores, each driven from
+its own process, stream 30.0-30.2 GB/s at fp16 and 27.5-29.3 GB/s at int8 [HW sweep 2026-11-21].
+The CPU decode of llama.cpp streams ~22-27 GB/s on the four A76 cores, so the NPU's stream is
+1.0-1.4x the CPU's [host-computed]. Each NPU call adds a dispatch, a fence, a de-tile and a pad
+of M to 4. Decode on the NPU end to end is not characterized, and the frontends keep it on the
+CPU.
+
+A Whisper decoder step with every matmul on the NPU, at M 4 with resident fp16 weights, runs
+1.8-2.2x slower than whisper.cpp's 4-thread CPU step. It uses about 40% of that step's CPU time
+[HW sweep 2026-11-21].
+
+**Conditions:** as the matmul table above. The stream rates are `tests/gemv_bw_probe.c` at K 4096
+and N 4096. The Whisper step is `tests/whisper_decode_step_probe.c` on three workers, pinned to
+cores 4-7. The CPU baselines ran on another RK1: llama.cpp b11539 at `taskset 0xf0 -t 4`
+(2026-11-01) and whisper.cpp v1.9.4 on 4 threads (2026-10-10).
 
 ## Capabilities and limitations
 
@@ -392,16 +465,17 @@ against an fp64 oracle reference, and [API.md](API.md#tests) holds the full cata
 limits:
 
 - **Integer K-partials accumulate on the host.** The conv accumulator reduces K only within
-  one CBUF-resident tile. The cross-tile adder is the DPU eltwise, which accumulates fp16
-  partials on the NPU as the on-NPU K-accumulation. With all of its precision fields set to
-  one integer code, the eltwise ALU also adds int32 exactly (`tests/ew_int_probe`). The
-  library has no integer K-accumulation mode. One would not speed prefill, which is
-  dispatch-bound and DMA-bound rather than readback-bound.
-- **Quantization does not accelerate prefill.** int8 and int4 are for RAM rather than speed.
-- **Decode (M=1 GEMV) stays on the CPU.** It is bound by DDR bandwidth, which the NPU shares
-  with the CPU, so offloading it adds only dispatch overhead. A Whisper decoder step with every
-  matmul on the NPU runs 2.6-2.8x slower than whisper.cpp's 4-thread CPU step (RK3588 at
-  ~816 MHz, measured 2026-10-10).
+  one CBUF-resident tile, and the DPU eltwise adds fp16 partials across tiles on the NPU. With
+  all of its precision fields set to one integer code, the eltwise ALU also adds int32 exactly
+  (`tests/ew_int_probe`). The library has no integer K-accumulation mode, so the host reads
+  back and sums each int32 K pass. At M 512 the streamed int8 plan takes one pass at K 3072 and
+  six or seven at K 12288-14336 [host-computed]. The prefill gain of an on-NPU sum is not
+  characterized.
+- **Quantization mainly reduces memory.** At equal residency, int8 changes prefill speed by a
+  few percent and int4 slows it ([Quantization and prefill speed](#quantization-and-prefill-speed)).
+- **Decode (M=1 GEMV) is not characterized on the NPU end to end.** With SPLL programmed, the
+  NPU's three-core weight stream is 1.0-1.4x the CPU decoder's. Each call adds a dispatch, a
+  de-tile and a pad to M 4 ([Decode](#decode)).
 - **Weights are packed on the host.** No register converts a layout, because the datapath
   has no transpose or RUBIK engine. A matmul's activation and output need no packing. A
   stride-only register form reads A and writes C as plain rows, exact at fp16 and int8

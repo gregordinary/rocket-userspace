@@ -237,8 +237,11 @@ int  rocket_batched_submit_supported(void);
  *
  * Measured on the vendor provider at 512×3840×4096 fp16 over three warm rounds, a chained
  * submit takes 36.8-39.3 ms against 68-77 ms unchained. With the driver's own core
- * scheduler as well it takes 26.1-27.7 ms, against 23.5-24.4 ms for the same shape on
- * mainline.
+ * scheduler as well it takes 26.1-27.7 ms. All three ran the whole-tile plan on `rknpu` 0.9.8
+ * at 1 GHz, behind a boot loader that programs SPLL [HW sweep 2026-08-23]. The same shape on
+ * mainline `rocket` took 23.5-24.4 ms, at an NPU clock not recorded. The mainline run was
+ * behind a boot loader that leaves SPLL unprogrammed, which halves the NPU's DDR read rate.
+ * The two drivers are therefore not compared at one operating point.
  *
  * The result is probed once and cached. */
 int  rocket_batched_submit_native(void);

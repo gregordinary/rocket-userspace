@@ -33,9 +33,10 @@ extern "C" {
  * are optional, and NULL means none (Whisper has bq, bv and bo, and no bk).
  *
  * The matmuls run on the NPU. The softmax runs on the host by default, because the scores are
- * already there. The on-NPU softmax costs two transfers of the score plane and three jobs. At
- * d 384, 6 heads and T 101-1616, the host default makes the call 1.63-1.78x faster. It also
- * uses 0.68-0.69x the CPU time [HW sweep, RK3588, 2026-11-20].
+ * already there. The on-NPU softmax costs two transfers of the score plane and three jobs.
+ * The host default makes the call 1.54-1.83x faster than the on-NPU softmax (d 384, 6 heads,
+ * T 101-1616) [HW sweep 2026-11-21, RK3588 at 1028 MHz, SPLL programmed]. With SPLL
+ * unprogrammed it used 0.68-0.69x the CPU time [HW sweep 2026-11-20, RK3588 at 928 MHz].
  *
  * `ROCKET_ATTN_HOST_SOFTMAX=0` runs the softmax on the NPU, with the accuracy
  * `rocket_softmax_fp16` states. The variable reads the same on every attention path: a nonzero
@@ -153,13 +154,17 @@ void           rocket_fa_ctx_free(rocket_fa_ctx *c);
  * then needs neither a per-call BO allocation nor a full-BO zero, which nearly doubles the
  * FA-op throughput against a per-call batch.
  *
- * Chaining collapses the fixed small-GEMM dispatch overhead that made short and mid-context
- * attention slower on the NPU than on the CPU. It moves the FA-NPU-vs-CPU prefill crossover
- * from ~6K down to ~2K (parity <=1K), and so it is the default. The mask and softmax run
- * between the two batched jobs, so chaining is compatible with the host-softmax default. The
- * result is numerically identical to the per-head path. `ROCKET_FA_CHAIN_ELEMS` bounds the
- * head group by score-matrix size (default 32M elems), and `ROCKET_FA_CHAIN=0` forces the
- * per-head path.
+ * Chaining collapses the fixed small-GEMM dispatch overhead of short and mid-context attention,
+ * and so it is the default. `ggml-rocket` offloads an attention op from 1024 keys. Through it,
+ * Gemma-4-12B F16 prefills 1.07-1.09x as fast as with llama.cpp's CPU flash attention at a
+ * 1024-token prompt, and 1.94x as fast at 16384. Offloading every op of a 512-token prompt
+ * measures 0.99-1.00x the CPU's rate [HW sweep 2026-11-21, RK3588 at 927.5 MHz, SPLL
+ * programmed].
+ *
+ * The mask and softmax run between the two batched jobs, so chaining is compatible with the
+ * host-softmax default. The result is numerically identical to the per-head path.
+ * `ROCKET_FA_CHAIN_ELEMS` bounds the head group by score-matrix size (default 32M elems), and
+ * `ROCKET_FA_CHAIN=0` forces the per-head path.
  *
  * Chaining applies to the `_mt` and `_ctx` paths per worker, and to the `nthreads`==1 and
  * single-fd path over the whole range. The group size is an upper bound. When the driver
@@ -180,9 +185,12 @@ void           rocket_fa_ctx_free(rocket_fa_ctx *c);
  * The row handoff is bit-identical to the cube handoff, with one exception. A lone head in a
  * chained group keeps the batch's fp32 K-accumulation for AV. The cube handoff runs that head
  * as a one-shot matmul, which accumulates in fp16 on the device by default (a few fp16 ulps).
- * On the RK1 at ~816 MHz, the call measured 0.64-0.69x the cube handoff's time at a 1370-token
- * ViT layer [HW sweep 2026-10-11]. In the same sweep it measured 0.73-0.82x at a 512-query LLM
- * prefill shape from 2048 to 32768 keys.
+ *
+ * At a 512-query LLM prefill shape (head dimension 256, 16 query and 8 KV heads, causal), the
+ * call takes 0.65-0.76x the cube handoff's time from 2048 to 32768 keys, under the default
+ * `ROCKET_FA_RM_MAX_ROW`. Plain rows past a 4 KiB row take 0.83-0.86x [HW sweep 2026-11-21,
+ * RK3588 at 1028 MHz, SPLL programmed]. At a 1370-token ViT layer the call takes 0.64-0.69x
+ * [HW sweep 2026-10-11, RK3588 at ~816 MHz, SPLL unprogrammed].
  *
  * `ROCKET_FA_TILE_KV` selects the online, tiled path for long context. The materialized path
  * runs one QK matmul over the full key axis. It holds the [n_tokens,n_kv] score matrix on the
